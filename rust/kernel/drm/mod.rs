@@ -4,6 +4,7 @@
 
 pub mod device;
 pub mod drv;
+pub mod mm;
 
 pub(crate) mod private {
     pub trait Sealed {}
