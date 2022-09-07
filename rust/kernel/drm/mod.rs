@@ -3,6 +3,7 @@
 //! DRM subsystem
 
 pub mod device;
+pub mod drv;
 
 pub(crate) mod private {
     pub trait Sealed {}
