@@ -18,6 +18,7 @@
  * accidentally exposed.
  */
 
+#include <drm/drm_gem.h>
 #include <linux/amba/bus.h>
 #include <linux/bug.h>
 #include <linux/build_bug.h>
@@ -654,6 +655,44 @@ int rust_helper_fs_parse(struct fs_context *fc,
 	return fs_parse(fc, desc, param, result);
 }
 EXPORT_SYMBOL_GPL(rust_helper_fs_parse);
+
+int rust_helper_dma_set_mask_and_coherent(struct device *dev, u64 mask)
+{
+	return dma_set_mask_and_coherent(dev, mask);
+}
+EXPORT_SYMBOL_GPL(rust_helper_dma_set_mask_and_coherent);
+
+struct device_node *rust_helper_of_parse_phandle(const struct device_node *np,
+		const char *phandle_name,
+		int index)
+{
+	return of_parse_phandle(np, phandle_name, index);
+}
+EXPORT_SYMBOL_GPL(rust_helper_of_parse_phandle);
+
+bool rust_helper_of_node_is_root(const struct device_node *np)
+{
+	return of_node_is_root(np);
+}
+EXPORT_SYMBOL_GPL(rust_helper_of_node_is_root);
+
+resource_size_t rust_helper_resource_size(const struct resource *res)
+{
+	return resource_size(res);
+}
+EXPORT_SYMBOL_GPL(rust_helper_resource_size);
+
+void rust_helper_drm_gem_object_get(struct drm_gem_object *obj)
+{
+	drm_gem_object_get(obj);
+}
+EXPORT_SYMBOL_GPL(rust_helper_drm_gem_object_get);
+
+void rust_helper_drm_gem_object_put(struct drm_gem_object *obj)
+{
+	drm_gem_object_put(obj);
+}
+EXPORT_SYMBOL_GPL(rust_helper_drm_gem_object_put);
 
 /*
  * We use `bindgen`'s `--size_t-is-usize` option to bind the C `size_t` type
