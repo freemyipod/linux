@@ -5,6 +5,8 @@
 //!
 //! C header: [`include/linux/drm/drm_gem.h`](../../../../include/linux/drm/drm_gem.h)
 
+pub mod shmem;
+
 use alloc::boxed::Box;
 
 use crate::{
