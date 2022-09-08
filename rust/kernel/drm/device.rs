@@ -29,6 +29,13 @@ impl Drop for Device {
     }
 }
 
+impl Clone for Device {
+    fn clone(&self) -> Self {
+        unsafe { bindings::drm_dev_get(self.ptr) };
+        Device { ptr: self.ptr }
+    }
+}
+
 // SAFETY: `Device` only holds a pointer to a C device, which is safe to be used from any thread.
 unsafe impl Send for Device {}
 
