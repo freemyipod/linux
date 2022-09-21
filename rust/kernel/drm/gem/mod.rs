@@ -179,3 +179,21 @@ impl<T: IntoGEMObject> Deref for ObjectRef<T> {
         unsafe { &*self.ptr }
     }
 }
+
+pub(super) fn create_fops() -> bindings::file_operations {
+    bindings::file_operations {
+        owner: core::ptr::null_mut(),
+        open: Some(bindings::drm_open),
+        release: Some(bindings::drm_release),
+        unlocked_ioctl: Some(bindings::drm_ioctl),
+        #[cfg(CONFIG_COMPAT)]
+        compat_ioctl: Some(bindings::drm_compat_ioctl),
+        #[cfg(not(CONFIG_COMPAT))]
+        compat_ioctl: None,
+        poll: Some(bindings::drm_poll),
+        read: Some(bindings::drm_read),
+        llseek: Some(bindings::noop_llseek),
+        mmap: Some(bindings::drm_gem_mmap),
+        ..Default::default()
+    }
+}

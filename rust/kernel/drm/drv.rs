@@ -6,8 +6,8 @@
 //! C header: [`include/linux/drm/drm_drv.h`](../../../../include/linux/drm/drm_drv.h)
 
 use crate::{
-    bindings, device, drm, drm::private, error::code::*, error::from_kernel_err_ptr, str::CStr,
-    sync::LockClassKey, types::PointerWrapper, Error, Result,
+    bindings, device, drm, drm::private, error::code::*, error::from_kernel_err_ptr, prelude::*,
+    str::CStr, sync::LockClassKey, types::PointerWrapper, Error, Result, ThisModule,
 };
 use core::{
     marker::{PhantomData, PhantomPinned},
@@ -129,6 +129,8 @@ pub struct Registration<T: Driver> {
     drm: drm::device::Device<T>,
     parent: device::Device,
     registered: bool,
+    fops: bindings::file_operations,
+    vtable: Pin<Box<bindings::drm_driver>>,
     _p: PhantomData<T>,
     _pin: PhantomPinned,
 }
@@ -202,7 +204,8 @@ impl<T: Driver> Registration<T> {
     ///
     /// It is allowed to move.
     pub fn new(parent: &dyn device::RawDevice) -> Result<Self> {
-        let raw_drm = unsafe { bindings::drm_dev_alloc(&Self::VTABLE, parent.raw_device()) };
+        let vtable = Pin::new(Box::try_new(Self::VTABLE)?);
+        let raw_drm = unsafe { bindings::drm_dev_alloc(&*vtable, parent.raw_device()) };
         let raw_drm = from_kernel_err_ptr(raw_drm)?;
 
         // The reference count is one, and now we take ownership of that reference as a drm::device::Device.
@@ -212,6 +215,8 @@ impl<T: Driver> Registration<T> {
             drm,
             parent: device::Device::from_dev(parent),
             registered: false,
+            vtable,
+            fops: drm::gem::create_fops(),
             _pin: PhantomPinned,
             _p: PhantomData,
         })
@@ -225,6 +230,7 @@ impl<T: Driver> Registration<T> {
         self: Pin<&mut Self>,
         data: T::Data,
         flags: usize,
+        module: &'static ThisModule,
         lock_keys: [&'static LockClassKey; 2],
     ) -> Result {
         if self.registered {
@@ -239,6 +245,9 @@ impl<T: Driver> Registration<T> {
         unsafe {
             (*this.drm.raw_mut()).dev_private = data_pointer as *mut _;
         }
+
+        this.fops.owner = module.0;
+        this.vtable.fops = &this.fops;
 
         let ret = unsafe { bindings::drm_dev_register(this.drm.raw_mut(), flags as u64) };
         if ret < 0 {
@@ -292,6 +301,12 @@ macro_rules! drm_device_register {
     ($reg:expr, $data:expr, $flags:expr $(,)?) => {{
         static CLASS1: $crate::sync::LockClassKey = $crate::sync::LockClassKey::new();
         static CLASS2: $crate::sync::LockClassKey = $crate::sync::LockClassKey::new();
-        $crate::drm::drv::Registration::register($reg, $data, $flags, [&CLASS1, &CLASS2])
+        $crate::drm::drv::Registration::register(
+            $reg,
+            $data,
+            $flags,
+            &crate::THIS_MODULE,
+            [&CLASS1, &CLASS2],
+        )
     }};
 }
