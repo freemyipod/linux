@@ -110,10 +110,14 @@ pub trait Driver {
     ///
     /// Determines the type of the context data passed to each of the methods of the trait.
     type Data: PointerWrapper + Sync + Send;
+
     /// The type used to manage memory for this driver.
     ///
     /// Should be either drm::gem::Object<T> or drm::gem::shmem::Object<T>
     type Object: AllocImpl;
+
+    /// The type used to represent a DRM File (client)
+    type File: drm::file::DriverFile;
 
     const INFO: DriverInfo;
     const FEATURES: u32;
@@ -163,8 +167,8 @@ macro_rules! drm_legacy_fields {
 impl<T: Driver> Registration<T> {
     const VTABLE: bindings::drm_driver = drm_legacy_fields! {
         load: None,
-        open: None,
-        postclose: None,
+        open: Some(drm::file::open_callback::<T::File>),
+        postclose: Some(drm::file::postclose_callback::<T::File>),
         lastclose: None,
         unload: None,
         release: None,
