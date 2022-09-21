@@ -122,7 +122,7 @@ pub trait Driver {
 /// A registration of a DRM device
 pub struct Registration<T: Driver> {
     // Invariant: always a valid pointer to an allocated drm_device
-    drm: drm::device::Device,
+    drm: drm::device::Device<T>,
     parent: device::Device,
     registered: bool,
     _p: PhantomData<T>,
@@ -202,7 +202,7 @@ impl<T: Driver> Registration<T> {
         let raw_drm = from_kernel_err_ptr(raw_drm)?;
 
         // The reference count is one, and now we take ownership of that reference as a drm::device::Device.
-        let drm = drm::device::Device { ptr: raw_drm };
+        let drm = drm::device::Device::from_raw(raw_drm);
 
         Ok(Self {
             drm,
@@ -247,7 +247,7 @@ impl<T: Driver> Registration<T> {
         Ok(())
     }
 
-    pub fn device(&self) -> &drm::device::Device {
+    pub fn device(&self) -> &drm::device::Device<T> {
         &self.drm
     }
 }

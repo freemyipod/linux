@@ -22,7 +22,7 @@ use gem::BaseObject;
 #[repr(C)]
 pub struct Object<T: DriverObject> {
     obj: bindings::drm_gem_shmem_object,
-    dev: ManuallyDrop<device::Device>,
+    dev: ManuallyDrop<device::Device<T::Driver>>,
     p: T,
 }
 
@@ -31,7 +31,7 @@ pub struct Object<T: DriverObject> {
 #[repr(C)]
 struct NewObject<T: DriverObject> {
     obj: bindings::drm_gem_shmem_object,
-    dev: MaybeUninit<ManuallyDrop<device::Device>>,
+    dev: MaybeUninit<ManuallyDrop<device::Device<T::Driver>>>,
     p: MaybeUninit<T>,
 }
 
@@ -261,7 +261,11 @@ impl<T: DriverObject> Object<T> {
         &self.obj as *const _ as *mut _
     }
 
-    pub fn new(dev: &device::Device, private: T, size: usize) -> Result<gem::ObjectRef<Self>> {
+    pub fn new(
+        dev: &device::Device<T::Driver>,
+        private: T,
+        size: usize,
+    ) -> Result<gem::ObjectRef<Self>> {
         // SAFETY: This function can be called as long as the ALLOC_OPS are set properly
         // for this driver.
         let p = unsafe { bindings::drm_gem_shmem_create(dev.raw() as *mut _, size) };
@@ -272,8 +276,9 @@ impl<T: DriverObject> Object<T> {
         let new: &mut NewObject<T> = unsafe { &mut *(p as *mut _) };
 
         new.p.write(private);
-        new.dev
-            .write(ManuallyDrop::new(device::Device { ptr: dev.ptr }));
+        new.dev.write(ManuallyDrop::new(unsafe {
+            device::Device::from_raw(dev.ptr)
+        }));
 
         // SAFETY: p is fully initialized now, so we can take a mutable reference
         T::init(unsafe { &mut *p })?;
@@ -284,7 +289,7 @@ impl<T: DriverObject> Object<T> {
         Ok(obj_ref)
     }
 
-    pub fn dev(&self) -> &device::Device {
+    pub fn dev(&self) -> &device::Device<T::Driver> {
         &self.dev
     }
 
