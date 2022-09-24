@@ -11,7 +11,8 @@ use alloc::boxed::Box;
 
 use crate::{
     bindings,
-    drm::{device, drv, private},
+    drm::{device, drv, file, private},
+    prelude::*,
     to_result, Result,
 };
 use core::{mem, mem::ManuallyDrop, ops::Deref};
@@ -25,12 +26,23 @@ pub trait BaseDriverObject<T: BaseObject>: Sync + Send + Sized {
 }
 
 pub trait IntoGEMObject: Sized + private::Sealed {
+    type Driver: drv::Driver;
+
     fn gem_obj(&self) -> &bindings::drm_gem_object;
 }
 
 pub trait BaseObject: IntoGEMObject {
     fn size(&self) -> usize;
     fn reference(&self) -> ObjectRef<Self>;
+    fn create_handle(
+        &self,
+        file: &file::File<<<Self as IntoGEMObject>::Driver as drv::Driver>::File>,
+    ) -> Result<u32>;
+    fn lookup_handle(
+        file: &file::File<<<Self as IntoGEMObject>::Driver as drv::Driver>::File>,
+        handle: u32,
+    ) -> Result<ObjectRef<Self>>;
+    fn create_mmap_offset(&self) -> Result<u64>;
 }
 
 #[repr(C)]
@@ -66,12 +78,14 @@ unsafe extern "C" fn free_callback<T: DriverObject>(obj: *mut bindings::drm_gem_
 }
 
 impl<T: DriverObject> IntoGEMObject for Object<T> {
+    type Driver = T::Driver;
+
     fn gem_obj(&self) -> &bindings::drm_gem_object {
         &self.obj
     }
 }
 
-impl<T: IntoGEMObject + Sized> BaseObject for T {
+impl<T: IntoGEMObject> BaseObject for T {
     fn size(&self) -> usize {
         self.gem_obj().size
     }
@@ -84,6 +98,46 @@ impl<T: IntoGEMObject + Sized> BaseObject for T {
         ObjectRef {
             ptr: self as *const _,
         }
+    }
+
+    fn create_handle(
+        &self,
+        file: &file::File<<<Self as IntoGEMObject>::Driver as drv::Driver>::File>,
+    ) -> Result<u32> {
+        let mut handle: u32 = 0;
+        to_result(unsafe {
+            bindings::drm_gem_handle_create(
+                file.raw() as *mut _,
+                self.gem_obj() as *const _ as *mut _,
+                &mut handle,
+            )
+        })?;
+        Ok(handle)
+    }
+
+    fn lookup_handle(
+        file: &file::File<<<Self as IntoGEMObject>::Driver as drv::Driver>::File>,
+        handle: u32,
+    ) -> Result<ObjectRef<Self>> {
+        let ptr = unsafe { bindings::drm_gem_object_lookup(file.raw() as *mut _, handle) };
+
+        if ptr.is_null() {
+            Err(ENOENT)
+        } else {
+            Ok(ObjectRef {
+                ptr: ptr as *const _,
+            })
+        }
+    }
+
+    fn create_mmap_offset(&self) -> Result<u64> {
+        to_result(unsafe {
+            // TODO: is this threadsafe?
+            bindings::drm_gem_create_mmap_offset(self.gem_obj() as *const _ as *mut _)
+        })?;
+        Ok(unsafe {
+            bindings::drm_vma_node_offset_addr(&self.gem_obj().vma_node as *const _ as *mut _)
+        })
     }
 }
 

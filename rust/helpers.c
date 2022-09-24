@@ -758,6 +758,12 @@ int rust_helper_sg_dma_len(const struct scatterlist *sg)
 }
 EXPORT_SYMBOL_GPL(rust_helper_sg_dma_len);
 
+__u64 rust_helper_drm_vma_node_offset_addr(struct drm_vma_offset_node *node)
+{
+		return drm_vma_node_offset_addr(node);
+}
+EXPORT_SYMBOL_GPL(rust_helper_drm_vma_node_offset_addr);
+
 /*
  * We use `bindgen`'s `--size_t-is-usize` option to bind the C `size_t` type
  * as the Rust `usize` type, so we can use it in contexts where Rust

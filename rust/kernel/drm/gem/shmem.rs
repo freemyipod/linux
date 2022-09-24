@@ -42,6 +42,8 @@ pub trait DriverObject: gem::BaseDriverObject<Object<Self>> {
 impl<T: DriverObject> private::Sealed for Object<T> {}
 
 impl<T: DriverObject> gem::IntoGEMObject for Object<T> {
+    type Driver = T::Driver;
+
     fn gem_obj(&self) -> &bindings::drm_gem_object {
         &self.obj.base
     }
