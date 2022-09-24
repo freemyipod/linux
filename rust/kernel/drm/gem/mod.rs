@@ -158,7 +158,7 @@ impl<T: DriverObject> drv::AllocImpl for Object<T> {
 }
 
 impl<T: DriverObject> Object<T> {
-    const SIZE: usize = mem::size_of::<Self>();
+    pub const SIZE: usize = mem::size_of::<Self>();
 
     const OBJECT_FUNCS: bindings::drm_gem_object_funcs = bindings::drm_gem_object_funcs {
         free: Some(free_callback::<T>),

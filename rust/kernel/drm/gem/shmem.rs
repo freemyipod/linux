@@ -23,7 +23,7 @@ use gem::BaseObject;
 pub struct Object<T: DriverObject> {
     obj: bindings::drm_gem_shmem_object,
     dev: ManuallyDrop<device::Device<T::Driver>>,
-    p: T,
+    pub p: T,
 }
 
 // Invariant: must be identical in layout to the above,
