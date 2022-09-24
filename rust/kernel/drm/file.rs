@@ -62,11 +62,15 @@ impl<T: DriverFile> File<T> {
         }
     }
 
-    fn file(&mut self) -> &mut bindings::drm_file {
-        unsafe { &mut *self.raw }
+    pub(super) fn raw(&self) -> *const bindings::drm_file {
+        self.raw
     }
 
-    pub fn inner(&mut self) -> &mut T {
-        unsafe { &mut *(self.file().driver_priv as *mut T) }
+    pub(super) fn file(&self) -> &bindings::drm_file {
+        unsafe { &*self.raw }
+    }
+
+    pub fn inner(&self) -> &T {
+        unsafe { &*(self.file().driver_priv as *const T) }
     }
 }
