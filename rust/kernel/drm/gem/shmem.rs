@@ -14,6 +14,8 @@ use core::{
     marker::PhantomData,
     mem,
     mem::{ManuallyDrop, MaybeUninit},
+    ops::{Deref, DerefMut},
+    ptr::addr_of_mut,
     slice,
 };
 
@@ -23,16 +25,7 @@ use gem::BaseObject;
 pub struct Object<T: DriverObject> {
     obj: bindings::drm_gem_shmem_object,
     dev: ManuallyDrop<device::Device<T::Driver>>,
-    pub p: T,
-}
-
-// Invariant: must be identical in layout to the above,
-// just with MaybeUninit
-#[repr(C)]
-struct NewObject<T: DriverObject> {
-    obj: bindings::drm_gem_shmem_object,
-    dev: MaybeUninit<ManuallyDrop<device::Device<T::Driver>>>,
-    p: MaybeUninit<T>,
+    inner: T,
 }
 
 pub trait DriverObject: gem::BaseDriverObject<Object<Self>> {
@@ -50,24 +43,39 @@ impl<T: DriverObject> gem::IntoGEMObject for Object<T> {
 }
 
 unsafe extern "C" fn gem_create_object<T: DriverObject>(
-    _dev: *mut bindings::drm_device,
-    _size: usize,
+    raw_dev: *mut bindings::drm_device,
+    size: usize,
 ) -> *mut bindings::drm_gem_object {
+    // SAFETY: GEM ensures the device lives as long as its objects live,
+    // so we can conjure up a reference from thin air and never drop it.
+    let dev = ManuallyDrop::new(unsafe { device::Device::from_raw(raw_dev) });
+
+    let inner = match T::new(&*dev, size) {
+        Ok(v) => v,
+        Err(e) => return e.to_ptr(),
+    };
+
     let p = unsafe {
         bindings::krealloc(
             core::ptr::null(),
             Object::<T>::SIZE,
             bindings::GFP_KERNEL | bindings::__GFP_ZERO,
-        )
+        ) as *mut Object<T>
     };
 
     if p.is_null() {
         return ENOMEM.to_ptr();
     }
 
+    // SAFETY: p is valid as long as the alloc succeeded
+    unsafe {
+        addr_of_mut!((*p).dev).write(dev);
+        addr_of_mut!((*p).inner).write(inner);
+    }
+
     // SAFETY: drm_gem_shmem_object is safe to zero-init, and
-    // the rest of NewObject is MaybeUninit
-    let new: &mut NewObject<T> = unsafe { &mut *(p as *mut _) };
+    // the rest of Object has been initialized
+    let new: &mut Object<T> = unsafe { &mut *(p as *mut _) };
 
     new.obj.base.funcs = &Object::<T>::VTABLE;
     &mut new.obj.base
@@ -75,10 +83,7 @@ unsafe extern "C" fn gem_create_object<T: DriverObject>(
 
 unsafe extern "C" fn free_callback<T: DriverObject>(obj: *mut bindings::drm_gem_object) {
     // SAFETY: All of our objects are Object<T>.
-    let p = crate::container_of!(obj, Object<T>, obj) as *mut _;
-
-    // SAFETY: The pointer must be valid since we used container_of!()
-    T::uninit(unsafe { &mut *p });
+    let p = crate::container_of!(obj, Object<T>, obj) as *mut Object<T>;
 
     // SAFETY: p is never used after this
     unsafe {
@@ -263,30 +268,15 @@ impl<T: DriverObject> Object<T> {
         &self.obj as *const _ as *mut _
     }
 
-    pub fn new(
-        dev: &device::Device<T::Driver>,
-        private: T,
-        size: usize,
-    ) -> Result<gem::ObjectRef<Self>> {
+    pub fn new(dev: &device::Device<T::Driver>, size: usize) -> Result<gem::UniqueObjectRef<Self>> {
         // SAFETY: This function can be called as long as the ALLOC_OPS are set properly
-        // for this driver.
+        // for this driver, and the gem_create_object is called.
         let p = unsafe { bindings::drm_gem_shmem_create(dev.raw() as *mut _, size) };
         let p = crate::container_of!(p, Object<T>, obj) as *mut _;
 
-        // SAFETY: drm_gem_shmem_object is safe to zero-init, and
-        // the rest of NewObject is MaybeUninit
-        let new: &mut NewObject<T> = unsafe { &mut *(p as *mut _) };
-
-        new.p.write(private);
-        new.dev.write(ManuallyDrop::new(unsafe {
-            device::Device::from_raw(dev.ptr)
-        }));
-
-        // SAFETY: p is fully initialized now, so we can take a mutable reference
-        T::init(unsafe { &mut *p })?;
-
-        // SAFETY: Since everything is now initialized, we can take a reference as an Object<T>
-        let obj_ref = gem::ObjectRef { ptr: p };
+        // SAFETY: The gem_create_object callback ensures this is a valid Object<T>,
+        // so we can take a unique reference to it.
+        let obj_ref = gem::UniqueObjectRef { ptr: p };
 
         Ok(obj_ref)
     }
@@ -319,5 +309,19 @@ impl<T: DriverObject> Object<T> {
             map,
             owner: self.reference(),
         })
+    }
+}
+
+impl<T: DriverObject> Deref for Object<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<T: DriverObject> DerefMut for Object<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
 }

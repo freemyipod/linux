@@ -15,14 +15,11 @@ use crate::{
     prelude::*,
     to_result, Result,
 };
-use core::{mem, mem::ManuallyDrop, ops::Deref};
+use core::{mem, mem::ManuallyDrop, ops::Deref, ops::DerefMut};
 
 /// GEM object functions
 pub trait BaseDriverObject<T: BaseObject>: Sync + Send + Sized {
-    fn init(_obj: &mut T) -> Result<()> {
-        Ok(())
-    }
-    fn uninit(_obj: &mut T) {}
+    fn new(dev: &device::Device<T::Driver>, size: usize) -> Result<Self>;
 }
 
 pub trait IntoGEMObject: Sized + private::Sealed {
@@ -49,7 +46,7 @@ pub trait BaseObject: IntoGEMObject {
 pub struct Object<T: DriverObject> {
     obj: bindings::drm_gem_object,
     dev: ManuallyDrop<device::Device<T::Driver>>,
-    pub p: T,
+    inner: T,
 }
 
 pub trait DriverObject: BaseDriverObject<Object<Self>> {
@@ -61,12 +58,14 @@ pub struct ObjectRef<T: IntoGEMObject> {
     ptr: *const T,
 }
 
+pub struct UniqueObjectRef<T: IntoGEMObject> {
+    // Invariant: the pointer is valid and initialized, and this ObjectRef owns the only reference to it
+    ptr: *mut T,
+}
+
 unsafe extern "C" fn free_callback<T: DriverObject>(obj: *mut bindings::drm_gem_object) {
     // SAFETY: All of our objects are Object<T>.
-    let this = crate::container_of!(obj, Object<T>, obj) as *mut _;
-
-    // SAFETY: The pointer must be valid since we used container_of!()
-    T::uninit(unsafe { &mut *this });
+    let this = crate::container_of!(obj, Object<T>, obj) as *mut Object<T>;
 
     // SAFETY: The pointer we got has to be valid
     unsafe { bindings::drm_gem_object_release(obj) };
@@ -175,18 +174,14 @@ impl<T: DriverObject> Object<T> {
         vm_ops: core::ptr::null_mut(),
     };
 
-    pub fn new(
-        dev: &device::Device<T::Driver>,
-        private: T,
-        size: usize,
-    ) -> Result<ObjectRef<Self>> {
+    pub fn new(dev: &device::Device<T::Driver>, size: usize) -> Result<UniqueObjectRef<Self>> {
         let mut obj: Box<Self> = Box::try_new(Self {
             // SAFETY: This struct is expected to be zero-initialized
             obj: unsafe { mem::zeroed() },
             // SAFETY: The drm subsystem guarantees that the drm_device will live as long as
             // the GEM object lives, so we can conjure a reference out of thin air.
             dev: ManuallyDrop::new(unsafe { device::Device::from_raw(dev.ptr) }),
-            p: private,
+            inner: T::new(dev, size)?,
         })?;
 
         obj.obj.funcs = &Self::OBJECT_FUNCS;
@@ -194,12 +189,9 @@ impl<T: DriverObject> Object<T> {
             bindings::drm_gem_object_init(dev.raw() as *mut _, &mut obj.obj, size)
         })?;
 
-        let obj_ref = ObjectRef {
+        let obj_ref = UniqueObjectRef {
             ptr: Box::leak(obj),
         };
-
-        // SAFETY: We have the only ref so far, so it's safe to deref as mutable
-        T::init(unsafe { &mut *(obj_ref.ptr as *mut _) })?;
 
         Ok(obj_ref)
     }
@@ -217,11 +209,35 @@ impl<T: IntoGEMObject> Clone for ObjectRef<T> {
 
 impl<T: IntoGEMObject> Drop for ObjectRef<T> {
     fn drop(&mut self) {
-        // SAFETY: Having an ObjectRef implies holding a GEM reference
-        // The free callback will take care of deallocation
+        // SAFETY: Having an ObjectRef implies holding a GEM reference.
+        // The free callback will take care of deallocation.
         unsafe {
             bindings::drm_gem_object_put((*self.ptr).gem_obj() as *const _ as *mut _);
         }
+    }
+}
+
+impl<T: IntoGEMObject> Drop for UniqueObjectRef<T> {
+    fn drop(&mut self) {
+        // SAFETY: Having a UniqueObjectRef implies holding a GEM
+        // reference. The free callback will take care of deallocation.
+        unsafe {
+            bindings::drm_gem_object_put((*self.ptr).gem_obj() as *const _ as *mut _);
+        }
+    }
+}
+
+impl<T: DriverObject> Deref for Object<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<T: DriverObject> DerefMut for Object<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
 }
 
@@ -231,6 +247,31 @@ impl<T: IntoGEMObject> Deref for ObjectRef<T> {
     fn deref(&self) -> &Self::Target {
         // SAFETY: The pointer is valid per the invariant
         unsafe { &*self.ptr }
+    }
+}
+
+impl<T: IntoGEMObject> Deref for UniqueObjectRef<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: The pointer is valid per the invariant
+        unsafe { &*self.ptr }
+    }
+}
+
+impl<T: IntoGEMObject> DerefMut for UniqueObjectRef<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: The pointer is valid per the invariant
+        unsafe { &mut *self.ptr }
+    }
+}
+
+impl<T: IntoGEMObject> UniqueObjectRef<T> {
+    pub fn into_ref(self) -> ObjectRef<T> {
+        let ptr = self.ptr as *const _;
+        core::mem::forget(self);
+
+        ObjectRef { ptr }
     }
 }
 
