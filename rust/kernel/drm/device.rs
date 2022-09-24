@@ -8,13 +8,17 @@ use crate::{bindings, device, drm, types::PointerWrapper};
 use core::marker::PhantomData;
 
 pub struct Device<T: drm::drv::Driver> {
-    // Type invariant: ptr must be a valid and initialized drm_device
+    // Type invariant: ptr must be a valid and initialized drm_device,
+    // and this value must either own a reference to it or the caller
+    // must ensure that it is never dropped if the reference is borrowed.
     pub(super) ptr: *mut bindings::drm_device,
     _p: PhantomData<T>,
 }
 
 impl<T: drm::drv::Driver> Device<T> {
-    pub(crate) fn from_raw(raw: *mut bindings::drm_device) -> Device<T> {
+    // Not intended to be called externally, except via declare_drm_ioctls!()
+    #[doc(hidden)]
+    pub unsafe fn from_raw(raw: *mut bindings::drm_device) -> Device<T> {
         Device {
             ptr: raw,
             _p: PhantomData,
@@ -44,8 +48,11 @@ impl<T: drm::drv::Driver> Drop for Device<T> {
 
 impl<T: drm::drv::Driver> Clone for Device<T> {
     fn clone(&self) -> Self {
-        unsafe { bindings::drm_dev_get(self.ptr) };
-        Device::from_raw(self.ptr)
+        // SAFETY: We get a new reference and then create a new owning object from the raw pointer
+        unsafe {
+            bindings::drm_dev_get(self.ptr);
+            Device::from_raw(self.ptr)
+        }
     }
 }
 

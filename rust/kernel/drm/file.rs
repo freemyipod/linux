@@ -25,7 +25,7 @@ pub(super) unsafe extern "C" fn open_callback<T: DriverFile>(
     dev: *mut bindings::drm_device,
     raw_file: *mut bindings::drm_file,
 ) -> core::ffi::c_int {
-    let drm = drm::device::Device::from_raw(dev);
+    let drm = unsafe { drm::device::Device::from_raw(dev) };
     // SAFETY: This reference won't escape this function
     let file = unsafe { &mut *raw_file };
 
@@ -53,7 +53,9 @@ pub(super) unsafe extern "C" fn postclose_callback<T: DriverFile>(
 }
 
 impl<T: DriverFile> File<T> {
-    unsafe fn from_raw(raw_file: *mut bindings::drm_file) -> File<T> {
+    // Not intended to be called externally, except via declare_drm_ioctls!()
+    #[doc(hidden)]
+    pub unsafe fn from_raw(raw_file: *mut bindings::drm_file) -> File<T> {
         File {
             raw: raw_file,
             _p: PhantomData,

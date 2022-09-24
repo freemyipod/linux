@@ -209,7 +209,7 @@ impl<T: Driver> Registration<T> {
         let raw_drm = from_kernel_err_ptr(raw_drm)?;
 
         // The reference count is one, and now we take ownership of that reference as a drm::device::Device.
-        let drm = drm::device::Device::from_raw(raw_drm);
+        let drm = unsafe { drm::device::Device::from_raw(raw_drm) };
 
         Ok(Self {
             drm,
