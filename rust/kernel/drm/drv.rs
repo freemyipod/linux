@@ -121,6 +121,7 @@ pub trait Driver {
 
     const INFO: DriverInfo;
     const FEATURES: u32;
+    const IOCTLS: &'static [drm::ioctl::DRMIOCTLDescriptor];
 }
 
 /// A registration of a DRM device
@@ -195,8 +196,8 @@ impl<T: Driver> Registration<T> {
         date: T::INFO.date.as_char_ptr() as *mut _,
 
         driver_features: T::FEATURES,
-        ioctls: core::ptr::null_mut(),
-        num_ioctls: 0,
+        ioctls: T::IOCTLS.as_ptr(),
+        num_ioctls: T::IOCTLS.len() as i32,
         fops: core::ptr::null_mut(),
     };
 

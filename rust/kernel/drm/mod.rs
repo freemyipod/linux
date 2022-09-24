@@ -6,6 +6,7 @@ pub mod device;
 pub mod drv;
 pub mod file;
 pub mod gem;
+pub mod ioctl;
 pub mod mm;
 
 pub(crate) mod private {
