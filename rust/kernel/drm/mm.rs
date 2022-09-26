@@ -19,6 +19,7 @@ pub type Node<T> = Pin<Box<NodeData<T>>>;
 
 pub struct NodeData<T> {
     node: bindings::drm_mm_node,
+    valid: bool,
     inner: T,
 }
 
@@ -61,9 +62,11 @@ impl<T> DerefMut for NodeData<T> {
 
 impl<T> Drop for NodeData<T> {
     fn drop(&mut self) {
-        // SAFETY: TODO: Make sure self outlives the Allocator<Self>
-        unsafe {
-            bindings::drm_mm_remove_node(&mut self.node);
+        if self.valid {
+            // SAFETY: TODO: Make sure self outlives the Allocator<Self>
+            unsafe {
+                bindings::drm_mm_remove_node(&mut self.node);
+            }
         }
     }
 }
@@ -114,6 +117,7 @@ impl<T> Allocator<T> {
     ) -> Result<Node<T>> {
         let mut mm_node = Box::try_new(NodeData {
             node: unsafe { core::mem::zeroed() },
+            valid: false,
             inner: node,
         })?;
 
@@ -129,6 +133,8 @@ impl<T> Allocator<T> {
                 mode as u32,
             )
         })?;
+
+        mm_node.valid = true;
 
         Ok(Pin::from(mm_node))
     }
