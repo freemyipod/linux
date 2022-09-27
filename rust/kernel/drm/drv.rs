@@ -7,7 +7,7 @@
 
 use crate::{
     bindings, device, drm, drm::private, error::code::*, error::from_kernel_err_ptr, prelude::*,
-    str::CStr, sync::LockClassKey, types::PointerWrapper, Error, Result, ThisModule,
+    str::CStr, types::PointerWrapper, Error, Result, ThisModule,
 };
 use core::{
     marker::{PhantomData, PhantomPinned},
@@ -128,7 +128,6 @@ pub trait Driver {
 pub struct Registration<T: Driver> {
     // Invariant: always a valid pointer to an allocated drm_device
     drm: drm::device::Device<T>,
-    parent: device::Device,
     registered: bool,
     fops: bindings::file_operations,
     vtable: Pin<Box<bindings::drm_driver>>,
@@ -214,7 +213,6 @@ impl<T: Driver> Registration<T> {
 
         Ok(Self {
             drm,
-            parent: device::Device::from_dev(parent),
             registered: false,
             vtable,
             fops: drm::gem::create_fops(),
@@ -232,7 +230,6 @@ impl<T: Driver> Registration<T> {
         data: T::Data,
         flags: usize,
         module: &'static ThisModule,
-        lock_keys: [&'static LockClassKey; 2],
     ) -> Result {
         if self.registered {
             // Already registered.
@@ -296,18 +293,10 @@ impl<T: Driver> Drop for Registration<T> {
 
 /// Registers a DRM device with the rest of the kernel.
 ///
-/// It automatically defines the required lock classes.
+/// It automatically picks up THIS_MODULE.
 #[macro_export]
 macro_rules! drm_device_register {
     ($reg:expr, $data:expr, $flags:expr $(,)?) => {{
-        static CLASS1: $crate::sync::LockClassKey = $crate::sync::LockClassKey::new();
-        static CLASS2: $crate::sync::LockClassKey = $crate::sync::LockClassKey::new();
-        $crate::drm::drv::Registration::register(
-            $reg,
-            $data,
-            $flags,
-            &crate::THIS_MODULE,
-            [&CLASS1, &CLASS2],
-        )
+        $crate::drm::drv::Registration::register($reg, $data, $flags, &crate::THIS_MODULE)
     }};
 }

@@ -203,7 +203,7 @@ impl SGEntry {
 
 pub struct SGTable<T: DriverObject> {
     sgt: *const bindings::sg_table,
-    owner: gem::ObjectRef<Object<T>>,
+    _owner: gem::ObjectRef<Object<T>>,
 }
 
 pub struct SGTableIter<'a> {
@@ -292,7 +292,7 @@ impl<T: DriverObject> Object<T> {
 
         Ok(SGTable {
             sgt,
-            owner: self.reference(),
+            _owner: self.reference(),
         })
     }
 
