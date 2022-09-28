@@ -105,6 +105,7 @@ impl<T> Allocator<T> {
         self.insert_node_in_range(node, size, alignment, color, 0, u64::MAX, mode)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_node_in_range(
         &mut self,
         node: T,
