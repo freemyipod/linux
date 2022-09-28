@@ -294,6 +294,7 @@ impl<T: Driver> Drop for Registration<T> {
 /// Registers a DRM device with the rest of the kernel.
 ///
 /// It automatically picks up THIS_MODULE.
+#[allow(clippy::crate_in_macro_def)]
 #[macro_export]
 macro_rules! drm_device_register {
     ($reg:expr, $data:expr, $flags:expr $(,)?) => {{
