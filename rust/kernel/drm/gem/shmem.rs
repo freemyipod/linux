@@ -92,7 +92,7 @@ unsafe extern "C" fn free_callback<T: DriverObject>(obj: *mut bindings::drm_gem_
 
     // SAFETY: This pointer has to be valid, since p is valid
     unsafe {
-        bindings::drm_gem_shmem_free(&mut (&mut *p).obj);
+        bindings::drm_gem_shmem_free(&mut (*p).obj);
     }
 }
 
