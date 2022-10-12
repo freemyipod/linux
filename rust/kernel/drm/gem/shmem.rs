@@ -87,7 +87,7 @@ unsafe extern "C" fn free_callback<T: DriverObject>(obj: *mut bindings::drm_gem_
 
     // SAFETY: p is never used after this
     unsafe {
-        core::ptr::drop_in_place(p);
+        core::ptr::drop_in_place(&mut (*p).inner);
     }
 
     // SAFETY: This pointer has to be valid, since p is valid
