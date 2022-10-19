@@ -206,6 +206,9 @@ pub struct SGTable<T: DriverObject> {
     _owner: gem::ObjectRef<Object<T>>,
 }
 
+unsafe impl<T: DriverObject> Send for SGTable<T> {}
+unsafe impl<T: DriverObject> Sync for SGTable<T> {}
+
 pub struct SGTableIter<'a> {
     sg: *mut bindings::scatterlist,
     left: usize,
