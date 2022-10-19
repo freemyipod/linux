@@ -22,10 +22,10 @@ pub struct File<T: DriverFile> {
 }
 
 pub(super) unsafe extern "C" fn open_callback<T: DriverFile>(
-    dev: *mut bindings::drm_device,
+    raw_dev: *mut bindings::drm_device,
     raw_file: *mut bindings::drm_file,
 ) -> core::ffi::c_int {
-    let drm = unsafe { drm::device::Device::from_raw(dev) };
+    let drm = core::mem::ManuallyDrop::new(unsafe { drm::device::Device::from_raw(raw_dev) });
     // SAFETY: This reference won't escape this function
     let file = unsafe { &mut *raw_file };
 
