@@ -40,6 +40,10 @@ impl<T: DriverObject> gem::IntoGEMObject for Object<T> {
     fn gem_obj(&self) -> &bindings::drm_gem_object {
         &self.obj.base
     }
+
+    fn from_gem_obj(obj: *mut bindings::drm_gem_object) -> *mut Object<T> {
+        crate::container_of!(obj, Object<T>, obj) as *mut Object<T>
+    }
 }
 
 unsafe extern "C" fn gem_create_object<T: DriverObject>(
@@ -253,8 +257,8 @@ impl<T: DriverObject> Object<T> {
     const SIZE: usize = mem::size_of::<Self>();
     const VTABLE: bindings::drm_gem_object_funcs = bindings::drm_gem_object_funcs {
         free: Some(free_callback::<T>),
-        open: None,
-        close: None,
+        open: Some(super::open_callback::<T, Object<T>>),
+        close: Some(super::close_callback::<T, Object<T>>),
         print_info: Some(bindings::drm_gem_shmem_object_print_info),
         export: None,
         pin: Some(bindings::drm_gem_shmem_object_pin),

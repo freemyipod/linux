@@ -99,7 +99,7 @@ pub struct AllocOps {
     >,
 }
 
-pub trait AllocImpl: private::Sealed {
+pub trait AllocImpl: private::Sealed + drm::gem::IntoGEMObject {
     const ALLOC_OPS: AllocOps;
 }
 

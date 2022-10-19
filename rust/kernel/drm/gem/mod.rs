@@ -21,12 +21,26 @@ use core::{mem, mem::ManuallyDrop, ops::Deref, ops::DerefMut};
 /// GEM object functions
 pub trait BaseDriverObject<T: BaseObject>: Sync + Send + Sized {
     fn new(dev: &device::Device<T::Driver>, size: usize) -> Result<Self>;
+
+    fn open(
+        _obj: &<<T as IntoGEMObject>::Driver as drv::Driver>::Object,
+        _file: &file::File<<<T as IntoGEMObject>::Driver as drv::Driver>::File>,
+    ) -> Result {
+        Ok(())
+    }
+
+    fn close(
+        _obj: &<<T as IntoGEMObject>::Driver as drv::Driver>::Object,
+        _file: &file::File<<<T as IntoGEMObject>::Driver as drv::Driver>::File>,
+    ) {
+    }
 }
 
 pub trait IntoGEMObject: Sized + private::Sealed {
     type Driver: drv::Driver;
 
     fn gem_obj(&self) -> &bindings::drm_gem_object;
+    fn from_gem_obj(obj: *mut bindings::drm_gem_object) -> *mut Self;
 }
 
 pub trait BaseObject: IntoGEMObject {
@@ -77,11 +91,54 @@ unsafe extern "C" fn free_callback<T: DriverObject>(obj: *mut bindings::drm_gem_
     unsafe { Box::from_raw(this) };
 }
 
+unsafe extern "C" fn open_callback<T: BaseDriverObject<U>, U: BaseObject>(
+    raw_obj: *mut bindings::drm_gem_object,
+    raw_file: *mut bindings::drm_file,
+) -> core::ffi::c_int {
+    // SAFETY: The pointer we got has to be valid.
+    let file = unsafe {
+        file::File::<<<U as IntoGEMObject>::Driver as drv::Driver>::File>::from_raw(raw_file)
+    };
+    let obj =
+        <<<U as IntoGEMObject>::Driver as drv::Driver>::Object as IntoGEMObject>::from_gem_obj(
+            raw_obj,
+        );
+
+    // SAFETY: from_gem_obj() returns a valid pointer as long as the type is
+    // correct and the raw_obj we got is valid.
+    match T::open(unsafe { &*obj }, &file) {
+        Err(e) => e.to_kernel_errno(),
+        Ok(()) => 0,
+    }
+}
+
+unsafe extern "C" fn close_callback<T: BaseDriverObject<U>, U: BaseObject>(
+    raw_obj: *mut bindings::drm_gem_object,
+    raw_file: *mut bindings::drm_file,
+) {
+    // SAFETY: The pointer we got has to be valid.
+    let file = unsafe {
+        file::File::<<<U as IntoGEMObject>::Driver as drv::Driver>::File>::from_raw(raw_file)
+    };
+    let obj =
+        <<<U as IntoGEMObject>::Driver as drv::Driver>::Object as IntoGEMObject>::from_gem_obj(
+            raw_obj,
+        );
+
+    // SAFETY: from_gem_obj() returns a valid pointer as long as the type is
+    // correct and the raw_obj we got is valid.
+    T::close(unsafe { &*obj }, &file);
+}
+
 impl<T: DriverObject> IntoGEMObject for Object<T> {
     type Driver = T::Driver;
 
     fn gem_obj(&self) -> &bindings::drm_gem_object {
         &self.obj
+    }
+
+    fn from_gem_obj(obj: *mut bindings::drm_gem_object) -> *mut Object<T> {
+        crate::container_of!(obj, Object<T>, obj) as *mut Object<T>
     }
 }
 
@@ -162,8 +219,8 @@ impl<T: DriverObject> Object<T> {
 
     const OBJECT_FUNCS: bindings::drm_gem_object_funcs = bindings::drm_gem_object_funcs {
         free: Some(free_callback::<T>),
-        open: None,
-        close: None,
+        open: Some(open_callback::<T, Object<T>>),
+        close: Some(close_callback::<T, Object<T>>),
         print_info: None,
         export: None,
         pin: None,
