@@ -5,7 +5,11 @@
 //!
 //! C header: [`include/linux/drm/drm_mm.h`](../../../../include/linux/drm/drm_mm.h)
 
-use crate::{bindings, to_result, Opaque, Result};
+use crate::{
+    bindings,
+    sync::{smutex::Mutex, Arc, UniqueArc},
+    to_result, Opaque, Result,
+};
 
 use alloc::boxed::Box;
 
@@ -17,8 +21,11 @@ use core::{
 
 pub type Node<T> = Pin<Box<NodeData<T>>>;
 
+struct MmInner(Opaque<bindings::drm_mm>);
+
 pub struct NodeData<T> {
     node: bindings::drm_mm_node,
+    mm: Arc<Mutex<MmInner>>,
     valid: bool,
     inner: T,
 }
@@ -63,8 +70,8 @@ impl<T> DerefMut for NodeData<T> {
 impl<T> Drop for NodeData<T> {
     fn drop(&mut self) {
         if self.valid {
-            // SAFETY: TODO: Make sure self outlives the Allocator<Self>
             unsafe {
+                let _guard = self.mm.lock();
                 bindings::drm_mm_remove_node(&mut self.node);
             }
         }
@@ -72,20 +79,21 @@ impl<T> Drop for NodeData<T> {
 }
 
 pub struct Allocator<T> {
-    mm: Pin<Box<Opaque<bindings::drm_mm>>>,
+    mm: Arc<Mutex<MmInner>>,
     _p: PhantomData<T>,
 }
 
 impl<T> Allocator<T> {
     pub fn new(start: u64, size: u64) -> Result<Allocator<T>> {
-        let mm: Box<Opaque<bindings::drm_mm>> = Box::try_new(Opaque::uninit())?;
+        let mm: UniqueArc<Mutex<MmInner>> =
+            UniqueArc::try_new(Mutex::new(MmInner(Opaque::uninit())))?;
 
         unsafe {
-            bindings::drm_mm_init(mm.get(), start, size);
+            bindings::drm_mm_init(mm.lock().0.get(), start, size);
         }
 
         Ok(Allocator {
-            mm: Pin::from(mm),
+            mm: Pin::from(mm).into(),
             _p: PhantomData,
         })
     }
@@ -120,11 +128,12 @@ impl<T> Allocator<T> {
             node: unsafe { core::mem::zeroed() },
             valid: false,
             inner: node,
+            mm: self.mm.clone(),
         })?;
 
         to_result(unsafe {
             bindings::drm_mm_insert_node_in_range(
-                self.mm.get(),
+                self.mm.lock().0.get(),
                 &mut mm_node.node,
                 size,
                 alignment,
@@ -141,12 +150,12 @@ impl<T> Allocator<T> {
     }
 }
 
-impl<T> Drop for Allocator<T> {
+impl Drop for MmInner {
     fn drop(&mut self) {
         unsafe {
-            bindings::drm_mm_takedown(self.mm.get());
+            bindings::drm_mm_takedown(self.0.get());
         }
     }
 }
 
-unsafe impl<T> Send for Allocator<T> {}
+unsafe impl Send for MmInner {}
