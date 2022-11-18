@@ -148,6 +148,34 @@ impl<T> Allocator<T> {
 
         Ok(Pin::from(mm_node))
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_node(
+        &mut self,
+        node: T,
+        start: u64,
+        size: u64,
+        color: usize,
+    ) -> Result<Node<T>> {
+        let mut mm_node = Box::try_new(NodeData {
+            node: unsafe { core::mem::zeroed() },
+            valid: false,
+            inner: node,
+            mm: self.mm.clone(),
+        })?;
+
+        mm_node.node.start = start;
+        mm_node.node.size = size;
+        mm_node.node.color = color as core::ffi::c_ulong;
+
+        to_result(unsafe {
+            bindings::drm_mm_reserve_node(self.mm.lock().0.get(), &mut mm_node.node)
+        })?;
+
+        mm_node.valid = true;
+
+        Ok(Pin::from(mm_node))
+    }
 }
 
 impl Drop for MmInner {
