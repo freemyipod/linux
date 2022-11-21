@@ -19,19 +19,25 @@ use core::{
     pin::Pin,
 };
 
-pub type Node<T> = Pin<Box<NodeData<T>>>;
+pub type Node<A, T> = Pin<Box<NodeData<A, T>>>;
 
-struct MmInner(Opaque<bindings::drm_mm>);
+pub trait AllocInner<T> {
+    fn drop_object(&mut self, _start: u64, _size: u64, _color: usize, _object: &mut T) {}
+}
 
-pub struct NodeData<T> {
+impl<T> AllocInner<T> for () {}
+
+struct MmInner<A: AllocInner<T>, T>(Opaque<bindings::drm_mm>, A, PhantomData<T>);
+
+pub struct NodeData<A: AllocInner<T>, T> {
     node: bindings::drm_mm_node,
-    mm: Arc<Mutex<MmInner>>,
+    mm: Arc<Mutex<MmInner<A, T>>>,
     valid: bool,
     inner: T,
 }
 
-unsafe impl<T: Send> Send for NodeData<T> {}
-unsafe impl<T: Sync> Sync for NodeData<T> {}
+unsafe impl<A: Send + AllocInner<T>, T: Send> Send for NodeData<A, T> {}
+unsafe impl<A: Send + AllocInner<T>, T: Sync> Sync for NodeData<A, T> {}
 
 #[repr(u32)]
 pub enum InsertMode {
@@ -41,7 +47,7 @@ pub enum InsertMode {
     Evict = bindings::drm_mm_insert_mode_DRM_MM_INSERT_EVICT,
 }
 
-impl<T> NodeData<T> {
+impl<A: AllocInner<T>, T> NodeData<A, T> {
     pub fn color(&self) -> usize {
         self.node.color as usize
     }
@@ -51,9 +57,13 @@ impl<T> NodeData<T> {
     pub fn size(&self) -> u64 {
         self.node.size
     }
+    pub fn with_inner<RetVal>(&self, cb: impl FnOnce(&mut A) -> RetVal) -> RetVal {
+        let mut l = self.mm.lock();
+        cb(&mut l.1)
+    }
 }
 
-impl<T> Deref for NodeData<T> {
+impl<A: AllocInner<T>, T> Deref for NodeData<A, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -61,32 +71,34 @@ impl<T> Deref for NodeData<T> {
     }
 }
 
-impl<T> DerefMut for NodeData<T> {
+impl<A: AllocInner<T>, T> DerefMut for NodeData<A, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
 }
 
-impl<T> Drop for NodeData<T> {
+impl<A: AllocInner<T>, T> Drop for NodeData<A, T> {
     fn drop(&mut self) {
         if self.valid {
-            unsafe {
-                let _guard = self.mm.lock();
-                bindings::drm_mm_remove_node(&mut self.node);
-            }
+            let mut guard = self.mm.lock();
+
+            guard
+                .1
+                .drop_object(self.start(), self.size(), self.color(), &mut self.inner);
+            unsafe { bindings::drm_mm_remove_node(&mut self.node) };
         }
     }
 }
 
-pub struct Allocator<T> {
-    mm: Arc<Mutex<MmInner>>,
+pub struct Allocator<A: AllocInner<T>, T> {
+    mm: Arc<Mutex<MmInner<A, T>>>,
     _p: PhantomData<T>,
 }
 
-impl<T> Allocator<T> {
-    pub fn new(start: u64, size: u64) -> Result<Allocator<T>> {
-        let mm: UniqueArc<Mutex<MmInner>> =
-            UniqueArc::try_new(Mutex::new(MmInner(Opaque::uninit())))?;
+impl<A: AllocInner<T>, T> Allocator<A, T> {
+    pub fn new(start: u64, size: u64, inner: A) -> Result<Allocator<A, T>> {
+        let mm: UniqueArc<Mutex<MmInner<A, T>>> =
+            UniqueArc::try_new(Mutex::new(MmInner(Opaque::uninit(), inner, PhantomData)))?;
 
         unsafe {
             bindings::drm_mm_init(mm.lock().0.get(), start, size);
@@ -98,7 +110,7 @@ impl<T> Allocator<T> {
         })
     }
 
-    pub fn insert_node(&mut self, node: T, size: u64) -> Result<Node<T>> {
+    pub fn insert_node(&mut self, node: T, size: u64) -> Result<Node<A, T>> {
         self.insert_node_generic(node, size, 0, 0, InsertMode::Best)
     }
 
@@ -109,7 +121,7 @@ impl<T> Allocator<T> {
         alignment: u64,
         color: usize,
         mode: InsertMode,
-    ) -> Result<Node<T>> {
+    ) -> Result<Node<A, T>> {
         self.insert_node_in_range(node, size, alignment, color, 0, u64::MAX, mode)
     }
 
@@ -123,7 +135,7 @@ impl<T> Allocator<T> {
         start: u64,
         end: u64,
         mode: InsertMode,
-    ) -> Result<Node<T>> {
+    ) -> Result<Node<A, T>> {
         let mut mm_node = Box::try_new(NodeData {
             node: unsafe { core::mem::zeroed() },
             valid: false,
@@ -156,7 +168,7 @@ impl<T> Allocator<T> {
         start: u64,
         size: u64,
         color: usize,
-    ) -> Result<Node<T>> {
+    ) -> Result<Node<A, T>> {
         let mut mm_node = Box::try_new(NodeData {
             node: unsafe { core::mem::zeroed() },
             valid: false,
@@ -176,9 +188,14 @@ impl<T> Allocator<T> {
 
         Ok(Pin::from(mm_node))
     }
+
+    pub fn with_inner<RetVal>(&self, cb: impl FnOnce(&mut A) -> RetVal) -> RetVal {
+        let mut l = self.mm.lock();
+        cb(&mut l.1)
+    }
 }
 
-impl Drop for MmInner {
+impl<A: AllocInner<T>, T> Drop for MmInner<A, T> {
     fn drop(&mut self) {
         unsafe {
             bindings::drm_mm_takedown(self.0.get());
@@ -186,4 +203,4 @@ impl Drop for MmInner {
     }
 }
 
-unsafe impl Send for MmInner {}
+unsafe impl<A: Send + AllocInner<T>, T> Send for MmInner<A, T> {}
