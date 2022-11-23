@@ -317,6 +317,10 @@ impl<T: DriverObject> Object<T> {
             owner: self.reference(),
         })
     }
+
+    pub fn set_wc(&mut self, map_wc: bool) {
+        unsafe { (*self.mut_shmem()).map_wc = map_wc };
+    }
 }
 
 impl<T: DriverObject> Deref for Object<T> {
