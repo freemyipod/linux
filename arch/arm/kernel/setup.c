@@ -970,6 +970,9 @@ static int __init init_machine_late(void)
 	if (machine_desc->init_late)
 		machine_desc->init_late();
 
+    if (system_serial != NULL) {
+        return 0;
+    }
 	root = of_find_node_by_path("/");
 	if (root) {
 		ret = of_property_read_string(root, "serial-number",
