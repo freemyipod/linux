@@ -16,6 +16,7 @@ config CPU_S5L8730
 	def_bool y
 	select ARM_AMBA
 	select PL330_DMA if DMADEVICES
+	select SOC_BUS
 	help
 	  Enable S5L8730 CPU support
 
