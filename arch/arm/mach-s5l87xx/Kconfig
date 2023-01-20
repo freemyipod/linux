@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# Copyright (c) 2010 Samsung Electronics Co., Ltd.
+#		http://www.samsung.com/
+
+# Configuration options for the S5PV210/S5PC110
+
+config ARCH_S5L87XX
+	bool "Samsung/Apple S5L87XX"
+	depends on ARCH_MULTI_V6
+	select ARM_VIC
+
+if ARCH_S5L87XX
+
+config CPU_S5L8730
+	def_bool y
+	select ARM_AMBA
+	select PL330_DMA if DMADEVICES
+	help
+	  Enable S5L8730 CPU support
+
+endif
