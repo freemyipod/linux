@@ -518,6 +518,8 @@ source "arch/arm/mach-s3c/Kconfig"
 
 source "arch/arm/mach-s5pv210/Kconfig"
 
+source "arch/arm/mach-s5l87xx/Kconfig"
+
 source "arch/arm/mach-sa1100/Kconfig"
 
 source "arch/arm/mach-shmobile/Kconfig"

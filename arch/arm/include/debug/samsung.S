@@ -7,6 +7,20 @@
 
 #include <linux/serial_s3c.h>
 
+/* The S5L87XX implementations are as belows. */
+
+	.macro fifo_level_s5l87xx rd, rx
+		ldr	\rd, [\rx, # S3C2410_UFSTAT]
+ARM_BE8(rev \rd, \rd)
+		and	\rd, \rd, #S5L87XX_UFSTAT_TXMASK
+	.endm
+
+	.macro  fifo_full_s5l87xx rd, rx
+		ldr	\rd, [\rx, # S3C2410_UFSTAT]
+ARM_BE8(rev \rd, \rd)
+		tst	\rd, #S5L87XX_UFSTAT_TXFULL
+	.endm
+
 /* The S5PV210/S5PC110 implementations are as belows. */
 
 	.macro fifo_level_s5pv210 rd, rx
