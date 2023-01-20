@@ -2780,7 +2780,7 @@ static const struct s3c24xx_serial_drv_data exynos850_serial_drv_data = {
 #define EXYNOS850_SERIAL_DRV_DATA NULL
 #endif
 
-#ifdef CONFIG_ARCH_APPLE
+#if defined(CONFIG_ARCH_APPLE) || defined(CONFIG_ARCH_S5L87XX)
 static const struct s3c24xx_serial_drv_data s5l_serial_drv_data = {
 	.info = {
 		.name		= "Apple S5L UART",
