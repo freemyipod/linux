@@ -101,7 +101,12 @@ static void dwc2_set_s5l8730_params(struct dwc2_hsotg *hsotg)
 	p->otg_caps.hnp_support = true;
 	p->otg_caps.srp_support = true;
 	p->phy_utmi_width = 16;
-	// eh?
+	// If we enable DMA, we get BULK packet corruption, eg. in the CDC EEM
+	// gadget, eg.:
+	// [    5.530000] g_ether gadget.0: invalid EEM CRC
+	// I _think_ this is a DMA mechanism built into the DWC2 core, and not using
+	// the kernel DMAEngine, as that seems to be working fine (and this happens
+	// even if we have no DMA controllers).
 	p->g_dma = false;
 }
 
