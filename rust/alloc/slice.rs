@@ -1,84 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! A dynamically-sized view into a contiguous sequence, `[T]`.
+//! Utilities for the slice primitive type.
 //!
 //! *[See also the slice primitive type](slice).*
 //!
-//! Slices are a view into a block of memory represented as a pointer and a
-//! length.
+//! Most of the structs in this module are iterator types which can only be created
+//! using a certain function. For example, `slice.iter()` yields an [`Iter`].
 //!
-//! ```
-//! // slicing a Vec
-//! let vec = vec![1, 2, 3];
-//! let int_slice = &vec[..];
-//! // coercing an array to a slice
-//! let str_slice: &[&str] = &["one", "two", "three"];
-//! ```
-//!
-//! Slices are either mutable or shared. The shared slice type is `&[T]`,
-//! while the mutable slice type is `&mut [T]`, where `T` represents the element
-//! type. For example, you can mutate the block of memory that a mutable slice
-//! points to:
-//!
-//! ```
-//! let x = &mut [1, 2, 3];
-//! x[1] = 7;
-//! assert_eq!(x, &[1, 7, 3]);
-//! ```
-//!
-//! Here are some of the things this module contains:
-//!
-//! ## Structs
-//!
-//! There are several structs that are useful for slices, such as [`Iter`], which
-//! represents iteration over a slice.
-//!
-//! ## Trait Implementations
-//!
-//! There are several implementations of common traits for slices. Some examples
-//! include:
-//!
-//! * [`Clone`]
-//! * [`Eq`], [`Ord`] - for slices whose element type are [`Eq`] or [`Ord`].
-//! * [`Hash`] - for slices whose element type is [`Hash`].
-//!
-//! ## Iteration
-//!
-//! The slices implement `IntoIterator`. The iterator yields references to the
-//! slice elements.
-//!
-//! ```
-//! let numbers = &[0, 1, 2];
-//! for n in numbers {
-//!     println!("{n} is a number!");
-//! }
-//! ```
-//!
-//! The mutable slice yields mutable references to the elements:
-//!
-//! ```
-//! let mut scores = [7, 8, 9];
-//! for score in &mut scores[..] {
-//!     *score += 1;
-//! }
-//! ```
-//!
-//! This iterator yields mutable references to the slice's elements, so while
-//! the element type of the slice is `i32`, the element type of the iterator is
-//! `&mut i32`.
-//!
-//! * [`.iter`] and [`.iter_mut`] are the explicit methods to return the default
-//!   iterators.
-//! * Further methods that return iterators are [`.split`], [`.splitn`],
-//!   [`.chunks`], [`.windows`] and more.
-//!
-//! [`Hash`]: core::hash::Hash
-//! [`.iter`]: slice::iter
-//! [`.iter_mut`]: slice::iter_mut
-//! [`.split`]: slice::split
-//! [`.splitn`]: slice::splitn
-//! [`.chunks`]: slice::chunks
-//! [`.windows`]: slice::windows
+//! A few functions are provided to create a slice from a value reference
+//! or from a raw pointer.
 #![stable(feature = "rust1", since = "1.0.0")]
 // Many of the usings in this module are only used in the test configuration.
 // It's cleaner to just turn off the unused_imports warning than to fix them.
@@ -88,18 +18,16 @@ use core::borrow::{Borrow, BorrowMut};
 #[cfg(not(no_global_oom_handling))]
 use core::cmp::Ordering::{self, Less};
 #[cfg(not(no_global_oom_handling))]
-use core::mem;
-#[cfg(not(no_global_oom_handling))]
-use core::mem::size_of;
+use core::mem::{self, SizedTypeProperties};
 #[cfg(not(no_global_oom_handling))]
 use core::ptr;
 
 use crate::alloc::Allocator;
-#[cfg(not(no_global_oom_handling))]
 use crate::alloc::Global;
 #[cfg(not(no_global_oom_handling))]
 use crate::borrow::ToOwned;
 use crate::boxed::Box;
+use crate::collections::TryReserveError;
 use crate::vec::Vec;
 
 #[unstable(feature = "slice_range", issue = "76393")]
@@ -116,6 +44,8 @@ pub use core::slice::EscapeAscii;
 pub use core::slice::SliceIndex;
 #[stable(feature = "from_ref", since = "1.28.0")]
 pub use core::slice::{from_mut, from_ref};
+#[unstable(feature = "slice_from_ptr_range", issue = "89792")]
+pub use core::slice::{from_mut_ptr_range, from_ptr_range};
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use core::slice::{from_raw_parts, from_raw_parts_mut};
 #[stable(feature = "rust1", since = "1.0.0")]
@@ -159,6 +89,7 @@ pub(crate) mod hack {
     use core::alloc::Allocator;
 
     use crate::boxed::Box;
+    use crate::collections::TryReserveError;
     use crate::vec::Vec;
 
     // We shouldn't add inline attribute to this since this is used in
@@ -178,9 +109,20 @@ pub(crate) mod hack {
         T::to_vec(s, alloc)
     }
 
+    #[inline]
+    pub fn try_to_vec<T: TryConvertVec, A: Allocator>(s: &[T], alloc: A) -> Result<Vec<T, A>, TryReserveError> {
+        T::try_to_vec(s, alloc)
+    }
+
     #[cfg(not(no_global_oom_handling))]
     pub trait ConvertVec {
         fn to_vec<A: Allocator>(s: &[Self], alloc: A) -> Vec<Self, A>
+        where
+            Self: Sized;
+    }
+
+    pub trait TryConvertVec {
+        fn try_to_vec<A: Allocator>(s: &[Self], alloc: A) -> Result<Vec<Self, A>, TryReserveError>
         where
             Self: Sized;
     }
@@ -237,6 +179,42 @@ pub(crate) mod hack {
             v
         }
     }
+
+    impl<T: Clone> TryConvertVec for T {
+        #[inline]
+        default fn try_to_vec<A: Allocator>(s: &[Self], alloc: A) -> Result<Vec<Self, A>, TryReserveError> {
+            struct DropGuard<'a, T, A: Allocator> {
+                vec: &'a mut Vec<T, A>,
+                num_init: usize,
+            }
+            impl<'a, T, A: Allocator> Drop for DropGuard<'a, T, A> {
+                #[inline]
+                fn drop(&mut self) {
+                    // SAFETY:
+                    // items were marked initialized in the loop below
+                    unsafe {
+                        self.vec.set_len(self.num_init);
+                    }
+                }
+            }
+            let mut vec = Vec::try_with_capacity_in(s.len(), alloc)?;
+            let mut guard = DropGuard { vec: &mut vec, num_init: 0 };
+            let slots = guard.vec.spare_capacity_mut();
+            // .take(slots.len()) is necessary for LLVM to remove bounds checks
+            // and has better codegen than zip.
+            for (i, b) in s.iter().enumerate().take(slots.len()) {
+                guard.num_init = i;
+                slots[i].write(b.clone());
+            }
+            core::mem::forget(guard);
+            // SAFETY:
+            // the vec was allocated and initialized above to at least this length.
+            unsafe {
+                vec.set_len(s.len());
+            }
+            Ok(vec)
+        }
+    }
 }
 
 #[cfg(not(test))]
@@ -275,7 +253,7 @@ impl<T> [T] {
     where
         T: Ord,
     {
-        merge_sort(self, |a, b| a.lt(b));
+        merge_sort(self, T::lt);
     }
 
     /// Sorts the slice with a comparator function.
@@ -483,6 +461,25 @@ impl<T> [T] {
         self.to_vec_in(Global)
     }
 
+    /// Tries to copy `self` into a new `Vec`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let s = [10, 40, 30];
+    /// let x = s.try_to_vec().unwrap();
+    /// // Here, `s` and `x` can be modified independently.
+    /// ```
+    #[rustc_allow_incoherent_impl]
+    #[inline]
+    #[stable(feature = "kernel", since = "1.0.0")]
+    pub fn try_to_vec(&self) -> Result<Vec<T>, TryReserveError>
+    where
+        T: Clone,
+    {
+        self.try_to_vec_in(Global)
+    }
+
     /// Copies `self` into a new `Vec` with an allocator.
     ///
     /// # Examples
@@ -506,6 +503,30 @@ impl<T> [T] {
     {
         // N.B., see the `hack` module in this file for more details.
         hack::to_vec(self, alloc)
+    }
+
+    /// Tries to copy `self` into a new `Vec` with an allocator.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(allocator_api)]
+    ///
+    /// use std::alloc::System;
+    ///
+    /// let s = [10, 40, 30];
+    /// let x = s.try_to_vec_in(System).unwrap();
+    /// // Here, `s` and `x` can be modified independently.
+    /// ```
+    #[rustc_allow_incoherent_impl]
+    #[inline]
+    #[stable(feature = "kernel", since = "1.0.0")]
+    pub fn try_to_vec_in<A: Allocator>(&self, alloc: A) -> Result<Vec<T, A>, TryReserveError>
+    where
+        T: Clone,
+    {
+        // N.B., see the `hack` module in this file for more details.
+        hack::try_to_vec(self, alloc)
     }
 
     /// Converts `self` into a vector without clones or allocation.
@@ -836,14 +857,14 @@ impl<T: Clone, V: Borrow<[T]>> Join<&[T]> for [V] {
 ////////////////////////////////////////////////////////////////////////////////
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T> Borrow<[T]> for Vec<T> {
+impl<T, A: Allocator> Borrow<[T]> for Vec<T, A> {
     fn borrow(&self) -> &[T] {
         &self[..]
     }
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T> BorrowMut<[T]> for Vec<T> {
+impl<T, A: Allocator> BorrowMut<[T]> for Vec<T, A> {
     fn borrow_mut(&mut self) -> &mut [T] {
         &mut self[..]
     }
@@ -1024,7 +1045,7 @@ where
             // Consume the greater side.
             // If equal, prefer the right run to maintain stability.
             unsafe {
-                let to_copy = if is_less(&*right.offset(-1), &*left.offset(-1)) {
+                let to_copy = if is_less(&*right.sub(1), &*left.sub(1)) {
                     decrement_and_get(left)
                 } else {
                     decrement_and_get(right)
@@ -1038,12 +1059,12 @@ where
 
     unsafe fn get_and_increment<T>(ptr: &mut *mut T) -> *mut T {
         let old = *ptr;
-        *ptr = unsafe { ptr.offset(1) };
+        *ptr = unsafe { ptr.add(1) };
         old
     }
 
     unsafe fn decrement_and_get<T>(ptr: &mut *mut T) -> *mut T {
-        *ptr = unsafe { ptr.offset(-1) };
+        *ptr = unsafe { ptr.sub(1) };
         *ptr
     }
 
@@ -1088,7 +1109,7 @@ where
     const MIN_RUN: usize = 10;
 
     // Sorting has no meaningful behavior on zero-sized types.
-    if size_of::<T>() == 0 {
+    if T::IS_ZST {
         return;
     }
 

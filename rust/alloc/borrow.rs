@@ -13,7 +13,7 @@ use core::ops::{Add, AddAssign};
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use core::borrow::{Borrow, BorrowMut};
 
-use core::fmt;
+use crate::fmt;
 #[cfg(not(no_global_oom_handling))]
 use crate::string::String;
 
@@ -23,7 +23,6 @@ use Cow::*;
 impl<'a, B: ?Sized> Borrow<B> for Cow<'a, B>
 where
     B: ToOwned,
-    <B as ToOwned>::Owned: 'a,
 {
     fn borrow(&self) -> &B {
         &**self
@@ -62,21 +61,20 @@ pub trait ToOwned {
 
     /// Uses borrowed data to replace owned data, usually by cloning.
     ///
-    /// This is borrow-generalized version of `Clone::clone_from`.
+    /// This is borrow-generalized version of [`Clone::clone_from`].
     ///
     /// # Examples
     ///
     /// Basic usage:
     ///
     /// ```
-    /// # #![feature(toowned_clone_into)]
     /// let mut s: String = String::new();
     /// "hello".clone_into(&mut s);
     ///
     /// let mut v: Vec<i32> = Vec::new();
     /// [1, 2][..].clone_into(&mut v);
     /// ```
-    #[unstable(feature = "toowned_clone_into", reason = "recently added", issue = "41263")]
+    #[stable(feature = "toowned_clone_into", since = "1.63.0")]
     fn clone_into(&self, target: &mut Self::Owned) {
         *target = self.to_owned();
     }

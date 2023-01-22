@@ -50,14 +50,9 @@ core-cfgs = \
     --cfg no_fp_fmt_parse
 
 alloc-cfgs = \
-    --cfg no_fmt \
     --cfg no_global_oom_handling \
-    --cfg no_macros \
     --cfg no_rc \
-    --cfg no_str \
-    --cfg no_string \
-    --cfg no_sync \
-    --cfg no_thin
+    --cfg no_sync
 
 quiet_cmd_rustdoc = RUSTDOC $(if $(rustdoc_host),H, ) $<
       cmd_rustdoc = \
@@ -261,6 +256,7 @@ bindgen_skip_c_flags := -mno-fp-ret-in-387 -mpreferred-stack-boundary=% \
 	--param=% --param asan-%
 
 # Derived from `scripts/Makefile.clang`.
+BINDGEN_TARGET_arm  := arm-linux-gnueabi
 BINDGEN_TARGET_x86	:= x86_64-linux-gnu
 BINDGEN_TARGET		:= $(BINDGEN_TARGET_$(SRCARCH))
 

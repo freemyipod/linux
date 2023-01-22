@@ -18,6 +18,6 @@ pub(crate) fn concat_idents(ts: TokenStream) -> TokenStream {
     assert_eq!(expect_punct(&mut it), ',');
     let b = expect_ident(&mut it);
     assert!(it.next().is_none(), "only two idents can be concatenated");
-    let res = Ident::new(&format!("{a}{b}"), b.span());
+    let res = Ident::new(&(a.to_string() + &b.to_string()), b.span());
     TokenStream::from_iter([TokenTree::Ident(res)])
 }

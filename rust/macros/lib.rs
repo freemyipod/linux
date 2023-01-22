@@ -68,6 +68,29 @@ use proc_macro::TokenStream;
 ///   - `description`: byte array of the description of the kernel module.
 ///   - `license`: byte array of the license of the kernel module (required).
 ///   - `alias`: byte array of alias name of the kernel module.
+///   - `alias_rtnl_link`: byte array of the `rtnl_link_alias` of the kernel module
+///     (mutually exclusive with `alias`).
+///   - `params`: parameters for the kernel module, as described below.
+///
+/// # Supported parameter types
+///
+///   - `bool`: Corresponds to C `bool` param type.
+///   - `i8`: No equivalent C param type.
+///   - `u8`: Corresponds to C `char` param type.
+///   - `i16`: Corresponds to C `short` param type.
+///   - `u16`: Corresponds to C `ushort` param type.
+///   - `i32`: Corresponds to C `int` param type.
+///   - `u32`: Corresponds to C `uint` param type.
+///   - `i64`: No equivalent C param type.
+///   - `u64`: Corresponds to C `ullong` param type.
+///   - `isize`: No equivalent C param type.
+///   - `usize`: No equivalent C param type.
+///   - `str`: Corresponds to C `charp` param type. Reading returns a byte slice.
+///   - `ArrayParam<T,N>`: Corresponds to C parameters created using `module_param_array`.
+///     An array of `T`'s of length at **most** `N`.
+///
+/// `invbool` is unsupported: it was only ever used in a few modules.
+/// Consider using a `bool` and inverting the logic instead.
 #[proc_macro]
 pub fn module(ts: TokenStream) -> TokenStream {
     module::module(ts)
