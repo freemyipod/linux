@@ -3023,7 +3023,7 @@ static const struct amba_id pl08x_ids[] = {
 	{
 		.id	= 0x0a141080,
 		.mask	= 0xffffffff,
-		.data	= &vendor_pl080s,
+		.data	= &vendor_pl080,
 	},
 	/* PL080 */
 	{
