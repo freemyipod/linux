@@ -247,7 +247,7 @@ impl<T: Driver> Registration<T> {
         this.fops.owner = module.0;
         this.vtable.fops = &this.fops;
 
-        let ret = unsafe { bindings::drm_dev_register(this.drm.raw_mut(), flags as u64) };
+        let ret = unsafe { bindings::drm_dev_register(this.drm.raw_mut(), flags as core::ffi::c_ulong) };
         if ret < 0 {
             // SAFETY: `data_pointer` was returned by `into_pointer` above.
             unsafe { T::Data::from_pointer(data_pointer) };
