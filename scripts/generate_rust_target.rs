@@ -161,6 +161,15 @@ fn main() {
         ts.push("features", features);
         ts.push("llvm-target", "x86_64-linux-gnu");
         ts.push("target-pointer-width", "64");
+    } else if cfg.has("ARM") {
+        ts.push("arch", "arm");
+        ts.push(
+            "data-layout",
+            "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64",
+        );
+        ts.push("features", "+v6,-vfp2,+soft-float");
+        ts.push("llvm-target", "arm-linux-gnueabi");
+        ts.push("target-pointer-width", "32");
     } else {
         panic!("Unsupported architecture");
     }

@@ -46,6 +46,10 @@ define_panicking_intrinsics!("`f32` should not be used", {
     __mulsf3,
     __nesf2,
     __unordsf2,
+    __aeabi_fcmpeq,
+    __aeabi_fcmpun,
+    __aeabi_dcmpun,
+    __aeabi_uldivmod,
 });
 
 define_panicking_intrinsics!("`f64` should not be used", {
