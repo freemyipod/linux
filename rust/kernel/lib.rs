@@ -55,6 +55,7 @@ pub mod file;
 pub mod fs;
 pub mod gpio;
 pub mod hwrng;
+pub mod iopoll;
 pub mod irq;
 pub mod kasync;
 pub mod miscdev;
