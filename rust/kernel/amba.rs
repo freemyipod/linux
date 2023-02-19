@@ -172,7 +172,7 @@ impl Device {
         // INVARIANT: The safety requirements of the function ensure the lifetime invariant.
         Self {
             ptr,
-            res: Resource::new(dev.res.start, dev.res.end),
+            res: Resource::new(dev.res.start, dev.res.end, dev.res.flags),
         }
     }
 

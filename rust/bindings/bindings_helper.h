@@ -39,6 +39,7 @@
 #include <linux/security.h>
 #include <linux/slab.h>
 #include <linux/sysctl.h>
+#include <linux/timekeeping.h>
 #include <linux/uaccess.h>
 #include <linux/uio.h>
 #include <uapi/asm-generic/ioctl.h>
