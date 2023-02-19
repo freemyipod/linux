@@ -86,9 +86,9 @@ ENTRY(printascii)
 		ldrbne	r1, [r0], #1
 		teqne	r1, #0
 		reteq	lr
-2:		teq     r1, #'\n'
+2:		teq     r1, #0x0a
 		bne	3f
-		mov	r1, #'\r'
+		mov	r1, #0x0d
 #ifdef CONFIG_DEBUG_UART_FLOW_CONTROL
 		waituartcts r2, r3
 #endif
