@@ -355,6 +355,13 @@ impl Error {
         self.0
     }
 
+    /// Returns the error encoded as a pointer.
+    #[allow(dead_code)]
+    pub(crate) fn to_ptr<T>(self) -> *mut T {
+        // SAFETY: Valid as long as self.0 is a valid error
+        unsafe { bindings::ERR_PTR(self.0.into()) as *mut _ }
+    }
+
     /// Returns a string representing the error, if one exists.
     #[cfg(not(testlib))]
     pub fn name(&self) -> Option<&'static CStr> {
@@ -532,7 +539,7 @@ pub(crate) use from_kernel_result;
 /// ```
 // TODO: Remove `dead_code` marker once an in-kernel client is available.
 #[allow(dead_code)]
-pub(crate) fn from_kernel_err_ptr<T>(ptr: *mut T) -> Result<*mut T> {
+pub fn from_kernel_err_ptr<T>(ptr: *mut T) -> Result<*mut T> {
     // CAST: Casting a pointer to `*const core::ffi::c_void` is always valid.
     let const_ptr: *const core::ffi::c_void = ptr.cast();
     // SAFETY: The FFI function does not deref the pointer.

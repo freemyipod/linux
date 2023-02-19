@@ -18,8 +18,13 @@
  * accidentally exposed.
  */
 
+#include <drm/drm_atomic.h>
+#include <drm/drm_crtc.h>
 #include <drm/drm_gem.h>
+#include <drm/drm_connector.h>
+#include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_gem_shmem_helper.h>
+#include <uapi/drm/drm_fourcc.h>
 #include <linux/amba/bus.h>
 #include <linux/bug.h>
 #include <linux/build_bug.h>
@@ -345,6 +350,12 @@ long rust_helper_PTR_ERR(__force const void *ptr)
 	return PTR_ERR(ptr);
 }
 EXPORT_SYMBOL_GPL(rust_helper_PTR_ERR);
+
+__force void *rust_helper_ERR_PTR(long err)
+{
+	return ERR_PTR(err);
+}
+EXPORT_SYMBOL_GPL(rust_helper_ERR_PTR);
 
 const char *rust_helper_errname(int err)
 {
@@ -772,12 +783,44 @@ int rust_helper_sg_dma_len(const struct scatterlist *sg)
 }
 EXPORT_SYMBOL_GPL(rust_helper_sg_dma_len);
 
-__u64 rust_helper_drm_vma_node_offset_addr(struct drm_vma_offset_node *node)
-{
-		return drm_vma_node_offset_addr(node);
-}
-EXPORT_SYMBOL_GPL(rust_helper_drm_vma_node_offset_addr);
 #endif
+
+void rust_helper_drm_connector_put(struct drm_connector *connector)
+{
+		drm_connector_put(connector);
+}
+EXPORT_SYMBOL_GPL(rust_helper_drm_connector_put);
+
+void rust_helper_drm_connector_get(struct drm_connector *connector)
+{
+		drm_connector_get(connector);
+}
+EXPORT_SYMBOL_GPL(rust_helper_drm_connector_get);
+
+uint32_t rust_helper_drm_crtc_mask(const struct drm_crtc *crtc)
+{
+        return drm_crtc_mask(crtc);
+}
+EXPORT_SYMBOL_GPL(rust_helper_drm_crtc_mask);
+
+struct drm_plane_state *rust_helper_drm_atomic_get_new_plane_state(struct drm_atomic_state *state, struct drm_plane *plane)
+{
+    return drm_atomic_get_new_plane_state(state, plane);
+}
+EXPORT_SYMBOL_GPL(rust_helper_drm_atomic_get_new_plane_state);
+
+struct drm_plane_state *rust_helper_drm_atomic_get_old_plane_state(struct drm_atomic_state *state, struct drm_plane *plane)
+{
+    return drm_atomic_get_old_plane_state(state, plane);
+}
+EXPORT_SYMBOL_GPL(rust_helper_drm_atomic_get_old_plane_state);
+
+struct drm_shadow_plane_state *rust_helper_to_drm_shadow_plane_state(struct drm_plane_state *state)
+{
+    return to_drm_shadow_plane_state(state);
+}
+
+EXPORT_SYMBOL_GPL(rust_helper_to_drm_shadow_plane_state);
 
 /*
  * We use `bindgen`'s `--size_t-is-usize` option to bind the C `size_t` type

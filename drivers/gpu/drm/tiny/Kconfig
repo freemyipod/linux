@@ -212,3 +212,10 @@ config TINYDRM_ST7735R
 	  * Okaya RH128128T 1.44" 128x128 TFT
 
 	  If M is selected the module will be called st7735r.
+
+config TINYDRM_S5L8730
+    bool "DRM support for Samsung S5L8730 DSI output"
+	depends on DRM && OF
+	select DRM_GEM_DMA_HELPER
+	select DRM_GEM_SHMEM_HELPER
+	select DRM_KMS_HELPER

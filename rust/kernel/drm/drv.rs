@@ -209,7 +209,13 @@ impl<T: Driver> Registration<T> {
         let raw_drm = from_kernel_err_ptr(raw_drm)?;
 
         // The reference count is one, and now we take ownership of that reference as a drm::device::Device.
-        let drm = unsafe { drm::device::Device::from_raw(raw_drm) };
+        let mut drm = unsafe { drm::device::Device::from_raw(raw_drm) };
+
+        if (T::FEATURES & FEAT_MODESET) != 0 {
+            unsafe {
+                bindings::drmm_mode_config_init(drm.raw_mut());
+            }
+        }
 
         Ok(Self {
             drm,
@@ -247,6 +253,12 @@ impl<T: Driver> Registration<T> {
         this.fops.owner = module.0;
         this.vtable.fops = &this.fops;
 
+        if (T::FEATURES & FEAT_MODESET) != 0 {
+            unsafe {
+                bindings::drm_mode_config_reset(this.drm.raw_mut());
+            }
+        }
+
         let ret = unsafe { bindings::drm_dev_register(this.drm.raw_mut(), flags as core::ffi::c_ulong) };
         if ret < 0 {
             // SAFETY: `data_pointer` was returned by `into_pointer` above.
@@ -254,12 +266,18 @@ impl<T: Driver> Registration<T> {
             return Err(Error::from_kernel_errno(ret));
         }
 
+        unsafe { bindings::drm_fbdev_generic_setup(this.drm.raw_mut(), 0) };
+
         this.registered = true;
         Ok(())
     }
 
     pub fn device(&self) -> &drm::device::Device<T> {
         &self.drm
+    }
+
+    pub fn device_mut(&mut self) -> &mut drm::device::Device<T> {
+        &mut self.drm
     }
 }
 

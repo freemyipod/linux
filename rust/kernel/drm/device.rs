@@ -26,11 +26,11 @@ impl<T: drm::drv::Driver> Device<T> {
         }
     }
 
-    pub(crate) fn raw(&self) -> *const bindings::drm_device {
+    pub fn raw(&self) -> *const bindings::drm_device {
         self.ptr
     }
 
-    pub(crate) fn raw_mut(&mut self) -> *mut bindings::drm_device {
+    pub fn raw_mut(&mut self) -> *mut bindings::drm_device {
         self.ptr
     }
 
