@@ -326,7 +326,7 @@ $(obj)/exports_kernel_generated.h: $(obj)/kernel.o FORCE
 
 quiet_cmd_rustc_procmacro = $(RUSTC_OR_CLIPPY_QUIET) P $@
       cmd_rustc_procmacro = \
-	$(RUSTC_OR_CLIPPY) $(rust_common_flags) \
+	$(RUSTC_OR_CLIPPY) $(rust_common_flags) $(HOSTRUSTFLAGS) \
 		--emit=dep-info,link --extern proc_macro \
 		--crate-type proc-macro --out-dir $(objtree)/$(obj) \
 		--crate-name $(patsubst lib%.so,%,$(notdir $@)) $<; \
