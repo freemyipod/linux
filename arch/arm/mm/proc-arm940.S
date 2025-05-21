@@ -356,6 +356,7 @@ __arm940_proc_info:
 	.long	0x41009400
 	.long	0xff00fff0
 	.long	0
+    .long   0
 	initfn	__arm940_setup, __arm940_proc_info
 	.long	cpu_arch_name
 	.long	cpu_elf_name

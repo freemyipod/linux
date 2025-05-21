@@ -318,6 +318,7 @@ const struct of_device_id dwc2_of_match_table[] = {
 	{ .compatible = "lantiq,xrx200-usb", .data = dwc2_set_ltq_params },
 	{ .compatible = "snps,dwc2" },
 	{ .compatible = "apple,ipodnano5g-usb", .data = dwc2_set_s5l8730_params },
+	{ .compatible = "apple,ipodnano2g-usb", .data = dwc2_set_s5l8730_params },
 	{ .compatible = "samsung,s3c6400-hsotg",
 	  .data = dwc2_set_s3c6400_params },
 	{ .compatible = "amlogic,meson8-usb",

@@ -10,6 +10,7 @@
 
 static const char * const s5l8730_dt_compat[] = {
     "samsung,s5l8730",
+    "samsung,s5l8700",
 	NULL,
 };
 
@@ -21,7 +22,8 @@ static void __init s5l87xx_open_all_clkgates(void)
     struct device_node *np;
     void __iomem *syscon_base;
 
-    printk("%s: HACK: enabling all s5l8730 clock gates!\n", __func__);
+    //printk("%s: HACK: enabling all s5l8730 clock gates!\n", __func__);
+    printk("%s: HACK: enabling timer s5l8730 clock gates!\n", __func__);
     np = of_find_compatible_node(NULL, NULL, "samsung,s5l87xx-syscon");
     if (!np) {
         pr_err("%s: no devcfg node found\n", __func__);
@@ -35,9 +37,19 @@ static void __init s5l87xx_open_all_clkgates(void)
         return;
     }
 
+#if 1
+#define S5L87XX_PWRCON(i)    (*((uint32_t volatile*)(syscon_base + ((i) == 1 ? 0x40 : 0x28))))
+    /*
+    for (int i = 0; i < 64; i++) {
+        S5L87XX_PWRCON(i >> 5) &= ~(1 << (i & 0x1f));
+    }*/
+    // TIMER
+        S5L87XX_PWRCON(4 >> 5) &= ~(1 << (4 & 0x1f));
+#else
     for (int i = 0; i < 9; i++) {
         writel(0, syscon_base + 0x48 + i * 4);
     }
+#endif
 }
 
 static u64 __init s5l87xx_get_dieid(void)
@@ -91,11 +103,11 @@ static void __init s5l8730_init_machine(void)
     }
 
     soc_dev_attr->family = "Samsung/Apple S5L87XX";
-    soc_dev_attr->soc_id = "8730";
+    soc_dev_attr->soc_id = "8700";
     soc_dev_attr->revision = "";
     soc_dev_attr->serial_number = kasprintf(GFP_KERNEL, "%llx", s5l87xx_get_dieid());
 
-    system_rev = 0x8730;
+    system_rev = 0x8700;
     system_serial = soc_dev_attr->serial_number;
 
     soc_dev = soc_device_register(soc_dev_attr);
@@ -109,7 +121,7 @@ static void __init s5l8730_init_machine(void)
     of_platform_default_populate(NULL, NULL, parent);
 }
 
-DT_MACHINE_START(SUNXI_DT, "Samsung/Apple S5L8730")
+DT_MACHINE_START(S5L8730, "Samsung/Apple S5L8730")
 	.dt_compat	= s5l8730_dt_compat,
     .init_machine = s5l8730_init_machine,
 MACHINE_END
