@@ -312,7 +312,7 @@ config MMU
 	  support by paged memory management. If unsure, say 'Y'.
 
 config ARM_SINGLE_ARMV7M
-	def_bool !MMU
+	def_bool n
 	select ARM_NVIC
 	select CPU_V7M
 	select NO_IOPORT_MAP
@@ -341,7 +341,6 @@ config ARCH_MULTIPLATFORM
 	  DEBUG_UNCOMPRESS, XIP_KERNEL and ZBOOT_ROM. If unsure, say Y.
 
 menu "Platform selection"
-	depends on MMU
 
 comment "CPU Core family selection"
 

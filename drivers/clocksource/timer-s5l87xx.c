@@ -14,7 +14,7 @@
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
 
-#define TIMER_C0 0xc0
+#define TIMER_20 0x20
 
 #define REG_CON     0x00
 #define REG_CMD     0x04
@@ -42,21 +42,30 @@ struct s5l87xx_timer {
 static inline void s5l87xx_timer_disable(struct s5l87xx_timer *timer)
 {
     pr_debug("%s...\n", __func__);
-    writel_relaxed(CMD_STOP, timer->base + TIMER_C0 + REG_CMD);
+    writel_relaxed(CMD_STOP, timer->base + TIMER_20 + REG_CMD);
 }
 
 static inline void s5l87xx_timer_enable(struct s5l87xx_timer *timer)
 {
     pr_debug("%s...\n", __func__);
-    writel_relaxed(CMD_START | CMD_CLR, timer->base + TIMER_C0 + REG_CMD);
+    writel_relaxed(CMD_START, timer->base + TIMER_20 + REG_CMD);
+}
+
+static inline void s5l87xx_timer_clear(struct s5l87xx_timer *timer)
+{
+    pr_debug("%s...\n", __func__);
+    writel_relaxed(CMD_CLR, timer->base + TIMER_20 + REG_CMD);
 }
 
 static inline void s5l87xx_timer_ack(struct s5l87xx_timer *timer)
 {
     u32 stat;
 
-    stat = readl_relaxed(timer->base + REG_IRQSTAT);
-    writel_relaxed(stat, timer->base + REG_IRQLATCH);
+    u32 tcon = readl_relaxed(timer->base + TIMER_20 + REG_CON);
+    writel_relaxed(tcon, timer->base + TIMER_20 + REG_CON);
+
+//    stat = readl_relaxed(timer->base + REG_IRQSTAT);
+//    writel_relaxed(stat, timer->base + REG_IRQLATCH);
 }
 
 static struct s5l87xx_timer *clksrc;
@@ -81,23 +90,29 @@ static int s5l87xx_timer_set_periodic(struct clock_event_device *ce) {
     struct s5l87xx_timer *timer = s5l87xx_timer(ce);
     pr_debug("%s\n", __func__);
     s5l87xx_timer_disable(timer);
+    s5l87xx_timer_clear(timer);
+    writel_relaxed((1 << 12) | (2 << 8) | (0 << 4), timer->base + TIMER_20 + REG_CON);
+    writel_relaxed(300 - 1, timer->base + TIMER_20 + REG_PRE);
+    writel_relaxed(1000, timer->base + TIMER_20 + REG_DATA0);
+    //writel_relaxed(0, timer->base + TIMER_20 + REG_DATA1);
     s5l87xx_timer_enable(timer);
     return 0;
 };
 
 static void s5l87xx_timer_dump(struct s5l87xx_timer *timer) {
     pr_debug(" offs: %08x\n", timer->base);
-    pr_debug("  CON: %08x\n", readl_relaxed(timer->base + TIMER_C0 + REG_CON));
-    pr_debug("  CMD: %08x\n", readl_relaxed(timer->base + TIMER_C0 + REG_CMD));
-    pr_debug("DATA0: %08x\n", readl_relaxed(timer->base + TIMER_C0 + REG_DATA0));
-    pr_debug("DATA1: %08x\n", readl_relaxed(timer->base + TIMER_C0 + REG_DATA1));
-    pr_debug("  PRE: %08x\n", readl_relaxed(timer->base + TIMER_C0 + REG_PRE));
-    pr_debug("  CND: %08x\n", readl_relaxed(timer->base + TIMER_C0 + REG_CNT));
+    pr_debug("  CON: %08x\n", readl_relaxed(timer->base + TIMER_20 + REG_CON));
+    pr_debug("  CMD: %08x\n", readl_relaxed(timer->base + TIMER_20 + REG_CMD));
+    pr_debug("DATA0: %08x\n", readl_relaxed(timer->base + TIMER_20 + REG_DATA0));
+    pr_debug("DATA1: %08x\n", readl_relaxed(timer->base + TIMER_20 + REG_DATA1));
+    pr_debug("  PRE: %08x\n", readl_relaxed(timer->base + TIMER_20 + REG_PRE));
+    pr_debug("  CND: %08x\n", readl_relaxed(timer->base + TIMER_20 + REG_CNT));
     pr_debug("\n");
     pr_debug(" IRQSTAT: %08x\n", readl_relaxed(timer->base + REG_IRQSTAT));
     pr_debug("IRQLATCH: %08x\n", readl_relaxed(timer->base + REG_IRQLATCH));
     pr_debug("\n");
 }
+
 
 static irqreturn_t s5l87xx_timer_interrupt(int irq, void *dev_id) {
     struct clock_event_device *ce = dev_id;
@@ -170,7 +185,6 @@ static int __init s5l87xx_timer_init(struct device_node *np)
     }
 
     clockevents_config_and_register(ce, 1000, 1, UINT_MAX);
-
     pr_debug("%s: success\n", __func__);
     return 0;
 
