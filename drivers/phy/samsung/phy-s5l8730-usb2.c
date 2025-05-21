@@ -15,6 +15,8 @@ struct s5l8730_usbphy {
 #define S5L8730_OTGPHY_RSTCON 0x08
 #define S5L8730_OTGPHY_UNKCON 0x1C
 
+#define PHYBASE 0x3C400000
+
 static int s5l8730_usbphy_phy_init(struct phy *phy)
 {
     printk("%s...\n", __func__);
@@ -32,6 +34,18 @@ static int s5l8730_usbphy_phy_power_on(struct phy *phy)
 	struct s5l8730_usbphy *usbphy = phy_get_drvdata(phy);
     printk("%s...\n", __func__);
 
+    *((volatile uint32_t*)(PHYBASE + 0x00)) = 0;  /* PHY: Power up */
+    udelay(10);
+    *((volatile uint32_t*)(PHYBASE + 0x1c)) = 1;
+    *((volatile uint32_t*)(PHYBASE + 0x44)) = 0xe3f;
+    *((volatile uint32_t*)(PHYBASE + 0x08)) = 1;  /* PHY: Assert Software Reset */
+    udelay(10);
+    *((volatile uint32_t*)(PHYBASE + 0x08)) = 0;  /* PHY: Deassert Software Reset */
+    udelay(10);
+    *((volatile uint32_t*)(PHYBASE + 0x18)) = 0x600;
+    *((volatile uint32_t*)(PHYBASE + 0x04)) = 0;
+    udelay(400);
+#if 0
 	writel_relaxed(0, usbphy->base + S5L8730_OTGPHY_PWR);
     mdelay(10);
 	writel_relaxed(1, usbphy->base + S5L8730_OTGPHY_RSTCON);
@@ -41,6 +55,7 @@ static int s5l8730_usbphy_phy_power_on(struct phy *phy)
 	writel_relaxed(6, usbphy->base + S5L8730_OTGPHY_UNKCON);
 	writel_relaxed(1, usbphy->base + S5L8730_OTGPHY_CON);
     mdelay(400);
+#endif
     return 0;
 }
 
@@ -49,11 +64,17 @@ static int s5l8730_usbphy_phy_power_off(struct phy *phy)
 	struct s5l8730_usbphy *usbphy = phy_get_drvdata(phy);
     printk("%s...\n", __func__);
 
+    *((volatile uint32_t*)(PHYBASE + 0x00)) = 0xf;  /* PHY: Power down */
+    udelay(10);
+    *((volatile uint32_t*)(PHYBASE + 0x08)) = 7;  /* PHY: Assert Software Reset */
+    udelay(10);
+#if 0
     writel_relaxed(0xff, usbphy->base + S5L8730_OTGPHY_PWR);
     mdelay(10);
     writel_relaxed(0xff, usbphy->base + S5L8730_OTGPHY_RSTCON);
     mdelay(10);
     writel_relaxed(4, usbphy->base + S5L8730_OTGPHY_UNKCON);
+#endif
     return 0;
 }
 
