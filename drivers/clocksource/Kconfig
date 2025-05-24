@@ -793,4 +793,15 @@ config RTK_SYSTIMER
 	  this option only when building for a Realtek platform or for compilation
 	  testing.
 
+config S5L8720_TIMER
+	bool "S5L8720 timer driver"
+	depends on ARCH_S5L87XX
+	depends on GENERIC_CLOCKEVENTS
+	depends on HAS_IOMEM
+	select CLKSRC_MMIO
+	select TIMER_OF
+	help
+	  Enables support for the Samsung S5l8720 timer as
+	  clocksource and clockevent.
+
 endmenu
