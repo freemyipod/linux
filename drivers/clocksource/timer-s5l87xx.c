@@ -93,7 +93,7 @@ static int s5l87xx_timer_set_periodic(struct clock_event_device *ce) {
     s5l87xx_timer_clear(timer);
     writel_relaxed((1 << 12) | (2 << 8) | (0 << 4), timer->base + TIMER_20 + REG_CON);
     writel_relaxed(300 - 1, timer->base + TIMER_20 + REG_PRE);
-    writel_relaxed(1000, timer->base + TIMER_20 + REG_DATA0);
+    writel_relaxed(100, timer->base + TIMER_20 + REG_DATA0);
     //writel_relaxed(0, timer->base + TIMER_20 + REG_DATA1);
     s5l87xx_timer_enable(timer);
     return 0;
@@ -184,7 +184,7 @@ static int __init s5l87xx_timer_init(struct device_node *np)
         goto out_irq;
     }
 
-    clockevents_config_and_register(ce, 1000, 1, UINT_MAX);
+    clockevents_config_and_register(ce, 100, 1, UINT_MAX);
     pr_debug("%s: success\n", __func__);
     return 0;
 
