@@ -5003,6 +5003,9 @@ int dwc2_gadget_init(struct dwc2_hsotg *hsotg)
 	hsotg->gadget.otg_caps = &hsotg->params.otg_caps;
 	hsotg->remote_wakeup_allowed = 0;
 
+	// Without this on nano2g checksuming fails.
+	hsotg->gadget.quirk_avoids_skb_reserve = 1;
+
 	if (hsotg->params.lpm)
 		hsotg->gadget.lpm_capable = true;
 
