@@ -152,6 +152,7 @@ config TINYDRM_ILI9320
 	depends on DRM && OF
 	select DRM_GEM_DMA_HELPER
 	select DRM_KMS_HELPER
+    select FB_PROVIDE_GET_FB_UNMAPPED_AREA
 	help
 	  DRM driver for the Ilitek ILI93920 panel
 
