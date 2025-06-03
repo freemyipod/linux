@@ -179,11 +179,7 @@ static void lcd_init(void)
     }
 
     DMACON8 = 0x20000000 | 0x180000 | (1 << 16);
-// the preload count and the subtraction somehow belong together...
-#define LCD_PRELOAD_COUNT 3
-#define LCD_DMA_SUBTRACT_COUNT 5
-#define LCD_DMA_ADDR_SKIP_COUNT 5
-    DMATCNT8 = (LCD_WIDTH * LCD_HEIGHT / 2) - LCD_DMA_SUBTRACT_COUNT;
+    DMATCNT8 = (LCD_WIDTH * LCD_HEIGHT / 2) - 1;
 
     if (lcd_type == 0) {
         LCDCON = (0xd50 | (1 << 7));
@@ -203,6 +199,9 @@ static uint32_t lcd_detect(void)
 void displaylcd_setup(unsigned int startx, unsigned int endx,
                       unsigned int starty, unsigned int endy, bool safe)
 {
+    // huh? this just breaks stuff...
+    return;
+
     while (DMAALLST2 & 0x40000);
     if (lcd_detect() == 2)
     {
@@ -256,18 +255,6 @@ static void displaylcd_dma(void* data, int pixels)
 {
     uint16_t* in = (uint16_t*)data;
     while (LCDSTATUS & 8);
-    int i = 0;
-
-    // Ok this is really weird and might skip some pixels in the beginning.
-    // But it mostly works.
-    in += LCD_DMA_ADDR_SKIP_COUNT;
-
-    while (i < LCD_PRELOAD_COUNT)
-    {
-        LCDWDATA = *in++;
-        i++;
-        pixels--;
-    }
     if (!pixels) return;
     lcd_dma_busy = true;
     DMABASE8 = in;
