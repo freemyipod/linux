@@ -34,17 +34,17 @@
 #include <linux/delay.h>
 
 #define CLK_BASE 0x3C500000
-#define PWRCONEXT               (*(volatile uint32_t*)(CLK_BASE + 0x40))
+#define PWRCONEXT			   (*(volatile uint32_t*)(CLK_BASE + 0x40))
 
-#define DMABASE8     (*((void* volatile*)(0x38400100)))
-#define DMACON8      (*((volatile uint32_t*)(0x38400104)))
-#define DMATCNT8     (*((volatile uint32_t*)(0x38400108)))
-#define DMACADDR8    (*((void* volatile*)(0x3840010C)))
-#define DMACTCNT8    (*((volatile uint32_t*)(0x38400110)))
-#define DMACOM8      (*((volatile uint32_t*)(0x38400114)))
+#define DMABASE8	 (*((void* volatile*)(0x38400100)))
+#define DMACON8	  (*((volatile uint32_t*)(0x38400104)))
+#define DMATCNT8	 (*((volatile uint32_t*)(0x38400108)))
+#define DMACADDR8	(*((void* volatile*)(0x3840010C)))
+#define DMACTCNT8	(*((volatile uint32_t*)(0x38400110)))
+#define DMACOM8	  (*((volatile uint32_t*)(0x38400114)))
 
-#define DMAALLST     (*((volatile uint32_t*)(0x38400180)))
-#define DMAALLST2    (*((volatile uint32_t*)(0x38400184)))
+#define DMAALLST	 (*((volatile uint32_t*)(0x38400180)))
+#define DMAALLST2	(*((volatile uint32_t*)(0x38400184)))
 
 
 // TODO: Put these to dtb
@@ -52,8 +52,8 @@
 #define LCD_HEIGHT 132
 
 #define LCD_BASE (void*)0x38600000
-#define LCD_RST_TIME            (*(volatile uint32_t*)(LCD_BASE + 0x24))  /* Reset active period 07FF */
-#define LCD_DRV_RST             (*(volatile uint32_t*)(LCD_BASE + 0x28))  /* Reset drive signal */
+#define LCD_RST_TIME			(*(volatile uint32_t*)(LCD_BASE + 0x24))  /* Reset active period 07FF */
+#define LCD_DRV_RST			 (*(volatile uint32_t*)(LCD_BASE + 0x28))  /* Reset drive signal */
 #define LCDCON	(*((volatile uint32_t*)(0x38600000)))
 #define LCDWCMD   (*((volatile uint32_t*)(0x38600004)))
 #define LCDPHTIME (*((volatile uint32_t*)(0x38600010)))
@@ -70,27 +70,27 @@
 
 /* LCD type 0 register defines */
 
-#define R_ENTRY_MODE              0x03
-#define R_DISPLAY_CONTROL_1       0x07
-#define R_POWER_CONTROL_1         0x10
-#define R_POWER_CONTROL_2         0x12
-#define R_POWER_CONTROL_3         0x13
-#define R_HORIZ_GRAM_ADDR_SET     0x20
-#define R_VERT_GRAM_ADDR_SET      0x21
-#define R_WRITE_DATA_TO_GRAM      0x22
-#define R_HORIZ_ADDR_START_POS    0x50
-#define R_HORIZ_ADDR_END_POS      0x51
-#define R_VERT_ADDR_START_POS     0x52
-#define R_VERT_ADDR_END_POS       0x53
+#define R_ENTRY_MODE			  0x03
+#define R_DISPLAY_CONTROL_1	   0x07
+#define R_POWER_CONTROL_1		 0x10
+#define R_POWER_CONTROL_2		 0x12
+#define R_POWER_CONTROL_3		 0x13
+#define R_HORIZ_GRAM_ADDR_SET	 0x20
+#define R_VERT_GRAM_ADDR_SET	  0x21
+#define R_WRITE_DATA_TO_GRAM	  0x22
+#define R_HORIZ_ADDR_START_POS	0x50
+#define R_HORIZ_ADDR_END_POS	  0x51
+#define R_VERT_ADDR_START_POS	 0x52
+#define R_VERT_ADDR_END_POS	   0x53
 
 
 /* LCD type 1 register defines */
 
-#define R_SLEEP_IN                0x10
-#define R_DISPLAY_OFF             0x28
-#define R_COLUMN_ADDR_SET         0x2a
-#define R_ROW_ADDR_SET            0x2b
-#define R_MEMORY_WRITE            0x2c
+#define R_SLEEP_IN				0x10
+#define R_DISPLAY_OFF			 0x28
+#define R_COLUMN_ADDR_SET		 0x2a
+#define R_ROW_ADDR_SET			0x2b
+#define R_MEMORY_WRITE			0x2c
 
 
 static bool lcd_dma_busy = false;
@@ -100,100 +100,100 @@ static bool lcd_dma_busy = false;
 #define DATA16  2
 
 unsigned short lcd_init_sequence_0[] = {
-    CMD16,  0x00a4, DATA16, 0x0001,
-    SLEEP,  0x0000,
-    CMD16,  0x0001, DATA16, 0x0100,
-    CMD16,  0x0002, DATA16, 0x0300,
-    CMD16,  0x0003, DATA16, 0x1230,
-    CMD16,  0x0008, DATA16, 0x0404,
-    CMD16,  0x0008, DATA16, 0x0404,
-    CMD16,  0x000e, DATA16, 0x0010,
-    CMD16,  0x0070, DATA16, 0x1000,
-    CMD16,  0x0071, DATA16, 0x0001,
-    CMD16,  0x0030, DATA16, 0x0002,
-    CMD16,  0x0031, DATA16, 0x0400,
-    CMD16,  0x0032, DATA16, 0x0007,
-    CMD16,  0x0033, DATA16, 0x0500,
-    CMD16,  0x0034, DATA16, 0x0007,
-    CMD16,  0x0035, DATA16, 0x0703,
-    CMD16,  0x0036, DATA16, 0x0507,
-    CMD16,  0x0037, DATA16, 0x0005,
-    CMD16,  0x0038, DATA16, 0x0407,
-    CMD16,  0x0039, DATA16, 0x000e,
-    CMD16,  0x0040, DATA16, 0x0202,
-    CMD16,  0x0041, DATA16, 0x0003,
-    CMD16,  0x0042, DATA16, 0x0000,
-    CMD16,  0x0043, DATA16, 0x0200,
-    CMD16,  0x0044, DATA16, 0x0707,
-    CMD16,  0x0045, DATA16, 0x0407,
-    CMD16,  0x0046, DATA16, 0x0505,
-    CMD16,  0x0047, DATA16, 0x0002,
-    CMD16,  0x0048, DATA16, 0x0004,
-    CMD16,  0x0049, DATA16, 0x0004,
-    CMD16,  0x0060, DATA16, 0x0202,
-    CMD16,  0x0061, DATA16, 0x0003,
-    CMD16,  0x0062, DATA16, 0x0000,
-    CMD16,  0x0063, DATA16, 0x0200,
-    CMD16,  0x0064, DATA16, 0x0707,
-    CMD16,  0x0065, DATA16, 0x0407,
-    CMD16,  0x0066, DATA16, 0x0505,
-    CMD16,  0x0068, DATA16, 0x0004,
-    CMD16,  0x0069, DATA16, 0x0004,
-    CMD16,  0x0007, DATA16, 0x0001,
-    CMD16,  0x0018, DATA16, 0x0001,
-    CMD16,  0x0010, DATA16, 0x1690,
-    CMD16,  0x0011, DATA16, 0x0100,
-    CMD16,  0x0012, DATA16, 0x0117,
-    CMD16,  0x0013, DATA16, 0x0f80,
-    CMD16,  0x0012, DATA16, 0x0137,
-    CMD16,  0x0020, DATA16, 0x0000,
-    CMD16,  0x0021, DATA16, 0x0000,
-    CMD16,  0x0050, DATA16, 0x0000,
-    CMD16,  0x0051, DATA16, 0x00af,
-    CMD16,  0x0052, DATA16, 0x0000,
-    CMD16,  0x0053, DATA16, 0x0083,
-    CMD16,  0x0090, DATA16, 0x0003,
-    CMD16,  0x0091, DATA16, 0x0000,
-    CMD16,  0x0092, DATA16, 0x0101,
-    CMD16,  0x0098, DATA16, 0x0400,
-    CMD16,  0x0099, DATA16, 0x1302,
-    CMD16,  0x009a, DATA16, 0x0202,
-    CMD16,  0x009b, DATA16, 0x0200,
-    SLEEP,  0x0000,
-    CMD16,  0x0007, DATA16, 0x0021,
-    CMD16,  0x0012, DATA16, 0x0137,
-    SLEEP,  0x0000,
-    CMD16,  0x0007, DATA16, 0x0021,
-    CMD16,  0x0012, DATA16, 0x1137,
-    SLEEP,  0x0000,
-    CMD16,  0x0007, DATA16, 0x0233,
+	CMD16,  0x00a4, DATA16, 0x0001,
+	SLEEP,  0x0000,
+	CMD16,  0x0001, DATA16, 0x0100,
+	CMD16,  0x0002, DATA16, 0x0300,
+	CMD16,  0x0003, DATA16, 0x1230,
+	CMD16,  0x0008, DATA16, 0x0404,
+	CMD16,  0x0008, DATA16, 0x0404,
+	CMD16,  0x000e, DATA16, 0x0010,
+	CMD16,  0x0070, DATA16, 0x1000,
+	CMD16,  0x0071, DATA16, 0x0001,
+	CMD16,  0x0030, DATA16, 0x0002,
+	CMD16,  0x0031, DATA16, 0x0400,
+	CMD16,  0x0032, DATA16, 0x0007,
+	CMD16,  0x0033, DATA16, 0x0500,
+	CMD16,  0x0034, DATA16, 0x0007,
+	CMD16,  0x0035, DATA16, 0x0703,
+	CMD16,  0x0036, DATA16, 0x0507,
+	CMD16,  0x0037, DATA16, 0x0005,
+	CMD16,  0x0038, DATA16, 0x0407,
+	CMD16,  0x0039, DATA16, 0x000e,
+	CMD16,  0x0040, DATA16, 0x0202,
+	CMD16,  0x0041, DATA16, 0x0003,
+	CMD16,  0x0042, DATA16, 0x0000,
+	CMD16,  0x0043, DATA16, 0x0200,
+	CMD16,  0x0044, DATA16, 0x0707,
+	CMD16,  0x0045, DATA16, 0x0407,
+	CMD16,  0x0046, DATA16, 0x0505,
+	CMD16,  0x0047, DATA16, 0x0002,
+	CMD16,  0x0048, DATA16, 0x0004,
+	CMD16,  0x0049, DATA16, 0x0004,
+	CMD16,  0x0060, DATA16, 0x0202,
+	CMD16,  0x0061, DATA16, 0x0003,
+	CMD16,  0x0062, DATA16, 0x0000,
+	CMD16,  0x0063, DATA16, 0x0200,
+	CMD16,  0x0064, DATA16, 0x0707,
+	CMD16,  0x0065, DATA16, 0x0407,
+	CMD16,  0x0066, DATA16, 0x0505,
+	CMD16,  0x0068, DATA16, 0x0004,
+	CMD16,  0x0069, DATA16, 0x0004,
+	CMD16,  0x0007, DATA16, 0x0001,
+	CMD16,  0x0018, DATA16, 0x0001,
+	CMD16,  0x0010, DATA16, 0x1690,
+	CMD16,  0x0011, DATA16, 0x0100,
+	CMD16,  0x0012, DATA16, 0x0117,
+	CMD16,  0x0013, DATA16, 0x0f80,
+	CMD16,  0x0012, DATA16, 0x0137,
+	CMD16,  0x0020, DATA16, 0x0000,
+	CMD16,  0x0021, DATA16, 0x0000,
+	CMD16,  0x0050, DATA16, 0x0000,
+	CMD16,  0x0051, DATA16, 0x00af,
+	CMD16,  0x0052, DATA16, 0x0000,
+	CMD16,  0x0053, DATA16, 0x0083,
+	CMD16,  0x0090, DATA16, 0x0003,
+	CMD16,  0x0091, DATA16, 0x0000,
+	CMD16,  0x0092, DATA16, 0x0101,
+	CMD16,  0x0098, DATA16, 0x0400,
+	CMD16,  0x0099, DATA16, 0x1302,
+	CMD16,  0x009a, DATA16, 0x0202,
+	CMD16,  0x009b, DATA16, 0x0200,
+	SLEEP,  0x0000,
+	CMD16,  0x0007, DATA16, 0x0021,
+	CMD16,  0x0012, DATA16, 0x0137,
+	SLEEP,  0x0000,
+	CMD16,  0x0007, DATA16, 0x0021,
+	CMD16,  0x0012, DATA16, 0x1137,
+	SLEEP,  0x0000,
+	CMD16,  0x0007, DATA16, 0x0233,
 };
 
 unsigned short lcd_init_sequence_1[] = {
-    CMD16,  0x0011, DATA16, 0x0000,
-    CMD16,  0x0029, DATA16, 0x0000,
-    SLEEP,  0x0000,
+	CMD16,  0x0011, DATA16, 0x0000,
+	CMD16,  0x0029, DATA16, 0x0000,
+	SLEEP,  0x0000,
 };
 
 static void lcd_send_cmd(uint32_t cmd)
 {
-    while (LCDSTATUS & 0x10);
-    LCDWCMD = cmd;
+	while (LCDSTATUS & 0x10);
+	LCDWCMD = cmd;
 }
 
 static void lcd_send_data(uint32_t data)
 {
-    while (LCDSTATUS & 0x10);
-    LCDWDATA = data;
+	while (LCDSTATUS & 0x10);
+	LCDWDATA = data;
 }
 
 static void lcd_send_cmd_data(uint32_t cmd, uint32_t data)
 {
-    while (LCDSTATUS & 0x10);
-    LCDWCMD = cmd;
+	while (LCDSTATUS & 0x10);
+	LCDWCMD = cmd;
 
-    while (LCDSTATUS & 0x10);
-    LCDWDATA = data;
+	while (LCDSTATUS & 0x10);
+	LCDWDATA = data;
 }
 
 static int lcd_type;
@@ -202,116 +202,116 @@ static int lcd_type;
 // Based on rockbox an freemyipod
 static void lcd_init(void)
 {
-    unsigned short *lcd_init_sequence;
-    unsigned int lcd_init_sequence_length;
+	unsigned short *lcd_init_sequence;
+	unsigned int lcd_init_sequence_length;
 
-	PCON13 &= ~0xf;    /* Set pin 0 to input */
+	PCON13 &= ~0xf;	/* Set pin 0 to input */
 	PCON14 &= ~0xf0;   /* Set pin 1 to input */
 
-    if (((PDAT13 & 1) == 0) && ((PDAT14 & 2) == 2)) {
-        lcd_type   = 0;     /* Similar to ILI9320 - aka "type 2" */
-        //LCDCON   |= 0x180; /* use 16 bit bus width, big endian */
-    } else {
-        lcd_type   = 1;     /* Similar to LDS176  - aka "type 7" */
-        //LCDCON   |= 0x100; /* use 16 bit bus width, little endian */
-    }
+	if (((PDAT13 & 1) == 0) && ((PDAT14 & 2) == 2)) {
+		lcd_type   = 0;	 /* Similar to ILI9320 - aka "type 2" */
+		//LCDCON   |= 0x180; /* use 16 bit bus width, big endian */
+	} else {
+		lcd_type   = 1;	 /* Similar to LDS176  - aka "type 7" */
+		//LCDCON   |= 0x100; /* use 16 bit bus width, little endian */
+	}
 
-//    DMACON8 = 0x20000000 | 0x180000 | (1 << 16);
-//    DMACON8 = 0x30890003; for 888
-//    DMACON8 = 0x30190006;//for 888
-//    DMACON8 = 0x33c90004; // for 8888
-//    DMACON8 = 0x30590008; // for 8888
-    DMACON8 = 0x20190000;
+//	DMACON8 = 0x20000000 | 0x180000 | (1 << 16);
+//	DMACON8 = 0x30890003; for 888
+//	DMACON8 = 0x30190006;//for 888
+//	DMACON8 = 0x33c90004; // for 8888
+//	DMACON8 = 0x30590008; // for 8888
+	DMACON8 = 0x20190000;
 
-    if (lcd_type == 0) {
-        LCDCON = LCDCON_SETUPVALUE | 0x80;
-    } else {
-        LCDCON = LCDCON_SETUPVALUE;
-    }
-    DMATCNT8 = (LCD_WIDTH * LCD_HEIGHT / 2) - 1;
+	if (lcd_type == 0) {
+		LCDCON = LCDCON_SETUPVALUE | 0x80;
+	} else {
+		LCDCON = LCDCON_SETUPVALUE;
+	}
+	DMATCNT8 = (LCD_WIDTH * LCD_HEIGHT / 2) - 1;
 
-    LCDPHTIME = 0x0;
-    lcd_dma_busy = false;
+	LCDPHTIME = 0x0;
+	lcd_dma_busy = false;
 }
 
 static uint32_t lcd_detect(void)
 {
-    return (PDAT13 & 1) | (PDAT14 & 2);
+	return (PDAT13 & 1) | (PDAT14 & 2);
 }
 
 static void lcd_setup_drawing_region(int x, int y, int width, int height)
 {
-    int y0, x0, y1, x1;
+	int y0, x0, y1, x1;
 
-    x0 = x;                         /* start horiz */
-    y0 = y;                         /* start vert */
-    x1 = (x + width) - 1;           /* max horiz */
-    y1 = (y + height) - 1;          /* max vert */
+	x0 = x;						 /* start horiz */
+	y0 = y;						 /* start vert */
+	x1 = (x + width) - 1;		   /* max horiz */
+	y1 = (y + height) - 1;		  /* max vert */
 
-    if (lcd_type==0) {
-        lcd_send_cmd_data(R_HORIZ_ADDR_START_POS, x0);
-        lcd_send_cmd_data(R_HORIZ_ADDR_END_POS,   x1);
-        lcd_send_cmd_data(R_VERT_ADDR_START_POS,  y0);
-        lcd_send_cmd_data(R_VERT_ADDR_END_POS,    y1);
+	if (lcd_type==0) {
+		lcd_send_cmd_data(R_HORIZ_ADDR_START_POS, x0);
+		lcd_send_cmd_data(R_HORIZ_ADDR_END_POS,   x1);
+		lcd_send_cmd_data(R_VERT_ADDR_START_POS,  y0);
+		lcd_send_cmd_data(R_VERT_ADDR_END_POS,	y1);
 
-        lcd_send_cmd_data(R_HORIZ_GRAM_ADDR_SET,  (x1 << 8) | x0);
-        lcd_send_cmd_data(R_VERT_GRAM_ADDR_SET,   (y1 << 8) | y0);
+		lcd_send_cmd_data(R_HORIZ_GRAM_ADDR_SET,  (x1 << 8) | x0);
+		lcd_send_cmd_data(R_VERT_GRAM_ADDR_SET,   (y1 << 8) | y0);
 
-        lcd_send_cmd(0);
-        lcd_send_cmd(R_WRITE_DATA_TO_GRAM);
-    } else {
-        lcd_send_cmd(R_COLUMN_ADDR_SET);
-        lcd_send_data(x0);            /* Start column */
-        lcd_send_data(x1);            /* End column */
+		lcd_send_cmd(0);
+		lcd_send_cmd(R_WRITE_DATA_TO_GRAM);
+	} else {
+		lcd_send_cmd(R_COLUMN_ADDR_SET);
+		lcd_send_data(x0);			/* Start column */
+		lcd_send_data(x1);			/* End column */
 
-        lcd_send_cmd(R_ROW_ADDR_SET);
-        lcd_send_data(y0);            /* Start row */
-        lcd_send_data(y1);            /* End row */
+		lcd_send_cmd(R_ROW_ADDR_SET);
+		lcd_send_data(y0);			/* Start row */
+		lcd_send_data(y1);			/* End row */
 
-        lcd_send_cmd(R_MEMORY_WRITE);
-    }
+		lcd_send_cmd(R_MEMORY_WRITE);
+	}
 }
 
 void displaylcd_setup(unsigned int startx, unsigned int endx,
-                      unsigned int starty, unsigned int endy, bool safe)
+					  unsigned int starty, unsigned int endy, bool safe)
 {
-    while (DMAALLST2 & 0x40000);
-    while (!(LCDSTATUS & 0x2));
-    LCDCON = LCDCON_CMDMODEVALUE | ((lcd_type == 0) ? 0x80 : 0);
-    lcd_setup_drawing_region(startx, starty, endx + 1, endy + 1);
-    while (!(LCDSTATUS & 0x2));
-    LCDCON = LCDCON_FRAMEMODEVALUE | ((lcd_type == 0) ? 0x80 : 0);
+	while (DMAALLST2 & 0x40000);
+	while (!(LCDSTATUS & 0x2));
+	LCDCON = LCDCON_CMDMODEVALUE | ((lcd_type == 0) ? 0x80 : 0);
+	lcd_setup_drawing_region(startx, starty, endx + 1, endy + 1);
+	while (!(LCDSTATUS & 0x2));
+	LCDCON = LCDCON_FRAMEMODEVALUE | ((lcd_type == 0) ? 0x80 : 0);
 }
 
 void noinline clean_dcache(void) __attribute__((naked));
 void clean_dcache(void)
 {
-    asm volatile(
-        "MOV R0, #0                \n\t"
-        "clean_dcache_loop2:        \n\t"
-        "MCR p15, 0, R0,c7,c10,2   \n\t"
-        "ADD R1, R0, #0x10         \n\t"
-        "MCR p15, 0, R1,c7,c10,2   \n\t"
-        "ADD R1, R1, #0x10         \n\t"
-        "MCR p15, 0, R1,c7,c10,2   \n\t"
-        "ADD R1, R1, #0x10         \n\t"
-        "MCR p15, 0, R1,c7,c10,2   \n\t"
-        "ADDS R0, R0, #0x04000000  \n\t"
-        "BNE clean_dcache_loop2     \n\t"
-        "MCR p15, 0, R0,c7,c10,4   \n\t"
-        "MOV PC, LR                \n\t"
-    );
+	asm volatile(
+		"MOV R0, #0				\n\t"
+		"clean_dcache_loop2:		\n\t"
+		"MCR p15, 0, R0,c7,c10,2   \n\t"
+		"ADD R1, R0, #0x10		 \n\t"
+		"MCR p15, 0, R1,c7,c10,2   \n\t"
+		"ADD R1, R1, #0x10		 \n\t"
+		"MCR p15, 0, R1,c7,c10,2   \n\t"
+		"ADD R1, R1, #0x10		 \n\t"
+		"MCR p15, 0, R1,c7,c10,2   \n\t"
+		"ADDS R0, R0, #0x04000000  \n\t"
+		"BNE clean_dcache_loop2	 \n\t"
+		"MCR p15, 0, R0,c7,c10,4   \n\t"
+		"MOV PC, LR				\n\t"
+	);
 }
 
 static void displaylcd_dma(void* data, int pixels)
 {
-    uint16_t* in = (uint16_t*)data;
-    while (LCDSTATUS & 8);
-    if (!pixels) return;
-    lcd_dma_busy = true;
-    DMABASE8 = in;
-    clean_dcache();
-    DMACOM8 = 4;
+	uint16_t* in = (uint16_t*)data;
+	while (LCDSTATUS & 8);
+	if (!pixels) return;
+	lcd_dma_busy = true;
+	DMABASE8 = in;
+	clean_dcache();
+	DMACOM8 = 4;
 }
 
 
@@ -338,8 +338,8 @@ struct ili9320drm_device {
 	uint32_t formats[8];
 	struct drm_connector	conn;
 	struct drm_simple_display_pipe   pipe;
-    int irq;
-    void *ptr;
+	int irq;
+	void *ptr;
 };
 
 static struct ili9320drm_device *ili9320drm_device_of_dev(struct drm_device *dev)
@@ -383,37 +383,37 @@ static void ili9320drm_pipe_update(struct drm_simple_display_pipe *pipe,
 	struct drm_rect rect;
 
 	if (drm_atomic_helper_damage_merged(old_state, state, &rect)) {
-	    if (state->fb->format->format == FORMAT) {
-	        struct drm_gem_dma_object *dma_obj = drm_fb_dma_get_gem_obj(state->fb, 0);
-	        //lcd_update_rect(0, 0, state->fb->width, state->fb->height, dma_obj->vaddr, state->fb->pitches[0]);
+		if (state->fb->format->format == FORMAT) {
+			struct drm_gem_dma_object *dma_obj = drm_fb_dma_get_gem_obj(state->fb, 0);
+			//lcd_update_rect(0, 0, state->fb->width, state->fb->height, dma_obj->vaddr, state->fb->pitches[0]);
 //			local_irq_disable();
-            if (!sdev->ptr) {
-		        drm_warn(&sdev->dev, "Initializing lcd, pitch: %d\n", state->fb->pitches[0]);
-                lcd_init();
-                displaylcd_setup(0, LCD_WIDTH - 1, 0, LCD_HEIGHT - 1, true);
-                displaylcd_dma(dma_obj->vaddr, LCD_WIDTH * LCD_HEIGHT);
-            } else if (sdev->ptr != dma_obj->vaddr) {
-		        drm_warn(&sdev->dev, "unequal...\n");
-//                DMACON8 = 0x20000000 | 0x180000 | (1 << 16);
+			if (!sdev->ptr) {
+				drm_warn(&sdev->dev, "Initializing lcd, pitch: %d\n", state->fb->pitches[0]);
+				lcd_init();
+				displaylcd_setup(0, LCD_WIDTH - 1, 0, LCD_HEIGHT - 1, true);
+				displaylcd_dma(dma_obj->vaddr, LCD_WIDTH * LCD_HEIGHT);
+			} else if (sdev->ptr != dma_obj->vaddr) {
+				drm_warn(&sdev->dev, "unequal...\n");
+//				DMACON8 = 0x20000000 | 0x180000 | (1 << 16);
 
-                sdev->ptr = 0;
-                while (lcd_dma_busy) {
-		            drm_warn(&sdev->dev, "Waiting for dma...\n");
-                    mdelay(1);
-                }
-                //DMACOM8 = 7;
-                displaylcd_setup(0, LCD_WIDTH - 1, 0, LCD_HEIGHT - 1, true);
-                displaylcd_dma(dma_obj->vaddr, LCD_WIDTH * LCD_HEIGHT);
-                sdev->ptr = dma_obj->vaddr;
-            }
-            sdev->ptr = dma_obj->vaddr;
+				sdev->ptr = 0;
+				while (lcd_dma_busy) {
+					drm_warn(&sdev->dev, "Waiting for dma...\n");
+					mdelay(1);
+				}
+				//DMACOM8 = 7;
+				displaylcd_setup(0, LCD_WIDTH - 1, 0, LCD_HEIGHT - 1, true);
+				displaylcd_dma(dma_obj->vaddr, LCD_WIDTH * LCD_HEIGHT);
+				sdev->ptr = dma_obj->vaddr;
+			}
+			sdev->ptr = dma_obj->vaddr;
 //			local_irq_enable();
-	    } else {
-		    drm_warn(&sdev->dev, "unknown format %x\n", state->fb->format->format);
-        }
+		} else {
+			drm_warn(&sdev->dev, "unknown format %x\n", state->fb->format->format);
+		}
 	} else {
-        drm_warn(&sdev->dev, "no damage?\n");
-    }
+		drm_warn(&sdev->dev, "no damage?\n");
+	}
 }
 
 static const struct drm_simple_display_pipe_funcs ili9320drm_pipe_funcs = {
@@ -444,7 +444,7 @@ static const struct drm_connector_funcs ili9320drm_connector_funcs = {
 
 static struct drm_framebuffer*
 ili9320_fb_create(struct drm_device *dev, struct drm_file *file_priv,
-	     const struct drm_mode_fb_cmd2 *mode_cmd)
+		 const struct drm_mode_fb_cmd2 *mode_cmd)
 {
 	return drm_gem_fb_create(dev, file_priv, mode_cmd);
 }
@@ -474,20 +474,20 @@ static struct drm_display_mode ili9320drm_mode(unsigned int width,
 
 static irqreturn_t dma_irq(int irq, void *pw)
 {
-    uint32_t dmaallst = DMAALLST;
-    uint32_t dmaallst2 = DMAALLST2;
+	uint32_t dmaallst = DMAALLST;
+	uint32_t dmaallst2 = DMAALLST2;
 
 	struct ili9320drm_device *sdev = pw;
 
-    if (dmaallst2 & DMACON8 & 0x30000) {
-        DMACOM8 = 7;
-        lcd_dma_busy = false;
-        if (sdev->ptr) {
-            displaylcd_setup(0, LCD_WIDTH - 1, 0, LCD_HEIGHT - 1, true);
-            displaylcd_dma(sdev->ptr, LCD_WIDTH * LCD_HEIGHT);
-        }
-    }
-    return IRQ_HANDLED;
+	if (dmaallst2 & DMACON8 & 0x30000) {
+		DMACOM8 = 7;
+		lcd_dma_busy = false;
+		if (sdev->ptr) {
+			displaylcd_setup(0, LCD_WIDTH - 1, 0, LCD_HEIGHT - 1, true);
+			displaylcd_dma(sdev->ptr, LCD_WIDTH * LCD_HEIGHT);
+		}
+	}
+	return IRQ_HANDLED;
 }
 
 static struct ili9320drm_device *ili9320drm_device_create(struct drm_driver *drv,
@@ -506,7 +506,7 @@ static struct ili9320drm_device *ili9320drm_device_create(struct drm_driver *drv
 	dev = &sdev->dev;
 	platform_set_drvdata(pdev, sdev);
 
-    sdev->ptr = 0;
+	sdev->ptr = 0;
 
 	width = LCD_WIDTH;
 	height = LCD_HEIGHT;
@@ -530,7 +530,7 @@ static struct ili9320drm_device *ili9320drm_device_create(struct drm_driver *drv
 		return ERR_PTR(sdev->irq);
 
 	ret = devm_request_irq(&pdev->dev, sdev->irq, dma_irq,
-			       IRQF_SHARED, dev_name(&pdev->dev), sdev);
+				   IRQF_SHARED, dev_name(&pdev->dev), sdev);
 	if (ret < 0) {
 		drm_err(dev, "cannot claim IRQ for lcd dma\n");
 		return ERR_PTR(ret);
@@ -561,13 +561,13 @@ static struct ili9320drm_device *ili9320drm_device_create(struct drm_driver *drv
 		return ERR_PTR(ret);
 
 	ret = drm_simple_display_pipe_init(&sdev->dev,
-	                   &sdev->pipe,
-	                   &ili9320drm_pipe_funcs,
-	                   ili9320drm_pipe_formats,
-	                   ARRAY_SIZE(ili9320drm_pipe_formats),
-	                   ili9320drm_pipe_format_modifiers,
-	                   &sdev->conn);
-    drm_plane_enable_fb_damage_clips(&sdev->pipe.plane);
+					   &sdev->pipe,
+					   &ili9320drm_pipe_funcs,
+					   ili9320drm_pipe_formats,
+					   ARRAY_SIZE(ili9320drm_pipe_formats),
+					   ili9320drm_pipe_format_modifiers,
+					   &sdev->conn);
+	drm_plane_enable_fb_damage_clips(&sdev->pipe.plane);
 
 	drm_mode_config_reset(dev);
 
@@ -577,26 +577,26 @@ static struct ili9320drm_device *ili9320drm_device_create(struct drm_driver *drv
 // These are based on drivers/gpu/drm/drm_gem_dma_helper.c
 int ili9320_drm_gem_dma_mmap(struct drm_gem_dma_object *dma_obj, struct vm_area_struct *vma)
 {
-    struct drm_gem_object *obj = &dma_obj->base;
-    int ret;
+	struct drm_gem_object *obj = &dma_obj->base;
+	int ret;
 
-    /*
-     * Clear the VM_PFNMAP flag that was set by drm_gem_mmap(), and set the
-     * vm_pgoff (used as a fake buffer offset by DRM) to 0 as we want to map
-     * the whole buffer.
-     */
-    vma->vm_pgoff -= drm_vma_node_start(&obj->vma_node);
-    vma->vm_flags &= ~VM_PFNMAP;
-    vma->vm_flags |= VM_DONTEXPAND;
+	/*
+	 * Clear the VM_PFNMAP flag that was set by drm_gem_mmap(), and set the
+	 * vm_pgoff (used as a fake buffer offset by DRM) to 0 as we want to map
+	 * the whole buffer.
+	 */
+	vma->vm_pgoff -= drm_vma_node_start(&obj->vma_node);
+	vma->vm_flags &= ~VM_PFNMAP;
+	vma->vm_flags |= VM_DONTEXPAND;
 
-    if (dma_obj->map_noncoherent) {
-        vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
-    }
-    ret = vm_iomap_memory(vma, virt_to_phys(dma_obj->vaddr), vma->vm_end - vma->vm_start);
-    if (ret)
-        drm_gem_vm_close(vma);
+	if (dma_obj->map_noncoherent) {
+		vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+	}
+	ret = vm_iomap_memory(vma, virt_to_phys(dma_obj->vaddr), vma->vm_end - vma->vm_start);
+	if (ret)
+		drm_gem_vm_close(vma);
 
-    return ret;
+	return ret;
 }
 
 static inline int ili9320_drm_gem_dma_object_mmap(struct drm_gem_object *obj, struct vm_area_struct *vma)
@@ -607,13 +607,13 @@ static inline int ili9320_drm_gem_dma_object_mmap(struct drm_gem_object *obj, st
 }
 
 int ili9320_drm_gem_dma_vmap(struct drm_gem_dma_object *dma_obj,
-             struct iosys_map *map)
+			 struct iosys_map *map)
 {
-    // using iomem here to get screen_base initialized for get_fb_unmapped_area
-    // TODO: Check again if still needed.
-    iosys_map_set_vaddr_iomem(map, dma_obj->vaddr);
+	// using iomem here to get screen_base initialized for get_fb_unmapped_area
+	// TODO: Check again if still needed.
+	iosys_map_set_vaddr_iomem(map, dma_obj->vaddr);
 
-    return 0;
+	return 0;
 }
 
 static inline int ili9320_drm_gem_dma_object_vmap(struct drm_gem_object *obj,
@@ -812,7 +812,7 @@ static void ili9320_drm_fb_helper_fill_pixel_fmt(struct fb_var_screeninfo *var,
 		var->transp.length = 1;
 		break;
 	case 16:
-    // ili9320
+	// ili9320
 		var->red.offset = 6;
 		var->green.offset = 0;
 		var->blue.offset = 11;
@@ -823,7 +823,7 @@ static void ili9320_drm_fb_helper_fill_pixel_fmt(struct fb_var_screeninfo *var,
 		var->transp.length = 0;
 		break;
 	case 24:
-    // ili9320
+	// ili9320
 		var->red.offset = 8;
 		var->green.offset = 0;
 		var->blue.offset = 16;
@@ -889,7 +889,7 @@ static void drm_fb_helper_fill_fix(struct fb_info *info, uint32_t pitch,
 {
 	info->fix.type = FB_TYPE_PACKED_PIXELS;
 	info->fix.visual = is_color_indexed ? FB_VISUAL_PSEUDOCOLOR
-					    : FB_VISUAL_TRUECOLOR;
+						: FB_VISUAL_TRUECOLOR;
 	info->fix.mmio_start = 0;
 	info->fix.mmio_len = 0;
 	info->fix.type_aux = 0;
@@ -902,15 +902,15 @@ static void drm_fb_helper_fill_fix(struct fb_info *info, uint32_t pitch,
 }
 
 void ili9320_drm_fb_helper_fill_info(struct fb_info *info,
-			     struct drm_fb_helper *fb_helper,
-			     struct drm_fb_helper_surface_size *sizes)
+				 struct drm_fb_helper *fb_helper,
+				 struct drm_fb_helper_surface_size *sizes)
 {
 	struct drm_framebuffer *fb = fb_helper->fb;
 
 	drm_fb_helper_fill_fix(info, fb->pitches[0],
-			       fb->format->is_color_indexed);
+				   fb->format->is_color_indexed);
 	ili9320_drm_fb_helper_fill_var(info, fb_helper,
-			       sizes->fb_width, sizes->fb_height);
+				   sizes->fb_width, sizes->fb_height);
 
 	info->par = fb_helper;
 	/*
@@ -930,8 +930,8 @@ static bool drm_fbdev_use_shadow_fb(struct drm_fb_helper *fb_helper)
 	struct drm_framebuffer *fb = fb_helper->fb;
 
 	return dev->mode_config.prefer_shadow_fbdev ||
-	       dev->mode_config.prefer_shadow ||
-	       fb->funcs->dirty;
+		   dev->mode_config.prefer_shadow ||
+		   fb->funcs->dirty;
 }
 
 /* @user: 1=userspace, 0=fbcon */
@@ -1090,7 +1090,7 @@ static struct fb_deferred_io drm_fbdev_defio = {
 };
 
 static int ili9320_drm_fbdev_fb_probe(struct drm_fb_helper *fb_helper,
-			      struct drm_fb_helper_surface_size *sizes)
+				  struct drm_fb_helper_surface_size *sizes)
 {
 	struct drm_client_dev *client = &fb_helper->client;
 	struct drm_device *dev = fb_helper->dev;
@@ -1102,12 +1102,12 @@ static int ili9320_drm_fbdev_fb_probe(struct drm_fb_helper *fb_helper,
 	int ret;
 
 	drm_dbg_kms(dev, "surface width(%d), height(%d) and bpp(%d)\n",
-		    sizes->surface_width, sizes->surface_height,
-		    sizes->surface_bpp);
+			sizes->surface_width, sizes->surface_height,
+			sizes->surface_bpp);
 
 	format = drm_mode_legacy_fb_format(sizes->surface_bpp, sizes->surface_depth);
 	buffer = drm_client_framebuffer_create(client, sizes->surface_width,
-					       sizes->surface_height, format);
+						   sizes->surface_height, format);
 	if (IS_ERR(buffer))
 		return PTR_ERR(buffer);
 
@@ -1153,7 +1153,7 @@ static int ili9320_drm_fbdev_fb_probe(struct drm_fb_helper *fb_helper,
 		 */
 #if IS_ENABLED(CONFIG_DRM_FBDEV_LEAK_PHYS_SMEM)
 		if (fb_helper->hint_leak_smem_start && fbi->fix.smem_start == 0 &&
-		    !drm_WARN_ON_ONCE(dev, map.is_iomem))
+			!drm_WARN_ON_ONCE(dev, map.is_iomem))
 			fbi->fix.smem_start =
 				page_to_phys(virt_to_page(fbi->screen_buffer));
 #endif
@@ -1163,8 +1163,8 @@ static int ili9320_drm_fbdev_fb_probe(struct drm_fb_helper *fb_helper,
 }
 
 static void ili9320_drm_fbdev_damage_blit_real(struct drm_fb_helper *fb_helper,
-				       struct drm_clip_rect *clip,
-				       struct iosys_map *dst)
+					   struct drm_clip_rect *clip,
+					   struct iosys_map *dst)
 {
 	struct drm_framebuffer *fb = fb_helper->fb;
 	size_t offset = clip->y1 * fb->pitches[0];
@@ -1338,41 +1338,41 @@ static const struct drm_client_funcs drm_fbdev_client_funcs = {
 };
 
 void ili9320_drm_fbdev_setup(struct drm_device *dev,
-                 unsigned int preferred_bpp)
+				 unsigned int preferred_bpp)
 {
-    struct drm_fb_helper *fb_helper;
-    int ret;
+	struct drm_fb_helper *fb_helper;
+	int ret;
 
-    drm_WARN(dev, !dev->registered, "Device has not been registered.\n");
-    drm_WARN(dev, dev->fb_helper, "fb_helper is already set!\n");
+	drm_WARN(dev, !dev->registered, "Device has not been registered.\n");
+	drm_WARN(dev, dev->fb_helper, "fb_helper is already set!\n");
 
-    fb_helper = kzalloc(sizeof(*fb_helper), GFP_KERNEL);
-    if (!fb_helper)
-        return;
+	fb_helper = kzalloc(sizeof(*fb_helper), GFP_KERNEL);
+	if (!fb_helper)
+		return;
 
-    ret = drm_client_init(dev, &fb_helper->client, "fbdev", &drm_fbdev_client_funcs);
-    if (ret) {
-        kfree(fb_helper);
-        drm_err(dev, "Failed to register client: %d\n", ret);
-        return;
-    }
+	ret = drm_client_init(dev, &fb_helper->client, "fbdev", &drm_fbdev_client_funcs);
+	if (ret) {
+		kfree(fb_helper);
+		drm_err(dev, "Failed to register client: %d\n", ret);
+		return;
+	}
 
-    /*
-     * FIXME: This mixes up depth with bpp, which results in a glorious
-     * mess, resulting in some drivers picking wrong fbdev defaults and
-     * others wrong preferred_depth defaults.
-     */
-    if (!preferred_bpp)
-        preferred_bpp = dev->mode_config.preferred_depth;
-    if (!preferred_bpp)
-        preferred_bpp = 32;
-    fb_helper->preferred_bpp = preferred_bpp;
+	/*
+	 * FIXME: This mixes up depth with bpp, which results in a glorious
+	 * mess, resulting in some drivers picking wrong fbdev defaults and
+	 * others wrong preferred_depth defaults.
+	 */
+	if (!preferred_bpp)
+		preferred_bpp = dev->mode_config.preferred_depth;
+	if (!preferred_bpp)
+		preferred_bpp = 32;
+	fb_helper->preferred_bpp = preferred_bpp;
 
-    ret = ili9320_drm_fbdev_client_hotplug(&fb_helper->client);
-    if (ret)
-        drm_dbg_kms(dev, "client hotplug ret=%d\n", ret);
+	ret = ili9320_drm_fbdev_client_hotplug(&fb_helper->client);
+	if (ret)
+		drm_dbg_kms(dev, "client hotplug ret=%d\n", ret);
 
-    drm_client_register(&fb_helper->client);
+	drm_client_register(&fb_helper->client);
 }
 
 /*
