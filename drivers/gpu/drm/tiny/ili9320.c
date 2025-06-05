@@ -29,6 +29,8 @@
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_framebuffer.h>
+#include <drm/drm_client.h>
+#include <drm/drm_fb_helper.h>
 #include <linux/delay.h>
 
 #define CLK_BASE 0x3C500000
@@ -57,7 +59,9 @@
 #define LCDPHTIME (*((volatile uint32_t*)(0x38600010)))
 #define LCDSTATUS (*((volatile uint32_t*)(0x3860001c)))
 #define LCDWDATA  (*((volatile uint32_t*)(0x38600040)))
-#define LCDCON_INITVALUE 0xd01
+#define LCDCON_CMDMODEVALUE 0xd01
+#define LCDCON_SETUPVALUE 0x2d50
+#define LCDCON_FRAMEMODEVALUE 0xe10
 
 #define PCON13	   (*((volatile uint32_t*)(0x3CF000D0)))
 #define PCON14	   (*((volatile uint32_t*)(0x3CF000E0)))
@@ -212,14 +216,19 @@ static void lcd_init(void)
         //LCDCON   |= 0x100; /* use 16 bit bus width, little endian */
     }
 
-    DMACON8 = 0x20000000 | 0x180000 | (1 << 16);
-    DMATCNT8 = (LCD_WIDTH * LCD_HEIGHT / 2) - 1;
+//    DMACON8 = 0x20000000 | 0x180000 | (1 << 16);
+//    DMACON8 = 0x30890003; for 888
+//    DMACON8 = 0x30190006;//for 888
+//    DMACON8 = 0x33c90004; // for 8888
+//    DMACON8 = 0x30590008; // for 8888
+    DMACON8 = 0x20190000;
 
     if (lcd_type == 0) {
-        LCDCON = 0x2d50 | 0x80;
+        LCDCON = LCDCON_SETUPVALUE | 0x80;
     } else {
-        LCDCON = 0x2d50;
+        LCDCON = LCDCON_SETUPVALUE;
     }
+    DMATCNT8 = (LCD_WIDTH * LCD_HEIGHT / 2) - 1;
 
     LCDPHTIME = 0x0;
     lcd_dma_busy = false;
@@ -268,14 +277,10 @@ void displaylcd_setup(unsigned int startx, unsigned int endx,
 {
     while (DMAALLST2 & 0x40000);
     while (!(LCDSTATUS & 0x2));
-    LCDCON = 0xd81;
+    LCDCON = LCDCON_CMDMODEVALUE | ((lcd_type == 0) ? 0x80 : 0);
     lcd_setup_drawing_region(startx, starty, endx + 1, endy + 1);
     while (!(LCDSTATUS & 0x2));
-    if (lcd_type == 0) {
-        LCDCON = 0x2d50 | 0x80;
-    } else {
-        LCDCON = 0x2d50;
-    }
+    LCDCON = LCDCON_FRAMEMODEVALUE | ((lcd_type == 0) ? 0x80 : 0);
 }
 
 void noinline clean_dcache(void) __attribute__((naked));
@@ -346,8 +351,12 @@ static struct ili9320drm_device *ili9320drm_device_of_dev(struct drm_device *dev
  * Hardware
  */
 
+#define FORMAT DRM_FORMAT_RGB565
+#define FORMAT_BPP 2
+#define FORMAT_DEPTH 16
+
 static const uint32_t ili9320drm_pipe_formats[] = {
-	DRM_FORMAT_RGB565,
+	FORMAT,
 };
 
 static const uint64_t ili9320drm_pipe_format_modifiers[] = {
@@ -374,7 +383,7 @@ static void ili9320drm_pipe_update(struct drm_simple_display_pipe *pipe,
 	struct drm_rect rect;
 
 	if (drm_atomic_helper_damage_merged(old_state, state, &rect)) {
-	    if (state->fb->format->format == DRM_FORMAT_RGB565) {
+	    if (state->fb->format->format == FORMAT) {
 	        struct drm_gem_dma_object *dma_obj = drm_fb_dma_get_gem_obj(state->fb, 0);
 	        //lcd_update_rect(0, 0, state->fb->width, state->fb->height, dma_obj->vaddr, state->fb->pitches[0]);
 //			local_irq_disable();
@@ -501,8 +510,8 @@ static struct ili9320drm_device *ili9320drm_device_create(struct drm_driver *drv
 
 	width = LCD_WIDTH;
 	height = LCD_HEIGHT;
-	stride = LCD_WIDTH * 2;
-	format = drm_format_info(DRM_FORMAT_RGB565);
+	stride = LCD_WIDTH * FORMAT_BPP;
+	format = drm_format_info(FORMAT);
 
 	sdev->mode = ili9320drm_mode(width, height);
 	sdev->format = format;
@@ -542,7 +551,7 @@ static struct ili9320drm_device *ili9320drm_device_create(struct drm_driver *drv
 	dev->mode_config.max_width = max_width;
 	dev->mode_config.min_height = height;
 	dev->mode_config.max_height = max_height;
-	dev->mode_config.preferred_depth = 16;
+	dev->mode_config.preferred_depth = FORMAT_DEPTH;
 	dev->mode_config.funcs = &ili9320drm_mode_config_funcs;
 
 	drm_connector_helper_add(&sdev->conn, &ili9320drm_connector_helper_funcs);
@@ -669,6 +678,7 @@ error:
 	kfree(dma_obj);
 	return ERR_PTR(ret);
 }
+
 struct drm_gem_dma_object *ili9320_drm_gem_dma_create(struct drm_device *drm,
 						  size_t size)
 {
@@ -773,6 +783,598 @@ static struct drm_driver ili9320drm_driver = {
 	.fops			= &ili9320drm_fops,
 };
 
+static void ili9320_drm_fb_helper_fill_pixel_fmt(struct fb_var_screeninfo *var,
+					 const struct drm_format_info *format)
+{
+	u8 depth = format->depth;
+
+	if (format->is_color_indexed) {
+		var->red.offset = 0;
+		var->green.offset = 0;
+		var->blue.offset = 0;
+		var->red.length = depth;
+		var->green.length = depth;
+		var->blue.length = depth;
+		var->transp.offset = 0;
+		var->transp.length = 0;
+		return;
+	}
+
+	switch (depth) {
+	case 15:
+		var->red.offset = 10;
+		var->green.offset = 5;
+		var->blue.offset = 0;
+		var->red.length = 5;
+		var->green.length = 5;
+		var->blue.length = 5;
+		var->transp.offset = 15;
+		var->transp.length = 1;
+		break;
+	case 16:
+    // ili9320
+		var->red.offset = 6;
+		var->green.offset = 0;
+		var->blue.offset = 11;
+		var->red.length = 5;
+		var->green.length = 6;
+		var->blue.length = 5;
+		var->transp.offset = 0;
+		var->transp.length = 0;
+		break;
+	case 24:
+    // ili9320
+		var->red.offset = 8;
+		var->green.offset = 0;
+		var->blue.offset = 16;
+		var->red.length = 8;
+		var->green.length = 8;
+		var->blue.length = 8;
+		var->transp.offset = 0;
+		var->transp.length = 0;
+		break;
+	case 32:
+		var->red.offset = 8;
+		var->green.offset = 0;
+		var->blue.offset = 16;
+		var->red.length = 8;
+		var->green.length = 8;
+		var->blue.length = 8;
+		var->transp.offset = 24;
+		var->transp.length = 8;
+		break;
+	default:
+		break;
+	}
+}
+
+
+static void ili9320_drm_fb_helper_fill_var(struct fb_info *info,
+				   struct drm_fb_helper *fb_helper,
+				   uint32_t fb_width, uint32_t fb_height)
+{
+	struct drm_framebuffer *fb = fb_helper->fb;
+	const struct drm_format_info *format = fb->format;
+
+	switch (format->format) {
+	case DRM_FORMAT_C1:
+	case DRM_FORMAT_C2:
+	case DRM_FORMAT_C4:
+		/* supported format with sub-byte pixels */
+		break;
+
+	default:
+		WARN_ON((drm_format_info_block_width(format, 0) > 1) ||
+			(drm_format_info_block_height(format, 0) > 1));
+		break;
+	}
+
+	info->pseudo_palette = fb_helper->pseudo_palette;
+	info->var.xres_virtual = fb->width;
+	info->var.yres_virtual = fb->height;
+	info->var.bits_per_pixel = drm_format_info_bpp(format, 0);
+	info->var.accel_flags = FB_ACCELF_TEXT;
+	info->var.xoffset = 0;
+	info->var.yoffset = 0;
+	info->var.activate = FB_ACTIVATE_NOW;
+
+	ili9320_drm_fb_helper_fill_pixel_fmt(&info->var, format);
+
+	info->var.xres = fb_width;
+	info->var.yres = fb_height;
+}
+
+static void drm_fb_helper_fill_fix(struct fb_info *info, uint32_t pitch,
+				   bool is_color_indexed)
+{
+	info->fix.type = FB_TYPE_PACKED_PIXELS;
+	info->fix.visual = is_color_indexed ? FB_VISUAL_PSEUDOCOLOR
+					    : FB_VISUAL_TRUECOLOR;
+	info->fix.mmio_start = 0;
+	info->fix.mmio_len = 0;
+	info->fix.type_aux = 0;
+	info->fix.xpanstep = 1; /* doing it in hw */
+	info->fix.ypanstep = 1; /* doing it in hw */
+	info->fix.ywrapstep = 0;
+	info->fix.accel = FB_ACCEL_NONE;
+
+	info->fix.line_length = pitch;
+}
+
+void ili9320_drm_fb_helper_fill_info(struct fb_info *info,
+			     struct drm_fb_helper *fb_helper,
+			     struct drm_fb_helper_surface_size *sizes)
+{
+	struct drm_framebuffer *fb = fb_helper->fb;
+
+	drm_fb_helper_fill_fix(info, fb->pitches[0],
+			       fb->format->is_color_indexed);
+	ili9320_drm_fb_helper_fill_var(info, fb_helper,
+			       sizes->fb_width, sizes->fb_height);
+
+	info->par = fb_helper;
+	/*
+	 * The DRM drivers fbdev emulation device name can be confusing if the
+	 * driver name also has a "drm" suffix on it. Leading to names such as
+	 * "simpledrmdrmfb" in /proc/fb. Unfortunately, it's an uAPI and can't
+	 * be changed due user-space tools (e.g: pm-utils) matching against it.
+	 */
+	snprintf(info->fix.id, sizeof(info->fix.id), "%sdrmfb",
+		 fb_helper->dev->driver->name);
+
+}
+
+static bool drm_fbdev_use_shadow_fb(struct drm_fb_helper *fb_helper)
+{
+	struct drm_device *dev = fb_helper->dev;
+	struct drm_framebuffer *fb = fb_helper->fb;
+
+	return dev->mode_config.prefer_shadow_fbdev ||
+	       dev->mode_config.prefer_shadow ||
+	       fb->funcs->dirty;
+}
+
+/* @user: 1=userspace, 0=fbcon */
+static int drm_fbdev_fb_open(struct fb_info *info, int user)
+{
+	struct drm_fb_helper *fb_helper = info->par;
+
+	/* No need to take a ref for fbcon because it unbinds on unregister */
+	if (user && !try_module_get(fb_helper->dev->driver->fops->owner))
+		return -ENODEV;
+
+	return 0;
+}
+
+static int drm_fbdev_fb_release(struct fb_info *info, int user)
+{
+	struct drm_fb_helper *fb_helper = info->par;
+
+	if (user)
+		module_put(fb_helper->dev->driver->fops->owner);
+
+	return 0;
+}
+
+static void drm_fbdev_cleanup(struct drm_fb_helper *fb_helper)
+{
+	struct fb_info *fbi = fb_helper->info;
+	void *shadow = NULL;
+
+	if (!fb_helper->dev)
+		return;
+
+	if (fbi) {
+		if (fbi->fbdefio)
+			fb_deferred_io_cleanup(fbi);
+		if (drm_fbdev_use_shadow_fb(fb_helper))
+			shadow = fbi->screen_buffer;
+	}
+
+	drm_fb_helper_fini(fb_helper);
+
+	if (shadow)
+		vfree(shadow);
+	else if (fb_helper->buffer)
+		drm_client_buffer_vunmap(fb_helper->buffer);
+
+	drm_client_framebuffer_delete(fb_helper->buffer);
+}
+
+static void drm_fbdev_release(struct drm_fb_helper *fb_helper)
+{
+	drm_fbdev_cleanup(fb_helper);
+	drm_client_release(&fb_helper->client);
+	kfree(fb_helper);
+}
+
+/*
+ * fb_ops.fb_destroy is called by the last put_fb_info() call at the end of
+ * unregister_framebuffer() or fb_release().
+ */
+static void drm_fbdev_fb_destroy(struct fb_info *info)
+{
+	drm_fbdev_release(info->par);
+}
+
+static int drm_fbdev_fb_mmap(struct fb_info *info, struct vm_area_struct *vma)
+{
+	struct drm_fb_helper *fb_helper = info->par;
+
+	if (drm_fbdev_use_shadow_fb(fb_helper))
+		return fb_deferred_io_mmap(info, vma);
+	else if (fb_helper->dev->driver->gem_prime_mmap)
+		return fb_helper->dev->driver->gem_prime_mmap(fb_helper->buffer->gem, vma);
+	else
+		return -ENODEV;
+}
+
+static bool drm_fbdev_use_iomem(struct fb_info *info)
+{
+	struct drm_fb_helper *fb_helper = info->par;
+	struct drm_client_buffer *buffer = fb_helper->buffer;
+
+	return !drm_fbdev_use_shadow_fb(fb_helper) && buffer->map.is_iomem;
+}
+
+static ssize_t drm_fbdev_fb_read(struct fb_info *info, char __user *buf,
+				 size_t count, loff_t *ppos)
+{
+	ssize_t ret;
+
+	if (drm_fbdev_use_iomem(info))
+		ret = drm_fb_helper_cfb_read(info, buf, count, ppos);
+	else
+		ret = drm_fb_helper_sys_read(info, buf, count, ppos);
+
+	return ret;
+}
+
+static ssize_t drm_fbdev_fb_write(struct fb_info *info, const char __user *buf,
+				  size_t count, loff_t *ppos)
+{
+	ssize_t ret;
+
+	if (drm_fbdev_use_iomem(info))
+		ret = drm_fb_helper_cfb_write(info, buf, count, ppos);
+	else
+		ret = drm_fb_helper_sys_write(info, buf, count, ppos);
+
+	return ret;
+}
+
+static void drm_fbdev_fb_fillrect(struct fb_info *info,
+				  const struct fb_fillrect *rect)
+{
+	if (drm_fbdev_use_iomem(info))
+		drm_fb_helper_cfb_fillrect(info, rect);
+	else
+		drm_fb_helper_sys_fillrect(info, rect);
+}
+
+static void drm_fbdev_fb_copyarea(struct fb_info *info,
+				  const struct fb_copyarea *area)
+{
+	if (drm_fbdev_use_iomem(info))
+		drm_fb_helper_cfb_copyarea(info, area);
+	else
+		drm_fb_helper_sys_copyarea(info, area);
+}
+
+static void drm_fbdev_fb_imageblit(struct fb_info *info,
+				   const struct fb_image *image)
+{
+	if (drm_fbdev_use_iomem(info))
+		drm_fb_helper_cfb_imageblit(info, image);
+	else
+		drm_fb_helper_sys_imageblit(info, image);
+}
+
+static const struct fb_ops drm_fbdev_fb_ops = {
+	.owner		= THIS_MODULE,
+	DRM_FB_HELPER_DEFAULT_OPS,
+	.fb_open	= drm_fbdev_fb_open,
+	.fb_release	= drm_fbdev_fb_release,
+	.fb_destroy	= drm_fbdev_fb_destroy,
+	.fb_mmap	= drm_fbdev_fb_mmap,
+	.fb_read	= drm_fbdev_fb_read,
+	.fb_write	= drm_fbdev_fb_write,
+	.fb_fillrect	= drm_fbdev_fb_fillrect,
+	.fb_copyarea	= drm_fbdev_fb_copyarea,
+	.fb_imageblit	= drm_fbdev_fb_imageblit,
+};
+
+static struct fb_deferred_io drm_fbdev_defio = {
+	.delay		= HZ / 20,
+	.deferred_io	= drm_fb_helper_deferred_io,
+};
+
+static int ili9320_drm_fbdev_fb_probe(struct drm_fb_helper *fb_helper,
+			      struct drm_fb_helper_surface_size *sizes)
+{
+	struct drm_client_dev *client = &fb_helper->client;
+	struct drm_device *dev = fb_helper->dev;
+	struct drm_client_buffer *buffer;
+	struct drm_framebuffer *fb;
+	struct fb_info *fbi;
+	u32 format;
+	struct iosys_map map;
+	int ret;
+
+	drm_dbg_kms(dev, "surface width(%d), height(%d) and bpp(%d)\n",
+		    sizes->surface_width, sizes->surface_height,
+		    sizes->surface_bpp);
+
+	format = drm_mode_legacy_fb_format(sizes->surface_bpp, sizes->surface_depth);
+	buffer = drm_client_framebuffer_create(client, sizes->surface_width,
+					       sizes->surface_height, format);
+	if (IS_ERR(buffer))
+		return PTR_ERR(buffer);
+
+	fb_helper->buffer = buffer;
+	fb_helper->fb = buffer->fb;
+	fb = buffer->fb;
+
+	fbi = drm_fb_helper_alloc_info(fb_helper);
+	if (IS_ERR(fbi))
+		return PTR_ERR(fbi);
+
+	fbi->fbops = &drm_fbdev_fb_ops;
+	fbi->screen_size = sizes->surface_height * fb->pitches[0];
+	fbi->fix.smem_len = fbi->screen_size;
+	fbi->flags = FBINFO_DEFAULT;
+
+	ili9320_drm_fb_helper_fill_info(fbi, fb_helper, sizes);
+
+	if (drm_fbdev_use_shadow_fb(fb_helper)) {
+		fbi->screen_buffer = vzalloc(fbi->screen_size);
+		if (!fbi->screen_buffer)
+			return -ENOMEM;
+		fbi->flags |= FBINFO_VIRTFB | FBINFO_READS_FAST;
+
+		fbi->fbdefio = &drm_fbdev_defio;
+		fb_deferred_io_init(fbi);
+	} else {
+		/* buffer is mapped for HW framebuffer */
+		ret = drm_client_buffer_vmap(fb_helper->buffer, &map);
+		if (ret)
+			return ret;
+		if (map.is_iomem) {
+			fbi->screen_base = map.vaddr_iomem;
+		} else {
+			fbi->screen_buffer = map.vaddr;
+			fbi->flags |= FBINFO_VIRTFB;
+		}
+
+		/*
+		 * Shamelessly leak the physical address to user-space. As
+		 * page_to_phys() is undefined for I/O memory, warn in this
+		 * case.
+		 */
+#if IS_ENABLED(CONFIG_DRM_FBDEV_LEAK_PHYS_SMEM)
+		if (fb_helper->hint_leak_smem_start && fbi->fix.smem_start == 0 &&
+		    !drm_WARN_ON_ONCE(dev, map.is_iomem))
+			fbi->fix.smem_start =
+				page_to_phys(virt_to_page(fbi->screen_buffer));
+#endif
+	}
+
+	return 0;
+}
+
+static void ili9320_drm_fbdev_damage_blit_real(struct drm_fb_helper *fb_helper,
+				       struct drm_clip_rect *clip,
+				       struct iosys_map *dst)
+{
+	struct drm_framebuffer *fb = fb_helper->fb;
+	size_t offset = clip->y1 * fb->pitches[0];
+	size_t len = clip->x2 - clip->x1;
+	unsigned int y;
+	void *src;
+
+	switch (drm_format_info_bpp(fb->format, 0)) {
+	case 1:
+		offset += clip->x1 / 8;
+		len = DIV_ROUND_UP(len + clip->x1 % 8, 8);
+		break;
+	case 2:
+		offset += clip->x1 / 4;
+		len = DIV_ROUND_UP(len + clip->x1 % 4, 4);
+		break;
+	case 4:
+		offset += clip->x1 / 2;
+		len = DIV_ROUND_UP(len + clip->x1 % 2, 2);
+		break;
+	default:
+		offset += clip->x1 * fb->format->cpp[0];
+		len *= fb->format->cpp[0];
+		break;
+	}
+
+	src = fb_helper->info->screen_buffer + offset;
+	iosys_map_incr(dst, offset); /* go to first pixel within clip rect */
+
+	for (y = clip->y1; y < clip->y2; y++) {
+		iosys_map_memcpy_to(dst, 0, src, len);
+		iosys_map_incr(dst, fb->pitches[0]);
+		src += fb->pitches[0];
+	}
+}
+
+static int ili9320_drm_fbdev_damage_blit(struct drm_fb_helper *fb_helper,
+				 struct drm_clip_rect *clip)
+{
+	struct drm_client_buffer *buffer = fb_helper->buffer;
+	struct iosys_map map, dst;
+	int ret;
+
+	/*
+	 * We have to pin the client buffer to its current location while
+	 * flushing the shadow buffer. In the general case, concurrent
+	 * modesetting operations could try to move the buffer and would
+	 * fail. The modeset has to be serialized by acquiring the reservation
+	 * object of the underlying BO here.
+	 *
+	 * For fbdev emulation, we only have to protect against fbdev modeset
+	 * operations. Nothing else will involve the client buffer's BO. So it
+	 * is sufficient to acquire struct drm_fb_helper.lock here.
+	 */
+	mutex_lock(&fb_helper->lock);
+
+	ret = drm_client_buffer_vmap(buffer, &map);
+	if (ret)
+		goto out;
+
+	dst = map;
+	ili9320_drm_fbdev_damage_blit_real(fb_helper, clip, &dst);
+
+	drm_client_buffer_vunmap(buffer);
+
+out:
+	mutex_unlock(&fb_helper->lock);
+
+	return ret;
+}
+
+static int ili9320_drm_fbdev_fb_dirty(struct drm_fb_helper *helper, struct drm_clip_rect *clip)
+{
+	struct drm_device *dev = helper->dev;
+	int ret;
+
+	if (!drm_fbdev_use_shadow_fb(helper))
+		return 0;
+
+	/* Call damage handlers only if necessary */
+	if (!(clip->x1 < clip->x2 && clip->y1 < clip->y2))
+		return 0;
+
+	if (helper->buffer) {
+		ret = ili9320_drm_fbdev_damage_blit(helper, clip);
+		if (drm_WARN_ONCE(dev, ret, "Damage blitter failed: ret=%d\n", ret))
+			return ret;
+	}
+
+	if (helper->fb->funcs->dirty) {
+		ret = helper->fb->funcs->dirty(helper->fb, NULL, 0, 0, clip, 1);
+		if (drm_WARN_ONCE(dev, ret, "Dirty helper failed: ret=%d\n", ret))
+			return ret;
+	}
+
+	return 0;
+}
+
+static const struct drm_fb_helper_funcs drm_fb_helper_ili9320_funcs = {
+	.fb_probe = ili9320_drm_fbdev_fb_probe,
+	.fb_dirty = ili9320_drm_fbdev_fb_dirty,
+};
+
+static int ili9320_drm_fbdev_client_hotplug(struct drm_client_dev *client)
+{
+	struct drm_fb_helper *fb_helper = drm_fb_helper_from_client(client);
+	struct drm_device *dev = client->dev;
+	int ret;
+
+	/* Setup is not retried if it has failed */
+	if (!fb_helper->dev && fb_helper->funcs)
+		return 0;
+
+	if (dev->fb_helper)
+		return drm_fb_helper_hotplug_event(dev->fb_helper);
+
+	if (!dev->mode_config.num_connector) {
+		drm_dbg_kms(dev, "No connectors found, will not create framebuffer!\n");
+		return 0;
+	}
+
+	drm_fb_helper_prepare(dev, fb_helper, &drm_fb_helper_ili9320_funcs);
+
+	ret = drm_fb_helper_init(dev, fb_helper);
+	if (ret)
+		goto err;
+
+	if (!drm_drv_uses_atomic_modeset(dev))
+		drm_helper_disable_unused_functions(dev);
+
+	ret = drm_fb_helper_initial_config(fb_helper, fb_helper->preferred_bpp);
+	if (ret)
+		goto err_cleanup;
+
+	return 0;
+
+err_cleanup:
+	drm_fbdev_cleanup(fb_helper);
+err:
+	fb_helper->dev = NULL;
+	fb_helper->info = NULL;
+
+	drm_err(dev, "fbdev: Failed to setup generic emulation (ret=%d)\n", ret);
+
+	return ret;
+}
+
+static void drm_fbdev_client_unregister(struct drm_client_dev *client)
+{
+	struct drm_fb_helper *fb_helper = drm_fb_helper_from_client(client);
+
+	if (fb_helper->info)
+		/* drm_fbdev_fb_destroy() takes care of cleanup */
+		drm_fb_helper_unregister_info(fb_helper);
+	else
+		drm_fbdev_release(fb_helper);
+}
+
+static int drm_fbdev_client_restore(struct drm_client_dev *client)
+{
+	drm_fb_helper_lastclose(client->dev);
+
+	return 0;
+}
+
+static const struct drm_client_funcs drm_fbdev_client_funcs = {
+	.owner		= THIS_MODULE,
+	.unregister	= drm_fbdev_client_unregister,
+	.restore	= drm_fbdev_client_restore,
+	.hotplug	= ili9320_drm_fbdev_client_hotplug,
+};
+
+void ili9320_drm_fbdev_setup(struct drm_device *dev,
+                 unsigned int preferred_bpp)
+{
+    struct drm_fb_helper *fb_helper;
+    int ret;
+
+    drm_WARN(dev, !dev->registered, "Device has not been registered.\n");
+    drm_WARN(dev, dev->fb_helper, "fb_helper is already set!\n");
+
+    fb_helper = kzalloc(sizeof(*fb_helper), GFP_KERNEL);
+    if (!fb_helper)
+        return;
+
+    ret = drm_client_init(dev, &fb_helper->client, "fbdev", &drm_fbdev_client_funcs);
+    if (ret) {
+        kfree(fb_helper);
+        drm_err(dev, "Failed to register client: %d\n", ret);
+        return;
+    }
+
+    /*
+     * FIXME: This mixes up depth with bpp, which results in a glorious
+     * mess, resulting in some drivers picking wrong fbdev defaults and
+     * others wrong preferred_depth defaults.
+     */
+    if (!preferred_bpp)
+        preferred_bpp = dev->mode_config.preferred_depth;
+    if (!preferred_bpp)
+        preferred_bpp = 32;
+    fb_helper->preferred_bpp = preferred_bpp;
+
+    ret = ili9320_drm_fbdev_client_hotplug(&fb_helper->client);
+    if (ret)
+        drm_dbg_kms(dev, "client hotplug ret=%d\n", ret);
+
+    drm_client_register(&fb_helper->client);
+}
+
 /*
  * Platform driver
  */
@@ -793,7 +1395,7 @@ static int ili9320drm_probe(struct platform_device *pdev)
 		return ret;
 
 	//lcd_init();
-	drm_fbdev_generic_setup(dev, 16);
+	ili9320_drm_fbdev_setup(dev, FORMAT_DEPTH);
 
 	return 0;
 }
