@@ -32,17 +32,17 @@
 #include <linux/delay.h>
 
 #define CLK_BASE 0x3C500000
-#define PWRCONEXT               (*(uint32_t volatile*)(CLK_BASE + 0x40))
+#define PWRCONEXT               (*(volatile uint32_t*)(CLK_BASE + 0x40))
 
 #define DMABASE8     (*((void* volatile*)(0x38400100)))
-#define DMACON8      (*((uint32_t volatile*)(0x38400104)))
-#define DMATCNT8     (*((uint32_t volatile*)(0x38400108)))
+#define DMACON8      (*((volatile uint32_t*)(0x38400104)))
+#define DMATCNT8     (*((volatile uint32_t*)(0x38400108)))
 #define DMACADDR8    (*((void* volatile*)(0x3840010C)))
-#define DMACTCNT8    (*((uint32_t volatile*)(0x38400110)))
-#define DMACOM8      (*((uint32_t volatile*)(0x38400114)))
+#define DMACTCNT8    (*((volatile uint32_t*)(0x38400110)))
+#define DMACOM8      (*((volatile uint32_t*)(0x38400114)))
 
-#define DMAALLST     (*((uint32_t volatile*)(0x38400180)))
-#define DMAALLST2    (*((uint32_t volatile*)(0x38400184)))
+#define DMAALLST     (*((volatile uint32_t*)(0x38400180)))
+#define DMAALLST2    (*((volatile uint32_t*)(0x38400184)))
 
 
 // TODO: Put these to dtb
@@ -50,19 +50,44 @@
 #define LCD_HEIGHT 132
 
 #define LCD_BASE (void*)0x38600000
-#define LCD_RST_TIME            (*(uint32_t volatile*)(LCD_BASE + 0x24))  /* Reset active period 07FF */
-#define LCD_DRV_RST             (*(uint32_t volatile*)(LCD_BASE + 0x28))  /* Reset drive signal */
-#define LCDCON	(*((uint32_t volatile*)(0x38600000)))
-#define LCDWCMD   (*((uint32_t volatile*)(0x38600004)))
-#define LCDPHTIME (*((uint32_t volatile*)(0x38600010)))
-#define LCDSTATUS (*((uint32_t volatile*)(0x3860001c)))
-#define LCDWDATA  (*((uint32_t volatile*)(0x38600040)))
+#define LCD_RST_TIME            (*(volatile uint32_t*)(LCD_BASE + 0x24))  /* Reset active period 07FF */
+#define LCD_DRV_RST             (*(volatile uint32_t*)(LCD_BASE + 0x28))  /* Reset drive signal */
+#define LCDCON	(*((volatile uint32_t*)(0x38600000)))
+#define LCDWCMD   (*((volatile uint32_t*)(0x38600004)))
+#define LCDPHTIME (*((volatile uint32_t*)(0x38600010)))
+#define LCDSTATUS (*((volatile uint32_t*)(0x3860001c)))
+#define LCDWDATA  (*((volatile uint32_t*)(0x38600040)))
 #define LCDCON_INITVALUE 0xd01
 
-#define PCON13	   (*((uint32_t volatile*)(0x3CF000D0)))
-#define PCON14	   (*((uint32_t volatile*)(0x3CF000E0)))
-#define PDAT13	   (*((uint32_t volatile*)(0x3CF000D4)))
-#define PDAT14	   (*((uint32_t volatile*)(0x3CF000E4)))
+#define PCON13	   (*((volatile uint32_t*)(0x3CF000D0)))
+#define PCON14	   (*((volatile uint32_t*)(0x3CF000E0)))
+#define PDAT13	   (*((volatile uint32_t*)(0x3CF000D4)))
+#define PDAT14	   (*((volatile uint32_t*)(0x3CF000E4)))
+
+/* LCD type 0 register defines */
+
+#define R_ENTRY_MODE              0x03
+#define R_DISPLAY_CONTROL_1       0x07
+#define R_POWER_CONTROL_1         0x10
+#define R_POWER_CONTROL_2         0x12
+#define R_POWER_CONTROL_3         0x13
+#define R_HORIZ_GRAM_ADDR_SET     0x20
+#define R_VERT_GRAM_ADDR_SET      0x21
+#define R_WRITE_DATA_TO_GRAM      0x22
+#define R_HORIZ_ADDR_START_POS    0x50
+#define R_HORIZ_ADDR_END_POS      0x51
+#define R_VERT_ADDR_START_POS     0x52
+#define R_VERT_ADDR_END_POS       0x53
+
+
+/* LCD type 1 register defines */
+
+#define R_SLEEP_IN                0x10
+#define R_DISPLAY_OFF             0x28
+#define R_COLUMN_ADDR_SET         0x2a
+#define R_ROW_ADDR_SET            0x2b
+#define R_MEMORY_WRITE            0x2c
+
 
 static bool lcd_dma_busy = false;
 
@@ -147,24 +172,57 @@ unsigned short lcd_init_sequence_1[] = {
 };
 
 static void lcd_send_cmd(uint32_t cmd)
-{   
+{
     while (LCDSTATUS & 0x10);
     LCDWCMD = cmd;
 }
-        
+
 static void lcd_send_data(uint32_t data)
-{       
+{
     while (LCDSTATUS & 0x10);
     LCDWDATA = data;
-}       
+}
 
+static void lcd_send_cmd_data(uint32_t cmd, uint32_t data)
+{
+    while (LCDSTATUS & 0x10);
+    LCDWCMD = cmd;
+
+    while (LCDSTATUS & 0x10);
+    LCDWDATA = data;
+}
+
+//static void lcd_send_cmd2(uint32_t cmd)
+//{
+//    while (LCDSTATUS & 0x10);
+//    LCDWCMD = (cmd >> 8);
+//
+//    while (LCDSTATUS & 0x10);
+//    LCDWCMD = (cmd & 0xff);
+//}
+//
+//static void lcd_send_data2(uint32_t data)
+//{
+//    while (LCDSTATUS & 0x10);
+//    LCDWDATA = (data >> 8);
+//
+//    while (LCDSTATUS & 0x10);
+//    LCDWDATA = (data & 0xff);
+//}
+//
+//static void lcd_send_cmd_data2(uint32_t cmd, uint32_t data)
+//{
+//    lcd_send_cmd2(cmd);
+//    lcd_send_cmd2(data);
+//}
+
+static int lcd_type;
 
 
 // Based on rockbox an freemyipod
 static void lcd_init(void)
 {
-    int lcd_type;
-    unsigned short *lcd_init_sequence; 
+    unsigned short *lcd_init_sequence;
     unsigned int lcd_init_sequence_length;
 
 	PCON13 &= ~0xf;    /* Set pin 0 to input */
@@ -182,9 +240,9 @@ static void lcd_init(void)
     DMATCNT8 = (LCD_WIDTH * LCD_HEIGHT / 2) - 1;
 
     if (lcd_type == 0) {
-        LCDCON = (0xd50 | (1 << 7));
+        LCDCON = 0x2d50;//(0xd50 | (1 << 7));
     } else {
-        LCDCON = (0xd50 & ~(1 << 7));
+        LCDCON = 0x2d50;//(0xd50 & ~(1 << 7));
     }
 
     LCDPHTIME = 0x0;
@@ -194,41 +252,50 @@ static void lcd_init(void)
 static uint32_t lcd_detect(void)
 {
     return (PDAT13 & 1) | (PDAT14 & 2);
-}   
+}
+
+static void lcd_setup_drawing_region(int x, int y, int width, int height)
+{
+    int y0, x0, y1, x1;
+
+    x0 = x;                         /* start horiz */
+    y0 = y;                         /* start vert */
+    x1 = (x + width) - 1;           /* max horiz */
+    y1 = (y + height) - 1;          /* max vert */
+
+    if (lcd_type==0) {
+        lcd_send_cmd_data(R_HORIZ_ADDR_START_POS, x0);
+        lcd_send_cmd_data(R_HORIZ_ADDR_END_POS,   x1);
+        lcd_send_cmd_data(R_VERT_ADDR_START_POS,  y0);
+        lcd_send_cmd_data(R_VERT_ADDR_END_POS,    y1);
+
+        lcd_send_cmd_data(R_HORIZ_GRAM_ADDR_SET,  (x1 << 8) | x0);
+        lcd_send_cmd_data(R_VERT_GRAM_ADDR_SET,   (y1 << 8) | y0);
+
+        lcd_send_cmd(0);
+        lcd_send_cmd(R_WRITE_DATA_TO_GRAM);
+    } else {
+        lcd_send_cmd(R_COLUMN_ADDR_SET);
+        lcd_send_data(x0);            /* Start column */
+        lcd_send_data(x1);            /* End column */
+
+        lcd_send_cmd(R_ROW_ADDR_SET);
+        lcd_send_data(y0);            /* Start row */
+        lcd_send_data(y1);            /* End row */
+
+        lcd_send_cmd(R_MEMORY_WRITE);
+    }
+}
 
 void displaylcd_setup(unsigned int startx, unsigned int endx,
                       unsigned int starty, unsigned int endy, bool safe)
 {
-    // huh? this just breaks stuff...
-    return;
-
     while (DMAALLST2 & 0x40000);
-    if (lcd_detect() == 2)
-    {
-        lcd_send_cmd(0x50);
-        lcd_send_data(startx);
-        lcd_send_cmd(0x51);
-        lcd_send_data(endx);
-        lcd_send_cmd(0x52);
-        lcd_send_data(starty);
-        lcd_send_cmd(0x53);
-        lcd_send_data(endy);
-        lcd_send_cmd(0x20);
-        lcd_send_data(startx);
-        lcd_send_cmd(0x21);
-        lcd_send_data(starty);
-        lcd_send_cmd(0x22);
-    }
-    else
-    {
-        lcd_send_cmd(0x2a);
-        lcd_send_data(startx);
-        lcd_send_data(endx);
-        lcd_send_cmd(0x2b);
-        lcd_send_data(starty);
-        lcd_send_data(endy);
-        lcd_send_cmd(0x2c);
-    }
+    while (!(LCDSTATUS & 0x2));
+    LCDCON = (0x2d50 & ~(1 << 4));
+    lcd_setup_drawing_region(startx, starty, endx + 1, endy + 1);
+    while (!(LCDSTATUS & 0x2));
+    LCDCON = (0x2d50 | (1 << 4));
 }
 
 void noinline clean_dcache(void) __attribute__((naked));
@@ -523,7 +590,7 @@ int ili9320_drm_gem_dma_mmap(struct drm_gem_dma_object *dma_obj, struct vm_area_
 {
     struct drm_gem_object *obj = &dma_obj->base;
     int ret;
- 
+
     /*
      * Clear the VM_PFNMAP flag that was set by drm_gem_mmap(), and set the
      * vm_pgoff (used as a fake buffer offset by DRM) to 0 as we want to map
