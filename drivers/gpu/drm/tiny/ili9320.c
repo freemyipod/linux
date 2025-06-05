@@ -292,10 +292,10 @@ void displaylcd_setup(unsigned int startx, unsigned int endx,
 {
     while (DMAALLST2 & 0x40000);
     while (!(LCDSTATUS & 0x2));
-    LCDCON = (0x2d50 & ~(1 << 4));
+    LCDCON = 0xd01;
     lcd_setup_drawing_region(startx, starty, endx + 1, endy + 1);
     while (!(LCDSTATUS & 0x2));
-    LCDCON = (0x2d50 | (1 << 4));
+    LCDCON = 0x2d50;
 }
 
 void noinline clean_dcache(void) __attribute__((naked));
