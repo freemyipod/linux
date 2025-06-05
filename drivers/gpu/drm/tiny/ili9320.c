@@ -92,89 +92,6 @@
 #define R_ROW_ADDR_SET			0x2b
 #define R_MEMORY_WRITE			0x2c
 
-
-static bool lcd_dma_busy = false;
-
-#define SLEEP   0
-#define CMD16   1
-#define DATA16  2
-
-unsigned short lcd_init_sequence_0[] = {
-	CMD16,  0x00a4, DATA16, 0x0001,
-	SLEEP,  0x0000,
-	CMD16,  0x0001, DATA16, 0x0100,
-	CMD16,  0x0002, DATA16, 0x0300,
-	CMD16,  0x0003, DATA16, 0x1230,
-	CMD16,  0x0008, DATA16, 0x0404,
-	CMD16,  0x0008, DATA16, 0x0404,
-	CMD16,  0x000e, DATA16, 0x0010,
-	CMD16,  0x0070, DATA16, 0x1000,
-	CMD16,  0x0071, DATA16, 0x0001,
-	CMD16,  0x0030, DATA16, 0x0002,
-	CMD16,  0x0031, DATA16, 0x0400,
-	CMD16,  0x0032, DATA16, 0x0007,
-	CMD16,  0x0033, DATA16, 0x0500,
-	CMD16,  0x0034, DATA16, 0x0007,
-	CMD16,  0x0035, DATA16, 0x0703,
-	CMD16,  0x0036, DATA16, 0x0507,
-	CMD16,  0x0037, DATA16, 0x0005,
-	CMD16,  0x0038, DATA16, 0x0407,
-	CMD16,  0x0039, DATA16, 0x000e,
-	CMD16,  0x0040, DATA16, 0x0202,
-	CMD16,  0x0041, DATA16, 0x0003,
-	CMD16,  0x0042, DATA16, 0x0000,
-	CMD16,  0x0043, DATA16, 0x0200,
-	CMD16,  0x0044, DATA16, 0x0707,
-	CMD16,  0x0045, DATA16, 0x0407,
-	CMD16,  0x0046, DATA16, 0x0505,
-	CMD16,  0x0047, DATA16, 0x0002,
-	CMD16,  0x0048, DATA16, 0x0004,
-	CMD16,  0x0049, DATA16, 0x0004,
-	CMD16,  0x0060, DATA16, 0x0202,
-	CMD16,  0x0061, DATA16, 0x0003,
-	CMD16,  0x0062, DATA16, 0x0000,
-	CMD16,  0x0063, DATA16, 0x0200,
-	CMD16,  0x0064, DATA16, 0x0707,
-	CMD16,  0x0065, DATA16, 0x0407,
-	CMD16,  0x0066, DATA16, 0x0505,
-	CMD16,  0x0068, DATA16, 0x0004,
-	CMD16,  0x0069, DATA16, 0x0004,
-	CMD16,  0x0007, DATA16, 0x0001,
-	CMD16,  0x0018, DATA16, 0x0001,
-	CMD16,  0x0010, DATA16, 0x1690,
-	CMD16,  0x0011, DATA16, 0x0100,
-	CMD16,  0x0012, DATA16, 0x0117,
-	CMD16,  0x0013, DATA16, 0x0f80,
-	CMD16,  0x0012, DATA16, 0x0137,
-	CMD16,  0x0020, DATA16, 0x0000,
-	CMD16,  0x0021, DATA16, 0x0000,
-	CMD16,  0x0050, DATA16, 0x0000,
-	CMD16,  0x0051, DATA16, 0x00af,
-	CMD16,  0x0052, DATA16, 0x0000,
-	CMD16,  0x0053, DATA16, 0x0083,
-	CMD16,  0x0090, DATA16, 0x0003,
-	CMD16,  0x0091, DATA16, 0x0000,
-	CMD16,  0x0092, DATA16, 0x0101,
-	CMD16,  0x0098, DATA16, 0x0400,
-	CMD16,  0x0099, DATA16, 0x1302,
-	CMD16,  0x009a, DATA16, 0x0202,
-	CMD16,  0x009b, DATA16, 0x0200,
-	SLEEP,  0x0000,
-	CMD16,  0x0007, DATA16, 0x0021,
-	CMD16,  0x0012, DATA16, 0x0137,
-	SLEEP,  0x0000,
-	CMD16,  0x0007, DATA16, 0x0021,
-	CMD16,  0x0012, DATA16, 0x1137,
-	SLEEP,  0x0000,
-	CMD16,  0x0007, DATA16, 0x0233,
-};
-
-unsigned short lcd_init_sequence_1[] = {
-	CMD16,  0x0011, DATA16, 0x0000,
-	CMD16,  0x0029, DATA16, 0x0000,
-	SLEEP,  0x0000,
-};
-
 static void lcd_send_cmd(uint32_t cmd)
 {
 	while (LCDSTATUS & 0x10);
@@ -196,42 +113,49 @@ static void lcd_send_cmd_data(uint32_t cmd, uint32_t data)
 	LCDWDATA = data;
 }
 
-static int lcd_type;
+struct ili9320drm_device {
+	struct drm_device dev;
 
+	/* ili9320fb settings */
+	struct drm_display_mode mode;
+	const struct drm_format_info *format;
+	unsigned int pitch;
+
+	/* modesetting */
+	uint32_t formats[8];
+	struct drm_connector	conn;
+	struct drm_simple_display_pipe   pipe;
+	int irq;
+	void *ptr;
+
+    bool lcd_dma_busy;
+    int lcd_type;
+};
 
 // Based on rockbox an freemyipod
-static void lcd_init(void)
+static void lcd_init(struct ili9320drm_device *sdev)
 {
-	unsigned short *lcd_init_sequence;
-	unsigned int lcd_init_sequence_length;
-
 	PCON13 &= ~0xf;	/* Set pin 0 to input */
 	PCON14 &= ~0xf0;   /* Set pin 1 to input */
 
 	if (((PDAT13 & 1) == 0) && ((PDAT14 & 2) == 2)) {
-		lcd_type   = 0;	 /* Similar to ILI9320 - aka "type 2" */
-		//LCDCON   |= 0x180; /* use 16 bit bus width, big endian */
+		sdev->lcd_type   = 0;	 /* Similar to ILI9320 - aka "type 2" */
 	} else {
-		lcd_type   = 1;	 /* Similar to LDS176  - aka "type 7" */
-		//LCDCON   |= 0x100; /* use 16 bit bus width, little endian */
+		sdev->lcd_type   = 1;	 /* Similar to LDS176  - aka "type 7" */
 	}
 
-//	DMACON8 = 0x20000000 | 0x180000 | (1 << 16);
-//	DMACON8 = 0x30890003; for 888
-//	DMACON8 = 0x30190006;//for 888
-//	DMACON8 = 0x33c90004; // for 8888
-//	DMACON8 = 0x30590008; // for 8888
 	DMACON8 = 0x20190000;
 
-	if (lcd_type == 0) {
+	if (sdev->lcd_type == 0) {
 		LCDCON = LCDCON_SETUPVALUE | 0x80;
 	} else {
 		LCDCON = LCDCON_SETUPVALUE;
 	}
+
 	DMATCNT8 = (LCD_WIDTH * LCD_HEIGHT / 2) - 1;
 
 	LCDPHTIME = 0x0;
-	lcd_dma_busy = false;
+	sdev->lcd_dma_busy = false;
 }
 
 static uint32_t lcd_detect(void)
@@ -239,7 +163,7 @@ static uint32_t lcd_detect(void)
 	return (PDAT13 & 1) | (PDAT14 & 2);
 }
 
-static void lcd_setup_drawing_region(int x, int y, int width, int height)
+static void lcd_setup_drawing_region(int lcd_type, int x, int y, int width, int height)
 {
 	int y0, x0, y1, x1;
 
@@ -248,7 +172,7 @@ static void lcd_setup_drawing_region(int x, int y, int width, int height)
 	x1 = (x + width) - 1;		   /* max horiz */
 	y1 = (y + height) - 1;		  /* max vert */
 
-	if (lcd_type==0) {
+	if (lcd_type == 0) {
 		lcd_send_cmd_data(R_HORIZ_ADDR_START_POS, x0);
 		lcd_send_cmd_data(R_HORIZ_ADDR_END_POS,   x1);
 		lcd_send_cmd_data(R_VERT_ADDR_START_POS,  y0);
@@ -272,15 +196,15 @@ static void lcd_setup_drawing_region(int x, int y, int width, int height)
 	}
 }
 
-void displaylcd_setup(unsigned int startx, unsigned int endx,
-					  unsigned int starty, unsigned int endy, bool safe)
+void displaylcd_setup(struct ili9320drm_device *sdev, unsigned int startx, unsigned int endx,
+					  unsigned int starty, unsigned int endy)
 {
 	while (DMAALLST2 & 0x40000);
 	while (!(LCDSTATUS & 0x2));
-	LCDCON = LCDCON_CMDMODEVALUE | ((lcd_type == 0) ? 0x80 : 0);
-	lcd_setup_drawing_region(startx, starty, endx + 1, endy + 1);
+	LCDCON = LCDCON_CMDMODEVALUE | ((sdev->lcd_type == 0) ? 0x80 : 0);
+	lcd_setup_drawing_region(sdev->lcd_type, startx, starty, endx + 1, endy + 1);
 	while (!(LCDSTATUS & 0x2));
-	LCDCON = LCDCON_FRAMEMODEVALUE | ((lcd_type == 0) ? 0x80 : 0);
+	LCDCON = LCDCON_FRAMEMODEVALUE | ((sdev->lcd_type == 0) ? 0x80 : 0);
 }
 
 void noinline clean_dcache(void) __attribute__((naked));
@@ -303,12 +227,12 @@ void clean_dcache(void)
 	);
 }
 
-static void displaylcd_dma(void* data, int pixels)
+static void displaylcd_dma(struct ili9320drm_device *sdev, void* data, int pixels)
 {
 	uint16_t* in = (uint16_t*)data;
 	while (LCDSTATUS & 8);
 	if (!pixels) return;
-	lcd_dma_busy = true;
+	sdev->lcd_dma_busy = true;
 	DMABASE8 = in;
 	clean_dcache();
 	DMACOM8 = 4;
@@ -318,29 +242,9 @@ static void displaylcd_dma(void* data, int pixels)
 
 #define DRIVER_NAME	"ili9320drm"
 #define DRIVER_DESC	"DRM driver for ili9320-framebuffer platform devices"
-#define DRIVER_DATE	"20200625"
+#define DRIVER_DATE	"20250605"
 #define DRIVER_MAJOR	1
 #define DRIVER_MINOR	0
-
-/*
- * Simple Framebuffer device
- */
-
-struct ili9320drm_device {
-	struct drm_device dev;
-
-	/* ili9320fb settings */
-	struct drm_display_mode mode;
-	const struct drm_format_info *format;
-	unsigned int pitch;
-
-	/* modesetting */
-	uint32_t formats[8];
-	struct drm_connector	conn;
-	struct drm_simple_display_pipe   pipe;
-	int irq;
-	void *ptr;
-};
 
 static struct ili9320drm_device *ili9320drm_device_of_dev(struct drm_device *dev)
 {
@@ -385,29 +289,26 @@ static void ili9320drm_pipe_update(struct drm_simple_display_pipe *pipe,
 	if (drm_atomic_helper_damage_merged(old_state, state, &rect)) {
 		if (state->fb->format->format == FORMAT) {
 			struct drm_gem_dma_object *dma_obj = drm_fb_dma_get_gem_obj(state->fb, 0);
-			//lcd_update_rect(0, 0, state->fb->width, state->fb->height, dma_obj->vaddr, state->fb->pitches[0]);
-//			local_irq_disable();
+
 			if (!sdev->ptr) {
 				drm_warn(&sdev->dev, "Initializing lcd, pitch: %d\n", state->fb->pitches[0]);
-				lcd_init();
-				displaylcd_setup(0, LCD_WIDTH - 1, 0, LCD_HEIGHT - 1, true);
-				displaylcd_dma(dma_obj->vaddr, LCD_WIDTH * LCD_HEIGHT);
+				lcd_init(sdev);
+				displaylcd_setup(sdev, 0, LCD_WIDTH - 1, 0, LCD_HEIGHT - 1);
+				displaylcd_dma(sdev, dma_obj->vaddr, LCD_WIDTH * LCD_HEIGHT);
 			} else if (sdev->ptr != dma_obj->vaddr) {
-				drm_warn(&sdev->dev, "unequal...\n");
-//				DMACON8 = 0x20000000 | 0x180000 | (1 << 16);
+				drm_warn(&sdev->dev, "Updating dma addr...\n");
 
 				sdev->ptr = 0;
-				while (lcd_dma_busy) {
+				while (sdev->lcd_dma_busy) {
 					drm_warn(&sdev->dev, "Waiting for dma...\n");
 					mdelay(1);
 				}
-				//DMACOM8 = 7;
-				displaylcd_setup(0, LCD_WIDTH - 1, 0, LCD_HEIGHT - 1, true);
-				displaylcd_dma(dma_obj->vaddr, LCD_WIDTH * LCD_HEIGHT);
-				sdev->ptr = dma_obj->vaddr;
+
+				displaylcd_setup(sdev, 0, LCD_WIDTH - 1, 0, LCD_HEIGHT - 1);
+				displaylcd_dma(sdev, dma_obj->vaddr, LCD_WIDTH * LCD_HEIGHT);
 			}
+
 			sdev->ptr = dma_obj->vaddr;
-//			local_irq_enable();
 		} else {
 			drm_warn(&sdev->dev, "unknown format %x\n", state->fb->format->format);
 		}
@@ -481,10 +382,10 @@ static irqreturn_t dma_irq(int irq, void *pw)
 
 	if (dmaallst2 & DMACON8 & 0x30000) {
 		DMACOM8 = 7;
-		lcd_dma_busy = false;
+		sdev->lcd_dma_busy = false;
 		if (sdev->ptr) {
-			displaylcd_setup(0, LCD_WIDTH - 1, 0, LCD_HEIGHT - 1, true);
-			displaylcd_dma(sdev->ptr, LCD_WIDTH * LCD_HEIGHT);
+			displaylcd_setup(sdev, 0, LCD_WIDTH - 1, 0, LCD_HEIGHT - 1);
+			displaylcd_dma(sdev, sdev->ptr, LCD_WIDTH * LCD_HEIGHT);
 		}
 	}
 	return IRQ_HANDLED;
