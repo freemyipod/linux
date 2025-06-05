@@ -207,26 +207,6 @@ void displaylcd_setup(struct ili9320drm_device *sdev, unsigned int startx, unsig
 	LCDCON = LCDCON_FRAMEMODEVALUE | ((sdev->lcd_type == 0) ? 0x80 : 0);
 }
 
-void noinline clean_dcache(void) __attribute__((naked));
-void clean_dcache(void)
-{
-	asm volatile(
-		"MOV R0, #0				\n\t"
-		"clean_dcache_loop2:		\n\t"
-		"MCR p15, 0, R0,c7,c10,2   \n\t"
-		"ADD R1, R0, #0x10		 \n\t"
-		"MCR p15, 0, R1,c7,c10,2   \n\t"
-		"ADD R1, R1, #0x10		 \n\t"
-		"MCR p15, 0, R1,c7,c10,2   \n\t"
-		"ADD R1, R1, #0x10		 \n\t"
-		"MCR p15, 0, R1,c7,c10,2   \n\t"
-		"ADDS R0, R0, #0x04000000  \n\t"
-		"BNE clean_dcache_loop2	 \n\t"
-		"MCR p15, 0, R0,c7,c10,4   \n\t"
-		"MOV PC, LR				\n\t"
-	);
-}
-
 static void displaylcd_dma(struct ili9320drm_device *sdev, void* data, int pixels)
 {
 	uint16_t* in = (uint16_t*)data;
@@ -234,11 +214,8 @@ static void displaylcd_dma(struct ili9320drm_device *sdev, void* data, int pixel
 	if (!pixels) return;
 	sdev->lcd_dma_busy = true;
 	DMABASE8 = in;
-	clean_dcache();
 	DMACOM8 = 4;
 }
-
-
 
 #define DRIVER_NAME	"ili9320drm"
 #define DRIVER_DESC	"DRM driver for ili9320-framebuffer platform devices"
