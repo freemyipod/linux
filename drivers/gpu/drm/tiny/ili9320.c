@@ -128,8 +128,8 @@ struct ili9320drm_device {
 	int irq;
 	void *ptr;
 
-    bool lcd_dma_busy;
-    int lcd_type;
+	bool lcd_dma_busy;
+	int lcd_type;
 };
 
 // Based on rockbox an freemyipod
@@ -232,17 +232,19 @@ static struct ili9320drm_device *ili9320drm_device_of_dev(struct drm_device *dev
  * Hardware
  */
 
-#define FORMAT DRM_FORMAT_RGB565
+#define FORMAT DRM_FORMAT_XRGB1555
 #define FORMAT_BPP 2
-#define FORMAT_DEPTH 16
+#define FORMAT_DEPTH 15
 
 static const uint32_t ili9320drm_pipe_formats[] = {
 	FORMAT,
 };
 
 static const uint64_t ili9320drm_pipe_format_modifiers[] = {
-	DRM_FORMAT_MOD_LINEAR,
-	DRM_FORMAT_MOD_INVALID
+	// None of the drm formats is in the correct order BRG,
+	// so just have an invalid modifier, userspace will use
+	// /dev/fb0 anyways.
+	DRM_FORMAT_MOD_INVALID,
 };
 
 static void ili9320drm_pipe_enable(struct drm_simple_display_pipe *pipe,
@@ -327,10 +329,17 @@ ili9320_fb_create(struct drm_device *dev, struct drm_file *file_priv,
 	return drm_gem_fb_create(dev, file_priv, mode_cmd);
 }
 
+const struct drm_format_info *
+	ili9320_get_format_info(const struct drm_mode_fb_cmd2 *mode_cmd)
+{
+	return drm_format_info(FORMAT);
+}
+
 static const struct drm_mode_config_funcs ili9320drm_mode_config_funcs = {
 	.fb_create = ili9320_fb_create,
 	.atomic_check = drm_atomic_helper_check,
 	.atomic_commit = drm_atomic_helper_commit,
+	.get_format_info = ili9320_get_format_info,
 };
 
 /*
@@ -680,13 +689,14 @@ static void ili9320_drm_fb_helper_fill_pixel_fmt(struct fb_var_screeninfo *var,
 
 	switch (depth) {
 	case 15:
-		var->red.offset = 10;
-		var->green.offset = 5;
-		var->blue.offset = 0;
+	// ili9320
+		var->red.offset = 6;
+		var->green.offset = 1;
+		var->blue.offset = 11;
 		var->red.length = 5;
 		var->green.length = 5;
 		var->blue.length = 5;
-		var->transp.offset = 15;
+		var->transp.offset = 0;
 		var->transp.length = 1;
 		break;
 	case 16:
@@ -983,7 +993,7 @@ static int ili9320_drm_fbdev_fb_probe(struct drm_fb_helper *fb_helper,
 			sizes->surface_width, sizes->surface_height,
 			sizes->surface_bpp);
 
-	format = drm_mode_legacy_fb_format(sizes->surface_bpp, sizes->surface_depth);
+	format = FORMAT;
 	buffer = drm_client_framebuffer_create(client, sizes->surface_width,
 						   sizes->surface_height, format);
 	if (IS_ERR(buffer))
@@ -1273,7 +1283,7 @@ static int ili9320drm_probe(struct platform_device *pdev)
 		return ret;
 
 	//lcd_init();
-	ili9320_drm_fbdev_setup(dev, FORMAT_DEPTH);
+	ili9320_drm_fbdev_setup(dev, FORMAT_BPP * 8);
 
 	return 0;
 }
