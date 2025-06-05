@@ -192,6 +192,30 @@ static void lcd_send_cmd_data(uint32_t cmd, uint32_t data)
     LCDWDATA = data;
 }
 
+static void lcd_send_cmd2(uint32_t cmd)
+{
+    while (LCDSTATUS & 0x10);
+    LCDWCMD = cmd >> 8;
+
+    while (LCDSTATUS & 0x10);
+    LCDWCMD = cmd & 0xff;
+}
+
+static void lcd_send_data2(uint32_t data)
+{
+    while (LCDSTATUS & 0x10);
+    LCDWDATA = data >> 8;
+
+    while (LCDSTATUS & 0x10);
+    LCDWDATA = data & 0xff;
+}
+
+static void lcd_send_cmd_data2(uint32_t cmd, uint32_t data)
+{
+    lcd_send_cmd2(cmd);
+    lcd_send_data2(data);
+}
+
 //static void lcd_send_cmd2(uint32_t cmd)
 //{
 //    while (LCDSTATUS & 0x10);
@@ -264,16 +288,18 @@ static void lcd_setup_drawing_region(int x, int y, int width, int height)
     y1 = (y + height) - 1;          /* max vert */
 
     if (lcd_type==0) {
-        lcd_send_cmd_data(R_HORIZ_ADDR_START_POS, x0);
-        lcd_send_cmd_data(R_HORIZ_ADDR_END_POS,   x1);
-        lcd_send_cmd_data(R_VERT_ADDR_START_POS,  y0);
-        lcd_send_cmd_data(R_VERT_ADDR_END_POS,    y1);
+        lcd_send_cmd_data2(R_HORIZ_ADDR_START_POS, x0);
+        lcd_send_cmd_data2(R_HORIZ_ADDR_END_POS,   x1);
+        lcd_send_cmd_data2(R_VERT_ADDR_START_POS,  y0);
+        lcd_send_cmd_data2(R_VERT_ADDR_END_POS,    y1);
 
-        lcd_send_cmd_data(R_HORIZ_GRAM_ADDR_SET,  (x1 << 8) | x0);
-        lcd_send_cmd_data(R_VERT_GRAM_ADDR_SET,   (y1 << 8) | y0);
+        lcd_send_cmd_data2(R_HORIZ_GRAM_ADDR_SET,  (x1 << 8) | x0);
+        lcd_send_cmd_data2(R_VERT_GRAM_ADDR_SET,   (y1 << 8) | y0);
 
-        lcd_send_cmd(0);
-        lcd_send_cmd(R_WRITE_DATA_TO_GRAM);
+//        lcd_send_cmd_data2(0xf, 1);
+
+        lcd_send_cmd2(0);
+        lcd_send_cmd2(R_WRITE_DATA_TO_GRAM);
     } else {
         lcd_send_cmd(R_COLUMN_ADDR_SET);
         lcd_send_data(x0);            /* Start column */
