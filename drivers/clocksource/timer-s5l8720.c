@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Copyright (c) 2023 Sergiusz 'q3k' Bazanski
+ * Copyright (c) 2025 __gsch
  *
- * S5L8720 timer driver, 16-bit and 32-bit.
+ * S5L8720 timer driver, based on code by Sergiusz 'q3k' Bazanski
  */
 
  #include <linux/clk.h>
