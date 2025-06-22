@@ -215,3 +215,11 @@ config TINYDRM_SHARP_MEMORY
 	  * 4.40" Sharp Memory LCD (LS044Q7DH01)
 
 	  If M is selected the module will be called sharp_memory.
+
+config TINYDRM_S5L8740
+    bool "DRM support for Samsung S5L8740"
+	depends on DRM && OF
+	select DRM_CLIENT_SELECTION
+	select DRM_GEM_DMA_HELPER
+	select DRM_GEM_SHMEM_HELPER
+	select DRM_KMS_HELPER
