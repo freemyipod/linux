@@ -56,7 +56,7 @@ static struct s5l8740_device *s5l8740_device_of_dev(struct drm_device *dev)
 }
 
 
-int drm_plane_helper_atomic_check(struct drm_plane *plane, struct drm_atomic_state *state)
+static int s5l8740_primary_plane_helper_atomic_check(struct drm_plane *plane, struct drm_atomic_state *state)
 {
 	struct drm_plane_state *new_plane_state = drm_atomic_get_new_plane_state(state, plane);
 	struct drm_crtc *new_crtc = new_plane_state->crtc;
@@ -102,7 +102,7 @@ out_drm_gem_fb_end_cpu_access:
 }
 
 static const struct drm_plane_helper_funcs s5l8740_primary_plane_helper_funcs = {
-	.atomic_check = drm_plane_helper_atomic_check,
+	.atomic_check = s5l8740_primary_plane_helper_atomic_check,
 	.atomic_update = s5l8740_primary_plane_helper_atomic_update,
     DRM_GEM_SHADOW_PLANE_HELPER_FUNCS,
 };
@@ -209,7 +209,7 @@ static const struct drm_display_mode s5l8740_mode = {
 
      res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
      if (!res)
-         return ERR_PTR(-EINVAL);
+         return -EINVAL;
 
      drm_dbg(dev, "using I/O memory framebuffer at %pr\n", res);
 
@@ -221,7 +221,7 @@ static const struct drm_display_mode s5l8740_mode = {
 
 	ret = drmm_mode_config_init(dev);
 	if (ret)
-		return ERR_PTR(ret);
+		return ret;
 
 
 	dev->mode_config.min_width = WIDTH;
@@ -242,7 +242,7 @@ static const struct drm_display_mode s5l8740_mode = {
            NULL,
            DRM_PLANE_TYPE_PRIMARY, NULL);
     if (ret)
-        return ERR_PTR(ret);
+        return ret;
     drm_plane_helper_add(primary_plane, &s5l8740_primary_plane_helper_funcs);
     drm_plane_enable_fb_damage_clips(primary_plane);
 
@@ -252,7 +252,7 @@ static const struct drm_display_mode s5l8740_mode = {
     ret = drm_crtc_init_with_planes(dev, crtc, primary_plane, NULL,
         &s5l8740_crtc_funcs, NULL);
     if (ret)
-        return ERR_PTR(ret);
+        return ret;
     drm_crtc_helper_add(crtc, &s5l8740_crtc_helper_funcs);
 
     /* Encoder */
@@ -261,7 +261,7 @@ static const struct drm_display_mode s5l8740_mode = {
     ret = drm_encoder_init(dev, encoder, &s5l8740_encoder_funcs,
        DRM_MODE_ENCODER_NONE, NULL);
     if (ret)
-        return ERR_PTR(ret);
+        return ret;
     encoder->possible_crtcs = drm_crtc_mask(crtc);
 
     /* Connector */
@@ -270,15 +270,14 @@ static const struct drm_display_mode s5l8740_mode = {
     ret = drm_connector_init(dev, connector, &s5l8740_connector_funcs,
      DRM_MODE_CONNECTOR_Unknown);
     if (ret)
-        return ERR_PTR(ret);
+        return ret;
     drm_connector_helper_add(connector, &s5l8740_connector_helper_funcs);
-    drm_connector_set_panel_orientation_with_quirk(connector,
-                   DRM_MODE_PANEL_ORIENTATION_UNKNOWN,
-                   WIDTH, HEIGHT);
+    drm_connector_set_panel_orientation(connector,
+                   DRM_MODE_PANEL_ORIENTATION_RIGHT_UP);
 
     ret = drm_connector_attach_encoder(connector, encoder);
     if (ret)
-        return ERR_PTR(ret);
+        return ret;
 
     drm_mode_config_reset(dev);
  
