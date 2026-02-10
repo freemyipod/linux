@@ -132,10 +132,11 @@ static void s5l8702_i2c_state_machine(struct s5l8702_i2c_dev *i2c_dev) {
 			goto generate_stop;
         }
         if ( (i2c_dev->msg->len - i2c_dev->msg_cursor) == 1 ) { // last byte of msg NACK
-          	i2c_dev->_iicCON &= ~S5L8702_I2C_CON_ACKGEN;
-        }
+          	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->_iicCON | S5L8702_I2C_CON_BUSHOLD );
+        } else {
+			s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->_iicCON | S5L8702_I2C_CON_BUSHOLD | S5L8702_I2C_CON_ACKGEN );
+		}
         i2c_dev->_iicExpectedIntStatus = S5L8702_I2C_INT_BUSHOLD;
-        s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->_iicCON | S5L8702_I2C_CON_BUSHOLD);
         i2c_dev->state = STATE_READ;
         break;
       case STATE_STOP: // Generate Stop
