@@ -21,11 +21,18 @@
 #define S5L8702_I2C_INT   0x20 /* Interrupt status register */
 #define S5L8702_I2C_UNK28 0x28
 
-#define S5L8702_I2C_CON_INIT     (0x3f00) // [TODO] I have a feeling this is enabling interrupts since it matches I2C_INT
-#define S5L8702_I2C_CON_BUSHOLD  BIT(4)
-#define S5L8702_I2C_CON_CKSEL16  (0 << 6)
-#define S5L8702_I2C_CON_CKSEL512 BIT(6)
-#define S5L8702_I2C_CON_ACKGEN   BIT(7)
+#define S5L8702_I2C_CON_CK_REG(x)		((x) & 0xf)
+#define S5L8702_I2C_CON_BUSHOLD  		BIT(4)
+#define S5L8702_I2C_CON_CKSEL16  		(0 << 6)
+#define S5L8702_I2C_CON_CKSEL512 		BIT(6)
+#define S5L8702_I2C_CON_ACKGEN   		BIT(7)
+#define S5L8702_I2C_CON_INTEN_BUSHOLD 	BIT(8)
+#define S5L8702_I2C_CON_INTEN_TIMEOUT 	BIT(9)
+#define S5L8702_I2C_CON_INTEN_RX      	BIT(10)
+#define S5L8702_I2C_CON_INTEN_TX      	BIT(11)
+#define S5L8702_I2C_CON_INTEN_START   	BIT(12)
+#define S5L8702_I2C_CON_INTEN_STOP    	BIT(13)
+#define S5L8702_I2C_CON_INTEN_ALL 		(0x3f00)
 
 #define S5L8702_I2C_STAT_LRB    BIT(0)
 // The missing bits probably match S5L8700X datasheet ADDR_ZERO, AAS, LBA
@@ -60,13 +67,12 @@ struct s5l8702_i2c_dev {
 	int irq;
 	enum s5l8702_i2c_state state;
 	struct i2c_msg	*msg;
-	unsigned int msg_cursor;
-	unsigned int msg_num;
-	unsigned int msg_idx;
+	unsigned int msg_pos;
+	unsigned int nmsgs;
 	int msg_ret;
-	unsigned int _iicSTAT;
-	unsigned int _iicCON;
-	unsigned int _iicExpectedIntStatus;
+	unsigned int iicstat;
+	unsigned int iiccon;
+	unsigned int pending_irq;
 	struct completion msg_complete;
 	struct i2c_adapter adapter;
 };
@@ -83,24 +89,23 @@ static inline u32 s5l8702_i2c_readl(struct s5l8702_i2c_dev *i2c_dev, u32 reg)
 }
 
 static void s5l8702_i2c_state_machine(struct s5l8702_i2c_dev *i2c_dev) {
-	unsigned int addr;
 	switch ( i2c_dev->state )
     {
+
       case STATE_START:
-		addr = i2c_dev->msg->addr << 1;	
+		i2c_dev->pending_irq = S5L8702_I2C_INT_BUSHOLD;
         if (i2c_dev->msg->flags & I2C_M_RD) {
-			i2c_dev->_iicSTAT = S5L8702_I2C_STAT_SOE | S5L8702_I2C_STAT_MASTER;  
-			addr |= 1;
+			i2c_dev->iicstat = S5L8702_I2C_STAT_SOE | S5L8702_I2C_STAT_MASTER;  
 		} else {
-          	i2c_dev->_iicSTAT = S5L8702_I2C_STAT_SOE | S5L8702_I2C_STAT_TX | S5L8702_I2C_STAT_MASTER;
+          	i2c_dev->iicstat = S5L8702_I2C_STAT_SOE | S5L8702_I2C_STAT_TX | S5L8702_I2C_STAT_MASTER;
 		}
-        s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, i2c_dev->_iicSTAT);
-        s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->_iicCON | S5L8702_I2C_CON_ACKGEN);
-        s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_DS, addr);
-        i2c_dev->_iicSTAT |= S5L8702_I2C_STAT_BB;
-        i2c_dev->_iicExpectedIntStatus = S5L8702_I2C_INT_BUSHOLD;
-        s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, i2c_dev->_iicSTAT);
-        i2c_dev->msg_cursor = 0;
+		i2c_dev->iiccon &= ~S5L8702_I2C_CON_BUSHOLD;
+		i2c_dev->iiccon |= S5L8702_I2C_CON_ACKGEN;
+        s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, i2c_dev->iicstat);
+        s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->iiccon);
+        s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_DS, i2c_8bit_addr_from_msg(i2c_dev->msg));
+        i2c_dev->iicstat |= S5L8702_I2C_STAT_BB;
+        s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, i2c_dev->iicstat);
         if (i2c_dev->msg->flags & I2C_M_RD) {
           	i2c_dev->state = STATE_PREPARE_READ;
 		}
@@ -108,60 +113,71 @@ static void s5l8702_i2c_state_machine(struct s5l8702_i2c_dev *i2c_dev) {
 			i2c_dev->state = STATE_WRITE;
 		}
         break;
+
       case STATE_WRITE: // Write
         if ( s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_STAT) & S5L8702_I2C_STAT_LRB ) { // Did we receive ACK?
           	i2c_dev->msg_ret = -EIO;
           	goto generate_stop;
         }
-        if ( i2c_dev->msg_cursor == i2c_dev->msg->len ) { // is the end of the msg
+        if ( i2c_dev->msg_pos == i2c_dev->msg->len ) { // is the end of the msg
           	goto generate_stop;
         }
-        i2c_dev->_iicExpectedIntStatus = S5L8702_I2C_INT_BUSHOLD;
-        s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_DS, i2c_dev->msg->buf[i2c_dev->msg_cursor++]);
-        s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->_iicCON | S5L8702_I2C_CON_BUSHOLD | S5L8702_I2C_CON_ACKGEN );
+        i2c_dev->pending_irq = S5L8702_I2C_INT_BUSHOLD;
+		i2c_dev->iiccon |= S5L8702_I2C_CON_BUSHOLD;
+        s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_DS, i2c_dev->msg->buf[i2c_dev->msg_pos++]);
+        s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->iiccon);
         break;
+
       case STATE_READ: // Read
-        i2c_dev->msg->buf[i2c_dev->msg_cursor++] = s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_DS);
+        i2c_dev->msg->buf[i2c_dev->msg_pos++] = s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_DS);
         fallthrough;
       case STATE_PREPARE_READ: // Prepare read
-        if ( !i2c_dev->msg_cursor && (s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_STAT) & S5L8702_I2C_STAT_LRB) ) {
+        if ( !i2c_dev->msg_pos && (s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_STAT) & S5L8702_I2C_STAT_LRB) ) {
         	i2c_dev->msg_ret = -EIO;
         	goto generate_stop;
         }
-        if ( i2c_dev->msg_cursor == i2c_dev->msg->len ) { // is the end of the msg
+
+        if ( i2c_dev->msg_pos == i2c_dev->msg->len ) { // is the end of the msg
 			goto generate_stop;
         }
-        if ( (i2c_dev->msg->len - i2c_dev->msg_cursor) == 1 ) { // last byte of msg NACK
-          	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->_iicCON | S5L8702_I2C_CON_BUSHOLD );
-        } else {
-			s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->_iicCON | S5L8702_I2C_CON_BUSHOLD | S5L8702_I2C_CON_ACKGEN );
-		}
-        i2c_dev->_iicExpectedIntStatus = S5L8702_I2C_INT_BUSHOLD;
+
+        if ( (i2c_dev->msg->len - i2c_dev->msg_pos) == 1 ) { // last byte of msg NACK
+			i2c_dev->iiccon &= ~S5L8702_I2C_CON_ACKGEN;
+        }
+		i2c_dev->iiccon |= S5L8702_I2C_CON_BUSHOLD;
+		i2c_dev->pending_irq = S5L8702_I2C_INT_BUSHOLD;
+		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->iiccon);
         i2c_dev->state = STATE_READ;
         break;
+
       case STATE_STOP: // Generate Stop
 generate_stop:
-        i2c_dev->_iicExpectedIntStatus = S5L8702_I2C_INT_STOP;
+        i2c_dev->pending_irq = S5L8702_I2C_INT_STOP;
+
         if (i2c_dev->msg->flags & I2C_M_RD) {
-			i2c_dev->_iicSTAT &= ~S5L8702_I2C_STAT_BB;
+			i2c_dev->iicstat &= ~S5L8702_I2C_STAT_BB;
 		}
 		else {
-        	i2c_dev->_iicSTAT &= ~( S5L8702_I2C_STAT_BB | S5L8702_I2C_STAT_TX );
+        	i2c_dev->iicstat &= ~( S5L8702_I2C_STAT_BB | S5L8702_I2C_STAT_TX );
 		}
-        s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, i2c_dev->_iicSTAT);
-        s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->_iicCON | S5L8702_I2C_CON_BUSHOLD);
-		i2c_dev->msg_idx++;
+        s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, i2c_dev->iicstat);
+		i2c_dev->iiccon &= ~S5L8702_I2C_CON_ACKGEN;
+		i2c_dev->iiccon |= S5L8702_I2C_CON_BUSHOLD;
+        s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->iiccon);
+		i2c_dev->nmsgs--;
 		i2c_dev->msg++;
+		i2c_dev->msg_pos = 0;
 
 		// If we have an error or we processed all messages then we are done
-		if (i2c_dev->msg_ret || (i2c_dev->msg_idx == i2c_dev->msg_num)) {
+		if (i2c_dev->msg_ret || (i2c_dev->nmsgs == 0)) {
 			i2c_dev->state = STATE_IDLE;
 		} else {
 			i2c_dev->state = STATE_START;
 		}
         break;
-	  case STATE_IDLE: // Nothing to do (error?)
-		i2c_dev->_iicExpectedIntStatus = 0;
+		
+	  case STATE_IDLE: // We are done
+		i2c_dev->pending_irq = 0;
 		complete(&i2c_dev->msg_complete);
 		break;
     }
@@ -175,13 +191,13 @@ static irqreturn_t s5l8702_i2c_isr(int this_irq, void *data)
 	val = s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_INT);
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_INT, val);
 
-	dev_info(i2c_dev->dev, "%s state=0x%04x msg_idx=0x%04x msg_cursor=0x%04x msg_ret=0x%04x _iicExpectedIntStatus=0x%04x val=0x%04x", __func__, i2c_dev->state, i2c_dev->msg_idx, i2c_dev->msg_cursor, i2c_dev->msg_ret, i2c_dev->_iicExpectedIntStatus, val);
+	dev_info(i2c_dev->dev, "%s state=0x%04x msg_ret=0x%04x pending_irq=0x%04x val=0x%04x",
+		__func__, i2c_dev->state, i2c_dev->msg_ret, i2c_dev->pending_irq, val);
 
-	i2c_dev->_iicExpectedIntStatus &= ~val;
-
+	i2c_dev->pending_irq &= ~val;
 
 	// [TODO] Is this the best way due to us getting other interrupts?
-	if (!i2c_dev->_iicExpectedIntStatus) {
+	if (!i2c_dev->pending_irq) {
 		s5l8702_i2c_state_machine(i2c_dev);
 	}
 
@@ -209,10 +225,9 @@ static int s5l8702_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[],
 	}
 
 	i2c_dev->msg     = msgs;
-	i2c_dev->msg_num = num;
+	i2c_dev->nmsgs   = num;
 	i2c_dev->msg_ret = 0;
-	i2c_dev->msg_cursor = 0;
-	i2c_dev->msg_idx = 0;
+	i2c_dev->msg_pos = 0;
 	i2c_dev->state   = STATE_START;
 
 	s5l8702_i2c_state_machine(i2c_dev);
@@ -224,11 +239,7 @@ static int s5l8702_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[],
 	if (time_left == 0)
 		return -ETIMEDOUT;
 
-	// [TODO] find a better way to do this
-	if (i2c_dev->msg_ret)
-		return i2c_dev->msg_ret;
-
-	return i2c_dev->msg_num;
+	return i2c_dev->msg_ret ? : num;
 }
 
 static u32 s5l8702_i2c_func(struct i2c_adapter *adap)
@@ -258,13 +269,12 @@ static int s5l8702_i2c_init(struct s5l8702_i2c_dev *i2c_dev) {
 	// [TODO] calculate divisors from freq in DT
 	// S5L8702_I2C_CON_CK_REG = 1 and S5L8702_I2C_CON_CKSEL16 so PCLK / 16 / 2
 	// and S5L8702_I2C_CON_INTEN_BUSHOLD probably
-	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, 0x100 | S5L8702_I2C_CON_ACKGEN | 1);
+	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, S5L8702_I2C_CON_INTEN_BUSHOLD | S5L8702_I2C_CON_ACKGEN | S5L8702_I2C_CON_CK_REG(1));
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, S5L8702_I2C_STAT_SOE); 
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_UNK28, 0);
 
-	// [TODO] Find a better place to init this
-	// Also maybe only enable the interrupts be are using 
-	i2c_dev->_iicCON = 0x2100 | 1;
+	i2c_dev->iicstat = S5L8702_I2C_STAT_SOE;
+	i2c_dev->iiccon = S5L8702_I2C_CON_INTEN_STOP | S5L8702_I2C_CON_INTEN_BUSHOLD | S5L8702_I2C_CON_CK_REG(1);
 
 	return 0;
 }
