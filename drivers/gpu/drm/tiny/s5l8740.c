@@ -272,8 +272,6 @@ static const struct drm_display_mode s5l8740_mode = {
     if (ret)
         return ret;
     drm_connector_helper_add(connector, &s5l8740_connector_helper_funcs);
-    drm_connector_set_panel_orientation(connector,
-                   DRM_MODE_PANEL_ORIENTATION_RIGHT_UP);
 
     ret = drm_connector_attach_encoder(connector, encoder);
     if (ret)
