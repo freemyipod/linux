@@ -72,7 +72,6 @@ static int s5l8702_usbphy_probe(struct platform_device *pdev)
 	struct s5l8702_usbphy *usbphy;
     struct phy_provider *phy_provider;
 	struct device *dev = &pdev->dev;
-    struct device_node *np = dev->of_node;
     int ret;
 
     printk("%s...\n", __func__);
