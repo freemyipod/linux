@@ -191,7 +191,7 @@ static irqreturn_t s5l8702_i2c_isr(int this_irq, void *data)
 	val = s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_INT);
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_INT, val);
 
-	dev_info(i2c_dev->dev, "%s state=0x%04x msg_ret=0x%04x pending_irq=0x%04x val=0x%04x",
+	dev_dbg(i2c_dev->dev, "%s state=0x%04x msg_ret=0x%04x pending_irq=0x%04x val=0x%04x",
 		__func__, i2c_dev->state, i2c_dev->msg_ret, i2c_dev->pending_irq, val);
 
 	i2c_dev->pending_irq &= ~val;
@@ -210,7 +210,7 @@ static int s5l8702_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[],
 	unsigned long time_left;
 	struct s5l8702_i2c_dev *i2c_dev = i2c_get_adapdata(adap);
 
-	dev_info(i2c_dev->dev, "%s start", __func__);
+	dev_dbg(i2c_dev->dev, "%s start", __func__);
 
 	// [TODO] implement clocks this is equivalent to set controller active and clear interrupts
 	// but we are missing clock enable and disable
@@ -220,7 +220,7 @@ static int s5l8702_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[],
 	int i;
 
 	for (i = 0; i < num; i++) {
-		dev_info(i2c_dev->dev, "%s addr=0x%04x flags=0x%04x len=%u buf=%02x",
+		dev_dbg(i2c_dev->dev, "%s addr=0x%04x flags=0x%04x len=%u buf=%02x",
 			__func__, msgs[i].addr, msgs[i].flags, msgs[i].len, msgs[i].buf[0]);
 	}
 
@@ -235,7 +235,7 @@ static int s5l8702_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[],
 	time_left = wait_for_completion_timeout(&i2c_dev->msg_complete,
 						S5L8702_I2C_XFER_TIMEOUT);
 
-	dev_info(i2c_dev->dev, "%s done time_left=0x%04lx msg_ret=0x%04x", __func__, time_left, i2c_dev->msg_ret);
+	dev_dbg(i2c_dev->dev, "%s done time_left=0x%04lx msg_ret=0x%04x", __func__, time_left, i2c_dev->msg_ret);
 	if (time_left == 0)
 		return -ETIMEDOUT;
 
@@ -246,7 +246,7 @@ static u32 s5l8702_i2c_func(struct i2c_adapter *adap)
 {
 	struct s5l8702_i2c_dev *i2c_dev = i2c_get_adapdata(adap);
 
-	dev_info(i2c_dev->dev, "%s", __func__);
+	dev_dbg(i2c_dev->dev, "%s", __func__);
 
 	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
 }
@@ -281,7 +281,7 @@ static int s5l8702_i2c_init(struct s5l8702_i2c_dev *i2c_dev) {
 
 static int s5l8702_i2c_probe(struct platform_device *pdev)
 {
-	dev_info(&pdev->dev, "%s", __func__);
+	dev_dbg(&pdev->dev, "%s", __func__);
 	struct s5l8702_i2c_dev *i2c_dev;
 	int ret;
 	struct i2c_adapter *adap;
@@ -343,7 +343,7 @@ err:
 static void s5l8702_i2c_remove(struct platform_device *pdev)
 {
 	struct s5l8702_i2c_dev *i2c_dev = platform_get_drvdata(pdev);
-	dev_info(i2c_dev->dev, "%s", __func__);
+	dev_dbg(i2c_dev->dev, "%s", __func__);
 
 	free_irq(i2c_dev->irq, i2c_dev);
 	i2c_del_adapter(&i2c_dev->adapter);
