@@ -47,6 +47,8 @@ dtb-$(CONFIG_ARCH_EXYNOS5) += \
 dtb-$(CONFIG_ARCH_S3C64XX) += \
 	s3c6410-mini6410.dtb \
 	s3c6410-smdk6410.dtb
+dtb-$(CONFIG_ARCH_S5L87XX) += \
+	s5l8740-n31.dtb
 dtb-$(CONFIG_ARCH_S5PV210) += \
 	s5pv210-aquila.dtb \
 	s5pv210-fascinate4g.dtb \

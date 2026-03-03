@@ -1,0 +1,177 @@
+// SPDX-License-Identifier: GPL-2.0+
+/*
+ * Apple S5L8740 SoC
+ *
+ * Other Names: N31
+ */
+/dts-v1/;
+
+/ {
+    #address-cells = <1>;
+    #size-cells = <1>;
+    model = "Apple iPod nano (7th generation)";
+    compatible = "apple,n31", "samsung,s5l8740";
+
+    aliases {
+        serial0 = &uart3;
+        console = &uart3;
+    };
+
+    chosen {
+        stdout-path = "serial0";
+    };
+
+    nclk: external_clock {
+        compatible = "fixed-clock";
+        #clock-cells = <0>;
+        clock-frequency = <24000000>;
+        clock-output-names = "nclk";
+    };
+
+
+    // pclk: clock-ref {
+    //     compatible = "fixed-clock";
+    //     #clock-cells = <0>;
+    //     clock-frequency = <6000000>;
+    //     clock-output-names = "pclk";
+    // };
+
+    cpus {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        cpu@0 {
+            device_type = "cpu";
+            reg = <0>;
+            compatible = "arm,cortex-a5";
+        };
+    };
+
+    memory {
+        device_type = "memory";
+        reg = <0x08000000 0x04000000>;
+    };
+
+    soc {
+        compatible = "simple-bus";
+        #address-cells = <1>;
+        #size-cells = <1>;
+        ranges;
+
+        vic0: interrupt-controller@38e00000 {
+            compatible = "arm,pl192-vic";
+            interrupt-controller;
+            reg = <0x38e00000 0x1000>;
+            #interrupt-cells = <1>;
+        };
+
+        vic1: interrupt-controller@38e01000 {
+            compatible = "arm,pl192-vic";
+            interrupt-controller;
+            reg = <0x38e01000 0x1000>;
+            #interrupt-cells = <1>;
+        };
+
+        timer: timer@3c700000 {
+            compatible = "samsung,s5l8720-timer";
+            reg = <0x3c700000 0x20000>;
+            interrupt-parent = <&vic0>;
+            interrupts = <7>;
+        };
+
+        uart3: uart@3dd00000 {
+            compatible = "apple,s5l-uart";
+            reg = <0x3dd00000 0x3c>;
+            id = <0>;
+            clocks = <&nclk>, <&nclk>;
+            clock-names = "uart", "clk_uart_baud0";
+            reg-io-width = <4>;
+            interrupt-parent = <&vic0>;
+            interrupts = <27>;
+            status = "okay";
+        };
+
+        usbphy: usbphy@3c400000 {
+            compatible = "apple,s5l8702-otgphy";
+            reg = <0x3c400000 0x100>;
+            status = "okay";
+            #phy-cells = <0>;
+        };
+
+        usbotg_hs: usb@38400000 {
+            compatible = "apple,s5l87xx-usb";
+            reg = <0x38400000 0x40000>;
+            interrupt-parent = <&vic0>;
+            interrupts = <19>;
+            phys = <&usbphy>;
+            phy-names = "usb2-phy";
+            clocks = <&nclk>;
+            clock-names = "otg";
+            g-rx-fifo-size = <256>;
+            g-np-tx-fifo-size = <32>;
+            g-tx-fifo-size = <256 256 512 512 512 768 768>;
+            status = "okay";
+            dr_mode = "peripheral";
+        };
+
+        lcdif: lcdif@38300000 {
+            compatible = "samsung,s5l8740-lcdif";
+            reg = <0x38300000 0x10000>;
+        };
+
+        wdt: watchdog@3c800000 {
+            compatible = "syscon", "simple-mfd";
+            reg = <0x3c800000 0x8>;
+
+            reboot: syscon-reboot@3c800000 {
+                compatible = "syscon-reboot";
+                offset = <0x0>;
+                value = <0x100000>;
+            };
+        };
+
+        gpio5: gpio@3cf00000 {
+            compatible = "brcm,bcm6345-gpio";
+            reg-names = "dat";
+            reg = <0x3cf000a4 0x4>;
+            #gpio-cells = <2>;
+            gpio-controller;
+            ngpios = <2>;
+        };
+
+        gpio-keys {
+            compatible = "gpio-keys-polled";
+            poll-interval = <10>;
+
+            volume-up-button {
+                label = "Volume Up";
+                linux,code = <115>; /* KEY_VOLUMEUP */
+                gpios = <&gpio5 0 1>; /* GPIO_ACTIVE_LOW */
+            };
+
+            volume-down-button {
+                label = "Volume Down";
+                linux,code = <114>; /* KEY_VOLUMEDOWN */
+                gpios = <&gpio5 1 1>; /* GPIO_ACTIVE_LOW */
+            };
+        };
+
+        i2c0: i2c@3c600000 {
+            compatible = "samsung,s5l8702-i2c";
+            reg = <0x3c600000 0x100>;
+            clock-frequency = <100000>;  /* UPDATE ME */
+            interrupt-parent = <&vic0>;
+            interrupts = <21>;
+            status = "okay";
+        };
+
+        i2c1: i2c@3c900000 {
+            compatible = "samsung,s5l8702-i2c";
+            reg = <0x3c900000 0x100>;
+            clock-frequency = <100000>; /* UPDATE ME */
+            interrupt-parent = <&vic0>;
+            interrupts = <22>;
+            status = "okay";
+        };
+    };
+};
