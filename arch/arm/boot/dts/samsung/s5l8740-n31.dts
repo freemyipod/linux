@@ -28,7 +28,6 @@
         clock-output-names = "nclk";
     };
 
-
     // pclk: clock-ref {
     //     compatible = "fixed-clock";
     //     #clock-cells = <0>;
@@ -47,7 +46,7 @@
         };
     };
 
-    memory {
+    memory@8000000 {
         device_type = "memory";
         reg = <0x08000000 0x04000000>;
     };
@@ -79,10 +78,9 @@
             interrupts = <7>;
         };
 
-        uart3: uart@3dd00000 {
+        uart3: serial@3dd00000 {
             compatible = "apple,s5l-uart";
             reg = <0x3dd00000 0x3c>;
-            id = <0>;
             clocks = <&nclk>, <&nclk>;
             clock-names = "uart", "clk_uart_baud0";
             reg-io-width = <4>;
@@ -120,7 +118,7 @@
         };
 
         wdt: watchdog@3c800000 {
-            compatible = "syscon", "simple-mfd";
+            compatible = "apple,s5l8740-syscon", "syscon", "simple-mfd";
             reg = <0x3c800000 0x8>;
 
             reboot: syscon-reboot@3c800000 {
@@ -139,23 +137,6 @@
             ngpios = <2>;
         };
 
-        gpio-keys {
-            compatible = "gpio-keys-polled";
-            poll-interval = <10>;
-
-            volume-up-button {
-                label = "Volume Up";
-                linux,code = <115>; /* KEY_VOLUMEUP */
-                gpios = <&gpio5 0 1>; /* GPIO_ACTIVE_LOW */
-            };
-
-            volume-down-button {
-                label = "Volume Down";
-                linux,code = <114>; /* KEY_VOLUMEDOWN */
-                gpios = <&gpio5 1 1>; /* GPIO_ACTIVE_LOW */
-            };
-        };
-
         i2c0: i2c@3c600000 {
             compatible = "samsung,s5l8702-i2c";
             reg = <0x3c600000 0x100>;
@@ -172,6 +153,23 @@
             interrupt-parent = <&vic0>;
             interrupts = <22>;
             status = "okay";
+        };
+    };
+
+    gpio-keys {
+        compatible = "gpio-keys-polled";
+        poll-interval = <10>;
+
+        volume-up-button {
+            label = "Volume Up";
+            linux,code = <115>; /* KEY_VOLUMEUP */
+            gpios = <&gpio5 0 1>; /* GPIO_ACTIVE_LOW */
+        };
+
+        volume-down-button {
+            label = "Volume Down";
+            linux,code = <114>; /* KEY_VOLUMEDOWN */
+            gpios = <&gpio5 1 1>; /* GPIO_ACTIVE_LOW */
         };
     };
 };
