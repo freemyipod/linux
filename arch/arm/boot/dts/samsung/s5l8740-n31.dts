@@ -6,6 +6,9 @@
  */
 /dts-v1/;
 
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/gpio/gpio.h>
+
 / {
     #address-cells = <1>;
     #size-cells = <1>;
@@ -162,14 +165,14 @@
 
         volume-up-button {
             label = "Volume Up";
-            linux,code = <115>; /* KEY_VOLUMEUP */
-            gpios = <&gpio5 0 1>; /* GPIO_ACTIVE_LOW */
+            linux,code = <KEY_VOLUMEUP>;
+            gpios = <&gpio5 0 GPIO_ACTIVE_LOW>;
         };
 
         volume-down-button {
             label = "Volume Down";
-            linux,code = <114>; /* KEY_VOLUMEDOWN */
-            gpios = <&gpio5 1 1>; /* GPIO_ACTIVE_LOW */
+            linux,code = <KEY_VOLUMEDOWN>;
+            gpios = <&gpio5 1 GPIO_ACTIVE_LOW>;
         };
     };
 };
