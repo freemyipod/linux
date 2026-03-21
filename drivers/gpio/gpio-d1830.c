@@ -110,7 +110,6 @@ static int d1830_gpio_parse_dt(struct d1830_gpio *gpio_dev)
 		dev_dbg(dev, "GPIO %d -> reg 0x%02x bit %u\n", i, reg, bit);
 	}
 
-	dev_info(dev, "Mapped %d GPIO lines\n", gpio_dev->num_gpios);
 	return 0;
 }
 
