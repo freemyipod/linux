@@ -151,11 +151,23 @@
 
         i2c1: i2c@3c900000 {
             compatible = "samsung,s5l8702-i2c";
+            #address-cells = <1>;
+            #size-cells = <0>;
             reg = <0x3c900000 0x100>;
             clock-frequency = <100000>; /* UPDATE ME */
             interrupt-parent = <&vic0>;
             interrupts = <22>;
             status = "okay";
+
+            d1830: pmic@73 {
+                compatible = "dlg,d1830-gpio";
+                reg = <0x73>;
+                gpio-controller;
+                #gpio-cells = <2>;
+                dlg,gpio-map = <0x07 4>, /* Menu button */
+                               <0x07 5>, /* Power button */
+                               <0x08 1>; /* Play/pause button */
+            };
         };
     };
 
@@ -163,13 +175,31 @@
         compatible = "gpio-keys-polled";
         poll-interval = <10>;
 
-        volume-up-button {
+        button-menu {
+            label = "Menu";
+            linux,code = <KEY_MENU>;
+            gpios = <&d1830 0 GPIO_ACTIVE_LOW>;
+        };
+
+        button-power {
+            label = "Power";
+            linux,code = <KEY_POWER>;
+            gpios = <&d1830 1 GPIO_ACTIVE_LOW>;
+        };
+
+        button-play-pause {
+            label = "Play/Pause";
+            linux,code = <KEY_PLAYPAUSE>;
+            gpios = <&d1830 2 GPIO_ACTIVE_LOW>;
+        };
+
+        button-volume-up {
             label = "Volume Up";
             linux,code = <KEY_VOLUMEUP>;
             gpios = <&gpio5 0 GPIO_ACTIVE_LOW>;
         };
 
-        volume-down-button {
+        button-volume-down {
             label = "Volume Down";
             linux,code = <KEY_VOLUMEDOWN>;
             gpios = <&gpio5 1 GPIO_ACTIVE_LOW>;
