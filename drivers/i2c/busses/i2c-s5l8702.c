@@ -296,8 +296,7 @@ static int s5l8702_i2c_probe(struct platform_device *pdev)
 	if (IS_ERR(i2c_dev->regs))
 		return PTR_ERR(i2c_dev->regs);
 
-
-	s5l8702_i2c_init(i2c_dev);
+	ret = s5l8702_i2c_init(i2c_dev);
 	if (ret) {
 		dev_err(&pdev->dev, "Could initialize I2C controller\n");
 		goto err;
@@ -309,7 +308,7 @@ static int s5l8702_i2c_probe(struct platform_device *pdev)
 		goto err;
 	}
 
-	ret = request_irq(i2c_dev->irq, s5l8702_i2c_isr, IRQF_SHARED,
+	ret = devm_request_irq(&pdev->dev, i2c_dev->irq, s5l8702_i2c_isr, IRQF_SHARED,
 			  dev_name(&pdev->dev), i2c_dev);
 	if (ret) {
 		dev_err(&pdev->dev, "Could not request IRQ\n");
@@ -323,30 +322,19 @@ static int s5l8702_i2c_probe(struct platform_device *pdev)
 	adap->owner = THIS_MODULE;
 	adap->class = I2C_CLASS_DEPRECATED;
 	snprintf(adap->name, sizeof(adap->name), "s5l8702 (%s)",
-		 of_node_full_name(pdev->dev.of_node));
+		 dev_name(&pdev->dev));
 	adap->algo = &s5l8702_i2c_algo;
 	adap->dev.parent = &pdev->dev;
 	adap->dev.of_node = pdev->dev.of_node;
 
-	ret = i2c_add_adapter(adap);
+	ret = devm_i2c_add_adapter(&pdev->dev, adap);
 	if (ret)
-		goto err_free_irq;
+		goto err;
 
 	return 0;
 
-err_free_irq:
-	free_irq(i2c_dev->irq, i2c_dev);
 err:
 	return ret;
-}
-
-static void s5l8702_i2c_remove(struct platform_device *pdev)
-{
-	struct s5l8702_i2c_dev *i2c_dev = platform_get_drvdata(pdev);
-	dev_dbg(i2c_dev->dev, "%s", __func__);
-
-	free_irq(i2c_dev->irq, i2c_dev);
-	i2c_del_adapter(&i2c_dev->adapter);
 }
 
 #ifdef CONFIG_OF
@@ -359,7 +347,6 @@ MODULE_DEVICE_TABLE(of, s5l8702_i2c_of_match);
 
 static struct platform_driver s5l8702_i2c_driver = {
 	.probe		= s5l8702_i2c_probe,
-	.remove		= s5l8702_i2c_remove,
 	.driver		= {
 		.name	= "i2c-s5l8702",
 		.of_match_table = of_match_ptr(s5l8702_i2c_of_match),
