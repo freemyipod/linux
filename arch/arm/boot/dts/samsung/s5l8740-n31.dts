@@ -159,6 +159,11 @@
             interrupts = <22>;
             status = "okay";
 
+            lis3dc: lis331dlh@18 {
+                compatible = "st,lis3lv02d";
+                reg = <0x18>;
+            };
+
             d1830: pmic@73 {
                 compatible = "dlg,d1830-gpio";
                 reg = <0x73>;
