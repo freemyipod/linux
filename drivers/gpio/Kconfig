@@ -1333,6 +1333,18 @@ config GPIO_CS5535
 
 	  If unsure, say N.
 
+config GPIO_D1830
+	tristate "Dialog Semiconductor D1830 PMIC GPIO (read-only, I2C)"
+	depends on I2C
+	depends on GPIOLIB
+	depends on OF
+	help
+	  Say Y or M here to enable read-only GPIO support for the
+	  Dialog Semiconductor D1830 PMIC. Individual register bits
+	  are exposed as GPIOs via device-tree configuration.  Useful
+	  together with gpio-keys-polled for physical buttons wired
+	  through the PMIC.
+
 config GPIO_DA9052
 	tristate "Dialog DA9052 GPIO"
 	depends on PMIC_DA9052
