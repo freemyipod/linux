@@ -1,0 +1,171 @@
+name: Build Kernel + DTB + initramfs + DFU Image (N31)
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-initramfs:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Setup initramfs cache so it's restored and saved if modified
+        id: cache-initramfs
+        uses: actions/cache@v5
+        with:
+          path: freemyipod/initramfs.cpio.gz
+          key: initramfs-${{ hashFiles('freemyipod/build-initramfs.sh') }}
+
+      - name: Build initramfs if cache miss
+        if: steps.cache-initramfs.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static systemd-container
+          chmod +x freemyipod/build-initramfs.sh
+          freemyipod/build-initramfs.sh
+
+      - name: Upload initramfs artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: initramfs
+          path: freemyipod/initramfs.cpio.gz
+
+  build-kernel:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-arm-none-eabi \
+            make \
+            bc \
+            bison \
+            flex \
+            libssl-dev \
+            libncurses-dev \
+            device-tree-compiler \
+            python3 \
+            python3-pip \
+            ccache
+
+      - name: Install Python dependencies for dtbs_check
+        run: |
+          set -e
+          pip3 install --upgrade pip
+          pip3 install dtschema yamllint
+
+      - name: Restore global ccache
+        uses: actions/cache@v5
+        with:
+          path: ~/.ccache
+          key: ccache-global
+
+      - name: Setup ccache
+        run: |
+          set -e
+          echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
+          ccache --zero-stats
+          ccache --max-size=256M
+          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
+          echo "CC=ccache arm-none-eabi-gcc" >> $GITHUB_ENV
+          echo "HOSTCC=ccache gcc" >> $GITHUB_ENV
+
+      - name: Configure kernel
+        run: make ARCH=arm apple_n31_defconfig
+
+      - name: Build kernel
+        run: make ARCH=arm CROSS_COMPILE=arm-none-eabi- -j $(nproc) zImage
+
+      - name: Check DTBs
+        run: make ARCH=arm CROSS_COMPILE=arm-none-eabi- dtbs_check
+
+      - name: Build DTBs
+        run: make ARCH=arm CROSS_COMPILE=arm-none-eabi- dtbs
+
+      - name: Show ccache stats
+        run: ccache --show-stats
+
+      - name: Copy kernel and DTB to /freemyipod
+        run: |
+          cp arch/arm/boot/zImage freemyipod/zImage
+          cp arch/arm/boot/dts/samsung/s5l8740-n31.dtb freemyipod/s5l8740-n31.dtb
+
+      - name: Upload kernel artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernel
+          path: |
+            freemyipod/zImage
+            freemyipod/s5l8740-n31.dtb
+
+  build-final-image:
+    runs-on: ubuntu-24.04
+    needs:
+      - build-initramfs
+      - build-kernel
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Download initramfs artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: initramfs
+          path: freemyipod
+
+      - name: Download kernel artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: kernel
+          path: freemyipod
+
+      - name: Install mkimage and dtc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y u-boot-tools device-tree-compiler
+
+      - name: Verify mkimage input files exist
+        working-directory: freemyipod
+        run: |
+          set -e
+          echo "Checking required files for mkimage..."
+          required_files=(
+            "zImage"
+            "s5l8740-n31.dtb"
+            "initramfs.cpio.gz"
+            "kernel_fdt.its"
+          )
+          for file in "${required_files[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "ERROR: Required file '$file' not found!"
+              ls -la
+              exit 1
+            fi
+            echo "Found: $file ($(stat -c%s "$file") bytes)"
+          done
+          echo "All required files present."
+
+      - name: Build final image
+        working-directory: freemyipod
+        run: mkimage -f kernel_fdt.its kernel_fdt.itb
+
+      - name: Upload final image
+        uses: actions/upload-artifact@v7
+        with:
+          name: dfu-image
+          path: freemyipod/kernel_fdt.itb
