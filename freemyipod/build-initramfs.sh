@@ -13,6 +13,10 @@ WORK_DIR=$(mktemp -d)
 trap 'sudo rm -rf "$WORK_DIR"' EXIT
 tar xf ${TAR} -C $WORK_DIR
 
+# login on the serial console
+echo 'ttySAC0::respawn:/sbin/getty -L 115200 ttySAC0 vt100' >> "$WORK_DIR/etc/inittab"
+echo ttySAC0 >> "$WORK_DIR/etc/securetty"
+
 # create minimal /init for initramfs
 cat >"$WORK_DIR/init" <<'EOF'
 #!/bin/sh
