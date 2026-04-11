@@ -326,7 +326,6 @@ ili9320_fb_create(struct drm_device *dev, struct drm_file *file_priv,
 	return drm_gem_fb_create(dev, file_priv, mode_cmd);
 }
 
-
 const struct drm_format_info *
 	ili9320_get_format_info(const struct drm_mode_fb_cmd2 *mode_cmd)
 {
@@ -337,7 +336,7 @@ static const struct drm_mode_config_funcs ili9320drm_mode_config_funcs = {
 	.fb_create = ili9320_fb_create,
 	.atomic_check = drm_atomic_helper_check,
 	.atomic_commit = drm_atomic_helper_commit,
-        .get_format_info = ili9320_get_format_info,
+    .get_format_info = ili9320_get_format_info,
 };
 
 /*
@@ -990,7 +989,7 @@ static int ili9320_drm_fbdev_fb_probe(struct drm_fb_helper *fb_helper,
 			sizes->surface_width, sizes->surface_height,
 			sizes->surface_bpp);
 
-        format = FORMAT;
+    format = FORMAT;
 	buffer = drm_client_framebuffer_create(client, sizes->surface_width,
 						   sizes->surface_height, format);
 	if (IS_ERR(buffer))
@@ -1280,7 +1279,7 @@ static int ili9320drm_probe(struct platform_device *pdev)
 		return ret;
 
 	//lcd_init();
-        ili9320_drm_fbdev_setup(dev, FORMAT_BPP * 8);
+    ili9320_drm_fbdev_setup(dev, FORMAT_BPP * 8);
 
 	return 0;
 }
