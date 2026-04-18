@@ -697,7 +697,7 @@ static void ili9320_drm_fb_helper_fill_pixel_fmt(struct fb_var_screeninfo *var,
 		break;
 	case 16:
 	// ili9320
-	// i cant tell if im using rgb555 or rgb565 because of DRM_FORMAT
+	// i cant tell if its using rgb555 or rgb565 because of DRM_FORMAT
 		var->red.offset = 5;
 		var->green.offset = 0;
 		var->blue.offset = 10;
