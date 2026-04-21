@@ -686,13 +686,13 @@ static void ili9320_drm_fb_helper_fill_pixel_fmt(struct fb_var_screeninfo *var,
 
 	switch (depth) {
 	case 15:
-		var->red.offset = 10;
-		var->green.offset = 5;
-		var->blue.offset = 0;
+		var->red.offset = 6;
+		var->green.offset = 1;
+		var->blue.offset = 11;
 		var->red.length = 5;
 		var->green.length = 5;
 		var->blue.length = 5;
-		var->transp.offset = 15;
+		var->transp.offset = 0;
 		var->transp.length = 1;
 		break;
 	case 16:
