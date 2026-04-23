@@ -1,0 +1,117 @@
+// SPDX-License-Identifier: GPL-2.0+
+/*
+ * Apple iPod nano 3rd generation (n3g)
+ * SoC: Samsung/Apple S5L8702 (ARM926EJ-S)
+ */
+/dts-v1/;
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	model = "Apple iPod nano (3rd generation)";
+	compatible = "apple,n3g", "samsung,s5l8702";
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		stdout-path = "serial0:57600n8";
+	};
+
+	/* Crystal reference: 12 MHz */
+	clkref: clock-ref {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <12000000>;
+		clock-output-names = "clkref";
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,arm926ej-s";
+			reg = <0>;
+		};
+	};
+
+	memory@8000000 {
+		device_type = "memory";
+		/* 32 MB SDRAM */
+		reg = <0x08000000 0x02000000>;
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		vic0: interrupt-controller@38e00000 {
+			compatible = "arm,pl192-vic";
+			interrupt-controller;
+			reg = <0x38e00000 0x1000>;
+			#interrupt-cells = <1>;
+		};
+
+		vic1: interrupt-controller@38e01000 {
+			compatible = "arm,pl192-vic";
+			interrupt-controller;
+			reg = <0x38e01000 0x1000>;
+			#interrupt-cells = <1>;
+		};
+
+		timer: timer@3c700000 {
+			compatible = "samsung,s5l8720-timer";
+			reg = <0x3c700000 0x20000>;
+			interrupt-parent = <&vic0>;
+			interrupts = <7>;
+		};
+
+		uart0: serial@3cc00000 {
+			compatible = "apple,s5l-uart";
+			reg = <0x3cc00000 0x4000>;
+			reg-io-width = <4>;
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			interrupt-parent = <&vic0>;
+			interrupts = <24>;
+			status = "okay";
+		};
+
+		usbphy: usbphy@3c400000 {
+			compatible = "apple,s5l8702-otgphy";
+			reg = <0x3c400000 0x100>;
+			status = "okay";
+			#phy-cells = <0>;
+		};
+
+		usbotg: usb@38400000 {
+			compatible = "apple,s5l87xx-usb";
+			reg = <0x38400000 0x40000>;
+			interrupt-parent = <&vic0>;
+			interrupts = <19>;
+			phys = <&usbphy>;
+			phy-names = "usb2-phy";
+			clocks = <&clkref>;
+			clock-names = "otg";
+			g-rx-fifo-size = <256>;
+			g-np-tx-fifo-size = <32>;
+			g-tx-fifo-size = <256 256 512 512 512 768 768>;
+			dr_mode = "peripheral";
+			status = "okay";
+		};
+
+		i2c0: i2c@3c600000 {
+			compatible = "samsung,s5l8702-i2c";
+			reg = <0x3c600000 0x100>;
+			clock-frequency = <100000>;
+			interrupt-parent = <&vic0>;
+			interrupts = <21>;
+			status = "okay";
+		};
+	};
+};

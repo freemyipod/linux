@@ -110,4 +110,4 @@ config PHY_S5L8702_USB2
 	depends on OF
 	select GENERIC_PHY
 	bool "S5L8702 USB2 PHY driver"
-	default CPU_S5L8740
+	default CPU_S5L8702 || CPU_S5L8740

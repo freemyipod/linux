@@ -75,6 +75,11 @@ modules.order
 /modules.nsdeps
 
 #
+# Rust-generated files
+#
+/rust/target.json
+
+#
 # RPM spec file (make rpm-pkg)
 #
 /rpmbuild/

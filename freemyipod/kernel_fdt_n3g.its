@@ -1,0 +1,54 @@
+/dts-v1/;
+
+/ {
+    description = "Linux kernel + FDT for iPod nano 3g (S5L8702)";
+    #address-cells = <1>;
+
+    images {
+        kernel {
+            description = "Linux kernel";
+            data = /incbin/("zImage");
+            type = "kernel";
+            arch = "arm";
+            os = "linux";
+            compression = "none";
+            load = <0x08000000>;
+            entry = <0x08000000>;
+            hash {
+                algo = "crc32";
+            };
+        };
+
+        fdt {
+            description = "Flattened Device Tree blob";
+            data = /incbin/("s5l8702-n3g.dtb");
+            type = "flat_dt";
+            arch = "arm";
+            compression = "none";
+            hash {
+                algo = "crc32";
+            };
+        };
+
+        ramdisk {
+            description = "Gzipped Initramfs";
+            data = /incbin/("initramfs.cpio.gz");
+            type = "ramdisk";
+            arch = "arm";
+            os = "linux";
+            hash {
+                algo = "crc32";
+            };
+        };
+    };
+
+    configurations {
+        default = "conf-1";
+        conf-1 {
+            description = "Boot Linux kernel with FDT and initramfs";
+            kernel = "kernel";
+            fdt = "fdt";
+            ramdisk = "ramdisk";
+        };
+    };
+};

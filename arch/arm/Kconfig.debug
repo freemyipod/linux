@@ -1005,10 +1005,11 @@ choice
 		  via SCIFA4 on Renesas SH-Mobile AG5 (SH73A0).
 
 	config DEBUG_S3C_UART0
-		depends on PLAT_SAMSUNG || ARCH_S5PV210 || ARCH_EXYNOS
+		depends on PLAT_SAMSUNG || ARCH_S5PV210 || ARCH_EXYNOS || ARCH_S5L87XX
 		select DEBUG_EXYNOS_UART if ARCH_EXYNOS
 		select DEBUG_S3C64XX_UART if ARCH_S3C64XX
 		select DEBUG_S5PV210_UART if ARCH_S5PV210
+		select DEBUG_S5L87XX_UART if ARCH_S5L87XX
 		bool "Use Samsung S3C UART 0 for low-level debug"
 		help
 		  Say Y here if you want the debug print routines to direct
