@@ -957,6 +957,14 @@ config SPI_QCOM_GENI
 	  This driver can also be built as a module.  If so, the module
 	  will be called spi-geni-qcom.
 
+config SPI_S5L8702
+	tristate "Samsung/Apple S5L8702 SPI controller"
+	depends on (ARCH_S5L87XX || COMPILE_TEST)
+	help
+	  SPI controller driver for the Samsung/Apple S5L8702 SoC,
+	  found in the iPod nano 3rd generation.  Enables access to
+	  the boot NOR flash via the MTD/spi-nor framework.
+
 config SPI_S3C64XX
 	tristate "Samsung S3C64XX/Exynos SoC series type SPI"
 	depends on (PLAT_SAMSUNG || ARCH_S5PV210 || ARCH_EXYNOS || COMPILE_TEST)

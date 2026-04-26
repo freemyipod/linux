@@ -113,5 +113,24 @@
 			interrupts = <21>;
 			status = "okay";
 		};
+
+		/*
+		 * SPI0: boot NOR flash (SST25-series, 4 MB).
+		 * CS is controlled manually via GPIOCMD; no cs-gpios needed.
+		 * Clock divider is fixed at 4 (PClk/5) by the driver.
+		 */
+		spi0: spi@3c300000 {
+			compatible = "apple,s5l8702-spi";
+			reg = <0x3c300000 0x50>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "okay";
+
+			flash@0 {
+				compatible = "jedec,spi-nor";
+				reg = <0>;
+				spi-max-frequency = <25000000>;
+			};
+		};
 	};
 };
