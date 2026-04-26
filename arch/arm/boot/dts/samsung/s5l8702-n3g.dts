@@ -65,7 +65,7 @@
 		};
 
 		timer: timer@3c700000 {
-			compatible = "samsung,s5l8720-timer";
+			compatible = "samsung,s5l8702-timer";
 			reg = <0x3c700000 0x20000>;
 			interrupt-parent = <&vic0>;
 			interrupts = <7>;

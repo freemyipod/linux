@@ -1,340 +1,210 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * S5L8702 I2C controller driver
+ * S5L8702 I2C controller driver — polled mode
+ *
+ * Based on the Rockbox i2c-s5l8702.c driver by theseven.
+ * Polling mirrors Rockbox's wait_rdy / i2c_wait_io pattern exactly.
  */
 
-#include <linux/device.h>
-#include <linux/dev_printk.h>
+#include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/mod_devicetable.h>
 #include <linux/platform_device.h>
 
-#define S5L8702_I2C_CON   0x0  /* Control register */
-#define S5L8702_I2C_STAT  0x4  /* Control/status register */
-#define S5L8702_I2C_ADD   0x8  /* Bus address register */
-#define S5L8702_I2C_DS    0xc  /* Transmit/receive data shift register */
-#define S5L8702_I2C_BUSY  0x10
-#define S5L8702_I2C_UNK14 0x14
-#define S5L8702_I2C_UNK18 0x18
-#define S5L8702_I2C_INT   0x20 /* Interrupt status register */
-#define S5L8702_I2C_UNK28 0x28
+// Register offsets
+#define IICCON   0x00
+#define IICSTAT  0x04
+#define IICADD   0x08
+#define IICDS    0x0c
+#define IICBUSY  0x10  // hardware-busy flag
+#define IICUNK14 0x14  // clock source select: 1 = ECLK
+#define IICUNK18 0x18
+#define IICSTA2  0x20  // Apple extended status; write 1-bits to clear
 
-#define S5L8702_I2C_CON_CK_REG(x)		((x) & 0xf)
-#define S5L8702_I2C_CON_BUSHOLD  		BIT(4)
-#define S5L8702_I2C_CON_CKSEL16  		(0 << 6)
-#define S5L8702_I2C_CON_CKSEL512 		BIT(6)
-#define S5L8702_I2C_CON_ACKGEN   		BIT(7)
-#define S5L8702_I2C_CON_INTEN_BUSHOLD 	BIT(8)
-#define S5L8702_I2C_CON_INTEN_TIMEOUT 	BIT(9)
-#define S5L8702_I2C_CON_INTEN_RX      	BIT(10)
-#define S5L8702_I2C_CON_INTEN_TX      	BIT(11)
-#define S5L8702_I2C_CON_INTEN_START   	BIT(12)
-#define S5L8702_I2C_CON_INTEN_STOP    	BIT(13)
-#define S5L8702_I2C_CON_INTEN_ALL 		(0x3f00)
+// IICCON
+#define CON_CK_REG(x)  ((x) & 0xf)
+#define CON_IRQ        BIT(4)   // IRQ-pending latch
+#define CON_CKSEL512   BIT(6)   // divide by 512 (vs 16)
+#define CON_ACKGEN     BIT(7)   // master generates ACK during receive
 
-#define S5L8702_I2C_STAT_LRB    BIT(0)
-// The missing bits probably match S5L8700X datasheet ADDR_ZERO, AAS, LBA
-#define S5L8702_I2C_STAT_SOE    BIT(4) // Serial Output Enable
-#define S5L8702_I2C_STAT_BB     BIT(5)
-#define S5L8702_I2C_STAT_TX     BIT(6)
-#define S5L8702_I2C_STAT_MASTER BIT(7)
+// IICSTAT
+#define STAT_LRB    BIT(0)  // last received bit: 0=ACK, 1=NACK
+#define STAT_SOE    BIT(4)  // serial output enable
+#define STAT_BB     BIT(5)  // bus busy
+#define STAT_TX     BIT(6)  // transmit mode
+#define STAT_MASTER BIT(7)
 
-#define S5L8702_I2C_INT_BUSHOLD BIT(8)
-#define S5L8702_I2C_INT_TIMEOUT BIT(9)
-#define S5L8702_I2C_INT_RX      BIT(10)
-#define S5L8702_I2C_INT_TX      BIT(11)
-#define S5L8702_I2C_INT_START   BIT(12)
-#define S5L8702_I2C_INT_STOP    BIT(13)
-#define S5L8702_I2C_INT_ALL     (0x3f00)
+// IICSTA2
+#define STA2_BUSHOLD  BIT(8)   // byte transferred (TX or RX)
+#define STA2_STOP     BIT(13)  // STOP condition completed
+#define STA2_CLEAR    (STA2_BUSHOLD | STA2_STOP)
 
-#define S5L8702_I2C_XFER_TIMEOUT	(msecs_to_jiffies(100))
+#define BUSY_LOOPS  5000
 
-/* i2c controller state */
-enum s5l8702_i2c_state {
-	STATE_IDLE,
-	STATE_START,
-	STATE_READ,
-	STATE_PREPARE_READ,
-	STATE_WRITE,
-	STATE_STOP
+struct s5l8702_i2c {
+	void __iomem      *regs;
+	struct i2c_adapter adap;
 };
 
-struct s5l8702_i2c_dev {
-	struct device *dev;
-	void __iomem *regs;
-	int irq;
-	enum s5l8702_i2c_state state;
-	struct i2c_msg	*msg;
-	unsigned int msg_pos;
-	unsigned int nmsgs;
-	int msg_ret;
-	unsigned int iicstat;
-	unsigned int iiccon;
-	unsigned int pending_irq;
-	struct completion msg_complete;
-	struct i2c_adapter adapter;
-};
+// Poll the hardware-busy flag before every register write.
+static void rdy(struct s5l8702_i2c *i2c) {
+	unsigned int n = BUSY_LOOPS;
 
-static inline void s5l8702_i2c_writel(struct s5l8702_i2c_dev *i2c_dev,
-					  u32 reg, u32 val)
-{
-	writel(val, i2c_dev->regs + reg);
+	while (readl(i2c->regs + IICBUSY) && --n) cpu_relax();
 }
 
-static inline u32 s5l8702_i2c_readl(struct s5l8702_i2c_dev *i2c_dev, u32 reg)
-{
-	return readl(i2c_dev->regs + reg);
-}
+// Wait for a byte transfer or STOP to complete.
+static int io_wait(struct s5l8702_i2c *i2c) {
+	unsigned long deadline = jiffies + msecs_to_jiffies(100);
 
-static void s5l8702_i2c_state_machine(struct s5l8702_i2c_dev *i2c_dev) {
-	switch ( i2c_dev->state )
-	{
+	while (1) {
+		u32 stat = readl(i2c->regs + IICSTAT);
+		u32 sta2 = readl(i2c->regs + IICSTA2);
 
-	  case STATE_START:
-		i2c_dev->pending_irq = S5L8702_I2C_INT_BUSHOLD;
-		if (i2c_dev->msg->flags & I2C_M_RD) {
-			i2c_dev->iicstat = S5L8702_I2C_STAT_SOE | S5L8702_I2C_STAT_MASTER;  
-		} else {
-		  	i2c_dev->iicstat = S5L8702_I2C_STAT_SOE | S5L8702_I2C_STAT_TX | S5L8702_I2C_STAT_MASTER;
-		}
-		i2c_dev->iiccon &= ~S5L8702_I2C_CON_BUSHOLD;
-		i2c_dev->iiccon |= S5L8702_I2C_CON_ACKGEN;
-		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, i2c_dev->iicstat);
-		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->iiccon);
-		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_DS, i2c_8bit_addr_from_msg(i2c_dev->msg));
-		i2c_dev->iicstat |= S5L8702_I2C_STAT_BB;
-		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, i2c_dev->iicstat);
-		if (i2c_dev->msg->flags & I2C_M_RD) {
-		  	i2c_dev->state = STATE_PREPARE_READ;
-		}
-		else {
-			i2c_dev->state = STATE_WRITE;
-		}
-		break;
-
-	  case STATE_WRITE: // Write
-		if ( s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_STAT) & S5L8702_I2C_STAT_LRB ) { // Did we receive ACK?
-		  	i2c_dev->msg_ret = -EIO;
-		  	goto generate_stop;
-		}
-		if ( i2c_dev->msg_pos == i2c_dev->msg->len ) { // is the end of the msg
-		  	goto generate_stop;
-		}
-		i2c_dev->pending_irq = S5L8702_I2C_INT_BUSHOLD;
-		i2c_dev->iiccon |= S5L8702_I2C_CON_BUSHOLD;
-		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_DS, i2c_dev->msg->buf[i2c_dev->msg_pos++]);
-		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->iiccon);
-		break;
-
-	  case STATE_READ: // Read
-		i2c_dev->msg->buf[i2c_dev->msg_pos++] = s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_DS);
-		fallthrough;
-	  case STATE_PREPARE_READ: // Prepare read
-		if ( !i2c_dev->msg_pos && (s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_STAT) & S5L8702_I2C_STAT_LRB) ) {
-			i2c_dev->msg_ret = -EIO;
-			goto generate_stop;
-		}
-
-		if ( i2c_dev->msg_pos == i2c_dev->msg->len ) { // is the end of the msg
-			goto generate_stop;
-		}
-
-		if ( (i2c_dev->msg->len - i2c_dev->msg_pos) == 1 ) { // last byte of msg NACK
-			i2c_dev->iiccon &= ~S5L8702_I2C_CON_ACKGEN;
-		}
-		i2c_dev->iiccon |= S5L8702_I2C_CON_BUSHOLD;
-		i2c_dev->pending_irq = S5L8702_I2C_INT_BUSHOLD;
-		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->iiccon);
-		i2c_dev->state = STATE_READ;
-		break;
-
-	  case STATE_STOP: // Generate Stop
-generate_stop:
-		i2c_dev->pending_irq = S5L8702_I2C_INT_STOP;
-
-		if (i2c_dev->msg->flags & I2C_M_RD) {
-			i2c_dev->iicstat &= ~S5L8702_I2C_STAT_BB;
-		}
-		else {
-			i2c_dev->iicstat &= ~( S5L8702_I2C_STAT_BB | S5L8702_I2C_STAT_TX );
-		}
-		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, i2c_dev->iicstat);
-		i2c_dev->iiccon &= ~S5L8702_I2C_CON_ACKGEN;
-		i2c_dev->iiccon |= S5L8702_I2C_CON_BUSHOLD;
-		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->iiccon);
-		i2c_dev->nmsgs--;
-		i2c_dev->msg++;
-		i2c_dev->msg_pos = 0;
-
-		// If we have an error or we processed all messages then we are done
-		if (i2c_dev->msg_ret || (i2c_dev->nmsgs == 0)) {
-			i2c_dev->state = STATE_IDLE;
-		} else {
-			i2c_dev->state = STATE_START;
-		}
-		break;
-		
-	  case STATE_IDLE: // We are done
-		i2c_dev->pending_irq = 0;
-		complete(&i2c_dev->msg_complete);
-		break;
-	}
-}
-
-static irqreturn_t s5l8702_i2c_isr(int this_irq, void *data)
-{
-	struct s5l8702_i2c_dev *i2c_dev = data;
-	u32 val;
-
-	val = s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_INT);
-	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_INT, val);
-
-	dev_dbg(i2c_dev->dev, "%s state=0x%04x msg_ret=0x%04x pending_irq=0x%04x val=0x%04x",
-		__func__, i2c_dev->state, i2c_dev->msg_ret, i2c_dev->pending_irq, val);
-
-	i2c_dev->pending_irq &= ~val;
-
-	// [TODO] Is this the best way due to us getting other interrupts?
-	if (!i2c_dev->pending_irq) {
-		s5l8702_i2c_state_machine(i2c_dev);
+		if ((sta2 & STA2_CLEAR) || !(stat & STAT_BB)) break;
+		if (time_after(jiffies, deadline)) return -ETIMEDOUT;
+		cpu_relax();
 	}
 
-	return IRQ_HANDLED;
+	rdy(i2c);
+	writel(STA2_CLEAR, i2c->regs + IICSTA2);
+	return 0;
 }
 
-static int s5l8702_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[],
-				int num)
-{
-	unsigned long time_left;
-	struct s5l8702_i2c_dev *i2c_dev = i2c_get_adapdata(adap);
+static int s5l8702_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num) {
+	struct s5l8702_i2c *i2c = i2c_get_adapdata(adap);
+	const u32 con = CON_ACKGEN | CON_CKSEL512 | CON_CK_REG(0);
+	int i, ret = 0;
 
-	dev_dbg(i2c_dev->dev, "%s start", __func__);
-
-	// [TODO] implement clocks this is equivalent to set controller active and clear interrupts
-	// but we are missing clock enable and disable
-	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_UNK14, 1);
-	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_INT, S5L8702_I2C_INT_ALL);
-
-	int i;
+	// Select ECLK as I2C source clock and clear any stale status.
+	writel(1, i2c->regs + IICUNK14);
+	writel(STA2_CLEAR, i2c->regs + IICSTA2);
 
 	for (i = 0; i < num; i++) {
-		dev_dbg(i2c_dev->dev, "%s addr=0x%04x flags=0x%04x len=%u buf=%02x",
-			__func__, msgs[i].addr, msgs[i].flags, msgs[i].len, msgs[i].buf[0]);
+		struct i2c_msg *m = &msgs[i];
+		bool rd   = !!(m->flags & I2C_M_RD);
+		u8   addr = i2c_8bit_addr_from_msg(m);
+		// mode: MASTER | SOE | (TX for writes)
+		u32  mode = STAT_MASTER | STAT_SOE | (rd ? 0 : STAT_TX);
+		int  j;
+
+		// START
+		rdy(i2c);
+		writel(con, i2c->regs + IICCON);     // set clock / ACK
+		rdy(i2c);
+		writel(mode, i2c->regs + IICSTAT);   // mode, bus idle
+		rdy(i2c);
+		writel(addr, i2c->regs + IICDS);     // slave address
+		rdy(i2c);
+		writel(mode | STAT_BB, i2c->regs + IICSTAT); // assert START
+		rdy(i2c);
+
+		ret = io_wait(i2c);
+		if (ret) goto stop;
+
+		// Check address ACK
+		if (readl(i2c->regs + IICSTAT) & STAT_LRB) {
+			ret = -EREMOTEIO;
+			goto stop;
+		}
+
+		// DATA
+		if (!rd) {
+			for (j = 0; j < m->len; j++) {
+				u32 cur;
+
+				rdy(i2c);
+				writel(m->buf[j], i2c->regs + IICDS);
+				udelay(5);
+				rdy(i2c);
+				cur = readl(i2c->regs + IICCON);
+				rdy(i2c);
+				writel(cur, i2c->regs + IICCON); // RMW no-op
+
+				ret = io_wait(i2c);
+				if (ret) goto stop;
+				if (readl(i2c->regs + IICSTAT) & STAT_LRB) {
+					ret = -EREMOTEIO;
+					goto stop;
+				}
+			}
+		} else {
+			for (j = 0; j < m->len; j++) {
+				u32 cur;
+
+				rdy(i2c);
+				cur = readl(i2c->regs + IICCON);
+				// NAK the last byte
+				if (j == m->len - 1) cur &= ~CON_ACKGEN;
+				else cur |= CON_ACKGEN;
+				rdy(i2c);
+				writel(cur, i2c->regs + IICCON);
+
+				ret = io_wait(i2c);
+				if (ret) goto stop;
+				m->buf[j] = readl(i2c->regs + IICDS);
+			}
+		}
+
+stop:
+		// Generate STOP
+		rdy(i2c);
+		writel(mode, i2c->regs + IICSTAT); // mode without BB = STOP
+		rdy(i2c);
+		writel(CON_IRQ, i2c->regs + IICCON);
+		io_wait(i2c); // wait for STOP
+
+		if (ret) break;
 	}
 
-	i2c_dev->msg     = msgs;
-	i2c_dev->nmsgs   = num;
-	i2c_dev->msg_ret = 0;
-	i2c_dev->msg_pos = 0;
-	i2c_dev->state   = STATE_START;
-
-	s5l8702_i2c_state_machine(i2c_dev);
-
-	time_left = wait_for_completion_timeout(&i2c_dev->msg_complete,
-						S5L8702_I2C_XFER_TIMEOUT);
-
-	dev_dbg(i2c_dev->dev, "%s done time_left=0x%04lx msg_ret=0x%04x", __func__, time_left, i2c_dev->msg_ret);
-	if (time_left == 0)
-		return -ETIMEDOUT;
-
-	return i2c_dev->msg_ret ? : num;
+	return ret ? ret : num;
 }
 
-static u32 s5l8702_i2c_func(struct i2c_adapter *adap)
-{
-	struct s5l8702_i2c_dev *i2c_dev = i2c_get_adapdata(adap);
-
-	dev_dbg(i2c_dev->dev, "%s", __func__);
-
-	return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL;
-}
+static u32 s5l8702_i2c_func(struct i2c_adapter *adap) { return I2C_FUNC_I2C | I2C_FUNC_SMBUS_EMUL; }
 
 static const struct i2c_algorithm s5l8702_i2c_algo = {
-	.xfer = s5l8702_i2c_xfer,
+	.xfer          = s5l8702_i2c_xfer,
 	.functionality = s5l8702_i2c_func,
 };
 
-static int s5l8702_i2c_init(struct s5l8702_i2c_dev *i2c_dev) {
-	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_ADD, 0x40); // [TODO] Get slave address from DT
-
-	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_UNK14, 1);
-	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_UNK18, 0);
-	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, S5L8702_I2C_STAT_MASTER);
-	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, 0);
-	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, 0); 
-	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_DS, 0x40); // [TODO] Get slave address from DT
-
-	// [TODO] calculate divisors from freq in DT
-	// S5L8702_I2C_CON_CK_REG = 1 and S5L8702_I2C_CON_CKSEL16 so PCLK / 16 / 2
-	// and S5L8702_I2C_CON_INTEN_BUSHOLD probably
-	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, S5L8702_I2C_CON_INTEN_BUSHOLD | S5L8702_I2C_CON_ACKGEN | S5L8702_I2C_CON_CK_REG(1));
-	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, S5L8702_I2C_STAT_SOE); 
-	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_UNK28, 0);
-
-	i2c_dev->iicstat = S5L8702_I2C_STAT_SOE;
-	i2c_dev->iiccon = S5L8702_I2C_CON_INTEN_STOP | S5L8702_I2C_CON_INTEN_BUSHOLD | S5L8702_I2C_CON_CK_REG(1);
-
-	return 0;
+static void s5l8702_i2c_hw_init(struct s5l8702_i2c *i2c) {
+	// Initialize I2C hardware.
+	writel(0x40, i2c->regs + IICADD);   // own slave address
+	writel(1,    i2c->regs + IICUNK14); // SRCCLK = ECLK
+	writel(0,    i2c->regs + IICUNK18);
+	rdy(i2c);
+	writel(STAT_MASTER, i2c->regs + IICSTAT);
+	rdy(i2c);
+	writel(0, i2c->regs + IICCON);
+	rdy(i2c);
+	writel(0, i2c->regs + IICSTAT);
+	rdy(i2c);
+	writel(STA2_CLEAR, i2c->regs + IICSTA2); // clear status
 }
 
-static int s5l8702_i2c_probe(struct platform_device *pdev)
-{
-	dev_dbg(&pdev->dev, "%s", __func__);
-	struct s5l8702_i2c_dev *i2c_dev;
-	int ret;
-	struct i2c_adapter *adap;
+static int s5l8702_i2c_probe(struct platform_device *pdev) {
+	struct s5l8702_i2c *i2c;
 
-	i2c_dev = devm_kzalloc(&pdev->dev, sizeof(*i2c_dev), GFP_KERNEL);
-	if (!i2c_dev)
-		return -ENOMEM;
-	platform_set_drvdata(pdev, i2c_dev);
-	i2c_dev->dev = &pdev->dev;
+	i2c = devm_kzalloc(&pdev->dev, sizeof(*i2c), GFP_KERNEL);
+	if (!i2c) return -ENOMEM;
+	platform_set_drvdata(pdev, i2c);
 
-	i2c_dev->regs = devm_platform_get_and_ioremap_resource(pdev, 0, NULL);
-	if (IS_ERR(i2c_dev->regs))
-		return PTR_ERR(i2c_dev->regs);
+	i2c->regs = devm_platform_get_and_ioremap_resource(pdev, 0, NULL);
+	if (IS_ERR(i2c->regs)) return PTR_ERR(i2c->regs);
 
-	ret = s5l8702_i2c_init(i2c_dev);
-	if (ret) {
-		dev_err(&pdev->dev, "Could initialize I2C controller\n");
-		goto err;
-	}
+	s5l8702_i2c_hw_init(i2c);
 
-	i2c_dev->irq = platform_get_irq(pdev, 0);
-	if (i2c_dev->irq < 0) {
-		ret = i2c_dev->irq;
-		goto err;
-	}
+	i2c->adap.owner       = THIS_MODULE;
+	i2c->adap.class       = I2C_CLASS_DEPRECATED;
+	i2c->adap.algo        = &s5l8702_i2c_algo;
+	i2c->adap.dev.parent  = &pdev->dev;
+	i2c->adap.dev.of_node = pdev->dev.of_node;
+	i2c_set_adapdata(&i2c->adap, i2c);
+	snprintf(i2c->adap.name, sizeof(i2c->adap.name), "s5l8702 (%s)", dev_name(&pdev->dev));
 
-	ret = devm_request_irq(&pdev->dev, i2c_dev->irq, s5l8702_i2c_isr, IRQF_SHARED,
-			  dev_name(&pdev->dev), i2c_dev);
-	if (ret) {
-		dev_err(&pdev->dev, "Could not request IRQ\n");
-		goto err;
-	}
-
-	init_completion(&i2c_dev->msg_complete);
-
-	adap = &i2c_dev->adapter;
-	i2c_set_adapdata(adap, i2c_dev);
-	adap->owner = THIS_MODULE;
-	adap->class = I2C_CLASS_DEPRECATED;
-	snprintf(adap->name, sizeof(adap->name), "s5l8702 (%s)",
-		 dev_name(&pdev->dev));
-	adap->algo = &s5l8702_i2c_algo;
-	adap->dev.parent = &pdev->dev;
-	adap->dev.of_node = pdev->dev.of_node;
-
-	ret = devm_i2c_add_adapter(&pdev->dev, adap);
-	if (ret)
-		goto err;
-
-	return 0;
-
-err:
-	return ret;
+	return devm_i2c_add_adapter(&pdev->dev, &i2c->adap);
 }
 
 #ifdef CONFIG_OF
@@ -346,9 +216,9 @@ MODULE_DEVICE_TABLE(of, s5l8702_i2c_of_match);
 #endif
 
 static struct platform_driver s5l8702_i2c_driver = {
-	.probe		= s5l8702_i2c_probe,
-	.driver		= {
-		.name	= "i2c-s5l8702",
+	.probe  = s5l8702_i2c_probe,
+	.driver = {
+		.name           = "i2c-s5l8702",
 		.of_match_table = of_match_ptr(s5l8702_i2c_of_match),
 	},
 };
