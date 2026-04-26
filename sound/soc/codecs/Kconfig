@@ -2293,7 +2293,7 @@ config SND_SOC_WM8962
 	depends on I2C && INPUT
 
 config SND_SOC_WM8971
-	tristate
+	tristate "Wolfson Microelectronics WM8971 CODEC"
 	depends on I2C
 
 config SND_SOC_WM8974
