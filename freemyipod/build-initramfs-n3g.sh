@@ -43,6 +43,9 @@ set_opt CONFIG_STATIC y
 set_opt CONFIG_STATIC_LIBGCC y
 # tc needs kernel-specific headers not available in the cross toolchain sysroot
 set_opt CONFIG_TC n
+set_opt CONFIG_MTD y
+set_opt CONFIG_NANDDUMP y
+set_opt CONFIG_NANDWRITE y
 
 # Accept any new questions with their defaults (non-interactive)
 yes "" | make -C "$BB_BUILD" ARCH=arm CROSS_COMPILE="$CROSS" oldconfig

@@ -132,5 +132,19 @@
 				spi-max-frequency = <25000000>;
 			};
 		};
+
+		/*
+		 * FMI (Flash Memory Interface) for the on-board NAND.
+		 * The driver also pokes the GPIO pinmux (0x3cf00000) and
+		 * the PWRCON0 clock-gate (0x3c500048) directly; those are
+		 * not modelled here yet.
+		 */
+		nand: nand@38a00000 {
+			compatible = "apple,s5l8702-nand";
+			reg = <0x38a00000 0x400>;
+			pmu-i2c = <&i2c0>;
+			apple,nand-bank = <0>;
+			status = "okay";
+		};
 	};
 };
