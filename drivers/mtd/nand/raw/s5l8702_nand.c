@@ -124,9 +124,10 @@ struct s5l8702_nand {
 	void			*dma_virt;
 	dma_addr_t		dma_phys;
 
-	// Captured OOB data (16 bytes per 512B chunk = 64 bytes total)
+	// Captured OOB data (16 bytes per 512B chunk = 64 bytes total).
+	// Filled as a side effect of fmi_read_chunk; consumed by the
+	// ecc.read_page / ecc.read_oob hooks.
 	u8			oob_buf[64] __aligned(4);
-	bool			oob_valid;
 };
 
 static inline struct s5l8702_nand *chip_to_priv(struct nand_chip *chip) { return container_of(chip, struct s5l8702_nand, chip); }
@@ -151,7 +152,6 @@ static int fmi_wait(struct s5l8702_nand *priv, u32 bit) {
 
 static int fmi_cmd(struct s5l8702_nand *priv, u8 opcode) {
 	dev_dbg(priv->dev, "fmi_cmd: CMD=0x%02x\n", opcode);
-	priv->oob_valid = false;
 	writel(1u << priv->bank, priv->regs + FMI_REG14);
 	writel(opcode, priv->regs + FMI_CMD);
 	return fmi_wait(priv, FMI_ST_CMD_DONE);
@@ -159,10 +159,19 @@ static int fmi_cmd(struct s5l8702_nand *priv, u8 opcode) {
 
 static int fmi_addr(struct s5l8702_nand *priv, const u8 *addrs, unsigned int naddrs) {
 	u32 addr0 = 0, addr1 = 0;
-	unsigned int i;
 
-	for (i = 0; i < min(naddrs, 4u); i++) addr0 |= (u32)addrs[i] << (i * 8);
-	if (naddrs > 4) addr1 = addrs[4];
+	/*
+	 * The FMI clocks address bytes from a fixed set of register-byte
+	 * positions: addr0[7:0], addr0[15:8], addr0[31:24], addr1[7:0],
+	 * addr1[15:8]. Bits 23:16 of addr0 are unused. Pack the framework's
+	 * little-endian addrs[] into those positions.
+	 */
+	if (naddrs > 0) addr0 |= (u32)addrs[0];
+	if (naddrs > 1) addr0 |= (u32)addrs[1] << 8;
+	if (naddrs > 2) addr0 |= (u32)addrs[2] << 24;
+	if (naddrs > 3) addr1 |= (u32)addrs[3];
+	if (naddrs > 4) addr1 |= (u32)addrs[4] << 8;
+	if (naddrs > 5) return -EINVAL;
 
 	dev_dbg(priv->dev, "fmi_addr: naddrs=%u addr0=0x%08x addr1=0x%08x\n", naddrs, addr0, addr1);
 
@@ -199,10 +208,10 @@ static int fmi_read_chunk(struct s5l8702_nand *priv, unsigned int chunk, u8 *dst
 	ret = fmi_wait(priv, FMI_ST_FIFO_DONE);
 	if (ret) return ret;
 
-	// Capture the 16 bytes of OOB for this chunk.
-	for (i = 0; i < 4; i++) ((u32 *)priv->oob_buf)[chunk * 4 + i] = readl(priv->regs + FMI_FIFO0);
-
-	priv->oob_valid = true;
+	// Capture the 16 bytes of OOB for this chunk. The response FIFO is
+	// exposed as four 32-bit windows at FMI_FIFO0..FMI_FIFO0+0xC, not as
+	// a single popping register, so step through each window.
+	for (i = 0; i < 4; i++) ((u32 *)priv->oob_buf)[chunk * 4 + i] = readl(priv->regs + FMI_FIFO0 + i * 4);
 
 	// 2. Fetch 512 bytes of data from NAND to FMI internal buffer
 	writel(FMI_CHUNK_BYTES - 1, priv->regs + FMI_DNUM);
@@ -317,28 +326,19 @@ static int s5l8702_exec_instr(struct s5l8702_nand *priv,
 		unsigned int len = instr->ctx.data.len;
 
 		if (len >= FMI_CHUNK_BYTES) {
-			// Full page (or multi-chunk) read via DMA
+			// Full-page (multi-chunk) read via DMA. As a side
+			// effect, priv->oob_buf is filled with the page's
+			// OOB; the ecc.read_page / read_oob hooks copy it
+			// into chip->oob_poi for callers that ask for OOB.
 			for (i = 0; i < len / FMI_CHUNK_BYTES; i++) {
 				ret = fmi_read_chunk(priv, i,
 						     buf + i * FMI_CHUNK_BYTES);
 				if (ret)
 					break;
 			}
-
-			// If there's a remainder (e.g. 2112 bytes), serve it from OOB buffer
-			if (!ret && (len % FMI_CHUNK_BYTES)) {
-				unsigned int done = (len / FMI_CHUNK_BYTES) * FMI_CHUNK_BYTES;
-				unsigned int rem = len % FMI_CHUNK_BYTES;
-
-				memcpy(buf + done, priv->oob_buf, min(rem, 64u));
-			}
 		} else {
-			// Short read.
-			if (priv->oob_valid && len <= 64) {
-				memcpy(buf, priv->oob_buf, len);
-			} else {
-				ret = fmi_fifo_read(priv, buf, len);
-			}
+			// Short reads: READID, READ STATUS, etc.
+			ret = fmi_fifo_read(priv, buf, len);
 		}
 		break;
 	}
@@ -383,9 +383,79 @@ out_deselect:
 	return ret;
 }
 
+/*
+ * The default nand_read_oob_std issues READ0 with col=writesize, which
+ * lands the chip in OOB territory and then expects a generic data read
+ * to clock OOB bytes out. The FMI doesn't expose that path — OOB is
+ * only reachable as a side effect of fmi_read_chunk. Override the page
+ * and OOB read hooks so both go through the chunk loop, and copy the
+ * captured OOB into chip->oob_poi.
+ */
+static int s5l8702_read_page_raw(struct nand_chip *chip, u8 *buf,
+				 int oob_required, int page)
+{
+	struct s5l8702_nand *priv = chip_to_priv(chip);
+	struct mtd_info *mtd = nand_to_mtd(chip);
+	int ret;
+
+	ret = nand_read_page_op(chip, page, 0, buf, mtd->writesize);
+	if (ret)
+		return ret;
+
+	if (oob_required)
+		memcpy(chip->oob_poi, priv->oob_buf, mtd->oobsize);
+
+	return 0;
+}
+
+static int s5l8702_read_oob_raw(struct nand_chip *chip, int page)
+{
+	struct s5l8702_nand *priv = chip_to_priv(chip);
+	struct mtd_info *mtd = nand_to_mtd(chip);
+	int ret;
+
+	// Throw the data away; we only want the OOB side effect.
+	ret = nand_read_page_op(chip, page, 0, priv->dma_virt, mtd->writesize);
+	if (ret)
+		return ret;
+
+	memcpy(chip->oob_poi, priv->oob_buf, mtd->oobsize);
+	return 0;
+}
+
 static int s5l8702_nand_attach_chip(struct nand_chip *chip) {
+	struct s5l8702_nand *priv = chip_to_priv(chip);
+	struct mtd_info *mtd = nand_to_mtd(chip);
+
 	// Skip error correction for now.
 	chip->ecc.engine_type = NAND_ECC_ENGINE_TYPE_NONE;
+	chip->ecc.read_page = s5l8702_read_page_raw;
+	chip->ecc.read_page_raw = s5l8702_read_page_raw;
+	chip->ecc.read_oob = s5l8702_read_oob_raw;
+	chip->ecc.read_oob_raw = s5l8702_read_oob_raw;
+
+	/*
+	 * Auto-detect from the 4-byte ID misreads the eraseblock-size field
+	 * for this Apple-spec'd Micron part (full ID 0xA5D5D52C). The chip
+	 * wants 128 pages per eraseblock (256 KiB); the framework picks 64
+	 * (128 KiB). Halve eraseblocks_per_lun to keep total size at 2 GiB
+	 * per chip and recompute mtd->erasesize before nand_scan_tail uses
+	 * it.
+	 */
+	if (chip->base.memorg.pages_per_eraseblock == 64 &&
+	    chip->base.memorg.eraseblocks_per_lun  == 16384) {
+		chip->base.memorg.pages_per_eraseblock = 128;
+		chip->base.memorg.eraseblocks_per_lun  = 8192;
+		mtd->erasesize = chip->base.memorg.pages_per_eraseblock * mtd->writesize;
+		// nand_scan_ident already computed these from the wrong
+		// erasesize before attach_chip ran; recompute them here.
+		chip->phys_erase_shift = ffs(mtd->erasesize) - 1;
+		chip->bbt_erase_shift  = chip->phys_erase_shift;
+		dev_info(priv->dev,
+			 "geometry override: erasesize=%u blocks/chip=%u\n",
+			 mtd->erasesize, chip->base.memorg.eraseblocks_per_lun);
+	}
+
 	return 0;
 }
 
@@ -543,8 +613,11 @@ static int s5l8702_nand_probe(struct platform_device *pdev) {
 	// Set this flag to satisfy the framework's bus-width sanity check.
 	chip->options |= NAND_BUSWIDTH_16;
 
-	// Skip the bad-block scan.
-	chip->options |= NAND_SKIP_BBTSCAN;
+	// Skip the bad-block scan. This NAND has probably been written by
+	// Apple's NAND Driver, which stores its own metadata in OOB byte 0.
+	// The standard "OOB[0] != 0xFF means bad" convention does not apply,
+	// so suppress the scan and tell MTD not to consult the marker either.
+	chip->options |= NAND_SKIP_BBTSCAN | NAND_NO_BBM_QUIRK;
 
 	nand_set_flash_node(chip, pdev->dev.of_node);
 
@@ -560,8 +633,10 @@ static int s5l8702_nand_probe(struct platform_device *pdev) {
 		 readl(priv->regs + FMI_CTRL1),
 		 readl(priv->regs + FMI_STATUS));
 
-	// Scan up to 8 banks to find all available NAND chips
-	ret = nand_scan(chip, 8);
+	// 4 GB iPod nano 3g has 2 NAND banks; the 8 GB has 4. Both fit in
+	// the maximum we pass here, and nand_scan stops as soon as a CS
+	// fails to respond to READID.
+	ret = nand_scan(chip, 4);
 	if (ret) {
 		dev_err(&pdev->dev, "nand_scan failed: %d\n", ret);
 		goto err_free_dma;

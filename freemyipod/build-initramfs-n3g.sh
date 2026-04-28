@@ -44,8 +44,10 @@ set_opt CONFIG_STATIC_LIBGCC y
 # tc needs kernel-specific headers not available in the cross toolchain sysroot
 set_opt CONFIG_TC n
 set_opt CONFIG_MTD y
-set_opt CONFIG_NANDDUMP y
-set_opt CONFIG_NANDWRITE y
+# Busybox's nanddump can't handle a 4 GiB MTD (size field is u32 and
+# wraps to 0). We use a custom dumpall tool built below instead.
+set_opt CONFIG_NANDDUMP n
+set_opt CONFIG_NANDWRITE n
 
 # Accept any new questions with their defaults (non-interactive)
 yes "" | make -C "$BB_BUILD" ARCH=arm CROSS_COMPILE="$CROSS" oldconfig
@@ -62,6 +64,16 @@ mkdir -p "$FS"/{bin,sbin,usr/bin,usr/sbin,etc/init.d,dev,proc,sys,tmp,root}
 # Install busybox + symlinks
 make -C "$BB_BUILD" ARCH=arm CROSS_COMPILE="$CROSS" \
     CONFIG_PREFIX="$FS" install
+
+# Cross-compile NAND helpers (statically); the toolchain ships mtd-user.h.
+# _FILE_OFFSET_BITS=64 so dumpall can lseek() past 2 GiB on this 4 GiB device.
+echo "=== Building NAND helpers (readoob, dumpall) ==="
+"${CROSS}gcc" $ARCH_FLAGS -static -O2 -Wall \
+    -D_FILE_OFFSET_BITS=64 \
+    -o "$FS/usr/sbin/readoob" "$SCRIPT_DIR/readoob.c"
+"${CROSS}gcc" $ARCH_FLAGS -static -O2 -Wall \
+    -D_FILE_OFFSET_BITS=64 \
+    -o "$FS/usr/sbin/dumpall" "$SCRIPT_DIR/dumpall.c"
 
 # /etc/inittab: spawn a root shell directly on the iPod's UART
 cat > "$FS/etc/inittab" <<'EOF'
