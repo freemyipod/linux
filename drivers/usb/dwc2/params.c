@@ -121,6 +121,10 @@ static void dwc2_set_s5l8702_params(struct dwc2_hsotg *hsotg)
 	// the kernel DMAEngine, as that seems to be working fine (and this happens
 	// even if we have no DMA controllers).
 	p->g_dma = false;
+	// On this core IEPInt/OEPInt latch on DAINT alone, not DAINT&DAINTMSK,
+	// so the standard ISR misses spurious DIEPINT bits on inactive EPs and
+	// storms forever. See iepint_unmasked_quirk in core_params.
+	p->iepint_unmasked_quirk = true;
 }
 
 static void dwc2_set_socfpga_agilex_params(struct dwc2_hsotg *hsotg)

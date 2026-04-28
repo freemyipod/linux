@@ -505,6 +505,17 @@ struct dwc2_core_params {
 	u32 g_tx_fifo_size[MAX_EPS_CHANNELS];
 
 	bool change_speed_quirk;
+
+	/*
+	 * Some old DWC2 cores (e.g. Apple S5L8702) raise GINTSTS.IEPInt /
+	 * GINTSTS.OEPInt whenever any DIEPINTn / DOEPINTn bit is set,
+	 * regardless of DAINTMSK. The standard ISR ANDs DAINT with DAINTMSK
+	 * before iterating, so spurious bits on masked endpoints are never
+	 * acked and the IRQ refires forever. When this quirk is set, the ISR
+	 * additionally clears DIEPINT/DOEPINT bits on EPs that are flagged
+	 * in raw DAINT but absent from DAINTMSK.
+	 */
+	bool iepint_unmasked_quirk;
 };
 
 /**

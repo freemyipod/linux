@@ -48,6 +48,11 @@ set_opt CONFIG_MTD y
 # wraps to 0). We use a custom dumpall tool built below instead.
 set_opt CONFIG_NANDDUMP n
 set_opt CONFIG_NANDWRITE n
+# Networking utils for USB gadget + telnet shell
+set_opt CONFIG_IFCONFIG y
+set_opt CONFIG_FEATURE_IFCONFIG_STATUS y
+set_opt CONFIG_TELNETD y
+set_opt CONFIG_FEATURE_TELNETD_STANDALONE y
 
 # Accept any new questions with their defaults (non-interactive)
 yes "" | make -C "$BB_BUILD" ARCH=arm CROSS_COMPILE="$CROSS" oldconfig
@@ -88,7 +93,22 @@ cat > "$FS/etc/init.d/rcS" <<'EOF'
 mount -t proc     proc     /proc
 mount -t sysfs    sysfs    /sys
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts
 echo "iPod nano 3g — Linux $(uname -r)"
+
+# Bring up USB gadget network. g_ether may take a moment to register usb0
+# after the host enumerates the device, so retry briefly.
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    if ifconfig usb0 192.168.7.2 netmask 255.255.255.0 up 2>/dev/null; then
+        echo "usb0 up at 192.168.7.2 (host: 192.168.7.1)"
+        break
+    fi
+    sleep 1
+done
+
+# No-auth root shell over telnet for development.
+telnetd -l /bin/sh && echo "telnetd listening on :23"
 EOF
 chmod +x "$FS/etc/init.d/rcS"
 

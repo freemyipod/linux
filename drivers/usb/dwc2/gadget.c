@@ -3792,6 +3792,30 @@ irq_retry:
 			if (daint_in & 1)
 				dwc2_hsotg_epint(hsotg, ep, 1);
 		}
+
+		/*
+		 * On cores whose IEPInt/OEPInt summary ignores DAINTMSK,
+		 * inactive endpoints can latch DIEPINT bits (e.g. TXFE,
+		 * INTknTXFEmp) that the masked iteration above will never
+		 * touch. Clear them here so the IRQ line drops.
+		 */
+		if (hsotg->params.iepint_unmasked_quirk) {
+			u32 raw_daint = dwc2_readl(hsotg, DAINT);
+			u32 spurious = raw_daint & ~daintmsk;
+			u32 spur_in  = spurious & ((1U << DAINT_OUTEP_SHIFT) - 1);
+			u32 spur_out = spurious >> DAINT_OUTEP_SHIFT;
+
+			for (ep = 0; ep < hsotg->num_of_eps && spur_in;
+					ep++, spur_in >>= 1) {
+				if (spur_in & 1)
+					dwc2_writel(hsotg, ~0U, DIEPINT(ep));
+			}
+			for (ep = 0; ep < hsotg->num_of_eps && spur_out;
+					ep++, spur_out >>= 1) {
+				if (spur_out & 1)
+					dwc2_writel(hsotg, ~0U, DOEPINT(ep));
+			}
+		}
 	}
 
 	/* check both FIFOs */

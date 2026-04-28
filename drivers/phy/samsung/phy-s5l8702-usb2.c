@@ -1,9 +1,19 @@
+// SPDX-License-Identifier: GPL-2.0+
+/*
+ * Apple/Samsung S5L8702 USB OTG PHY.
+ *
+ * Register layout and power-on sequence match u-boot's
+ * arch/arm/mach-s5l87xx/s5l87xx.c (reverse-engineered from a disk-mode QEMU
+ * trace and confirmed working for DFU). The PHY enable bit lives at offset
+ * 0x100, so the mapped region must cover at least 0x104 bytes.
+ */
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/phy/phy.h>
 #include <linux/delay.h>
+#include <linux/io.h>
 
 struct s5l8702_usbphy {
 	struct device *dev;
@@ -11,53 +21,71 @@ struct s5l8702_usbphy {
 	void __iomem *base;
 };
 
-#define S5L8702_OTGPHY_PWR 0x00
-#define S5L8702_OTGPHY_CON 0x04
-#define S5L8702_OTGPHY_RSTCON 0x08
-#define S5L8702_OTGPHY_UNKCON 0x1C
+#define S5L8702_OTGPHY_PWR	0x000
+#define S5L8702_OTGPHY_CLK	0x004
+#define S5L8702_OTGPHY_RSTCON	0x008
+#define S5L8702_OTGPHY_BIAS	0x018
+#define S5L8702_OTGPHY_INTFCON	0x030
+#define S5L8702_OTGPHY_CTRL1	0x040
+#define S5L8702_OTGPHY_CTRL2	0x044
+#define S5L8702_OTGPHY_ENABLE	0x100
 
 static int s5l8702_usbphy_phy_init(struct phy *phy)
 {
-	printk("%s...\n", __func__);
 	return 0;
 }
 
 static int s5l8702_usbphy_phy_exit(struct phy *phy)
 {
-	printk("%s...\n", __func__);
 	return 0;
 }
 
 static int s5l8702_usbphy_phy_power_on(struct phy *phy)
 {
 	struct s5l8702_usbphy *usbphy = phy_get_drvdata(phy);
-	printk("%s...\n", __func__);
+	void __iomem *b = usbphy->base;
 
-	writel_relaxed(0, usbphy->base + S5L8702_OTGPHY_PWR);
-	mdelay(10);
-	writel_relaxed(1, usbphy->base + S5L8702_OTGPHY_RSTCON);
-	mdelay(10);
-	writel_relaxed(0, usbphy->base + S5L8702_OTGPHY_RSTCON);
-	mdelay(10);
-	writel_relaxed(6, usbphy->base + S5L8702_OTGPHY_UNKCON);
-	writel_relaxed(1, usbphy->base + S5L8702_OTGPHY_CON);
-	mdelay(400);
+	writel(0x000, b + S5L8702_OTGPHY_PWR);
+	writel(0x000, b + S5L8702_OTGPHY_CLK);
+	writel(0x400, b + S5L8702_OTGPHY_BIAS);
+	writel(0x007, b + S5L8702_OTGPHY_RSTCON);
+
+	/* Analog stage 1 ramp */
+	writel(0x300, b + S5L8702_OTGPHY_CTRL1);
+	writel(0x340, b + S5L8702_OTGPHY_CTRL1);
+	writel(0x346, b + S5L8702_OTGPHY_CTRL1);
+	writel(0x347, b + S5L8702_OTGPHY_CTRL1);
+
+	/* Analog stage 2 ramp */
+	writel(0x0c00, b + S5L8702_OTGPHY_CTRL2);
+	writel(0x0fc0, b + S5L8702_OTGPHY_CTRL2);
+	writel(0x0fe0, b + S5L8702_OTGPHY_CTRL2);
+	writel(0x0ff0, b + S5L8702_OTGPHY_CTRL2);
+	writel(0x0fff, b + S5L8702_OTGPHY_CTRL2);
+
+	writel(1, b + S5L8702_OTGPHY_ENABLE);
+
+	writel(0x000, b + S5L8702_OTGPHY_RSTCON);
+	writel(0x400, b + S5L8702_OTGPHY_BIAS);
+	writel(0x000, b + S5L8702_OTGPHY_INTFCON);
+	writel(0x000, b + S5L8702_OTGPHY_BIAS);
+
+	/* Let the PLL lock before the controller starts poking the core. */
+	mdelay(40);
 	return 0;
 }
 
 static int s5l8702_usbphy_phy_power_off(struct phy *phy)
 {
 	struct s5l8702_usbphy *usbphy = phy_get_drvdata(phy);
-	printk("%s...\n", __func__);
+	void __iomem *b = usbphy->base;
 
-	writel_relaxed(0xff, usbphy->base + S5L8702_OTGPHY_PWR);
-	mdelay(10);
-	writel_relaxed(0xff, usbphy->base + S5L8702_OTGPHY_RSTCON);
-	mdelay(10);
-	writel_relaxed(4, usbphy->base + S5L8702_OTGPHY_UNKCON);
+	writel(0x0, b + S5L8702_OTGPHY_CTRL2);
+	writel(0x0, b + S5L8702_OTGPHY_CTRL1);
+	writel(0x7, b + S5L8702_OTGPHY_RSTCON);
+	writel(0xff, b + S5L8702_OTGPHY_PWR);
 	return 0;
 }
-
 
 static const struct phy_ops s5l8702_usbphy_phy_ops = {
 	.init = s5l8702_usbphy_phy_init,
@@ -73,8 +101,6 @@ static int s5l8702_usbphy_probe(struct platform_device *pdev)
 	struct phy_provider *phy_provider;
 	struct device *dev = &pdev->dev;
 	int ret;
-
-	printk("%s...\n", __func__);
 
 	usbphy = devm_kzalloc(dev, sizeof(*usbphy), GFP_KERNEL);
 	if (!usbphy)
@@ -95,14 +121,13 @@ static int s5l8702_usbphy_probe(struct platform_device *pdev)
 
 	phy_set_drvdata(usbphy->phy, usbphy);
 	phy_provider = devm_of_phy_provider_register(&pdev->dev,
-							 of_phy_simple_xlate);
+						     of_phy_simple_xlate);
 
 	return PTR_ERR_OR_ZERO(phy_provider);
 }
 
 static void s5l8702_usbphy_remove(struct platform_device *pdev)
 {
-	printk("%s...\n", __func__);
 }
 
 static const struct of_device_id s5l8702_usbphy_of_match[] = {
@@ -117,7 +142,6 @@ static struct platform_driver s5l8702_usbphy_driver = {
 	.driver = {
 		.of_match_table = s5l8702_usbphy_of_match,
 		.name = "s5l8702-usbphy",
-		//.pm = &stm32_usbphyc_pm_ops,
 	}
 };
 module_platform_driver(s5l8702_usbphy_driver);

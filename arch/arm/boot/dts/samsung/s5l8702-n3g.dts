@@ -84,7 +84,7 @@
 
 		usbphy: usbphy@3c400000 {
 			compatible = "apple,s5l8702-otgphy";
-			reg = <0x3c400000 0x100>;
+			reg = <0x3c400000 0x200>;
 			status = "okay";
 			#phy-cells = <0>;
 		};
