@@ -158,7 +158,7 @@ static void lcd_init(struct ili9320drm_device *sdev)
 	sdev->lcd_dma_busy = false;
 }
 
-static uint32_t lcd_detect(void)
+static uint32_t __maybe_unused lcd_detect(void)
 {
 	return (PDAT13 & 1) | (PDAT14 & 2);
 }
@@ -358,7 +358,7 @@ static struct drm_display_mode ili9320drm_mode(unsigned int width,
 
 static irqreturn_t dma_irq(int irq, void *pw)
 {
-	uint32_t dmaallst = DMAALLST;
+        (void)DMAALLST;
 	uint32_t dmaallst2 = DMAALLST2;
 
 	struct ili9320drm_device *sdev = pw;
@@ -470,8 +470,8 @@ int ili9320_drm_gem_dma_mmap(struct drm_gem_dma_object *dma_obj, struct vm_area_
 	 * the whole buffer.
 	 */
 	vma->vm_pgoff -= drm_vma_node_start(&obj->vma_node);
-	vma->vm_flags &= ~VM_PFNMAP;
-	vma->vm_flags |= VM_DONTEXPAND;
+        vm_flags_clear(vma, VM_PFNMAP);
+        vm_flags_set(vma, VM_DONTEXPAND);
 
 	if (dma_obj->map_noncoherent) {
 		vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
@@ -663,7 +663,6 @@ static struct drm_driver ili9320drm_driver = {
 	.major			= DRIVER_MAJOR,
 	.minor			= DRIVER_MINOR,
 	.driver_features	= DRIVER_ATOMIC | DRIVER_GEM | DRIVER_MODESET,
-	.gem_prime_mmap		= drm_gem_prime_mmap,
 	.fops			= &ili9320drm_fops,
 };
 
@@ -814,8 +813,7 @@ static bool drm_fbdev_use_shadow_fb(struct drm_fb_helper *fb_helper)
 	struct drm_device *dev = fb_helper->dev;
 	struct drm_framebuffer *fb = fb_helper->fb;
 
-	return dev->mode_config.prefer_shadow_fbdev ||
-		   dev->mode_config.prefer_shadow ||
+	return dev->mode_config.prefer_shadow ||
 		   fb->funcs->dirty;
 }
 
@@ -884,14 +882,12 @@ static void drm_fbdev_fb_destroy(struct fb_info *info)
 
 static int drm_fbdev_fb_mmap(struct fb_info *info, struct vm_area_struct *vma)
 {
-	struct drm_fb_helper *fb_helper = info->par;
+    struct drm_fb_helper *fb_helper = info->par;
 
-	if (drm_fbdev_use_shadow_fb(fb_helper))
-		return fb_deferred_io_mmap(info, vma);
-	else if (fb_helper->dev->driver->gem_prime_mmap)
-		return fb_helper->dev->driver->gem_prime_mmap(fb_helper->buffer->gem, vma);
-	else
-		return -ENODEV;
+    if (drm_fbdev_use_shadow_fb(fb_helper))
+        return fb_deferred_io_mmap(info, vma);
+
+    return drm_gem_prime_mmap(fb_helper->buffer->gem, vma);
 }
 
 static bool drm_fbdev_use_iomem(struct fb_info *info)
@@ -908,9 +904,9 @@ static ssize_t drm_fbdev_fb_read(struct fb_info *info, char __user *buf,
 	ssize_t ret;
 
 	if (drm_fbdev_use_iomem(info))
-		ret = drm_fb_helper_cfb_read(info, buf, count, ppos);
+		ret = fb_io_read(info, buf, count, ppos);
 	else
-		ret = drm_fb_helper_sys_read(info, buf, count, ppos);
+		ret = fb_sys_read(info, buf, count, ppos);
 
 	return ret;
 }
@@ -921,9 +917,9 @@ static ssize_t drm_fbdev_fb_write(struct fb_info *info, const char __user *buf,
 	ssize_t ret;
 
 	if (drm_fbdev_use_iomem(info))
-		ret = drm_fb_helper_cfb_write(info, buf, count, ppos);
+		ret = fb_io_write(info, buf, count, ppos);
 	else
-		ret = drm_fb_helper_sys_write(info, buf, count, ppos);
+		ret = fb_sys_write(info, buf, count, ppos);
 
 	return ret;
 }
@@ -932,27 +928,27 @@ static void drm_fbdev_fb_fillrect(struct fb_info *info,
 				  const struct fb_fillrect *rect)
 {
 	if (drm_fbdev_use_iomem(info))
-		drm_fb_helper_cfb_fillrect(info, rect);
+		cfb_fillrect(info, rect);
 	else
-		drm_fb_helper_sys_fillrect(info, rect);
+		sys_fillrect(info, rect);
 }
 
 static void drm_fbdev_fb_copyarea(struct fb_info *info,
 				  const struct fb_copyarea *area)
 {
 	if (drm_fbdev_use_iomem(info))
-		drm_fb_helper_cfb_copyarea(info, area);
+		cfb_copyarea(info, area);
 	else
-		drm_fb_helper_sys_copyarea(info, area);
+		sys_copyarea(info, area);
 }
 
 static void drm_fbdev_fb_imageblit(struct fb_info *info,
 				   const struct fb_image *image)
 {
 	if (drm_fbdev_use_iomem(info))
-		drm_fb_helper_cfb_imageblit(info, image);
+		cfb_imageblit(info, image);
 	else
-		drm_fb_helper_sys_imageblit(info, image);
+		sys_imageblit(info, image);
 }
 
 static const struct fb_ops drm_fbdev_fb_ops = {
@@ -1007,7 +1003,7 @@ static int ili9320_drm_fbdev_fb_probe(struct drm_fb_helper *fb_helper,
 	fbi->fbops = &drm_fbdev_fb_ops;
 	fbi->screen_size = sizes->surface_height * fb->pitches[0];
 	fbi->fix.smem_len = fbi->screen_size;
-	fbi->flags = FBINFO_DEFAULT;
+        fbi->flags = 0;
 
 	ili9320_drm_fb_helper_fill_info(fbi, fb_helper, sizes);
 
@@ -1171,7 +1167,8 @@ static int ili9320_drm_fbdev_client_hotplug(struct drm_client_dev *client)
 		return 0;
 	}
 
-	drm_fb_helper_prepare(dev, fb_helper, &drm_fb_helper_ili9320_funcs);
+        fb_helper->funcs = &drm_fb_helper_ili9320_funcs;
+        drm_fb_helper_prepare(dev, fb_helper, fb_helper->preferred_bpp, &drm_fb_helper_ili9320_funcs);
 
 	ret = drm_fb_helper_init(dev, fb_helper);
 	if (ret)
@@ -1180,7 +1177,7 @@ static int ili9320_drm_fbdev_client_hotplug(struct drm_client_dev *client)
 	if (!drm_drv_uses_atomic_modeset(dev))
 		drm_helper_disable_unused_functions(dev);
 
-	ret = drm_fb_helper_initial_config(fb_helper, fb_helper->preferred_bpp);
+        ret = drm_fb_helper_initial_config(fb_helper);
 	if (ret)
 		goto err_cleanup;
 

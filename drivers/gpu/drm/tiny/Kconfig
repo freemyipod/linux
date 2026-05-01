@@ -153,6 +153,10 @@ config TINYDRM_ILI9320
 	select DRM_GEM_DMA_HELPER
 	select DRM_KMS_HELPER
 	select FB_PROVIDE_GET_FB_UNMAPPED_AREA
+        select DRM_KMS_HELPER
+        select FB_CFB_FILLRECT
+        select FB_CFB_COPYAREA
+        select FB_CFB_IMAGEBLIT
 	help
 	  DRM driver for the Ilitek ILI93920 panel
 
