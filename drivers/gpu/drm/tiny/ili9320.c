@@ -32,6 +32,7 @@
 #include <drm/drm_client.h>
 #include <drm/drm_fb_helper.h>
 #include <linux/delay.h>
+#include <linux/vmalloc.h>
 
 #define CLK_BASE 0x3C500000
 #define PWRCONEXT			   (*(volatile uint32_t*)(CLK_BASE + 0x40))
@@ -899,29 +900,15 @@ static bool drm_fbdev_use_iomem(struct fb_info *info)
 }
 
 static ssize_t drm_fbdev_fb_read(struct fb_info *info, char __user *buf,
-				 size_t count, loff_t *ppos)
+                                 size_t count, loff_t *ppos)
 {
-	ssize_t ret;
-
-	if (drm_fbdev_use_iomem(info))
-		ret = fb_io_read(info, buf, count, ppos);
-	else
-		ret = fb_sys_read(info, buf, count, ppos);
-
-	return ret;
+    return fb_sys_read(info, buf, count, ppos);
 }
 
 static ssize_t drm_fbdev_fb_write(struct fb_info *info, const char __user *buf,
-				  size_t count, loff_t *ppos)
+                                  size_t count, loff_t *ppos)
 {
-	ssize_t ret;
-
-	if (drm_fbdev_use_iomem(info))
-		ret = fb_io_write(info, buf, count, ppos);
-	else
-		ret = fb_sys_write(info, buf, count, ppos);
-
-	return ret;
+        return fb_sys_write(info, buf, count, ppos);
 }
 
 static void drm_fbdev_fb_fillrect(struct fb_info *info,
