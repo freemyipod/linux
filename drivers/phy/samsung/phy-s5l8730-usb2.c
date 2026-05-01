@@ -3,6 +3,7 @@
 #include <linux/of_platform.h>
 #include <linux/phy/phy.h>
 #include <linux/delay.h>
+#include <linux/platform_device.h>
 
 struct s5l8730_usbphy {
     struct device *dev;
