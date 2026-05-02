@@ -856,4 +856,17 @@ config CRYPTO_DEV_SA2UL
 source "drivers/crypto/aspeed/Kconfig"
 source "drivers/crypto/starfive/Kconfig"
 
+config CRYPTO_DEV_S5L8702_SHA1
+    tristate "Support for Samsung S5L8702 SHA-1 accelerator"
+	depends on ARCH_S5L87XX || COMPILE_TEST
+	select CRYPTO_HASH
+	help
+	  If you say yes to this option, support will be included for the
+	  S5L8702 SHA-1 accelerator.
+
+	  If you don't know what to do here, say N.
+
+	  This support is also available as a module.  If so, the module
+	  will be called s5l8702-sha1.
+
 endif # CRYPTO_HW
