@@ -169,7 +169,7 @@
                 reg = <0x73>;
                 gpio-controller;
                 #gpio-cells = <2>;
-                dlg,gpio-map = <0x07 4>, /* Menu button */
+                dlg,gpio-map = <0x07 4>, /* Home button */
                                <0x07 5>, /* Power button */
                                <0x08 1>; /* Play/pause button */
             };
@@ -180,34 +180,36 @@
         compatible = "gpio-keys-polled";
         poll-interval = <50>;
 
-        button-menu {
-            label = "Menu";
-            linux,code = <KEY_MENU>;
+        button-home {
+            label = "Home Button";
             gpios = <&d1830 0 GPIO_ACTIVE_LOW>;
+            linux,code = <KEY_HOMEPAGE>;
+            wakeup-source;
         };
 
         button-power {
-            label = "Power";
-            linux,code = <KEY_POWER>;
+            label = "Power Button";
             gpios = <&d1830 1 GPIO_ACTIVE_LOW>;
+            linux,code = <KEY_POWER>;
+            wakeup-source;
         };
 
-        button-play-pause {
+        button-playpause {
             label = "Play/Pause";
-            linux,code = <KEY_PLAYPAUSE>;
             gpios = <&d1830 2 GPIO_ACTIVE_LOW>;
+            linux,code = <KEY_PLAYPAUSE>;
         };
 
-        button-volume-up {
+        button-volup {
             label = "Volume Up";
-            linux,code = <KEY_VOLUMEUP>;
             gpios = <&gpio5 0 GPIO_ACTIVE_LOW>;
+            linux,code = <KEY_VOLUMEUP>;
         };
 
-        button-volume-down {
+        button-voldown {
             label = "Volume Down";
-            linux,code = <KEY_VOLUMEDOWN>;
             gpios = <&gpio5 1 GPIO_ACTIVE_LOW>;
+            linux,code = <KEY_VOLUMEDOWN>;
         };
     };
 };
