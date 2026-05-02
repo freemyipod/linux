@@ -184,14 +184,12 @@
             label = "Home Button";
             gpios = <&d1830 0 GPIO_ACTIVE_LOW>;
             linux,code = <KEY_HOMEPAGE>;
-            wakeup-source;
         };
 
         button-power {
             label = "Power Button";
             gpios = <&d1830 1 GPIO_ACTIVE_LOW>;
             linux,code = <KEY_POWER>;
-            wakeup-source;
         };
 
         button-playpause {
