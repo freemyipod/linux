@@ -43,9 +43,6 @@
 #define S5L8702_SHA1_CONF_GO   BIT(1)
 #define S5L8702_SHA1_CONF_CONT BIT(3)
 
-#define S5L8702_SHA1_CMD_CONT 0
-#define S5L8702_SHA1_CMD_NEW 1
-
 #define S5L8702_SHA1_TIMEOUT_MS	100
 
 struct s5l8702_sha1_dev {
@@ -56,11 +53,11 @@ struct s5l8702_sha1_dev {
 };
 
 struct s5l8702_sha1_desc_ctx {
-	u32 cmd;
+	struct s5l8702_sha1_dev *sha1_dev;
 	u8 buffer[SHA1_BLOCK_SIZE];
 	u32 buf_len;
 	u64 total_len;
-	struct s5l8702_sha1_dev *sha1_dev;
+	bool is_first_block;
 };
 
 struct s5l8702_sha1_dev *sha1_dev_global;
@@ -108,7 +105,7 @@ static int s5l8702_sha1_hw_init(struct s5l8702_sha1_dev *sha1_dev)
 	return 0;
 }
 
-static int s5l8702_sha1_hw_run(struct s5l8702_sha1_dev *sha1_dev, const u32 *input, u32 *cmd)
+static int s5l8702_sha1_hw_run(struct s5l8702_sha1_dev *sha1_dev, const u32 *input, bool *is_first_block)
 {
 	int i;
 	u32 conf;
@@ -121,10 +118,10 @@ static int s5l8702_sha1_hw_run(struct s5l8702_sha1_dev *sha1_dev, const u32 *inp
 	// run the engine
 	conf = s5l8702_sha1_readl(sha1_dev, S5L8702_SHA1_CONF);
 
-	if (*cmd == S5L8702_SHA1_CMD_NEW) {
+	if (*is_first_block) {
 		// start new hash
 		conf &= ~S5L8702_SHA1_CONF_CONT;
-		*cmd = S5L8702_SHA1_CMD_CONT;
+		*is_first_block = false;
 	}
 	else {
 		// continue hash
@@ -189,7 +186,7 @@ static int s5l8702_sha1_init(struct shash_desc *desc)
 	}
 
 	// new hash
-	dctx->cmd = S5L8702_SHA1_CMD_NEW;
+	dctx->is_first_block = true;
 
 	return 0;
 }
@@ -217,7 +214,7 @@ static int s5l8702_sha1_update(struct shash_desc *desc,
 		memcpy(dctx->buffer + dctx->buf_len, data, fill);
 		u32 block[SHA1_BLOCK_WORDS];
 		memcpy(block, dctx->buffer, SHA1_BLOCK_SIZE);
-		ret = s5l8702_sha1_hw_run(sha1_dev, block, &dctx->cmd);
+		ret = s5l8702_sha1_hw_run(sha1_dev, block, &dctx->is_first_block);
 
 		if (ret) {
 			goto cleanup;
@@ -232,7 +229,7 @@ static int s5l8702_sha1_update(struct shash_desc *desc,
 	while (len >= SHA1_BLOCK_SIZE) {
 		u32 block[SHA1_BLOCK_WORDS];
 		memcpy(block, data, SHA1_BLOCK_SIZE);
-		ret = s5l8702_sha1_hw_run(sha1_dev, block, &dctx->cmd);
+		ret = s5l8702_sha1_hw_run(sha1_dev, block, &dctx->is_first_block);
 
 		if (ret) {
 			goto cleanup;
@@ -278,7 +275,7 @@ static int s5l8702_sha1_final(struct shash_desc *desc, u8 *out)
 		memset(buf + dctx->buf_len, 0, SHA1_BLOCK_SIZE - dctx->buf_len);
 		u32 block[SHA1_BLOCK_WORDS];
 		memcpy(block, buf, SHA1_BLOCK_SIZE);
-		ret = s5l8702_sha1_hw_run(sha1_dev, block, &dctx->cmd);
+		ret = s5l8702_sha1_hw_run(sha1_dev, block, &dctx->is_first_block);
 
 		if (ret) {
 			goto out;
@@ -299,7 +296,7 @@ static int s5l8702_sha1_final(struct shash_desc *desc, u8 *out)
 	// final block
 	u32 block[SHA1_BLOCK_WORDS];
 	memcpy(block, buf, SHA1_BLOCK_SIZE);
-	ret = s5l8702_sha1_hw_run(sha1_dev, block, &dctx->cmd);
+	ret = s5l8702_sha1_hw_run(sha1_dev, block, &dctx->is_first_block);
 
 	if (ret) {
 		goto out;
