@@ -404,11 +404,13 @@ static int s5l8702_sha1_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static void s5l8702_sha1_remove(struct platform_device *pdev)
+static int s5l8702_sha1_remove(struct platform_device *pdev)
 {
 	sha1_dev_global = NULL;
 
 	crypto_unregister_shash(&s5l8702_sha1_alg);
+
+        return 0;
 }
 
 
