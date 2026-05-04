@@ -77,7 +77,7 @@ static int s5l8702_sha1_hw_wait_idle(struct s5l8702_sha1_dev *sha1_dev)
 {
 	u32 conf;
 	return readl_poll_timeout(sha1_dev->regs + S5L8702_SHA1_CONF, conf,
-		!(conf & S5L8702_SHA1_CONF_BUSY), 10, 100000);
+		!(conf & S5L8702_SHA1_CONF_BUSY), 10, S5L8702_SHA1_TIMEOUT_MS * 1000);
 }
 
 static int s5l8702_sha1_hw_init(struct s5l8702_sha1_dev *sha1_dev)
