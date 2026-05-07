@@ -149,13 +149,13 @@ static void s5l8702_sha1_hw_get_hash(struct s5l8702_sha1_dev *sha1_dev, u32 *out
 static void s5l8702_sha1_enable_clockgate(struct s5l8702_sha1_dev *sha1_dev)
 {
 	// TODO clk_prepare_enable()
-	writel(readl(sha1_dev->clk_reg) & ~BIT(0), sha1_dev->clk_reg);
+	writel(readl(sha1_dev->clk_reg) & ~BIT(2), sha1_dev->clk_reg);
 }
 
 static void s5l8702_sha1_disable_clockgate(struct s5l8702_sha1_dev *sha1_dev)
 {
 	// TODO clk_disable_unprepare()
-	writel(readl(sha1_dev->clk_reg) | BIT(0), sha1_dev->clk_reg);
+	writel(readl(sha1_dev->clk_reg) | BIT(2), sha1_dev->clk_reg);
 }
 
 static int s5l8702_sha1_init(struct shash_desc *desc)
@@ -381,7 +381,7 @@ static int s5l8702_sha1_probe(struct platform_device *pdev)
 	}
 
 	// TODO: samsung_clk_register_gate() or similar
-	sha1_dev->clk_reg = devm_ioremap(dev, 0x3C500048, 4);
+	sha1_dev->clk_reg = devm_ioremap(dev, 0x3C500040, 4);
 
 	if (!sha1_dev->clk_reg) {
 		return -ENOMEM;
