@@ -508,12 +508,13 @@ struct dwc2_core_params {
 
 	/*
 	 * Some old DWC2 cores (e.g. Apple S5L8702) raise GINTSTS.IEPInt /
-	 * GINTSTS.OEPInt whenever any DIEPINTn / DOEPINTn bit is set,
-	 * regardless of DAINTMSK. The standard ISR ANDs DAINT with DAINTMSK
-	 * before iterating, so spurious bits on masked endpoints are never
-	 * acked and the IRQ refires forever. When this quirk is set, the ISR
-	 * additionally clears DIEPINT/DOEPINT bits on EPs that are flagged
-	 * in raw DAINT but absent from DAINTMSK.
+	 * GINTSTS.OEPInt off raw DIEPINTn / DOEPINTn bits, ignoring the
+	 * usual DAINTMSK gate. The standard ISR ANDs DAINT with DAINTMSK
+	 * before iterating, so an EP whose mask bit is momentarily clear
+	 * (between requests, or racing the re-enable in start_req) raises
+	 * IEPInt forever. When this quirk is set the ISR additionally
+	 * dispatches USBACTEP endpoints whose DAINTMSK bit is clear, and
+	 * clears stale latches on truly inactive ones.
 	 */
 	bool iepint_unmasked_quirk;
 };
