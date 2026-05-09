@@ -198,6 +198,10 @@ static int s5l8702_sha1_update(struct shash_desc *desc,
 	struct s5l8702_sha1_dev *sha1_dev = dctx->sha1_dev;
 	int ret;
 
+	if (WARN_ON(!sha1_dev)) {
+        return -EINVAL;
+    }
+
 	dctx->total_len += len;
 
 	// fill leftover, if any
@@ -261,6 +265,10 @@ static int s5l8702_sha1_final(struct shash_desc *desc, u8 *out)
 	u8 *buf = dctx->buffer;
 	u64 bits = cpu_to_be64(dctx->total_len * 8);
 	u32 pad_len;
+
+	if (WARN_ON(!sha1_dev)) {
+        return -EINVAL;
+    }
 
 	// append 0x80 after the last block data
 	if (dctx->buf_len >= SHA1_BLOCK_SIZE) {
@@ -382,7 +390,6 @@ static int s5l8702_sha1_probe(struct platform_device *pdev)
 
 	// TODO: samsung_clk_register_gate() or similar
 	sha1_dev->clk_reg = devm_ioremap(dev, 0x3C500048, 4);
-
 	if (!sha1_dev->clk_reg) {
 		return -ENOMEM;
 	}
@@ -390,6 +397,11 @@ static int s5l8702_sha1_probe(struct platform_device *pdev)
 	mutex_init(&sha1_dev->req_lock);
 
 	platform_set_drvdata(pdev, sha1_dev);
+
+	if (sha1_dev_global) {
+        dev_err(dev, "S5L8702 SHA-1 accelerator already registered\n");
+        return -EBUSY;
+    }
 
 	sha1_dev_global = sha1_dev;
 
@@ -399,14 +411,18 @@ static int s5l8702_sha1_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	dev_info(dev, "Initialized");
+	dev_info(dev, "S5L8702 SHA-1 accelerator initialized\n");
 
 	return 0;
 }
 
 static void s5l8702_sha1_remove(struct platform_device *pdev)
 {
-	sha1_dev_global = NULL;
+	struct s5l8702_sha1_dev *sha1_dev = platform_get_drvdata(pdev);
+
+	if (sha1_dev_global == sha1_dev) {
+        sha1_dev_global = NULL;
+    }
 
 	crypto_unregister_shash(&s5l8702_sha1_alg);
 }
