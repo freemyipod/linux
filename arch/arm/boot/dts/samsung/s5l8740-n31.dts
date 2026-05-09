@@ -179,6 +179,11 @@
             compatible = "samsung,s5l8702-sha1";
             reg = <0x38000000 0x100>;
         };
+
+        prng: prng@3c100000 {
+            compatible = "samsung,s5l8702-prng";
+            reg = <0x3c100000 0x100>;
+        };
     };
 
     gpio-keys {

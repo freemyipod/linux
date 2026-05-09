@@ -613,6 +613,19 @@ config HW_RANDOM_ROCKCHIP
 
 	  If unsure, say Y.
 
+config HW_RANDOM_S5L8702
+	tristate "S5L8702 Pseudo Random Number Generator"
+	depends on HW_RANDOM && (ARCH_S5L87XX || COMPILE_TEST)
+	default HW_RANDOM
+	help
+	  This driver provides kernel-side support for the Pseudo Random Number
+	  Generator hardware found on Samsung S5L8702 and later SOCs.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called s5l8702-prng.
+
+	  If unsure, say Y.
+
 endif # HW_RANDOM
 
 config UML_RANDOM
