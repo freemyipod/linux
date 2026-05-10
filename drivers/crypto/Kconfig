@@ -869,4 +869,17 @@ config CRYPTO_DEV_S5L8702_SHA1
 	  This support is also available as a module.  If so, the module
 	  will be called s5l8702-sha1.
 
+config CRYPTO_DEV_S5L8702_PRNG
+    tristate "Support for Samsung S5L8702 PRNG accelerator"
+	depends on ARCH_S5L87XX || COMPILE_TEST
+	select CRYPTO_RNG
+	help
+	  If you say yes to this option, support will be included for the
+	  S5L8702 PRNG accelerator.
+
+	  If you don't know what to do here, say N.
+
+	  This support is also available as a module.  If so, the module
+	  will be called s5l8702-prng.
+
 endif # CRYPTO_HW
