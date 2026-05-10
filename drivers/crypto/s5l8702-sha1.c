@@ -7,12 +7,15 @@
 #include <crypto/sha1.h>
 #include <linux/device.h>
 #include <linux/dev_printk.h>
+#include <linux/err.h>
+#include <linux/kernel.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/mod_devicetable.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/slab.h>
 
 #define WORD_SIZE (sizeof(u32))
 #define SHA1_BLOCK_WORDS (SHA1_BLOCK_SIZE / WORD_SIZE)
@@ -49,7 +52,7 @@ struct s5l8702_sha1_dev {
 	struct device *dev;
 	void __iomem *regs;
 	void __iomem *clk_reg;
-	struct mutex req_lock;
+	struct mutex lock;
 };
 
 struct s5l8702_sha1_desc_ctx {
@@ -169,7 +172,7 @@ static int s5l8702_sha1_init(struct shash_desc *desc)
 	}
 	sha1_dev = sha1_dev_global;
 
-	mutex_lock(&sha1_dev->req_lock);
+	mutex_lock(&sha1_dev->lock);
 
 	dctx->sha1_dev = sha1_dev;
 	dctx->buf_len = 0;
@@ -181,7 +184,7 @@ static int s5l8702_sha1_init(struct shash_desc *desc)
 
 	if (ret) {
 		s5l8702_sha1_disable_clockgate(sha1_dev);
-		mutex_unlock(&sha1_dev->req_lock);
+		mutex_unlock(&sha1_dev->lock);
 		return ret;
 	}
 
@@ -253,7 +256,7 @@ static int s5l8702_sha1_update(struct shash_desc *desc,
 
 cleanup:
 	s5l8702_sha1_disable_clockgate(sha1_dev);
-	mutex_unlock(&sha1_dev->req_lock);
+	mutex_unlock(&sha1_dev->lock);
 	return ret;
 }
 
@@ -317,7 +320,7 @@ static int s5l8702_sha1_final(struct shash_desc *desc, u8 *out)
 
 out:
 	s5l8702_sha1_disable_clockgate(sha1_dev);
-	mutex_unlock(&sha1_dev->req_lock);
+	mutex_unlock(&sha1_dev->lock);
 
 	return ret;
 }
@@ -376,12 +379,18 @@ static int s5l8702_sha1_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	int ret;
 
+	if (WARN_ON(sha1_dev_global)) {
+        dev_err(dev, "S5L8702 SHA-1 accelerator already registered\n");
+		return -EBUSY;
+	}
+
 	sha1_dev = devm_kzalloc(dev, sizeof(*sha1_dev), GFP_KERNEL);
 	if (!sha1_dev) {
 		return -ENOMEM;
 	}
 
 	sha1_dev->dev = dev;
+	mutex_init(&sha1_dev->lock);
 
 	sha1_dev->regs = devm_platform_get_and_ioremap_resource(pdev, 0, NULL);
 	if (IS_ERR(sha1_dev->regs)) {
@@ -394,22 +403,13 @@ static int s5l8702_sha1_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 
-	mutex_init(&sha1_dev->req_lock);
-
-	platform_set_drvdata(pdev, sha1_dev);
-
-	if (sha1_dev_global) {
-        dev_err(dev, "S5L8702 SHA-1 accelerator already registered\n");
-        return -EBUSY;
-    }
-
-	sha1_dev_global = sha1_dev;
-
 	ret = crypto_register_shash(&s5l8702_sha1_alg);
-
 	if (ret) {
 		return ret;
 	}
+
+	sha1_dev_global = sha1_dev;
+	platform_set_drvdata(pdev, sha1_dev);
 
 	dev_info(dev, "S5L8702 SHA-1 accelerator initialized\n");
 
