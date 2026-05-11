@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0+
 /*
  * Apple S5L8740 SoC
- *
- * Other Names: N31
+ * Board name: N31
+ * Product name: iPod nano (7th generation)
  */
 /dts-v1/;
 
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/clock/samsung,s5l8702-clock.h>
 
 / {
     #address-cells = <1>;
@@ -173,6 +174,13 @@
                                <0x07 5>, /* Power button */
                                <0x08 1>; /* Play/pause button */
             };
+        };
+
+        clkctrl: clock-controller@3c500000 {
+            compatible = "samsung,s5l8702-clock";
+            reg = <0x3c500000 0x100>;
+
+            #clock-cells = <1>;
         };
 
         sha1: sha1@38000000 {

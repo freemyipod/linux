@@ -296,6 +296,13 @@ config COMMON_CLK_S2MPS11
 	  clock. These multi-function devices have two (S2MPS14) or three
 	  (S2MPS11, S5M8767) fixed-rate oscillators, clocked at 32KHz each.
 
+config CLK_S5L8702
+	tristate "Clock driver for S5L8702"
+	depends on ARCH_S5L87XX || COMPILE_TEST
+	help
+	  Support for the clock controller present on the Samsung S5L8702 SoCs.
+	  Choose Y here only if you build for this SoC.
+
 config CLK_TWL
 	tristate "Clock driver for the TWL PMIC family"
 	depends on TWL4030_CORE
