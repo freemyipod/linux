@@ -5,6 +5,7 @@
 
 #include <crypto/internal/hash.h>
 #include <crypto/sha1.h>
+#include <linux/clk.h>
 #include <linux/device.h>
 #include <linux/dev_printk.h>
 #include <linux/err.h>
@@ -51,7 +52,7 @@
 struct s5l8702_sha1_dev {
 	struct device *dev;
 	void __iomem *regs;
-	void __iomem *clk_reg;
+	struct clk *clk;
 	struct mutex lock;
 };
 
@@ -149,18 +150,6 @@ static void s5l8702_sha1_hw_get_hash(struct s5l8702_sha1_dev *sha1_dev, u32 *out
 	}
 }
 
-static void s5l8702_sha1_enable_clockgate(struct s5l8702_sha1_dev *sha1_dev)
-{
-	// TODO clk_prepare_enable()
-	writel(readl(sha1_dev->clk_reg) & ~BIT(0), sha1_dev->clk_reg);
-}
-
-static void s5l8702_sha1_disable_clockgate(struct s5l8702_sha1_dev *sha1_dev)
-{
-	// TODO clk_disable_unprepare()
-	writel(readl(sha1_dev->clk_reg) | BIT(0), sha1_dev->clk_reg);
-}
-
 static int s5l8702_sha1_init(struct shash_desc *desc)
 {
 	struct s5l8702_sha1_desc_ctx *dctx = shash_desc_ctx(desc);
@@ -178,12 +167,16 @@ static int s5l8702_sha1_init(struct shash_desc *desc)
 	dctx->buf_len = 0;
 	dctx->total_len = 0;
 
-	s5l8702_sha1_enable_clockgate(sha1_dev);
+	ret = clk_prepare_enable(sha1_dev->clk);
+	if (ret) {
+		dev_err(sha1_dev->dev, "clk_prepare_enable failed: %d\n", ret);
+		return ret;
+	}
 
 	ret = s5l8702_sha1_hw_init(sha1_dev);
 
 	if (ret) {
-		s5l8702_sha1_disable_clockgate(sha1_dev);
+		clk_disable_unprepare(sha1_dev->clk);
 		mutex_unlock(&sha1_dev->lock);
 		return ret;
 	}
@@ -255,7 +248,7 @@ static int s5l8702_sha1_update(struct shash_desc *desc,
 	return 0;
 
 cleanup:
-	s5l8702_sha1_disable_clockgate(sha1_dev);
+	clk_disable_unprepare(sha1_dev->clk);
 	mutex_unlock(&sha1_dev->lock);
 	return ret;
 }
@@ -319,7 +312,7 @@ static int s5l8702_sha1_final(struct shash_desc *desc, u8 *out)
 	memcpy(out, result, SHA1_DIGEST_SIZE);
 
 out:
-	s5l8702_sha1_disable_clockgate(sha1_dev);
+	clk_disable_unprepare(sha1_dev->clk);
 	mutex_unlock(&sha1_dev->lock);
 
 	return ret;
@@ -397,10 +390,10 @@ static int s5l8702_sha1_probe(struct platform_device *pdev)
 		return PTR_ERR(sha1_dev->regs);
 	}
 
-	// TODO: samsung_clk_register_gate() or similar
-	sha1_dev->clk_reg = devm_ioremap(dev, 0x3C500048, 4);
-	if (!sha1_dev->clk_reg) {
-		return -ENOMEM;
+	sha1_dev->clk = devm_clk_get(dev, "sha1");
+	if (IS_ERR(sha1_dev->clk)) {
+		dev_err(dev, "Can't retrieve sha1 clock: %ld\n", PTR_ERR(sha1_dev->clk));
+		return PTR_ERR(sha1_dev->clk);
 	}
 
 	ret = crypto_register_shash(&s5l8702_sha1_alg);
