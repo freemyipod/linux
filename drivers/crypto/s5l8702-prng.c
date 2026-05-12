@@ -5,7 +5,8 @@
  * Note: This driver returns raw hardware output. If using for
  * cryptographic purposes, callers should consider discarding the
  * first 20 outputs after seeding to avoid potential weak/correlated
- * values.
+ * values. Hardware returns data in 4-byte blocks, so if requested
+ * size is not a multiple, a non-continuous stream is returned.
  */
 
 #include <crypto/internal/rng.h>
@@ -38,7 +39,7 @@ struct s5l8702_prng_ctx {
 	struct s5l8702_prng_dev *prng_dev;
 };
 
-struct s5l8702_prng_dev *prng_dev_global;
+static struct s5l8702_prng_dev *prng_dev_global;
 
 static inline void s5l8702_prng_writel(struct s5l8702_prng_dev *prng_dev,
 				       u32 reg, u32 val)
@@ -46,9 +47,9 @@ static inline void s5l8702_prng_writel(struct s5l8702_prng_dev *prng_dev,
 	writel(val, prng_dev->regs + reg);
 }
 
-static inline u32 s5l8702_prng_readl(struct s5l8702_prng_dev *prng_dev, u32 reg)
+static void s5l8702_prng_reset(struct s5l8702_prng_dev *prng_dev)
 {
-	return readl(prng_dev->regs + reg);
+	s5l8702_prng_writel(prng_dev, S5L8702_PRNG_CONF, 0);
 }
 
 static int s5l8702_prng_get_data(struct s5l8702_prng_dev *prng_dev, u32 *data)
@@ -84,6 +85,10 @@ static int s5l8702_prng_cra_init(struct crypto_tfm *tfm)
 		return ret;
 	}
 
+	mutex_lock(&ctx->prng_dev->lock);
+	s5l8702_prng_reset(ctx->prng_dev);
+	mutex_unlock(&ctx->prng_dev->lock);
+
 	return 0;
 }
 
@@ -105,16 +110,19 @@ static int s5l8702_prng_seed(struct crypto_rng *tfm, const u8 *seed, unsigned in
 	struct s5l8702_prng_dev *prng_dev = ctx->prng_dev;
 	u32 seed_val;
 
-	if (slen < sizeof(u32) || WARN_ON(!prng_dev)) {
+	if (WARN_ON(!prng_dev)) {
+		return -ENODEV;
+	}
+
+	if (slen < sizeof(u32)) {
 		return -EINVAL;
 	}
 
-	mutex_lock(&prng_dev->lock);
-
-	s5l8702_prng_writel(prng_dev, S5L8702_PRNG_CONF, 0);
 	memcpy(&seed_val, seed, sizeof(seed_val));
-	s5l8702_prng_writel(prng_dev, S5L8702_PRNG_SEED, seed_val);
 
+	mutex_lock(&prng_dev->lock);
+	s5l8702_prng_reset(prng_dev);
+	s5l8702_prng_writel(prng_dev, S5L8702_PRNG_SEED, seed_val);
 	mutex_unlock(&prng_dev->lock);
 
 	dev_dbg(prng_dev->dev, "S5L8702 PRNG seeded (%u bytes)\n", slen);
@@ -123,42 +131,48 @@ static int s5l8702_prng_seed(struct crypto_rng *tfm, const u8 *seed, unsigned in
 }
 
 static int s5l8702_prng_generate(struct crypto_rng *tfm, const u8 *src, unsigned int slen,
-				  u8 *rdata, unsigned int dlen)
+				  u8 *dst, unsigned int dlen)
 {
 	struct s5l8702_prng_ctx *ctx = crypto_rng_ctx(tfm);
 	struct s5l8702_prng_dev *prng_dev = ctx->prng_dev;
-	u32 *data = (u32 *)rdata;
-	size_t words = dlen / sizeof(u32);
-	size_t i;
-	int ret;
+	int ret, generated = 0;
 
-	if (!words || WARN_ON(!prng_dev)) {
+	if (WARN_ON(!prng_dev)) {
+		return -ENODEV;
+	}
+
+	if (src || slen) {
+    	return -EOPNOTSUPP;
+	}
+
+	if (!dlen) {
         return 0;
     }
 
 	mutex_lock(&prng_dev->lock);
 
-	// check if seed is provided
-	if (src && slen >= sizeof(u32)) {
-		u32 seed_val;
-		memcpy(&seed_val, src, sizeof(seed_val));
-		s5l8702_prng_writel(prng_dev, S5L8702_PRNG_SEED, seed_val);
-	}
+	do {
+		u32 data;
+		size_t copylen;
 
-	for (i = 0; i < words; i++) {
-		ret = s5l8702_prng_get_data(prng_dev, &data[i]);
+		ret = s5l8702_prng_get_data(prng_dev, &data);
 		if (ret) {
-			size_t generated = i * sizeof(u32);
 			mutex_unlock(&prng_dev->lock);
-			return generated ? (int)generated : ret;
+			return generated ? generated : ret;
 		}
-	}
+
+		copylen = min_t(size_t, dlen, sizeof(u32));
+		memcpy(dst, &data, copylen);
+		dst += copylen;
+		dlen -= copylen;
+		generated += copylen;
+	} while (dlen > 0);
 
 	mutex_unlock(&prng_dev->lock);
 
-	dev_dbg(prng_dev->dev, "Generated %u bytes\n", dlen);
+	dev_dbg(prng_dev->dev, "Generated %d bytes\n", generated);
 
-	return dlen;
+	return generated;
 }
 
 static struct rng_alg s5l8702_rng_alg = {
@@ -169,7 +183,6 @@ static struct rng_alg s5l8702_rng_alg = {
 		.cra_name			= "prng-s5l8702",
 		.cra_driver_name	= "s5l8702-prng",
 		.cra_priority		= 300,
-		.cra_flags			= CRYPTO_ALG_TYPE_RNG,
 		.cra_ctxsize		= sizeof(struct s5l8702_prng_ctx),
 		.cra_module			= THIS_MODULE,
 		.cra_init			= s5l8702_prng_cra_init,
