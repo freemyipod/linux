@@ -193,6 +193,8 @@
         prng: prng@3c100000 {
             compatible = "samsung,s5l8702-prng";
             reg = <0x3c100000 0x100>;
+            clocks = <&clkctrl CLK_PRNG>;
+            clock-names = "prng";
         };
     };
 

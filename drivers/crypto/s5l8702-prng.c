@@ -8,10 +8,8 @@
  * values.
  */
 
-#include <crypto/algapi.h>
 #include <crypto/internal/rng.h>
-#include <crypto/rng.h>
-#include <linux/atomic.h>
+#include <linux/clk.h>
 #include <linux/crypto.h>
 #include <linux/err.h>
 #include <linux/kernel.h>
@@ -32,9 +30,8 @@
 struct s5l8702_prng_dev {
 	struct device *dev;
 	void __iomem *regs;
-	void __iomem *clk_reg;
+	struct clk *clk;
 	struct mutex lock;
-	atomic_t clk_users;
 };
 
 struct s5l8702_prng_ctx {
@@ -52,26 +49,6 @@ static inline void s5l8702_prng_writel(struct s5l8702_prng_dev *prng_dev,
 static inline u32 s5l8702_prng_readl(struct s5l8702_prng_dev *prng_dev, u32 reg)
 {
 	return readl(prng_dev->regs + reg);
-}
-
-static void s5l8702_prng_enable_clockgate(struct s5l8702_prng_dev *prng_dev)
-{
-	// TODO clk_prepare_enable()
-	if (atomic_inc_return(&prng_dev->clk_users) == 1) {
-		writel(readl(prng_dev->clk_reg) & ~BIT(0), prng_dev->clk_reg);
-	}
-}
-
-static void s5l8702_prng_disable_clockgate(struct s5l8702_prng_dev *prng_dev)
-{
-	// TODO clk_disable_unprepare()
-	if (WARN_ON(atomic_read(&prng_dev->clk_users) == 0)) {
-		return;
-	}
-
-	if (atomic_dec_return(&prng_dev->clk_users) == 0) {
-		writel(readl(prng_dev->clk_reg) | BIT(0), prng_dev->clk_reg);
-	}
 }
 
 static int s5l8702_prng_get_data(struct s5l8702_prng_dev *prng_dev, u32 *data)
@@ -94,13 +71,18 @@ static int s5l8702_prng_get_data(struct s5l8702_prng_dev *prng_dev, u32 *data)
 static int s5l8702_prng_cra_init(struct crypto_tfm *tfm)
 {
 	struct s5l8702_prng_ctx *ctx = crypto_tfm_ctx(tfm);
+	int ret;
 
 	if (WARN_ON(!prng_dev_global)) {
 		return -ENODEV;
 	}
 	ctx->prng_dev = prng_dev_global;
 
-	s5l8702_prng_enable_clockgate(ctx->prng_dev);
+	ret = clk_prepare_enable(ctx->prng_dev->clk);
+	if (ret) {
+		dev_err(ctx->prng_dev->dev, "clk_prepare_enable failed: %d\n", ret);
+		return ret;
+	}
 
 	return 0;
 }
@@ -114,7 +96,7 @@ static void s5l8702_prng_cra_exit(struct crypto_tfm *tfm)
         return;
     }
 
-	s5l8702_prng_disable_clockgate(ctx->prng_dev);
+	clk_disable_unprepare(prng_dev->clk);
 }
 
 static int s5l8702_prng_seed(struct crypto_rng *tfm, const u8 *seed, unsigned int slen)
@@ -213,17 +195,16 @@ static int s5l8702_prng_probe(struct platform_device *pdev)
 
 	prng_dev->dev = dev;
 	mutex_init(&prng_dev->lock);
-	atomic_set(&prng_dev->clk_users, 0);
 
 	prng_dev->regs = devm_platform_get_and_ioremap_resource(pdev, 0, NULL);
 	if (IS_ERR(prng_dev->regs)) {
 		return PTR_ERR(prng_dev->regs);
 	}
 
-	// TODO: samsung_clk_register_gate() or similar
-	prng_dev->clk_reg = devm_ioremap(dev, 0x3C50004C, 4);
-	if (!prng_dev->clk_reg) {
-		return -ENOMEM;
+	prng_dev->clk = devm_clk_get(dev, "prng");
+	if (IS_ERR(prng_dev->clk)) {
+		dev_err(dev, "Can't retrieve prng clock: %ld\n", PTR_ERR(prng_dev->clk));
+		return PTR_ERR(prng_dev->clk);
 	}
 
 	ret = crypto_register_rng(&s5l8702_rng_alg);
@@ -244,11 +225,6 @@ static void s5l8702_prng_remove(struct platform_device *pdev)
 	struct s5l8702_prng_dev *prng_dev = platform_get_drvdata(pdev);
 
 	if (prng_dev_global == prng_dev) {
-		if (WARN_ON(atomic_read(&prng_dev->clk_users) != 0)) {
-			dev_warn(prng_dev->dev, "Removing with %d active clock users\n",
-				 atomic_read(&prng_dev->clk_users));
-		}
-
 		prng_dev_global = NULL;
 	}
 
