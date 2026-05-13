@@ -47,7 +47,7 @@
 #define S5L8702_SHA1_CONF_GO   BIT(1)
 #define S5L8702_SHA1_CONF_CONT BIT(3)
 
-#define S5L8702_SHA1_TIMEOUT_MS	100
+#define S5L8702_SHA1_TIMEOUT_US	2
 
 struct s5l8702_sha1_dev {
 	struct device *dev;
@@ -80,8 +80,8 @@ static inline u32 s5l8702_sha1_readl(struct s5l8702_sha1_dev *sha1_dev, u32 reg)
 static int s5l8702_sha1_hw_wait_idle(struct s5l8702_sha1_dev *sha1_dev)
 {
 	u32 conf;
-	return readl_poll_timeout(sha1_dev->regs + S5L8702_SHA1_CONF, conf,
-		!(conf & S5L8702_SHA1_CONF_BUSY), 10, S5L8702_SHA1_TIMEOUT_MS * 1000);
+	return readl_poll_timeout_atomic(sha1_dev->regs + S5L8702_SHA1_CONF, conf,
+		!(conf & S5L8702_SHA1_CONF_BUSY), 0, S5L8702_SHA1_TIMEOUT_US);
 }
 
 static int s5l8702_sha1_hw_init(struct s5l8702_sha1_dev *sha1_dev)
