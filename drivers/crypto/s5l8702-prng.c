@@ -30,6 +30,8 @@
 
 #define S5L8702_PRNG_FIFO_SIZE_WORDS 5
 
+#define S5L8702_PRNG_TIMEOUT_US	2
+
 struct s5l8702_prng_dev {
 	struct device *dev;
 	void __iomem *regs;
@@ -65,7 +67,7 @@ static inline int s5l8702_prng_get_fifo_cnt_wait(struct s5l8702_prng_dev *prng_d
 	int ret;
 
 	ret = readl_poll_timeout_atomic(prng_dev->regs + S5L8702_PRNG_CONF, conf,
-		(conf & S5L8702_PRNG_CONF_FIFO_CNT), 0, 2);
+		(conf & S5L8702_PRNG_CONF_FIFO_CNT), 0, S5L8702_PRNG_TIMEOUT_US);
 
 	if (ret) {
 		return ret;
