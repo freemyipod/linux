@@ -26,7 +26,9 @@
 #define S5L8702_PRNG_DATA	0x04
 #define S5L8702_PRNG_SEED	0x08
 
-#define S5L8702_PRNG_CONF_READY GENMASK(2, 0)
+#define S5L8702_PRNG_CONF_FIFO_CNT GENMASK(2, 0)
+
+#define S5L8702_PRNG_FIFO_SIZE_WORDS 5
 
 struct s5l8702_prng_dev {
 	struct device *dev;
@@ -47,26 +49,68 @@ static inline void s5l8702_prng_writel(struct s5l8702_prng_dev *prng_dev,
 	writel(val, prng_dev->regs + reg);
 }
 
-static void s5l8702_prng_reset(struct s5l8702_prng_dev *prng_dev)
+static inline u32 s5l8702_prng_readl(struct s5l8702_prng_dev *prng_dev, u32 reg)
+{
+	return readl(prng_dev->regs + reg);
+}
+
+static inline void s5l8702_prng_reset(struct s5l8702_prng_dev *prng_dev)
 {
 	s5l8702_prng_writel(prng_dev, S5L8702_PRNG_CONF, 0);
 }
 
-static int s5l8702_prng_get_data(struct s5l8702_prng_dev *prng_dev, u32 *data)
+static inline int s5l8702_prng_get_fifo_cnt_wait(struct s5l8702_prng_dev *prng_dev)
 {
-	int ret;
 	u32 conf;
+	int ret;
 
-	ret = readl_poll_timeout(prng_dev->regs + S5L8702_PRNG_CONF, conf,
-				 conf & S5L8702_PRNG_CONF_READY, 10, 1000);
+	ret = readl_poll_timeout_atomic(prng_dev->regs + S5L8702_PRNG_CONF, conf,
+		(conf & S5L8702_PRNG_CONF_FIFO_CNT), 0, 2);
 
 	if (ret) {
 		return ret;
 	}
 
-	*data = readl(prng_dev->regs + S5L8702_PRNG_DATA);
+	return conf & S5L8702_PRNG_CONF_FIFO_CNT;
+}
 
-	return 0;
+static inline u32 s5l8702_prng_get_data(struct s5l8702_prng_dev *prng_dev)
+{
+	return s5l8702_prng_readl(prng_dev, S5L8702_PRNG_DATA);
+}
+
+static inline void s5l8702_prng_set_seed(struct s5l8702_prng_dev *prng_dev, u32 seed)
+{
+	s5l8702_prng_writel(prng_dev, S5L8702_PRNG_SEED, seed);
+}
+
+static inline void s5l8702_prng_read_full_fifo(struct s5l8702_prng_dev *prng_dev, u32 *dst)
+{
+	dst[0] = s5l8702_prng_get_data(prng_dev);
+	dst[1] = s5l8702_prng_get_data(prng_dev);
+	dst[2] = s5l8702_prng_get_data(prng_dev);
+	dst[3] = s5l8702_prng_get_data(prng_dev);
+	dst[4] = s5l8702_prng_get_data(prng_dev);
+}
+
+static inline void s5l8702_prng_read_burst(struct s5l8702_prng_dev *prng_dev, u32 *dst, size_t words)
+{
+	switch (words) {
+		case 5:
+			dst[4] = s5l8702_prng_get_data(prng_dev);
+			fallthrough;
+		case 4:
+			dst[3] = s5l8702_prng_get_data(prng_dev);
+			fallthrough;
+		case 3:
+			dst[2] = s5l8702_prng_get_data(prng_dev);
+			fallthrough;
+		case 2:
+			dst[1] = s5l8702_prng_get_data(prng_dev);
+			fallthrough;
+		case 1:
+			dst[0] = s5l8702_prng_get_data(prng_dev);
+	}
 }
 
 static int s5l8702_prng_cra_init(struct crypto_tfm *tfm)
@@ -122,7 +166,7 @@ static int s5l8702_prng_seed(struct crypto_rng *tfm, const u8 *seed, unsigned in
 
 	mutex_lock(&prng_dev->lock);
 	s5l8702_prng_reset(prng_dev);
-	s5l8702_prng_writel(prng_dev, S5L8702_PRNG_SEED, seed_val);
+	s5l8702_prng_set_seed(prng_dev, seed_val);
 	mutex_unlock(&prng_dev->lock);
 
 	dev_dbg(prng_dev->dev, "S5L8702 PRNG seeded (%u bytes)\n", slen);
@@ -135,7 +179,8 @@ static int s5l8702_prng_generate(struct crypto_rng *tfm, const u8 *src, unsigned
 {
 	struct s5l8702_prng_ctx *ctx = crypto_rng_ctx(tfm);
 	struct s5l8702_prng_dev *prng_dev = ctx->prng_dev;
-	int ret, generated = 0;
+	size_t done = 0;
+	u32 buf[S5L8702_PRNG_FIFO_SIZE_WORDS];
 
 	if (WARN_ON(!prng_dev)) {
 		return -ENODEV;
@@ -151,28 +196,36 @@ static int s5l8702_prng_generate(struct crypto_rng *tfm, const u8 *src, unsigned
 
 	mutex_lock(&prng_dev->lock);
 
-	do {
-		u32 data;
-		size_t copylen;
+	while (done < dlen) {
+		int cnt;
+		size_t buf_used_words, copy_len;
 
-		ret = s5l8702_prng_get_data(prng_dev, &data);
-		if (ret) {
+		cnt = s5l8702_prng_get_fifo_cnt_wait(prng_dev);
+
+		if (cnt < 0) {
 			mutex_unlock(&prng_dev->lock);
-			return generated ? generated : ret;
+			return cnt;
 		}
 
-		copylen = min_t(size_t, dlen, sizeof(u32));
-		memcpy(dst, &data, copylen);
-		dst += copylen;
-		dlen -= copylen;
-		generated += copylen;
-	} while (dlen > 0);
+		buf_used_words = min(cnt, DIV_ROUND_UP(dlen - done, sizeof(u32)));
+
+		if (buf_used_words == S5L8702_PRNG_FIFO_SIZE_WORDS) {
+			s5l8702_prng_read_full_fifo(prng_dev, buf);
+		}
+		else {
+			s5l8702_prng_read_burst(prng_dev, buf, buf_used_words);
+		}
+
+		copy_len = min(buf_used_words * sizeof(u32), dlen - done);
+		memcpy(dst + done, buf, copy_len);
+		done += copy_len;
+	};
 
 	mutex_unlock(&prng_dev->lock);
 
-	dev_dbg(prng_dev->dev, "Generated %d bytes\n", generated);
+	dev_dbg(prng_dev->dev, "Generated %d bytes\n", done);
 
-	return generated;
+	return done;
 }
 
 static struct rng_alg s5l8702_rng_alg = {
