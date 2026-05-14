@@ -62,9 +62,9 @@ static int d1830_gpio_direction_output(struct gpio_chip *chip, unsigned int offs
 	return -ENOTSUPP;
 }
 
-static void d1830_gpio_set(struct gpio_chip *chip, unsigned int offset, int value)
+static int d1830_gpio_set(struct gpio_chip *chip, unsigned int offset, int value)
 {
-	// read-only
+	return -ENOTSUPP;
 }
 
 static int d1830_gpio_parse_dt(struct d1830_gpio *gpio_dev)
