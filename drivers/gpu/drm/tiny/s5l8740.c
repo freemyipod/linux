@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
-#define DEBUG
+#include <linux/iopoll.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
 
@@ -24,6 +24,21 @@
 #include <drm/drm_probe_helper.h>
 #include <drm/clients/drm_client_setup.h>
 
+#define S5L8740_LCD_CON			0x00 /* Control register. */
+#define S5L8740_LCD_WCMD		0x04 /* Write command register. */
+#define S5L8740_LCD_RCMD		0x0C /* Read command register. */
+#define S5L8740_LCD_RDATA		0x10 /* Read data register. */
+#define S5L8740_LCD_DBUFF		0x14 /* Read Data buffer */
+#define S5L8740_LCD_INTCON		0x18 /* Interrupt control register */
+#define S5L8740_LCD_STATUS		0x1C /* LCD Interface status 0106 */
+#define S5L8740_LCD_PHTIME		0x20 /* Phase time register 0060 */
+#define S5L8740_LCD_RST_TIME	0x24 /* Reset active period 07FF */
+#define S5L8740_LCD_DRV_RST		0x28 /* Reset drive signal */
+#define S5L8740_LCD_WDATA		0x40 /* Write data register (0x40...0x5C) FIXME */
+
+#define S5L8740_LCD_STATUS_BUSY	0x10
+
+#define S5L8740_LCD_TIMEOUT_US 1
 
 #define WIDTH 240
 #define HEIGHT 432
@@ -50,6 +65,12 @@
     struct drm_encoder encoder;
     struct drm_connector connector;
 };
+
+static inline void s5l8740_lcd_writel(struct s5l8740_device *lcd_dev,
+					  u32 reg, u32 val)
+{
+	writel(val, lcd_dev->lcdif + reg);
+}
 
 static struct s5l8740_device *s5l8740_device_of_dev(struct drm_device *dev)
 {
@@ -89,13 +110,23 @@ static void s5l8740_primary_plane_helper_atomic_update(struct drm_plane *plane,
 
     unsigned int count = fb->width * fb->height;
     int *src = shadow_plane_state->data[0].vaddr;
-    void *dst = sdev->lcdif;
 
-    for (int i=0; i < count;i++){
-        while ( (readl(dst + 0x1C) & 0x10) == 0x10 );
-        writel(src[i],dst + 0x40);
+    for (int i = 0; i < count; i++) {
+    	int ret;
+    	u32 status;
+
+    	ret = readl_poll_timeout_atomic(sdev->lcdif + S5L8740_LCD_STATUS, status,
+				!(status & S5L8740_LCD_STATUS_BUSY), 0, S5L8740_LCD_TIMEOUT_US);
+
+    	if (unlikely(ret)) {
+    		drm_warn(dev, "S5L8740_LCD_STATUS_BUSY timeout\n");
+			goto out_drm_dev_exit;
+    	}
+
+    	s5l8740_lcd_writel(sdev, S5L8740_LCD_WDATA, src[i]);
     }
 
+out_drm_dev_exit:
     drm_dev_exit(idx);
 out_drm_gem_fb_end_cpu_access:
     drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
