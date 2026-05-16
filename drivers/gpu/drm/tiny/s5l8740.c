@@ -56,7 +56,6 @@ static struct s5l8740_device *s5l8740_device_of_dev(struct drm_device *dev)
 	return container_of(dev, struct s5l8740_device, dev);
 }
 
-
 static int s5l8740_primary_plane_helper_atomic_check(struct drm_plane *plane, struct drm_atomic_state *state)
 {
 	struct drm_plane_state *new_plane_state = drm_atomic_get_new_plane_state(state, plane);
@@ -157,7 +156,6 @@ static const struct drm_mode_config_funcs s5l8740_mode_config_funcs = {
 	.atomic_commit = drm_atomic_helper_commit,
 };
 
-
 static const struct drm_display_mode s5l8740_mode = {
 	DRM_SIMPLE_MODE(WIDTH, HEIGHT, 30, 56),
 };
@@ -166,64 +164,61 @@ static const struct drm_display_mode s5l8740_mode = {
  * DRM driver
  */
 
- DEFINE_DRM_GEM_FOPS(s5l8740_fops);
+DEFINE_DRM_GEM_FOPS(s5l8740_fops);
 
- static struct drm_driver s5l8740_driver = {
-     DRM_GEM_SHMEM_DRIVER_OPS,
-     DRM_FBDEV_SHMEM_DRIVER_OPS,
-     .name			= "s5l8740",
-     .desc			= "s5l8740 lcdif",
-     .major			= 0,
-     .minor			= 1,
-     .driver_features	= DRIVER_ATOMIC | DRIVER_GEM | DRIVER_MODESET,
-     .fops			= &s5l8740_fops,
- };
+static struct drm_driver s5l8740_driver = {
+    DRM_GEM_SHMEM_DRIVER_OPS,
+    DRM_FBDEV_SHMEM_DRIVER_OPS,
+    .name			= "s5l8740",
+    .desc			= "s5l8740 lcdif",
+    .major			= 0,
+    .minor			= 1,
+    .driver_features	= DRIVER_ATOMIC | DRIVER_GEM | DRIVER_MODESET,
+    .fops			= &s5l8740_fops,
+};
 
 /*
  * Platform driver
  */
 
- static int s5l8740_probe(struct platform_device *pdev)
- {
-     struct s5l8740_device *sdev;
-     struct drm_device *dev;
-     struct resource *res;
-     const struct drm_format_info *format;
-	 struct drm_plane *primary_plane;
-	 struct drm_crtc *crtc;
-	 struct drm_encoder *encoder;
-	 struct drm_connector *connector;
-	 size_t nformats;
-     int ret;
+static int s5l8740_probe(struct platform_device *pdev)
+{
+    struct s5l8740_device *sdev;
+    struct drm_device *dev;
+    struct resource *res;
+    const struct drm_format_info *format;
+	struct drm_plane *primary_plane;
+	struct drm_crtc *crtc;
+	struct drm_encoder *encoder;
+	struct drm_connector *connector;
+	size_t nformats;
+    int ret;
 
-	 sdev = devm_drm_dev_alloc(&pdev->dev, &s5l8740_driver, struct s5l8740_device, dev);
-     if (IS_ERR(sdev))
-         return PTR_ERR(sdev);
+	sdev = devm_drm_dev_alloc(&pdev->dev, &s5l8740_driver, struct s5l8740_device, dev);
+    if (IS_ERR(sdev))
+        return PTR_ERR(sdev);
 
-     sdev->mode = s5l8740_mode;
-     format = drm_format_info(DRM_FORMAT_XRGB8888);
-     sdev->format = format;
+    sdev->mode = s5l8740_mode;
+    format = drm_format_info(DRM_FORMAT_XRGB8888);
+    sdev->format = format;
 
+    dev = &sdev->dev;
 
-     dev = &sdev->dev;
+    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+    if (!res)
+        return -EINVAL;
 
+    drm_dbg(dev, "using I/O memory framebuffer at %pr\n", res);
 
-     res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-     if (!res)
-         return -EINVAL;
+    sdev->lcdif = devm_ioremap_resource(&pdev->dev, res);
 
-     drm_dbg(dev, "using I/O memory framebuffer at %pr\n", res);
-
-     sdev->lcdif = devm_ioremap_resource(&pdev->dev, res);
-
-     /*
+    /*
 	 * Modesetting
 	 */
 
 	ret = drmm_mode_config_init(dev);
 	if (ret)
 		return ret;
-
 
 	dev->mode_config.min_width = WIDTH;
 	dev->mode_config.max_width = WIDTH;
@@ -280,39 +275,39 @@ static const struct drm_display_mode s5l8740_mode = {
 
     drm_mode_config_reset(dev);
  
-     ret = drm_dev_register(dev, 0);
-     if (ret)
+    ret = drm_dev_register(dev, 0);
+    if (ret)
          return ret;
 
-     drm_client_setup(dev, sdev->format);
+    drm_client_setup(dev, sdev->format);
 
-     return 0;
+    return 0;
  }
  
- static void s5l8740_remove(struct platform_device *pdev)
- {
-     struct s5l8740_device *sdev = platform_get_drvdata(pdev);
-     struct drm_device *dev = &sdev->dev;
+static void s5l8740_remove(struct platform_device *pdev)
+{
+    struct s5l8740_device *sdev = platform_get_drvdata(pdev);
+    struct drm_device *dev = &sdev->dev;
+
+    drm_dev_unplug(dev);
+}
  
-     drm_dev_unplug(dev);
- }
+static const struct of_device_id s5l8740_of_match_table[] = {
+    { .compatible = "samsung,s5l8740-lcdif", },
+    { },
+};
+MODULE_DEVICE_TABLE(of, s5l8740_of_match_table);
  
- static const struct of_device_id s5l8740_of_match_table[] = {
-     { .compatible = "samsung,s5l8740-lcdif", },
-     { },
- };
- MODULE_DEVICE_TABLE(of, s5l8740_of_match_table);
+static struct platform_driver s5l8740_platform_driver = {
+    .driver = {
+        .name = "s5l8740-lcdif",
+        .of_match_table = s5l8740_of_match_table,
+    },
+    .probe = s5l8740_probe,
+    .remove = s5l8740_remove,
+};
  
- static struct platform_driver s5l8740_platform_driver = {
-     .driver = {
-         .name = "s5l8740-lcdif",
-         .of_match_table = s5l8740_of_match_table,
-     },
-     .probe = s5l8740_probe,
-     .remove = s5l8740_remove,
- };
+module_platform_driver(s5l8740_platform_driver);
  
- module_platform_driver(s5l8740_platform_driver);
- 
- MODULE_DESCRIPTION("s5l8740 tiny drm");
- MODULE_LICENSE("GPL v2");
+MODULE_DESCRIPTION("s5l8740 tiny drm");
+MODULE_LICENSE("GPL v2");
