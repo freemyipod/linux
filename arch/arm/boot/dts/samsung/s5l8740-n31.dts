@@ -82,6 +82,39 @@
             interrupts = <7>;
         };
 
+        uart0: serial@3cc00000 {
+            compatible = "apple,s5l-uart";
+            reg = <0x3cc00000 0x3c>;
+            clocks = <&nclk>, <&nclk>;
+            clock-names = "uart", "clk_uart_baud0";
+            reg-io-width = <4>;
+            interrupt-parent = <&vic0>;
+            interrupts = <24>;
+            status = "disabled";
+        };
+
+        uart1: serial@3db00000 {
+            compatible = "apple,s5l-uart";
+            reg = <0x3db00000 0x3c>;
+            clocks = <&nclk>, <&nclk>;
+            clock-names = "uart", "clk_uart_baud0";
+            reg-io-width = <4>;
+            interrupt-parent = <&vic0>;
+            interrupts = <25>;
+            status = "disabled";
+        };
+
+        uart2: serial@3dc00000 {
+            compatible = "apple,s5l-uart";
+            reg = <0x3dc00000 0x3c>;
+            clocks = <&nclk>, <&nclk>;
+            clock-names = "uart", "clk_uart_baud0";
+            reg-io-width = <4>;
+            interrupt-parent = <&vic0>;
+            interrupts = <26>;
+            status = "disabled";
+        };
+
         uart3: serial@3dd00000 {
             compatible = "apple,s5l-uart";
             reg = <0x3dd00000 0x3c>;
