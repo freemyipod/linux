@@ -237,22 +237,27 @@
         compatible = "gpio-keys-polled";
         poll-interval = <50>;
 
+        /* these hammer the i2c bus and the driver breaks
+           at some point, disable them for now */
         button-home {
             label = "Home Button";
             gpios = <&d1830 0 GPIO_ACTIVE_LOW>;
             linux,code = <KEY_HOMEPAGE>;
+            status = "disabled";
         };
 
         button-power {
             label = "Power Button";
             gpios = <&d1830 1 GPIO_ACTIVE_LOW>;
             linux,code = <KEY_POWER>;
+            status = "disabled";
         };
 
         button-playpause {
             label = "Play/Pause";
             gpios = <&d1830 2 GPIO_ACTIVE_LOW>;
             linux,code = <KEY_PLAYPAUSE>;
+            status = "disabled";
         };
 
         button-volup {
