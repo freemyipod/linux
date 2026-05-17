@@ -866,7 +866,7 @@ config CRYPTO_DEV_S5L8702_SHA1
 
 	  If you don't know what to do here, say N.
 
-	  This support is also available as a module.  If so, the module
+	  This support is also available as a module. If so, the module
 	  will be called s5l8702-sha1.
 
 config CRYPTO_DEV_S5L8702_PRNG
@@ -879,7 +879,19 @@ config CRYPTO_DEV_S5L8702_PRNG
 
 	  If you don't know what to do here, say N.
 
-	  This support is also available as a module.  If so, the module
+	  This support is also available as a module. If so, the module
 	  will be called s5l8702-prng.
+
+config CRYPTO_DEV_S5L8702_AES
+    tristate "Support for Samsung S5L8702 AES accelerator"
+	depends on ARCH_S5L87XX || COMPILE_TEST
+	help
+	  If you say yes to this option, support will be included for the
+	  S5L8702 AES accelerator.
+
+	  If you don't know what to do here, say N.
+
+	  This support is also available as a module. If so, the module
+	  will be called s5l8702-aes.
 
 endif # CRYPTO_HW

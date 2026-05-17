@@ -33,8 +33,10 @@ struct s5l8702_clk_gate {
 	}
 
 static const struct s5l8702_clk_gate s5l8702_gates[] = {
-	[CLK_SHA1] = GATE("sha1", NULL, 0x48, 0),
-	[CLK_PRNG] = GATE("prng", NULL, 0x4c, 0),
+	[CLK_SHA1]	= GATE("sha1",	NULL, 0x48, 0),
+	[CLK_AES]	= GATE("aes",	NULL, 0x48, 7),
+
+	[CLK_PRNG]	= GATE("prng",	NULL, 0x4c, 0),
 };
 
 static int s5l8702_clk_probe(struct platform_device *pdev)

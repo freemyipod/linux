@@ -225,6 +225,13 @@
             clock-names = "sha1";
         };
 
+        aes: aes@38c00000 {
+            compatible = "samsung,s5l8702-aes";
+            reg = <0x38c00000 0x100>;
+            clocks = <&clkctrl CLK_AES>;
+            clock-names = "aes";
+        };
+
         prng: prng@3c100000 {
             compatible = "samsung,s5l8702-prng";
             reg = <0x3c100000 0x100>;
