@@ -89,6 +89,7 @@ struct s5l8702_aes_ctx {
 	u8 key[AES_MAX_KEY_SIZE];
 	u32 keylen;
 	bool cbc;
+	int type;
 };
 
 static struct s5l8702_aes_dev *aes_dev_global;
@@ -192,7 +193,7 @@ static inline void s5l8702_aes_write_buf(struct s5l8702_aes_dev *aes_dev, u32 sr
 	s5l8702_aes_writel(aes_dev, S5L8702_AES_CRYPT_SIZE, size);
 }
 
-static int s5l8702_aes_init(struct crypto_skcipher *tfm, bool cbc)
+static int s5l8702_aes_init(struct crypto_skcipher *tfm, bool cbc, int type)
 {
 	struct s5l8702_aes_ctx *ctx = crypto_skcipher_ctx(tfm);
 
@@ -202,18 +203,29 @@ static int s5l8702_aes_init(struct crypto_skcipher *tfm, bool cbc)
 
 	ctx->aes_dev = aes_dev_global;
 	ctx->cbc = cbc;
+	ctx->type = type;
 
 	return 0;
 }
 
 static int s5l8702_aes_init_ecb(struct crypto_skcipher *tfm)
 {
-	return s5l8702_aes_init(tfm, false);
+	return s5l8702_aes_init(tfm, false, S5L8702_AES_KEY_TYPE_USER_DEFINE);
 }
 
 static int s5l8702_aes_init_cbc(struct crypto_skcipher *tfm)
 {
-	return s5l8702_aes_init(tfm, true);
+	return s5l8702_aes_init(tfm, true, S5L8702_AES_KEY_TYPE_USER_DEFINE);
+}
+
+static int s5l8702_aes_init_cbc_gid(struct crypto_skcipher *tfm)
+{
+	return s5l8702_aes_init(tfm, true, S5L8702_AES_KEY_TYPE_GLOBAL_ID);
+}
+
+static int s5l8702_aes_init_cbc_uid(struct crypto_skcipher *tfm)
+{
+	return s5l8702_aes_init(tfm, true, S5L8702_AES_KEY_TYPE_USER_ID);
 }
 
 static void s5l8702_aes_exit(struct crypto_skcipher *tfm)
@@ -244,7 +256,7 @@ static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 	struct skcipher_walk walk;
 	void *key = ctx->key;
 	u32 key_len = ctx->keylen;
-	u32 key_type, compliment;
+	u32 compliment;
 	u32 cfg, irq;
 	int ret;
 
@@ -270,21 +282,18 @@ static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 	s5l8702_aes_clear_state(aes_dev);
 
 	// key type
-	if (memchr_inv(key, 0, key_len)) {
-		key_type = S5L8702_AES_KEY_TYPE_USER_DEFINE;
-	}
-	else {
-		key_type = S5L8702_AES_KEY_TYPE_ZERO;
+	if (ctx->type == S5L8702_AES_KEY_TYPE_USER_DEFINE && !memchr_inv(key, 0, key_len)) {
+		ctx->type = S5L8702_AES_KEY_TYPE_ZERO;
 	}
 
-	s5l8702_aes_writel(aes_dev, S5L8702_AES_CIPHERKEY_SEL, key_type);
+	s5l8702_aes_writel(aes_dev, S5L8702_AES_CIPHERKEY_SEL, ctx->type);
 
 	// compliment
 	compliment = ~s5l8702_aes_readl(aes_dev, S5L8702_AES_CIPHERKEY_SEL);
 	s5l8702_aes_writel(aes_dev, S5L8702_AES_COMPLIMENT, compliment);
 
 	// user-defined key
-	if (key_type == S5L8702_AES_KEY_TYPE_USER_DEFINE) {
+	if (ctx->type == S5L8702_AES_KEY_TYPE_USER_DEFINE) {
 		ret = s5l8702_aes_write_key(aes_dev, key, key_len);
 		if (ret)
 			goto out;
@@ -419,46 +428,114 @@ static int s5l8702_aes_decrypt(struct skcipher_request *req)
 	return s5l8702_aes_crypt(req, false);
 }
 
-static struct skcipher_alg s5l8702_aes_alg_ecb = {
-	.base = {
-		.cra_name			= "ecb(aes)",
-		.cra_driver_name	= DRV_NAME "-ecb",
-		.cra_priority		= 300,
-		.cra_flags			= 0,
-		.cra_blocksize		= AES_BLOCK_SIZE,
-		.cra_ctxsize		= sizeof(struct s5l8702_aes_ctx),
-		.cra_alignmask		= GENMASK(1, 0),
-		.cra_module			= THIS_MODULE,
+static struct skcipher_alg s5l8702_aes_algs[] = {
+	{
+		.base = {
+			.cra_name			= "ecb(aes)",
+			.cra_driver_name	= DRV_NAME "-ecb",
+			.cra_priority		= 300,
+			.cra_flags			= 0,
+			.cra_blocksize		= AES_BLOCK_SIZE,
+			.cra_ctxsize		= sizeof(struct s5l8702_aes_ctx),
+			.cra_alignmask		= GENMASK(1, 0),
+			.cra_module			= THIS_MODULE,
+		},
+		.init			= s5l8702_aes_init_ecb,
+		.exit			= s5l8702_aes_exit,
+		.setkey			= s5l8702_aes_setkey,
+		.encrypt		= s5l8702_aes_encrypt,
+		.decrypt		= s5l8702_aes_decrypt,
+		.min_keysize	= AES_MIN_KEY_SIZE,
+		.max_keysize	= AES_MAX_KEY_SIZE,
 	},
-	.init			= s5l8702_aes_init_ecb,
-	.exit			= s5l8702_aes_exit,
-	.setkey			= s5l8702_aes_setkey,
-	.encrypt		= s5l8702_aes_encrypt,
-	.decrypt		= s5l8702_aes_decrypt,
-	.min_keysize	= AES_MIN_KEY_SIZE,
-	.max_keysize	= AES_MAX_KEY_SIZE,
+	{
+		.base = {
+			.cra_name			= "cbc(aes)",
+			.cra_driver_name	= DRV_NAME "-cbc",
+			.cra_priority		= 300,
+			.cra_flags			= 0,
+			.cra_blocksize		= AES_BLOCK_SIZE,
+			.cra_ctxsize		= sizeof(struct s5l8702_aes_ctx),
+			.cra_alignmask		= GENMASK(1, 0),
+			.cra_module			= THIS_MODULE,
+		},
+		.init			= s5l8702_aes_init_cbc,
+		.exit			= s5l8702_aes_exit,
+		.setkey			= s5l8702_aes_setkey,
+		.encrypt		= s5l8702_aes_encrypt,
+		.decrypt		= s5l8702_aes_decrypt,
+		.min_keysize	= AES_MIN_KEY_SIZE,
+		.max_keysize	= AES_MAX_KEY_SIZE,
+		.ivsize			= AES_BLOCK_SIZE,
+	},
+	{
+		.base = {
+			.cra_name			= "cbc(aes-gid)",
+			.cra_driver_name	= DRV_NAME "-cbc-gid",
+			.cra_priority		= 300,
+			.cra_flags			= 0,
+			.cra_blocksize		= AES_BLOCK_SIZE,
+			.cra_ctxsize		= sizeof(struct s5l8702_aes_ctx),
+			.cra_alignmask		= GENMASK(1, 0),
+			.cra_module			= THIS_MODULE,
+		},
+		.init			= s5l8702_aes_init_cbc_gid,
+		.exit			= s5l8702_aes_exit,
+		.setkey			= s5l8702_aes_setkey,
+		.encrypt		= s5l8702_aes_encrypt,
+		.decrypt		= s5l8702_aes_decrypt,
+		.min_keysize	= AES_MIN_KEY_SIZE,
+		.max_keysize	= AES_MAX_KEY_SIZE,
+		.ivsize			= AES_BLOCK_SIZE,
+	},
+	{
+		.base = {
+			.cra_name			= "cbc(aes-uid)",
+			.cra_driver_name	= DRV_NAME "-cbc-uid",
+			.cra_priority		= 300,
+			.cra_flags			= 0,
+			.cra_blocksize		= AES_BLOCK_SIZE,
+			.cra_ctxsize		= sizeof(struct s5l8702_aes_ctx),
+			.cra_alignmask		= GENMASK(1, 0),
+			.cra_module			= THIS_MODULE,
+		},
+		.init			= s5l8702_aes_init_cbc_uid,
+		.exit			= s5l8702_aes_exit,
+		.setkey			= s5l8702_aes_setkey,
+		.encrypt		= s5l8702_aes_encrypt,
+		.decrypt		= s5l8702_aes_decrypt,
+		.min_keysize	= AES_MIN_KEY_SIZE,
+		.max_keysize	= AES_MAX_KEY_SIZE,
+		.ivsize			= AES_BLOCK_SIZE,
+	},
 };
 
-static struct skcipher_alg s5l8702_aes_alg_cbc = {
-	.base = {
-		.cra_name			= "cbc(aes)",
-		.cra_driver_name	= DRV_NAME "-cbc",
-		.cra_priority		= 300,
-		.cra_flags			= 0,
-		.cra_blocksize		= AES_BLOCK_SIZE,
-		.cra_ctxsize		= sizeof(struct s5l8702_aes_ctx),
-		.cra_alignmask		= GENMASK(1, 0),
-		.cra_module			= THIS_MODULE,
-	},
-	.init			= s5l8702_aes_init_cbc,
-	.exit			= s5l8702_aes_exit,
-	.setkey			= s5l8702_aes_setkey,
-	.encrypt		= s5l8702_aes_encrypt,
-	.decrypt		= s5l8702_aes_decrypt,
-	.min_keysize	= AES_MIN_KEY_SIZE,
-	.max_keysize	= AES_MAX_KEY_SIZE,
-	.ivsize			= AES_BLOCK_SIZE,
-};
+static int s5l8702_aes_register_algs(void)
+{
+	int err, i, j;
+
+	for (i = 0; i < ARRAY_SIZE(s5l8702_aes_algs); i++) {
+		err = crypto_register_skcipher(&s5l8702_aes_algs[i]);
+		if (err)
+			goto err_aes_algs;
+	}
+
+	return 0;
+
+	err_aes_algs:
+		for (j = 0; j < i; j++)
+			crypto_unregister_skcipher(&s5l8702_aes_algs[j]);
+
+	return err;
+}
+
+static void s5l8702_aes_unregister_algs(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(s5l8702_aes_algs); i++)
+		crypto_unregister_skcipher(&s5l8702_aes_algs[i]);
+}
 
 static int s5l8702_aes_probe(struct platform_device *pdev)
 {
@@ -494,15 +571,9 @@ static int s5l8702_aes_probe(struct platform_device *pdev)
 		return PTR_ERR(aes_dev->clk);
 	}
 
-	ret = crypto_register_skcipher(&s5l8702_aes_alg_ecb);
+	ret = s5l8702_aes_register_algs();
 	if (ret)
 		return ret;
-
-	ret = crypto_register_skcipher(&s5l8702_aes_alg_cbc);
-	if (ret) {
-		crypto_unregister_skcipher(&s5l8702_aes_alg_ecb);
-		return ret;
-	}
 
 	aes_dev_global = aes_dev;
 	platform_set_drvdata(pdev, aes_dev);
@@ -520,8 +591,7 @@ static void s5l8702_aes_remove(struct platform_device *pdev)
 		aes_dev_global = NULL;
 	}
 
-	crypto_unregister_skcipher(&s5l8702_aes_alg_ecb);
-	crypto_unregister_skcipher(&s5l8702_aes_alg_cbc);
+	s5l8702_aes_unregister_algs();
 }
 
 #ifdef CONFIG_OF
