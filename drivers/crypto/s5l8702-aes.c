@@ -162,6 +162,14 @@ static inline int s5l8702_aes_write_key(struct s5l8702_aes_dev *aes_dev, const u
 	return 0;
 }
 
+static inline void s5l8702_aes_read_iv(struct s5l8702_aes_dev *aes_dev, void *iv)
+{
+	put_unaligned_le32(s5l8702_aes_readl(aes_dev, S5L8702_AES_IV_1), iv);
+	put_unaligned_le32(s5l8702_aes_readl(aes_dev, S5L8702_AES_IV_2), iv + sizeof(u32));
+	put_unaligned_le32(s5l8702_aes_readl(aes_dev, S5L8702_AES_IV_3), iv + sizeof(u32) * 2);
+	put_unaligned_le32(s5l8702_aes_readl(aes_dev, S5L8702_AES_IV_4), iv + sizeof(u32) * 3);
+}
+
 static inline void s5l8702_aes_write_iv(struct s5l8702_aes_dev *aes_dev, const void *iv)
 {
 	s5l8702_aes_writel(aes_dev, S5L8702_AES_IV_1, get_unaligned_le32(iv));
@@ -343,13 +351,20 @@ static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 
 		// map addresses
 		src = dma_map_single(dev, walk.src.virt.addr, chunk_len, DMA_TO_DEVICE);
+		if (dma_mapping_error(dev, src)) {
+			ret = -ENOMEM;
+			goto out;
+		}
+
 		dst = dma_map_single(dev, walk.dst.virt.addr, chunk_len, DMA_FROM_DEVICE);
+		if (dma_mapping_error(dev, dst)) {
+			dma_unmap_single(dev, src, chunk_len, DMA_TO_DEVICE);
+			ret = -ENOMEM;
+			goto out;
+		}
 
 		// set src/dst buffer addresses and size
 		s5l8702_aes_write_buf(aes_dev, src, dst, chunk_len);
-
-		// sync cache to memory
-		dma_sync_single_for_device(dev, src, chunk_len, DMA_TO_DEVICE);
 
 		// go!
 		s5l8702_aes_writel(aes_dev, S5L8702_AES_COMMAND, S5L8702_AES_CMD_START);
@@ -359,21 +374,26 @@ static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 					 irq & S5L8702_AES_IRQ_ALL, 2, S5L8702_AES_POLL_TIMEOUT_US);
 		if (ret) {
 			dev_err(dev, "AES timed out (IRQ=0x%08x)\n", irq);
+
+			dma_unmap_single(dev, src, chunk_len, DMA_TO_DEVICE);
+			dma_unmap_single(dev, dst, chunk_len, DMA_FROM_DEVICE);
+
 			goto out;
 		}
 
 		// clear all pending IRQs
 		s5l8702_aes_writel(aes_dev, S5L8702_AES_IRQ, S5L8702_AES_IRQ_ALL);
 
-		// sync memory to cache
-		dma_sync_single_for_cpu(dev, dst, chunk_len, DMA_FROM_DEVICE);
-
 		// unmap addresses
 		dma_unmap_single(dev, src, chunk_len, DMA_TO_DEVICE);
 		dma_unmap_single(dev, dst, chunk_len, DMA_FROM_DEVICE);
 
+		// update IV
+		if (ctx->cbc)
+			s5l8702_aes_read_iv(aes_dev, walk.iv);
+
 		// update remaining bytes and process next chunk
-		ret = skcipher_walk_done(&walk, walk.nbytes % AES_BLOCK_SIZE);
+		ret = skcipher_walk_done(&walk, walk.nbytes - chunk_len);
 		if (ret)
 			goto out;
 	}
