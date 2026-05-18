@@ -484,60 +484,6 @@ fail:
 	return -ENOMEM;
 }
 
-/*
- * On cores that drive GINTSTS.IEPInt off DIEPMSK alone, ignoring both
- * DAINTMSK and DIEPEMPMSK (s5l8702), level-sensitive TXFEMP storms
- * whenever any IN endpoint's TX FIFO is empty and DIEPMSK[7] is set.
- * The driver normally relies on DIEPMSK[7] (gated by DIEPEMPMSK) to
- * trigger trytx() refills for multi-packet IN transfers; on this core
- * we instead toggle DIEPMSK[7] itself based on whether any IN EP has
- * bytes left to push. DIEPEMPMSK is also kept in sync per-EP so the
- * read_ep_interrupts mask path still routes TXFEMP into trytx when it
- * is genuinely needed.
- */
-static void dwc2_hsotg_set_diepempmsk(struct dwc2_hsotg *hsotg,
-				      struct dwc2_hsotg_ep *hs_ep)
-{
-	struct dwc2_hsotg_req *hs_req = hs_ep->req;
-	u32 emp, msk, msk_old, bit = BIT(hs_ep->index);
-	bool need;
-	bool any = false;
-	int i;
-
-	if (!hsotg->params.iepint_unmasked_quirk)
-		return;
-	if (!hs_ep->dir_in || using_dma(hsotg))
-		return;
-
-	need = hs_req && hs_req->req.actual < hs_req->req.length;
-
-	emp = dwc2_readl(hsotg, DIEPEMPMSK);
-	if (need)
-		emp |= bit;
-	else
-		emp &= ~bit;
-	dwc2_writel(hsotg, emp, DIEPEMPMSK);
-
-	for (i = 0; i < hsotg->num_of_eps; i++) {
-		struct dwc2_hsotg_ep *e = hsotg->eps_in[i];
-		struct dwc2_hsotg_req *r = e ? e->req : NULL;
-
-		if (r && r->req.actual < r->req.length) {
-			any = true;
-			break;
-		}
-	}
-
-	msk_old = dwc2_readl(hsotg, DIEPMSK);
-	msk = msk_old;
-	if (any)
-		msk |= DIEPMSK_TXFIFOEMPTY | DIEPMSK_INTKNTXFEMPMSK;
-	else
-		msk &= ~(DIEPMSK_TXFIFOEMPTY | DIEPMSK_INTKNTXFEMPMSK);
-	if (msk != msk_old)
-		dwc2_writel(hsotg, msk, DIEPMSK);
-}
-
 /**
  * dwc2_hsotg_write_fifo - write packet Data to the TxFIFO
  * @hsotg: The controller state.
@@ -1282,7 +1228,6 @@ static void dwc2_hsotg_start_req(struct dwc2_hsotg *hsotg,
 		hs_ep->fifo_load = 0;
 
 		dwc2_hsotg_write_fifo(hsotg, hs_ep, hs_req);
-		dwc2_hsotg_set_diepempmsk(hsotg, hs_ep);
 	}
 
 	/*
@@ -2549,7 +2494,6 @@ static void dwc2_hsotg_handle_rx(struct dwc2_hsotg *hsotg)
 	dev_dbg(hsotg->dev, "%s: GRXSTSP=0x%08x (%d@%d)\n",
 		__func__, grxstsr, size, epnum);
 
-
 	switch ((status & GRXSTS_PKTSTS_MASK) >> GRXSTS_PKTSTS_SHIFT) {
 	case GRXSTS_PKTSTS_GLOBALOUTNAK:
 		dev_dbg(hsotg->dev, "GLOBALOUTNAK\n");
@@ -2718,7 +2662,6 @@ static int dwc2_hsotg_trytx(struct dwc2_hsotg *hsotg,
 		if (hs_ep->index != 0)
 			dwc2_hsotg_ctrl_epint(hsotg, hs_ep->index,
 					      hs_ep->dir_in, 0);
-		dwc2_hsotg_set_diepempmsk(hsotg, hs_ep);
 		return 0;
 	}
 
@@ -2728,11 +2671,9 @@ static int dwc2_hsotg_trytx(struct dwc2_hsotg *hsotg,
 		dev_dbg(hsotg->dev, "trying to write more for ep%d\n",
 			hs_ep->index);
 		ret = dwc2_hsotg_write_fifo(hsotg, hs_ep, hs_req);
-		dwc2_hsotg_set_diepempmsk(hsotg, hs_ep);
 		return ret;
 	}
 
-	dwc2_hsotg_set_diepempmsk(hsotg, hs_ep);
 	return 0;
 }
 
@@ -2840,7 +2781,6 @@ static void dwc2_hsotg_complete_in(struct dwc2_hsotg *hsotg,
 	}
 
 	dwc2_hsotg_complete_request(hsotg, hs_ep, hs_req, 0);
-	dwc2_hsotg_set_diepempmsk(hsotg, hs_ep);
 }
 
 /**
@@ -3437,6 +3377,30 @@ static void dwc2_hsotg_irq_fifoempty(struct dwc2_hsotg *hsotg, bool periodic)
 			GINTSTS_RXFLVL)
 
 static int dwc2_hsotg_ep_disable(struct usb_ep *ep);
+
+/*
+ * Unmask the device-side bits in GINTMSK that session_valid_gintmsk_quirk
+ * defers until a session is valid. Called from the OTG interrupt path
+ * (SessReqInt / ConIDStsChng in device mode) on cores where the surrounding
+ * state machine - not the DWC2 core itself - gates session validity.
+ * Idempotent and a no-op when the quirk is not in use.
+ */
+void dwc2_hsotg_unmask_session_valid_intmsk(struct dwc2_hsotg *hsotg)
+{
+	u32 mask;
+
+	if (!hsotg->params.session_valid_gintmsk_quirk)
+		return;
+	if (!dwc2_is_device_mode(hsotg))
+		return;
+
+	mask = dwc2_readl(hsotg, GINTMSK);
+	mask |= GINTSTS_ERLYSUSP | GINTSTS_USBRST | GINTSTS_RESETDET |
+		GINTSTS_ENUMDONE | GINTSTS_USBSUSP | GINTSTS_WKUPINT |
+		GINTSTS_LPMTRANRCVD | GINTSTS_OEPINT | GINTSTS_IEPINT;
+	dwc2_writel(hsotg, mask, GINTMSK);
+}
+
 /**
  * dwc2_hsotg_core_init_disconnected - issue softreset to the core
  * @hsotg: The device state
@@ -3519,12 +3483,24 @@ void dwc2_hsotg_core_init_disconnected(struct dwc2_hsotg *hsotg,
 
 	/* Clear any pending interrupts */
 	dwc2_writel(hsotg, 0xffffffff, GINTSTS);
-	intmsk = GINTSTS_ERLYSUSP | GINTSTS_SESSREQINT |
-		GINTSTS_GOUTNAKEFF | GINTSTS_GINNAKEFF |
-		GINTSTS_USBRST | GINTSTS_RESETDET |
-		GINTSTS_ENUMDONE | GINTSTS_OTGINT |
-		GINTSTS_USBSUSP | GINTSTS_WKUPINT |
-		GINTSTS_LPMTRANRCVD;
+	intmsk = GINTSTS_SESSREQINT | GINTSTS_GOUTNAKEFF |
+		GINTSTS_GINNAKEFF | GINTSTS_OTGINT;
+
+	/*
+	 * S5L8702: keep device-side bits masked until session-valid is
+	 * reached, then unmasked via dwc2_hsotg_unmask_session_valid_intmsk()
+	 * from the SessReqInt path. Two cases let us include them up-front:
+	 *   - is_usb_reset: the bus reset itself proves session-valid.
+	 *   - GOTGCTL.BSESVLD already set: a session existed before we got
+	 *     here (e.g. cable plugged at boot, before SessReqInt would have
+	 *     fired) - no edge will arrive to do the unmask later.
+	 */
+	if (!hsotg->params.session_valid_gintmsk_quirk || is_usb_reset ||
+	    (dwc2_readl(hsotg, GOTGCTL) & GOTGCTL_BSESVLD))
+		intmsk |= GINTSTS_ERLYSUSP | GINTSTS_USBRST |
+			  GINTSTS_RESETDET | GINTSTS_ENUMDONE |
+			  GINTSTS_USBSUSP | GINTSTS_WKUPINT |
+			  GINTSTS_LPMTRANRCVD;
 
 	if (!using_desc_dma(hsotg))
 		intmsk |= GINTSTS_INCOMPL_SOIN | GINTSTS_INCOMPL_SOOUT;
@@ -3556,8 +3532,7 @@ void dwc2_hsotg_core_init_disconnected(struct dwc2_hsotg *hsotg,
 	 * interrupts.
 	 */
 
-	dwc2_writel(hsotg, ((hsotg->dedicated_fifos && !using_dma(hsotg) &&
-		!hsotg->params.iepint_unmasked_quirk) ?
+	dwc2_writel(hsotg, ((hsotg->dedicated_fifos && !using_dma(hsotg)) ?
 		DIEPMSK_TXFIFOEMPTY | DIEPMSK_INTKNTXFEMPMSK : 0) |
 		DIEPMSK_EPDISBLDMSK | DIEPMSK_XFERCOMPLMSK |
 		DIEPMSK_TIMEOUTMSK | DIEPMSK_AHBERRMSK,
@@ -3590,7 +3565,9 @@ void dwc2_hsotg_core_init_disconnected(struct dwc2_hsotg *hsotg,
 		dwc2_readl(hsotg, DOEPCTL0));
 
 	/* enable in and out endpoint interrupts */
-	dwc2_hsotg_en_gsint(hsotg, GINTSTS_OEPINT | GINTSTS_IEPINT);
+	if (!hsotg->params.session_valid_gintmsk_quirk || is_usb_reset ||
+	    (dwc2_readl(hsotg, GOTGCTL) & GOTGCTL_BSESVLD))
+		dwc2_hsotg_en_gsint(hsotg, GINTSTS_OEPINT | GINTSTS_IEPINT);
 
 	/*
 	 * Enable the RXFIFO when in slave mode, as this is how we collect
@@ -3857,44 +3834,6 @@ irq_retry:
 				dwc2_hsotg_epint(hsotg, ep, 1);
 		}
 
-		/*
-		 * On cores whose IEPInt/OEPInt summary ignores DAINTMSK,
-		 * an EP can raise GINTSTS.IEPInt/OEPInt while its DAINTMSK
-		 * bit is momentarily clear (e.g. between IN requests, when
-		 * dwc2_hsotg_trytx has masked the EP and a host IN token
-		 * sets INTknTXFEmpty/NAKIntrpt, or racing the re-enable in
-		 * dwc2_hsotg_start_req against a real XferCompl). The
-		 * masked iteration above misses these and the IRQ refires
-		 * forever. For EPs the gadget has actually enabled
-		 * (USBACTEP), dispatch through the normal handler so real
-		 * completions aren't dropped; for genuinely inactive EPs
-		 * (e.g. stale bits at probe time), just clear the latches.
-		 */
-		if (hsotg->params.iepint_unmasked_quirk) {
-			u32 raw = dwc2_readl(hsotg, DAINT);
-			u32 extra = raw & ~daintmsk;
-			u32 extra_in  = extra & ((1U << DAINT_OUTEP_SHIFT) - 1);
-			u32 extra_out = extra >> DAINT_OUTEP_SHIFT;
-
-			for (ep = 0; ep < hsotg->num_of_eps && extra_in;
-					ep++, extra_in >>= 1) {
-				if (!(extra_in & 1))
-					continue;
-				if (dwc2_readl(hsotg, DIEPCTL(ep)) & DXEPCTL_USBACTEP)
-					dwc2_hsotg_epint(hsotg, ep, 1);
-				else
-					dwc2_writel(hsotg, ~0U, DIEPINT(ep));
-			}
-			for (ep = 0; ep < hsotg->num_of_eps && extra_out;
-					ep++, extra_out >>= 1) {
-				if (!(extra_out & 1))
-					continue;
-				if (dwc2_readl(hsotg, DOEPCTL(ep)) & DXEPCTL_USBACTEP)
-					dwc2_hsotg_epint(hsotg, ep, 0);
-				else
-					dwc2_writel(hsotg, ~0U, DOEPINT(ep));
-			}
-		}
 	}
 
 	/* check both FIFOs */

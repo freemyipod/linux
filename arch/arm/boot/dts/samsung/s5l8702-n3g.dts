@@ -98,8 +98,8 @@
 			phy-names = "usb2-phy";
 			clocks = <&clkref>;
 			clock-names = "otg";
-			g-rx-fifo-size = <256>;
-			g-np-tx-fifo-size = <32>;
+			g-rx-fifo-size = <536>;
+			g-np-tx-fifo-size = <256>;
 			g-tx-fifo-size = <256 256 512 512 512 768 768>;
 			dr_mode = "peripheral";
 			status = "okay";
