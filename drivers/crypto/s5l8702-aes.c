@@ -15,6 +15,7 @@
 
 #include <crypto/aes.h>
 #include <crypto/internal/skcipher.h>
+#include <crypto/scatterwalk.h>
 #include <crypto/skcipher.h>
 
 #define DRV_NAME "s5l8702-aes"
@@ -69,6 +70,9 @@
 #define S5L8702_AES_CMD_ABORT		2
 #define S5L8702_AES_CMD_CONTINUE	3
 
+#define S5L8702_AES_CFG_KEYSIZE	GENMASK(5, 4)
+#define S5L8702_AES_CFG_PAUSE	GENMASK(2, 1)
+
 #define S5L8702_AES_IRQ_ALL	GENMASK(3, 0)
 
 #define S5L8702_AES_POLL_TIMEOUT_US 500000
@@ -78,8 +82,6 @@ struct s5l8702_aes_dev {
 	void __iomem *regs;
 	struct clk *clk;
 	struct mutex lock;
-	void *buf;
-	dma_addr_t phys;
 };
 
 struct s5l8702_aes_ctx {
@@ -160,17 +162,25 @@ static inline int s5l8702_aes_write_key(struct s5l8702_aes_dev *aes_dev, const u
 	return 0;
 }
 
-static inline void s5l8702_aes_write_buf(struct s5l8702_aes_dev *aes_dev, u32 start, u32 size)
+static inline void s5l8702_aes_write_iv(struct s5l8702_aes_dev *aes_dev, const void *iv)
+{
+	s5l8702_aes_writel(aes_dev, S5L8702_AES_IV_1, get_unaligned_le32(iv));
+	s5l8702_aes_writel(aes_dev, S5L8702_AES_IV_2, get_unaligned_le32(iv + sizeof(u32)));
+	s5l8702_aes_writel(aes_dev, S5L8702_AES_IV_3, get_unaligned_le32(iv + sizeof(u32) * 2));
+	s5l8702_aes_writel(aes_dev, S5L8702_AES_IV_4, get_unaligned_le32(iv + sizeof(u32) * 3));
+}
+
+static inline void s5l8702_aes_write_buf(struct s5l8702_aes_dev *aes_dev, u32 src_start, u32 dst_start, u32 size)
 {
 	s5l8702_aes_writel(aes_dev, S5L8702_AES_XFR_NUM, size);
 
-	s5l8702_aes_writel(aes_dev, S5L8702_AES_TBUF_START, start);
+	s5l8702_aes_writel(aes_dev, S5L8702_AES_TBUF_START, dst_start);
 	s5l8702_aes_writel(aes_dev, S5L8702_AES_TBUF_SIZE, size);
 
-	s5l8702_aes_writel(aes_dev, S5L8702_AES_SBUF_START, start);
+	s5l8702_aes_writel(aes_dev, S5L8702_AES_SBUF_START, src_start);
 	s5l8702_aes_writel(aes_dev, S5L8702_AES_SBUF_SIZE, size);
 
-	s5l8702_aes_writel(aes_dev, S5L8702_AES_CRYPT_START, start);
+	s5l8702_aes_writel(aes_dev, S5L8702_AES_CRYPT_START, src_start);
 	s5l8702_aes_writel(aes_dev, S5L8702_AES_CRYPT_SIZE, size);
 }
 
@@ -198,6 +208,13 @@ static int s5l8702_aes_init_cbc(struct crypto_skcipher *tfm)
 	return s5l8702_aes_init(tfm, true);
 }
 
+static void s5l8702_aes_exit(struct crypto_skcipher *tfm)
+{
+	struct s5l8702_aes_ctx *ctx = crypto_skcipher_ctx(tfm);
+
+	memzero_explicit(ctx->key, sizeof(ctx->key));
+}
+
 static int s5l8702_aes_setkey(struct crypto_skcipher *tfm, const u8 *key, unsigned int keylen)
 {
 	struct s5l8702_aes_ctx *ctx = crypto_skcipher_ctx(tfm);
@@ -216,25 +233,19 @@ static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 	struct s5l8702_aes_ctx *ctx = crypto_skcipher_ctx(tfm);
 	struct s5l8702_aes_dev *aes_dev = ctx->aes_dev;
 	struct device *dev = aes_dev->dev;
-	void *addr = sg_virt(req->src);
-	u32 len = req->cryptlen;
+	struct skcipher_walk walk;
 	void *key = ctx->key;
 	u32 key_len = ctx->keylen;
 	u32 key_type, compliment;
 	u32 cfg, irq;
 	int ret;
 
-	if (len == 0 || len % AES_BLOCK_SIZE)
-		return -EINVAL;
-
-	if (sg_nents(req->src) != 1 || sg_nents(req->dst) != 1)
-		return -EINVAL;
-
 	if (ctx->cbc && !req->iv)
 		return -EINVAL;
 
-	if (len > PAGE_SIZE)
-		return -EINVAL;
+	ret = skcipher_walk_virt(&walk, req, false);
+	if (ret)
+		return ret;
 
 	mutex_lock(&aes_dev->lock);
 
@@ -286,7 +297,7 @@ static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 	}
 
 	// pause engine
-	cfg |= GENMASK(2, 1);
+	cfg |= S5L8702_AES_CFG_PAUSE;
 
 	// chaining mode
 	if (ctx->cbc) {
@@ -299,17 +310,17 @@ static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 	}
 
 	// key size
-	cfg &= ~GENMASK(5, 4);
+	cfg &= ~S5L8702_AES_CFG_KEYSIZE;
 
 	switch (key_len) {
 		case AES_KEYSIZE_128:
-			cfg |= S5L8702_AES_KEY_SIZE_128 << 4;
+			cfg |= FIELD_PREP(S5L8702_AES_CFG_KEYSIZE, S5L8702_AES_KEY_SIZE_128);
 			break;
 		case AES_KEYSIZE_192:
-			cfg |= S5L8702_AES_KEY_SIZE_192 << 4;
+			cfg |= FIELD_PREP(S5L8702_AES_CFG_KEYSIZE, S5L8702_AES_KEY_SIZE_192);
 			break;
 		case AES_KEYSIZE_256:
-			cfg |= S5L8702_AES_KEY_SIZE_256 << 4;
+			cfg |= FIELD_PREP(S5L8702_AES_CFG_KEYSIZE, S5L8702_AES_KEY_SIZE_256);
 			break;
 		default:
 			dev_err(dev, "Invalid key length: %u\n", key_len);
@@ -319,38 +330,54 @@ static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 
 	s5l8702_aes_writel(aes_dev, S5L8702_AES_CFG, cfg);
 
-	// set IV for CBC
-	if (ctx->cbc) {
-		if (!req->iv) {
-			dev_err(dev, "Received NULL pointer for CBC IV");
-			ret = -EINVAL;
+	while (walk.nbytes > 0) {
+		dma_addr_t src, dst;
+		unsigned int chunk_len = round_down(walk.nbytes, AES_BLOCK_SIZE);
+
+		if (chunk_len == 0)
+			break;
+
+		// set IV for CBC
+		if (ctx->cbc)
+			s5l8702_aes_write_iv(aes_dev, walk.iv);
+
+		// map addresses
+		src = dma_map_single(dev, walk.src.virt.addr, chunk_len, DMA_TO_DEVICE);
+		dst = dma_map_single(dev, walk.dst.virt.addr, chunk_len, DMA_FROM_DEVICE);
+
+		// set src/dst buffer addresses and size
+		s5l8702_aes_write_buf(aes_dev, src, dst, chunk_len);
+
+		// sync cache to memory
+		dma_sync_single_for_device(dev, src, chunk_len, DMA_TO_DEVICE);
+
+		// go!
+		s5l8702_aes_writel(aes_dev, S5L8702_AES_COMMAND, S5L8702_AES_CMD_START);
+
+		// wait for completion
+		ret = readl_poll_timeout(aes_dev->regs + S5L8702_AES_IRQ, irq,
+					 irq & S5L8702_AES_IRQ_ALL, 2, S5L8702_AES_POLL_TIMEOUT_US);
+		if (ret) {
+			dev_err(dev, "AES timed out (IRQ=0x%08x)\n", irq);
 			goto out;
 		}
 
-		s5l8702_aes_writel(aes_dev, S5L8702_AES_IV_1, get_unaligned_le32(req->iv));
-		s5l8702_aes_writel(aes_dev, S5L8702_AES_IV_2, get_unaligned_le32(req->iv + sizeof(u32)));
-		s5l8702_aes_writel(aes_dev, S5L8702_AES_IV_3, get_unaligned_le32(req->iv + sizeof(u32) * 2));
-		s5l8702_aes_writel(aes_dev, S5L8702_AES_IV_4, get_unaligned_le32(req->iv + sizeof(u32) * 3));
+		// clear all pending IRQs
+		s5l8702_aes_writel(aes_dev, S5L8702_AES_IRQ, S5L8702_AES_IRQ_ALL);
+
+		// sync memory to cache
+		dma_sync_single_for_cpu(dev, dst, chunk_len, DMA_FROM_DEVICE);
+
+		// unmap addresses
+		dma_unmap_single(dev, src, chunk_len, DMA_TO_DEVICE);
+		dma_unmap_single(dev, dst, chunk_len, DMA_FROM_DEVICE);
+
+		// update remaining bytes and process next chunk
+		ret = skcipher_walk_done(&walk, walk.nbytes % AES_BLOCK_SIZE);
+		if (ret)
+			goto out;
 	}
 
-	// set buffer address and size
-	memcpy(aes_dev->buf, addr, len);
-	s5l8702_aes_write_buf(aes_dev, aes_dev->phys, len);
-
-	// go!
-	s5l8702_aes_writel(aes_dev, S5L8702_AES_COMMAND, S5L8702_AES_CMD_START);
-
-	// wait for completion
-	ret = readl_poll_timeout(aes_dev->regs + S5L8702_AES_IRQ, irq,
-					irq & S5L8702_AES_IRQ_ALL, 2, S5L8702_AES_POLL_TIMEOUT_US);
-
-	if (ret) {
-		dev_err(dev, "AES timed out (IRQ=0x%08x)\n", irq);
-		goto out;
-	}
-
-	// copy output
-	memcpy(sg_virt(req->dst), aes_dev->buf, len);
 	ret = 0;
 
 out:
@@ -378,11 +405,13 @@ static struct skcipher_alg s5l8702_aes_alg_ecb = {
 		.cra_driver_name	= DRV_NAME "-ecb",
 		.cra_priority		= 300,
 		.cra_flags			= 0,
-		.cra_blocksize		= 16,
+		.cra_blocksize		= AES_BLOCK_SIZE,
 		.cra_ctxsize		= sizeof(struct s5l8702_aes_ctx),
+		.cra_alignmask		= GENMASK(1, 0),
 		.cra_module			= THIS_MODULE,
 	},
 	.init			= s5l8702_aes_init_ecb,
+	.exit			= s5l8702_aes_exit,
 	.setkey			= s5l8702_aes_setkey,
 	.encrypt		= s5l8702_aes_encrypt,
 	.decrypt		= s5l8702_aes_decrypt,
@@ -396,11 +425,13 @@ static struct skcipher_alg s5l8702_aes_alg_cbc = {
 		.cra_driver_name	= DRV_NAME "-cbc",
 		.cra_priority		= 300,
 		.cra_flags			= 0,
-		.cra_blocksize		= 16,
+		.cra_blocksize		= AES_BLOCK_SIZE,
 		.cra_ctxsize		= sizeof(struct s5l8702_aes_ctx),
+		.cra_alignmask		= GENMASK(1, 0),
 		.cra_module			= THIS_MODULE,
 	},
 	.init			= s5l8702_aes_init_cbc,
+	.exit			= s5l8702_aes_exit,
 	.setkey			= s5l8702_aes_setkey,
 	.encrypt		= s5l8702_aes_encrypt,
 	.decrypt		= s5l8702_aes_decrypt,
@@ -430,10 +461,6 @@ static int s5l8702_aes_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	aes_dev->buf = dma_alloc_coherent(dev, PAGE_SIZE, &aes_dev->phys, GFP_KERNEL);
-	if (!aes_dev->buf)
-		return -ENOMEM;
-
 	aes_dev->dev = dev;
 	mutex_init(&aes_dev->lock);
 
@@ -452,8 +479,10 @@ static int s5l8702_aes_probe(struct platform_device *pdev)
 		return ret;
 
 	ret = crypto_register_skcipher(&s5l8702_aes_alg_cbc);
-	if (ret)
+	if (ret) {
+		crypto_unregister_skcipher(&s5l8702_aes_alg_ecb);
 		return ret;
+	}
 
 	aes_dev_global = aes_dev;
 	platform_set_drvdata(pdev, aes_dev);
@@ -470,8 +499,6 @@ static void s5l8702_aes_remove(struct platform_device *pdev)
 	if (aes_dev_global == aes_dev) {
 		aes_dev_global = NULL;
 	}
-
-	dma_free_coherent(aes_dev->dev, PAGE_SIZE, aes_dev->buf, aes_dev->phys);
 
 	crypto_unregister_skcipher(&s5l8702_aes_alg_ecb);
 	crypto_unregister_skcipher(&s5l8702_aes_alg_cbc);
