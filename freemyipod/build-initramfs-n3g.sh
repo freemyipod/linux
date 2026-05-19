@@ -80,6 +80,20 @@ echo "=== Building NAND helpers (readoob, dumpall) ==="
     -D_FILE_OFFSET_BITS=64 \
     -o "$FS/usr/sbin/dumpall" "$SCRIPT_DIR/dumpall.c"
 
+# nand-validate: jumps into the iPod's official disk-mode binary
+# (pre-decrypted, bundled at /etc/diskmode.bin below) and exercises the
+# in-firmware FTL against our kernel NAND driver via /dev/mtd1.
+"${CROSS}gcc" $ARCH_FLAGS -static -O2 -Wall \
+    -D_FILE_OFFSET_BITS=64 \
+    -o "$FS/usr/sbin/nand-validate" "$SCRIPT_DIR/nand-validate.c"
+
+# Bundle the pre-decrypted disk-mode image that nand-validate jumps into.
+# TODO: update the next line with an absolute path to your decrypted copy of disk mode
+DISKMODE_SRC=""
+if [[ -f "$DISKMODE_SRC" ]]; then
+    install -m 0644 "$DISKMODE_SRC" "$FS/etc/diskmode.bin"
+fi
+
 # /etc/inittab: spawn a root shell directly on the iPod's UART
 cat > "$FS/etc/inittab" <<'EOF'
 ::sysinit:/etc/init.d/rcS
