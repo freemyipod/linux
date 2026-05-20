@@ -2,7 +2,7 @@
 /*
  * Samsung/Apple S5L87XX SoC family machine descriptor
  *
- * Covers S5L8702 (ARM926EJ-S, iPod nano 3g) and
+ * Covers S5L8702 (ARM926EJ-S, iPod nano 3g / N46) and
  *        S5L8740 (Cortex-A5, iPod nano 7g)
  */
 
@@ -16,7 +16,7 @@
  * (used by the n31 / S5L8740) adds 0xE00000 + 3×0x100000 on top.
  * The matching virtual base lives at 0xF7000000 (S3C_VA_UART).
  *
- * CONFIG_DEBUG_S3C_UART carries the uart index (0 for n3g, 3 for n31).
+ * CONFIG_DEBUG_S3C_UART carries the uart index (0 for n3g / N46, 3 for n31).
  */
 #ifdef CONFIG_DEBUG_LL
 

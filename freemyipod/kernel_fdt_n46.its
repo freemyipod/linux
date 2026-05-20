@@ -1,7 +1,7 @@
 /dts-v1/;
 
 / {
-    description = "Linux kernel + FDT for iPod nano 3g (S5L8702)";
+    description = "Linux kernel + FDT for iPod nano 3g (N46, S5L8702)";
     #address-cells = <1>;
 
     images {
@@ -21,7 +21,7 @@
 
         fdt {
             description = "Flattened Device Tree blob";
-            data = /incbin/("s5l8702-n3g.dtb");
+            data = /incbin/("s5l8702-n46.dtb");
             type = "flat_dt";
             arch = "arm";
             compression = "none";

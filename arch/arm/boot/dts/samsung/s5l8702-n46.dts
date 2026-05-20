@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0+
 /*
- * Apple iPod nano 3rd generation (n3g)
+ * Apple iPod nano 3rd generation (N46)
  * SoC: Samsung/Apple S5L8702 (ARM926EJ-S)
  */
 /dts-v1/;
@@ -9,7 +9,7 @@
 	#address-cells = <1>;
 	#size-cells = <1>;
 	model = "Apple iPod nano (3rd generation)";
-	compatible = "apple,n3g", "samsung,s5l8702";
+	compatible = "apple,n46", "samsung,s5l8702";
 
 	aliases {
 		serial0 = &uart0;

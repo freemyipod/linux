@@ -172,7 +172,7 @@ static void nand_read_spare(uint8_t bank, uint32_t page, uint8_t* spare) {
 
 /* ---- FIL adapter functions (signatures unchanged from Pi version) ------ */
 
-/* 4-byte READID for the 4 GB n3g's Apple-spec'd Micron NAND part, per the
+/* 4-byte READID for the 4 GB n3g (N46)'s Apple-spec'd Micron NAND part, per the
  * comment in drivers/mtd/nand/raw/s5l8702_nand.c.  The original Pi tool
  * used 0xa5d5d589 which is the 8 GB variant; the fourth byte (geometry
  * hints) differs and makes the disk-mode firmware compute a wrong block

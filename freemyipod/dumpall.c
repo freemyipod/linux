@@ -2,7 +2,7 @@
  * dumpall - dump a range of NAND pages (data + OOB) via MTD ioctls.
  *
  * Each page is written as one record: <writesize bytes data><oobsize bytes OOB>
- * (so 2048 + 64 = 2112 bytes per page on the n3g).
+ * (so 2048 + 64 = 2112 bytes per page on the n3g / N46).
  *
  * Unlike busybox nanddump this doesn't trust struct mtd_info_user.size, so
  * it works on >= 4 GiB devices.

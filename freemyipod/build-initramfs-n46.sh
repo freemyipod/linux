@@ -1,7 +1,7 @@
 #!/bin/bash
-# Build a minimal ARMv5te initramfs for the iPod nano 3g (S5L8702 / ARM926EJ-S).
+# Build a minimal ARMv5te initramfs for the iPod nano 3g (N46, S5L8702 / ARM926EJ-S).
 # Requires: gcc-arm-linux-gnueabi, make, cpio, gzip
-# Output:   freemyipod/initramfs-n3g.cpio.gz  (relative to kernel tree root)
+# Output:   freemyipod/initramfs-n46.cpio.gz  (relative to kernel tree root)
 
 set -eEx
 
@@ -109,7 +109,7 @@ mount -t sysfs    sysfs    /sys
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 mkdir -p /dev/pts
 mount -t devpts devpts /dev/pts
-echo "iPod nano 3g — Linux $(uname -r)"
+echo "iPod nano 3g (N46) — Linux $(uname -r)"
 
 # Bring up USB gadget network. g_ether may take a moment to register usb0
 # after the host enumerates the device, so retry briefly.
@@ -134,7 +134,7 @@ EOF
 chmod +x "$FS/init"
 
 echo "=== Packing initramfs (via fakeroot for device nodes) ==="
-OUT="$SCRIPT_DIR/initramfs-n3g.cpio.gz"
+OUT="$SCRIPT_DIR/initramfs-n46.cpio.gz"
 fakeroot bash -c "
     mknod -m 600 '$FS/dev/console' c 5 1
     mknod -m 666 '$FS/dev/null'    c 1 3

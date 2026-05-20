@@ -6,12 +6,12 @@ config ARCH_S5L87XX
 if ARCH_S5L87XX
 
 config CPU_S5L8702
-	bool "Enable S5L8702 (iPod nano 3g) CPU support"
+	bool "Enable S5L8702 (iPod Nano 3rd Generation / N46) CPU support"
 	select ARCH_MULTI_V5
 	select ARM_VIC
 	help
 	  Enable support for the Samsung/Apple S5L8702 SoC (ARM926EJ-S),
-	  as found in the iPod nano 3rd generation.
+	  as found in the iPod Nano 3rd Generation (N46).
 
 config CPU_S5L8740
 	bool "Enable S5L8740 (iPod nano 7g) CPU support"
