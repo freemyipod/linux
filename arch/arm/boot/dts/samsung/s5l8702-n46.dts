@@ -139,6 +139,19 @@
 		 * the PWRCON0 clock-gate (0x3c500048) directly; those are
 		 * not modelled here yet.
 		 */
+		/*
+		 * LCD controller: custom 8080-series MPU interface block
+		 * driving an ILI93xx-family panel (auto-detected at probe).
+		 * Clock-gate lives in PWRCON0 bit 1 (0x3c500048); poked
+		 * directly by the driver until a clock controller is added.
+		 */
+		lcd: lcd@38300000 {
+			compatible = "apple,s5l8702-lcd";
+			reg = <0x38300000 0x100>;
+			pmu-i2c = <&i2c0>;
+			status = "okay";
+		};
+
 		nand: nand@38a00000 {
 			compatible = "apple,s5l8702-nand";
 			reg = <0x38a00000 0x400>;

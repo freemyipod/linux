@@ -80,6 +80,10 @@ echo "=== Building NAND helpers (readoob, dumpall) ==="
     -D_FILE_OFFSET_BITS=64 \
     -o "$FS/usr/sbin/dumpall" "$SCRIPT_DIR/dumpall.c"
 
+echo "=== Building fbclock (analog clock on /dev/fb0) ==="
+"${CROSS}gcc" $ARCH_FLAGS -static -O2 -Wall \
+    -o "$FS/usr/bin/fbclock" "$SCRIPT_DIR/fbclock.c"
+
 # nand-validate: jumps into the iPod's official disk-mode binary
 # (pre-decrypted, bundled at /etc/diskmode.bin below) and exercises the
 # in-firmware FTL against our kernel NAND driver via /dev/mtd1.
