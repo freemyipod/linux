@@ -1,0 +1,164 @@
+// SPDX-License-Identifier: GPL-2.0+
+/*
+ * Apple iPod nano 3rd generation (N46)
+ * SoC: Samsung/Apple S5L8702 (ARM926EJ-S)
+ */
+/dts-v1/;
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	model = "Apple iPod nano (3rd generation)";
+	compatible = "apple,n46", "samsung,s5l8702";
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		stdout-path = "serial0:57600n8";
+	};
+
+	/* Crystal reference: 12 MHz */
+	clkref: clock-ref {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <12000000>;
+		clock-output-names = "clkref";
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		cpu@0 {
+			device_type = "cpu";
+			compatible = "arm,arm926ej-s";
+			reg = <0>;
+		};
+	};
+
+	memory@8000000 {
+		device_type = "memory";
+		/* 32 MB SDRAM */
+		reg = <0x08000000 0x02000000>;
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		vic0: interrupt-controller@38e00000 {
+			compatible = "arm,pl192-vic";
+			interrupt-controller;
+			reg = <0x38e00000 0x1000>;
+			#interrupt-cells = <1>;
+		};
+
+		vic1: interrupt-controller@38e01000 {
+			compatible = "arm,pl192-vic";
+			interrupt-controller;
+			reg = <0x38e01000 0x1000>;
+			#interrupt-cells = <1>;
+		};
+
+		timer: timer@3c700000 {
+			compatible = "samsung,s5l8702-timer";
+			reg = <0x3c700000 0x20000>;
+			interrupt-parent = <&vic0>;
+			interrupts = <7>;
+		};
+
+		uart0: serial@3cc00000 {
+			compatible = "apple,s5l-uart";
+			reg = <0x3cc00000 0x4000>;
+			reg-io-width = <4>;
+			clocks = <&clkref>, <&clkref>;
+			clock-names = "uart", "clk_uart_baud0";
+			interrupt-parent = <&vic0>;
+			interrupts = <24>;
+			status = "okay";
+		};
+
+		usbphy: usbphy@3c400000 {
+			compatible = "apple,s5l8702-otgphy";
+			reg = <0x3c400000 0x200>;
+			status = "okay";
+			#phy-cells = <0>;
+		};
+
+		usbotg: usb@38400000 {
+			compatible = "apple,s5l87xx-usb";
+			reg = <0x38400000 0x40000>;
+			interrupt-parent = <&vic0>;
+			interrupts = <19>;
+			phys = <&usbphy>;
+			phy-names = "usb2-phy";
+			clocks = <&clkref>;
+			clock-names = "otg";
+			g-rx-fifo-size = <536>;
+			g-np-tx-fifo-size = <256>;
+			g-tx-fifo-size = <256 256 512 512 512 768 768>;
+			dr_mode = "peripheral";
+			status = "okay";
+		};
+
+		i2c0: i2c@3c600000 {
+			compatible = "samsung,s5l8702-i2c";
+			reg = <0x3c600000 0x100>;
+			clock-frequency = <100000>;
+			interrupt-parent = <&vic0>;
+			interrupts = <21>;
+			samsung,write-busy-poll;
+			status = "okay";
+		};
+
+		/*
+		 * SPI0: boot NOR flash (SST25-series, 4 MB).
+		 * CS is controlled manually via GPIOCMD; no cs-gpios needed.
+		 * Clock divider is fixed at 4 (PClk/5) by the driver.
+		 */
+		spi0: spi@3c300000 {
+			compatible = "apple,s5l8702-spi";
+			reg = <0x3c300000 0x50>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "okay";
+
+			flash@0 {
+				compatible = "jedec,spi-nor";
+				reg = <0>;
+				spi-max-frequency = <25000000>;
+			};
+		};
+
+		/*
+		 * FMI (Flash Memory Interface) for the on-board NAND.
+		 * The driver also pokes the GPIO pinmux (0x3cf00000) and
+		 * the PWRCON0 clock-gate (0x3c500048) directly; those are
+		 * not modelled here yet.
+		 */
+		/*
+		 * LCD controller: custom 8080-series MPU interface block
+		 * driving an ILI93xx-family panel (auto-detected at probe).
+		 * Clock-gate lives in PWRCON0 bit 1 (0x3c500048); poked
+		 * directly by the driver until a clock controller is added.
+		 */
+		lcd: lcd@38300000 {
+			compatible = "apple,s5l8702-lcd";
+			reg = <0x38300000 0x100>;
+			pmu-i2c = <&i2c0>;
+			status = "okay";
+		};
+
+		nand: nand@38a00000 {
+			compatible = "apple,s5l8702-nand";
+			reg = <0x38a00000 0x400>;
+			pmu-i2c = <&i2c0>;
+			apple,nand-bank = <0>;
+			status = "okay";
+		};
+	};
+};
