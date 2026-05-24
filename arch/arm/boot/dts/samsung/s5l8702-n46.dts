@@ -4,6 +4,7 @@
  * SoC: Samsung/Apple S5L8702 (ARM926EJ-S)
  */
 /dts-v1/;
+#include <dt-bindings/clock/samsung,s5l8702-clock.h>
 
 / {
 	#address-cells = <1>;
@@ -159,6 +160,19 @@
 			pmu-i2c = <&i2c0>;
 			apple,nand-bank = <0>;
 			status = "okay";
+		};
+
+		clkctrl: clock-controller@3c500000 {
+			compatible = "samsung,s5l8702-clock";
+			reg = <0x3c500000 0x100>;
+			#clock-cells = <1>;
+		};
+
+		sha1: sha1@38000000 {
+			compatible = "samsung,s5l8702-sha1";
+			reg = <0x38000000 0x100>;
+			clocks = <&clkctrl CLK_SHA1>;
+			clock-names = "sha1";
 		};
 	};
 };
