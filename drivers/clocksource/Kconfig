@@ -771,7 +771,19 @@ config S5L8720_TIMER
 	select CLKSRC_MMIO
 	select TIMER_OF
 	help
-	  Enables support for the Samsung S5l8720 timer as
+	  Enables support for the Samsung S5L8720 timer as
 	  clocksource and clockevent.
+
+config S5L8702_TIMER
+	bool "S5L8702 timer driver"
+	depends on ARCH_S5L87XX
+	depends on GENERIC_CLOCKEVENTS
+	depends on HAS_IOMEM
+	select CLKSRC_MMIO
+	select TIMER_OF
+	help
+	  Enables support for the Samsung/Apple S5L8702 timer as
+	  clocksource and clockevent. Covers the iPod nano 3rd
+	  Generation and iPod classic 6th Generation.
 
 endmenu

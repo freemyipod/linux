@@ -93,3 +93,4 @@ obj-$(CONFIG_CLKSRC_LOONGSON1_PWM)	+= timer-loongson1-pwm.o
 obj-$(CONFIG_EP93XX_TIMER)		+= timer-ep93xx.o
 obj-$(CONFIG_RALINK_TIMER)		+= timer-ralink.o
 obj-$(CONFIG_S5L8720_TIMER)		+= timer-s5l8720.o
+obj-$(CONFIG_S5L8702_TIMER)		+= timer-s5l8702.o
