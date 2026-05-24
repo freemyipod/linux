@@ -505,6 +505,20 @@ struct dwc2_core_params {
 	u32 g_tx_fifo_size[MAX_EPS_CHANNELS];
 
 	bool change_speed_quirk;
+
+	/*
+	 * On the S5L8702 the OTG state machine is layered above the DWC2
+	 * core. The hardware expects only OTG/mode bits in GINTMSK at init
+	 * (ConIDStsChng, SessReqInt, DisconnInt, OTGInt, ModeMism) and the
+	 * device-side bits (USBRST/RESETDET/ENUMDONE/USBSUSP/WKUPINT/ERLYSUSP/
+	 * IEPInt/OEPInt) to be ORed in only AFTER session-valid is reached via
+	 * SessReqInt/ConIDStsChng. Mainline dwc2 unmasks unconditionally; on
+	 * this SoC that produces a USBRST/IEPInt IRQ storm during disconnect
+	 * because the surrounding state machine has not yet told the core a
+	 * session exists. With this quirk set, the device-side bits stay
+	 * masked until a session-valid signal arrives.
+	 */
+	bool session_valid_gintmsk_quirk;
 };
 
 /**
@@ -1416,6 +1430,7 @@ void dwc2_hsotg_core_init_disconnected(struct dwc2_hsotg *dwc2,
 void dwc2_hsotg_core_disconnect(struct dwc2_hsotg *hsotg);
 void dwc2_hsotg_core_connect(struct dwc2_hsotg *hsotg);
 void dwc2_hsotg_disconnect(struct dwc2_hsotg *dwc2);
+void dwc2_hsotg_unmask_session_valid_intmsk(struct dwc2_hsotg *hsotg);
 int dwc2_hsotg_set_test_mode(struct dwc2_hsotg *hsotg, int testmode);
 #define dwc2_is_device_connected(hsotg) (hsotg->connected)
 #define dwc2_is_device_enabled(hsotg) (hsotg->enabled)
@@ -1451,6 +1466,7 @@ static inline void dwc2_hsotg_core_init_disconnected(struct dwc2_hsotg *dwc2,
 static inline void dwc2_hsotg_core_disconnect(struct dwc2_hsotg *hsotg) {}
 static inline void dwc2_hsotg_core_connect(struct dwc2_hsotg *hsotg) {}
 static inline void dwc2_hsotg_disconnect(struct dwc2_hsotg *dwc2) {}
+static inline void dwc2_hsotg_unmask_session_valid_intmsk(struct dwc2_hsotg *hsotg) {}
 static inline int dwc2_hsotg_set_test_mode(struct dwc2_hsotg *hsotg,
 					   int testmode)
 { return 0; }

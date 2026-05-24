@@ -3374,6 +3374,30 @@ static void dwc2_hsotg_irq_fifoempty(struct dwc2_hsotg *hsotg, bool periodic)
 			GINTSTS_RXFLVL)
 
 static int dwc2_hsotg_ep_disable(struct usb_ep *ep);
+
+/*
+ * Unmask the device-side bits in GINTMSK that session_valid_gintmsk_quirk
+ * defers until a session is valid. Called from the OTG interrupt path
+ * (SessReqInt / ConIDStsChng in device mode) on cores where the surrounding
+ * state machine - not the DWC2 core itself - gates session validity.
+ * Idempotent and a no-op when the quirk is not in use.
+ */
+void dwc2_hsotg_unmask_session_valid_intmsk(struct dwc2_hsotg *hsotg)
+{
+	u32 mask;
+
+	if (!hsotg->params.session_valid_gintmsk_quirk)
+		return;
+	if (!dwc2_is_device_mode(hsotg))
+		return;
+
+	mask = dwc2_readl(hsotg, GINTMSK);
+	mask |= GINTSTS_ERLYSUSP | GINTSTS_USBRST | GINTSTS_RESETDET |
+		GINTSTS_ENUMDONE | GINTSTS_USBSUSP | GINTSTS_WKUPINT |
+		GINTSTS_LPMTRANRCVD | GINTSTS_OEPINT | GINTSTS_IEPINT;
+	dwc2_writel(hsotg, mask, GINTMSK);
+}
+
 /**
  * dwc2_hsotg_core_init_disconnected - issue softreset to the core
  * @hsotg: The device state
@@ -3456,12 +3480,24 @@ void dwc2_hsotg_core_init_disconnected(struct dwc2_hsotg *hsotg,
 
 	/* Clear any pending interrupts */
 	dwc2_writel(hsotg, 0xffffffff, GINTSTS);
-	intmsk = GINTSTS_ERLYSUSP | GINTSTS_SESSREQINT |
-		GINTSTS_GOUTNAKEFF | GINTSTS_GINNAKEFF |
-		GINTSTS_USBRST | GINTSTS_RESETDET |
-		GINTSTS_ENUMDONE | GINTSTS_OTGINT |
-		GINTSTS_USBSUSP | GINTSTS_WKUPINT |
-		GINTSTS_LPMTRANRCVD;
+	intmsk = GINTSTS_SESSREQINT | GINTSTS_GOUTNAKEFF |
+		GINTSTS_GINNAKEFF | GINTSTS_OTGINT;
+
+	/*
+	 * S5L8702: keep device-side bits masked until session-valid is
+	 * reached, then unmasked via dwc2_hsotg_unmask_session_valid_intmsk()
+	 * from the SessReqInt path. Two cases let us include them up-front:
+	 *   - is_usb_reset: the bus reset itself proves session-valid.
+	 *   - GOTGCTL.BSESVLD already set: a session existed before we got
+	 *     here (e.g. cable plugged at boot, before SessReqInt would have
+	 *     fired) - no edge will arrive to do the unmask later.
+	 */
+	if (!hsotg->params.session_valid_gintmsk_quirk || is_usb_reset ||
+	    (dwc2_readl(hsotg, GOTGCTL) & GOTGCTL_BSESVLD))
+		intmsk |= GINTSTS_ERLYSUSP | GINTSTS_USBRST |
+			  GINTSTS_RESETDET | GINTSTS_ENUMDONE |
+			  GINTSTS_USBSUSP | GINTSTS_WKUPINT |
+			  GINTSTS_LPMTRANRCVD;
 
 	if (!using_desc_dma(hsotg))
 		intmsk |= GINTSTS_INCOMPL_SOIN | GINTSTS_INCOMPL_SOOUT;
@@ -3526,7 +3562,9 @@ void dwc2_hsotg_core_init_disconnected(struct dwc2_hsotg *hsotg,
 		dwc2_readl(hsotg, DOEPCTL0));
 
 	/* enable in and out endpoint interrupts */
-	dwc2_hsotg_en_gsint(hsotg, GINTSTS_OEPINT | GINTSTS_IEPINT);
+	if (!hsotg->params.session_valid_gintmsk_quirk || is_usb_reset ||
+	    (dwc2_readl(hsotg, GOTGCTL) & GOTGCTL_BSESVLD))
+		dwc2_hsotg_en_gsint(hsotg, GINTSTS_OEPINT | GINTSTS_IEPINT);
 
 	/*
 	 * Enable the RXFIFO when in slave mode, as this is how we collect

@@ -318,6 +318,13 @@ static void dwc2_handle_session_req_intr(struct dwc2_hsotg *hsotg)
 		}
 
 		/*
+		 * Session is now valid; on cores that defer device-side
+		 * GINTMSK bits, unmask them so USBRST/ENUMDONE/IEPInt/
+		 * OEPInt/etc. can flow.
+		 */
+		dwc2_hsotg_unmask_session_valid_intmsk(hsotg);
+
+		/*
 		 * Report disconnect if there is any previous session
 		 * established
 		 */
