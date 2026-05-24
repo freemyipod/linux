@@ -1796,6 +1796,19 @@ config FB_SIMPLE
 	  Configuration re: surface address, size, and format must be provided
 	  through device tree, or plain old platform data.
 
+config FB_S5L8702
+	tristate "Apple S5L8702 LCD framebuffer"
+	depends on FB && (ARCH_S5L87XX || COMPILE_TEST)
+	select FB_SYSMEM_HELPERS_DEFERRED
+	help
+	  Framebuffer driver for the LCD controller block on the Apple
+	  S5L8702 SoC (iPod nano 3rd generation, N46). Auto-detects the
+	  attached ILI93xx-family panel via display ID and provides a
+	  320x240 RGB565 framebuffer with deferred I/O.
+
+	  This driver does PIO blits and has no DMA path yet; it is meant
+	  for bring-up. Say Y here if you are building for the N46.
+
 config FB_SSD1307
 	tristate "Solomon SSD1307 framebuffer support"
 	depends on FB && I2C
