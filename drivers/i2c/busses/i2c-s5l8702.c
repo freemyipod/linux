@@ -9,6 +9,7 @@
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/mod_devicetable.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 
 #define S5L8702_I2C_CON   0x0  /* Control register */
@@ -51,6 +52,8 @@
 
 #define S5L8702_I2C_XFER_TIMEOUT	(msecs_to_jiffies(100))
 
+#define S5L8702_I2C_BUSY_LOOPS		5000
+
 /* i2c controller state */
 enum s5l8702_i2c_state {
 	STATE_IDLE,
@@ -65,6 +68,7 @@ struct s5l8702_i2c_dev {
 	struct device *dev;
 	void __iomem *regs;
 	int irq;
+	bool write_busy_poll;
 	enum s5l8702_i2c_state state;
 	struct i2c_msg	*msg;
 	unsigned int msg_pos;
@@ -77,15 +81,20 @@ struct s5l8702_i2c_dev {
 	struct i2c_adapter adapter;
 };
 
-static inline void s5l8702_i2c_writel(struct s5l8702_i2c_dev *i2c_dev,
-					  u32 reg, u32 val)
-{
-	writel(val, i2c_dev->regs + reg);
-}
-
 static inline u32 s5l8702_i2c_readl(struct s5l8702_i2c_dev *i2c_dev, u32 reg)
 {
 	return readl(i2c_dev->regs + reg);
+}
+
+static void s5l8702_i2c_writel(struct s5l8702_i2c_dev *i2c_dev, u32 reg, u32 val)
+{
+	if (i2c_dev->write_busy_poll) {
+		unsigned int n = S5L8702_I2C_BUSY_LOOPS;
+
+		while (readl(i2c_dev->regs + S5L8702_I2C_BUSY) && --n)
+			cpu_relax();
+	}
+	writel(val, i2c_dev->regs + reg);
 }
 
 static void s5l8702_i2c_state_machine(struct s5l8702_i2c_dev *i2c_dev) {
@@ -267,14 +276,15 @@ static int s5l8702_i2c_init(struct s5l8702_i2c_dev *i2c_dev) {
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_DS, 0x40); // [TODO] Get slave address from DT
 
 	// [TODO] calculate divisors from freq in DT
-	// S5L8702_I2C_CON_CK_REG = 1 and S5L8702_I2C_CON_CKSEL16 so PCLK / 16 / 2
-	// and S5L8702_I2C_CON_INTEN_BUSHOLD probably
-	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, S5L8702_I2C_CON_INTEN_BUSHOLD | S5L8702_I2C_CON_ACKGEN | S5L8702_I2C_CON_CK_REG(1));
+	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON,
+		S5L8702_I2C_CON_INTEN_BUSHOLD | S5L8702_I2C_CON_ACKGEN |
+		S5L8702_I2C_CON_CKSEL512 | S5L8702_I2C_CON_CK_REG(0));
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, S5L8702_I2C_STAT_SOE); 
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_UNK28, 0);
 
 	i2c_dev->iicstat = S5L8702_I2C_STAT_SOE;
-	i2c_dev->iiccon = S5L8702_I2C_CON_INTEN_STOP | S5L8702_I2C_CON_INTEN_BUSHOLD | S5L8702_I2C_CON_CK_REG(1);
+	i2c_dev->iiccon = S5L8702_I2C_CON_INTEN_STOP | S5L8702_I2C_CON_INTEN_BUSHOLD |
+		S5L8702_I2C_CON_CKSEL512 | S5L8702_I2C_CON_CK_REG(0);
 
 	return 0;
 }
@@ -295,6 +305,9 @@ static int s5l8702_i2c_probe(struct platform_device *pdev)
 	i2c_dev->regs = devm_platform_get_and_ioremap_resource(pdev, 0, NULL);
 	if (IS_ERR(i2c_dev->regs))
 		return PTR_ERR(i2c_dev->regs);
+
+	i2c_dev->write_busy_poll = of_property_read_bool(pdev->dev.of_node,
+							  "samsung,write-busy-poll");
 
 	ret = s5l8702_i2c_init(i2c_dev);
 	if (ret) {
