@@ -1,14 +1,13 @@
 /dts-v1/;
 
 / {
-    description = "Single Linux kernel with FDT and initramfs";
+    description = "Linux kernel + FDT for iPod nano (7th generation) (N31, S5L8740)";
     #address-cells = <1>;
 
     images {
-        /* Linux kernel */
         kernel {
             description = "Linux kernel";
-            data = /incbin/("zImage");
+            data = /incbin/("zImage-n31");
             type = "kernel";
             arch = "arm";
             os = "linux";
@@ -20,7 +19,6 @@
             };
         };
 
-        /* Flattened Device Tree */
         fdt {
             description = "Flattened Device Tree blob";
             data = /incbin/("s5l8740-n31.dtb");
@@ -32,10 +30,9 @@
             };
         };
 
-        /* Gzipped initramfs */
         ramdisk {
             description = "Gzipped Initramfs";
-            data = /incbin/("initramfs.cpio.gz");
+            data = /incbin/("initramfs-n31.cpio.gz");
             type = "ramdisk";
             arch = "arm";
             os = "linux";

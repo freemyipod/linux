@@ -22,7 +22,7 @@ jobs:
         id: cache-initramfs-apple-n31
         uses: actions/cache@v5
         with:
-          path: freemyipod/initramfs.cpio.gz
+          path: freemyipod/initramfs-n31.cpio.gz
           key: initramfs-${{ hashFiles('freemyipod/build-initramfs-n31.sh') }}-apple-n31
 
       - name: Build initramfs if cache miss
@@ -38,7 +38,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: initramfs-apple-n31
-          path: freemyipod/initramfs.cpio.gz
+          path: freemyipod/initramfs-n31.cpio.gz
 
   build-kernel:
     runs-on: ubuntu-24.04
@@ -102,7 +102,7 @@ jobs:
 
       - name: Copy kernel and DTB to /freemyipod
         run: |
-          cp arch/arm/boot/zImage freemyipod/zImage
+          cp arch/arm/boot/zImage freemyipod/zImage-n31
           cp arch/arm/boot/dts/samsung/s5l8740-n31.dtb freemyipod/s5l8740-n31.dtb
 
       - name: Upload kernel artifacts
@@ -110,7 +110,7 @@ jobs:
         with:
           name: kernel-dtb-apple-n31
           path: |
-            freemyipod/zImage
+            freemyipod/zImage-n31
             freemyipod/s5l8740-n31.dtb
 
   build-final-image:
@@ -145,9 +145,9 @@ jobs:
           set -e
           echo "Checking required files for mkimage..."
           required_files=(
-            "zImage"
+            "zImage-n31"
             "s5l8740-n31.dtb"
-            "initramfs.cpio.gz"
+            "initramfs-n31.cpio.gz"
             "kernel_fdt_n31.its"
           )
           for file in "${required_files[@]}"; do

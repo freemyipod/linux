@@ -78,4 +78,4 @@ rm -rf "$WORK_DIR/qemu-arm-static"
   find $WORK_DIR -printf "%P\0" |
   sudo cpio --directory=$WORK_DIR --null --create --verbose --owner root:root --format=newc |
   gzip -9
-) > freemyipod/initramfs.cpio.gz
+) > freemyipod/initramfs-n31.cpio.gz
