@@ -23,16 +23,16 @@ jobs:
         uses: actions/cache@v5
         with:
           path: freemyipod/initramfs.cpio.gz
-          key: initramfs-${{ hashFiles('freemyipod/build-initramfs.sh') }}-apple-n31
+          key: initramfs-${{ hashFiles('freemyipod/build-initramfs-n31.sh') }}-apple-n31
 
       - name: Build initramfs if cache miss
-        if: steps.cache-initramfs.outputs.cache-hit != 'true'
+        if: steps.cache-initramfs-apple-n31.outputs.cache-hit != 'true'
         run: |
           set -e
           sudo apt-get update
           sudo apt-get install -y qemu-user-static systemd-container
-          chmod +x freemyipod/build-initramfs.sh
-          freemyipod/build-initramfs.sh
+          chmod +x freemyipod/build-initramfs-n31.sh
+          freemyipod/build-initramfs-n31.sh
 
       - name: Upload initramfs artifact
         uses: actions/upload-artifact@v7
@@ -148,7 +148,7 @@ jobs:
             "zImage"
             "s5l8740-n31.dtb"
             "initramfs.cpio.gz"
-            "kernel_fdt.its"
+            "kernel_fdt_n31.its"
           )
           for file in "${required_files[@]}"; do
             if [ ! -f "$file" ]; then
@@ -162,10 +162,10 @@ jobs:
 
       - name: Build final image
         working-directory: freemyipod
-        run: mkimage -f kernel_fdt.its kernel_fdt.itb
+        run: mkimage -f kernel_fdt_n31.its kernel_fdt_n31.itb
 
       - name: Upload final image
         uses: actions/upload-artifact@v7
         with:
           name: dfu-image-apple-n31
-          path: freemyipod/kernel_fdt.itb
+          path: freemyipod/kernel_fdt_n31.itb
