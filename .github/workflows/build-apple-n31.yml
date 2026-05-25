@@ -1,4 +1,4 @@
-name: Build Kernel + DTB + initramfs + DFU Image (N31)
+name: Build for Apple N31 - iPod nano (7th generation)
 
 on:
   push:
@@ -19,11 +19,11 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup initramfs cache so it's restored and saved if modified
-        id: cache-initramfs
+        id: cache-initramfs-apple-n31
         uses: actions/cache@v5
         with:
           path: freemyipod/initramfs.cpio.gz
-          key: initramfs-${{ hashFiles('freemyipod/build-initramfs.sh') }}
+          key: initramfs-${{ hashFiles('freemyipod/build-initramfs.sh') }}-apple-n31
 
       - name: Build initramfs if cache miss
         if: steps.cache-initramfs.outputs.cache-hit != 'true'
@@ -37,7 +37,7 @@ jobs:
       - name: Upload initramfs artifact
         uses: actions/upload-artifact@v7
         with:
-          name: initramfs
+          name: initramfs-apple-n31
           path: freemyipod/initramfs.cpio.gz
 
   build-kernel:
@@ -69,11 +69,11 @@ jobs:
           pip3 install --upgrade pip
           pip3 install dtschema yamllint
 
-      - name: Restore global ccache
+      - name: Restore ccache
         uses: actions/cache@v5
         with:
           path: ~/.ccache
-          key: ccache-global
+          key: ccache-kernel-apple-n31
 
       - name: Setup ccache
         run: |
@@ -108,7 +108,7 @@ jobs:
       - name: Upload kernel artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: kernel
+          name: kernel-dtb-apple-n31
           path: |
             freemyipod/zImage
             freemyipod/s5l8740-n31.dtb
@@ -125,13 +125,13 @@ jobs:
       - name: Download initramfs artifact
         uses: actions/download-artifact@v8
         with:
-          name: initramfs
+          name: initramfs-apple-n31
           path: freemyipod
 
       - name: Download kernel artifacts
         uses: actions/download-artifact@v8
         with:
-          name: kernel
+          name: kernel-dtb-apple-n31
           path: freemyipod
 
       - name: Install mkimage and dtc
@@ -167,5 +167,5 @@ jobs:
       - name: Upload final image
         uses: actions/upload-artifact@v7
         with:
-          name: dfu-image
+          name: dfu-image-apple-n31
           path: freemyipod/kernel_fdt.itb
