@@ -7,7 +7,7 @@
     images {
         kernel {
             description = "Linux kernel";
-            data = /incbin/("zImage");
+            data = /incbin/("zImage-n46");
             type = "kernel";
             arch = "arm";
             os = "linux";
@@ -32,7 +32,7 @@
 
         ramdisk {
             description = "Gzipped Initramfs";
-            data = /incbin/("initramfs.cpio.gz");
+            data = /incbin/("initramfs-n46.cpio.gz");
             type = "ramdisk";
             arch = "arm";
             os = "linux";

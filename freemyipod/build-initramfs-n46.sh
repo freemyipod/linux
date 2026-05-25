@@ -113,7 +113,7 @@ mount -t sysfs    sysfs    /sys
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 mkdir -p /dev/pts
 mount -t devpts devpts /dev/pts
-echo "iPod nano 3g (N46) — Linux $(uname -r)"
+echo "iPod nano (3rd generation) (N46) — Linux $(uname -r)"
 
 # Bring up USB gadget network. g_ether may take a moment to register usb0
 # after the host enumerates the device, so retry briefly.
