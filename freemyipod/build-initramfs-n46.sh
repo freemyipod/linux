@@ -16,7 +16,7 @@ if [ ! -d "${KERNEL_ROOT}/../${BUSYBOX_DIR}" ]
 then
   cd "${KERNEL_ROOT}/.."
   wget "https://busybox.net/downloads/${BUSYBOX_FILENAME}"
-  tar -xzvf "${BUSYBOX_FILENAME}"
+  tar -xjvf "${BUSYBOX_FILENAME}"
   cd "${SCRIPT_DIR}"
 fi
 
