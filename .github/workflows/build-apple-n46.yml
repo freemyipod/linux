@@ -30,7 +30,7 @@ jobs:
         run: |
           set -e
           sudo apt-get update
-          sudo apt-get install -y qemu-user-static systemd-container
+          sudo apt-get install -y gcc-arm-linux-gnueabi
           chmod +x freemyipod/build-initramfs-n46.sh
           freemyipod/build-initramfs-n46.sh
 
