@@ -5,9 +5,22 @@
 
 set -eEx
 
+BUSYBOX_VERSION="1.36.1"
+BUSYBOX_DIR="busybox-${BUSYBOX_VERSION}"
+BUSYBOX_FILENAME="${BUSYBOX_DIR}.tar.bz2"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KERNEL_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-BUSYBOX_SRC="$(cd "$KERNEL_ROOT/../busybox-1.36.1" && pwd)"
+
+if [ ! -d "${KERNEL_ROOT}/../${BUSYBOX_DIR}" ]
+then
+  cd "${KERNEL_ROOT}/.."
+  wget "https://busybox.net/downloads/${BUSYBOX_FILENAME}"
+  tar -xzvf "${BUSYBOX_FILENAME}"
+  cd "${SCRIPT_DIR}"
+fi
+
+BUSYBOX_SRC="$(cd "$KERNEL_ROOT/../${BUSYBOX_DIR}" && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
