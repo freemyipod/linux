@@ -74,7 +74,6 @@ struct s5l8702_i2c_dev {
 	unsigned int msg_pos;
 	unsigned int nmsgs;
 	int msg_ret;
-	unsigned int iicstat;
 	unsigned int iiccon;
 	unsigned int pending_irq;
 	struct completion msg_complete;
@@ -98,23 +97,25 @@ static void s5l8702_i2c_writel(struct s5l8702_i2c_dev *i2c_dev, u32 reg, u32 val
 }
 
 static void s5l8702_i2c_state_machine(struct s5l8702_i2c_dev *i2c_dev) {
+	uint32_t stat;
+
 	switch ( i2c_dev->state )
 	{
 
 	  case STATE_START:
 		i2c_dev->pending_irq = S5L8702_I2C_INT_BUSHOLD;
 		if (i2c_dev->msg->flags & I2C_M_RD) {
-			i2c_dev->iicstat = S5L8702_I2C_STAT_SOE | S5L8702_I2C_STAT_MASTER;  
+			stat = S5L8702_I2C_STAT_SOE | S5L8702_I2C_STAT_MASTER;
 		} else {
-		  	i2c_dev->iicstat = S5L8702_I2C_STAT_SOE | S5L8702_I2C_STAT_TX | S5L8702_I2C_STAT_MASTER;
+		  	stat = S5L8702_I2C_STAT_SOE | S5L8702_I2C_STAT_TX | S5L8702_I2C_STAT_MASTER;
 		}
 		i2c_dev->iiccon &= ~S5L8702_I2C_CON_BUSHOLD;
 		i2c_dev->iiccon |= S5L8702_I2C_CON_ACKGEN;
-		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, i2c_dev->iicstat);
+		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, stat);
 		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->iiccon);
 		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_DS, i2c_8bit_addr_from_msg(i2c_dev->msg));
-		i2c_dev->iicstat |= S5L8702_I2C_STAT_BB;
-		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, i2c_dev->iicstat);
+		stat |= S5L8702_I2C_STAT_BB;
+		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, stat);
 		if (i2c_dev->msg->flags & I2C_M_RD) {
 		  	i2c_dev->state = STATE_PREPARE_READ;
 		}
@@ -164,12 +165,12 @@ generate_stop:
 		i2c_dev->pending_irq = S5L8702_I2C_INT_STOP;
 
 		if (i2c_dev->msg->flags & I2C_M_RD) {
-			i2c_dev->iicstat &= ~S5L8702_I2C_STAT_BB;
+			stat &= ~S5L8702_I2C_STAT_BB;
 		}
 		else {
-			i2c_dev->iicstat &= ~( S5L8702_I2C_STAT_BB | S5L8702_I2C_STAT_TX );
+			stat &= ~( S5L8702_I2C_STAT_BB | S5L8702_I2C_STAT_TX );
 		}
-		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, i2c_dev->iicstat);
+		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, stat);
 		i2c_dev->iiccon &= ~S5L8702_I2C_CON_ACKGEN;
 		i2c_dev->iiccon |= S5L8702_I2C_CON_BUSHOLD;
 		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_CON, i2c_dev->iiccon);
@@ -282,7 +283,6 @@ static int s5l8702_i2c_init(struct s5l8702_i2c_dev *i2c_dev) {
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, S5L8702_I2C_STAT_SOE); 
 	s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_UNK28, 0);
 
-	i2c_dev->iicstat = S5L8702_I2C_STAT_SOE;
 	i2c_dev->iiccon = S5L8702_I2C_CON_INTEN_STOP | S5L8702_I2C_CON_INTEN_BUSHOLD |
 		S5L8702_I2C_CON_CKSEL512 | S5L8702_I2C_CON_CK_REG(0);
 
