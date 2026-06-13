@@ -59,7 +59,7 @@ $(FS)/init: $(THIS_DIR)/init
 	chmod +x $@
 
 $(OUT): rootfs-install
-	find $(FS) -print0 | sort -z | cpio --quiet --null --format=newc --owner 0:0 --create > $@
+	cd $(FS) && find . -print0 | sort -z | cpio --quiet --null --format=newc --owner 0:0 --create > $@
 
 $(OUT_Z): $(OUT)
 	gzip -9 < $< > $@
