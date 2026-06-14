@@ -1,4 +1,4 @@
 ::sysinit:/etc/init.d/rcS
-::respawn:/bin/sh
+::respawn:/bin/cttyhack /bin/sh
 ::ctrlaltdel:/sbin/reboot
 ::shutdown:/bin/umount -a -r
