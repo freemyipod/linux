@@ -29,6 +29,8 @@ jobs:
         if: steps.cache-initramfs-apple-n31.outputs.cache-hit != 'true'
         run: |
           set -e
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf
           cd freemyipod/initramfs
           make BOARD=n31
 
