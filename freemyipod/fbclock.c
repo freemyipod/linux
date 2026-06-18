@@ -82,10 +82,10 @@ static void put_pixel(struct fb_api *fb, int x, int y, uint32_t color)
 
 	uint8_t *p = fb->buf + y * fb->finfo.line_length + x * ((bpp + 7) / 8);
 
-	if (bpp == 32)      *(uint32_t *)p = color;
+	if (bpp == 32)             *(uint32_t *)p = color;
 	else if (bpp == 15 || bpp == 16) *(uint16_t *)p = color;
-	else if (bpp == 24) { p[0] = color; p[1] = color >> 8; p[2] = color >> 16; } /* Assumes LE */
-	else if (bpp == 8)  *p = color;
+	else if (bpp == 24)        { p[0] = color; p[1] = color >> 8; p[2] = color >> 16; } /* Assumes LE */
+	else if (bpp == 8)         *p = color;
 }
 
 static void fill(struct fb_api *fb, uint32_t color)
@@ -174,6 +174,11 @@ static void draw_hand(struct fb_api *fb, int cx, int cy, int t60, int r_inner, i
 		draw_line(fb, cx + ix + i, cy + iy, cx + sx + i, cy + sy, color);
 	for (i = -thick; i <= thick; i++)
 		draw_line(fb, cx + ix, cy + iy + i, cx + sx, cy + sy + i, color);
+
+	draw_disc(fb, cx + sx, cy + sy, thick, color);
+
+	if (r_inner > 0)
+		draw_disc(fb, cx + ix, cy + iy, thick, color);
 }
 
 static void draw_face(struct fb_api *fb, int cx, int cy, int r_outer, int r_tick, uint32_t color)
@@ -216,9 +221,15 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
+	unsigned int bpp = fb.vinfo.bits_per_pixel;
+	if (bpp != 8 && bpp != 15 && bpp != 16 && bpp != 24 && bpp != 32) {
+		fprintf(stderr, "Unsupported color depth: %u bpp\n", bpp);
+		close(fb_fd);
+		return 1;
+	}
+
 	int cx = fb.vinfo.xres / 2;
 	int cy = fb.vinfo.yres / 2;
-
 	int min_dim = min(fb.vinfo.xres, fb.vinfo.yres);
 
 	int r_outer	= min_dim * 42 / 100;
@@ -231,11 +242,10 @@ int main(int argc, char *argv[])
 	int hand_thick	= max(1, min_dim / 200);
 
 	uint32_t color_bg = rgb_to_fb(&fb, COLOR_BLACK);
-
-	uint32_t color_face, color_hour, color_min;
-	color_face = color_hour = color_min = rgb_to_fb(&fb, COLOR_WHITE);
-
-	uint32_t color_sec = rgb_to_fb(&fb, COLOR_RED);
+	uint32_t color_face = rgb_to_fb(&fb, COLOR_WHITE);
+	uint32_t color_hour = color_face;
+	uint32_t color_min  = color_face;
+	uint32_t color_sec  = rgb_to_fb(&fb, COLOR_RED);
 
 	fb.buf = mmap(NULL, fb.finfo.smem_len, PROT_READ | PROT_WRITE, MAP_SHARED, fb_fd, 0);
 	if (fb.buf == MAP_FAILED) {
@@ -261,9 +271,7 @@ int main(int argc, char *argv[])
 
 	fill(&fb, color_bg);
 	munmap(fb.buf, fb.finfo.smem_len);
-
-	if (fb_fd >= 0)
-		close(fb_fd);
+	close(fb_fd);
 
 	return 0;
 }
