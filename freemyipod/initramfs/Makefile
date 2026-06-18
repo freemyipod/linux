@@ -81,7 +81,7 @@ $(ROOTFS)/init: $(THIS_DIR)/init
 
 $(ROOTFS)/usr/bin/fbclock: ../fbclock.c
 	mkdir -p $(dir $@)
-	arm-linux-gnueabihf-cc -mcpu=cortex-a5 -static -O2 -Wall -o $@ $<
+	arm-linux-gnueabihf-gcc -mcpu=cortex-a5 -static -O2 -Wall -o $@ $<
 	arm-linux-gnueabihf-strip $@
 
 $(ROOTFS_STAMP): $(ROOTFS_DEPS)
