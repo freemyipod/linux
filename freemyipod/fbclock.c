@@ -132,21 +132,6 @@ static void draw_line(struct fb_api *fb, int x0, int y0, int x1, int y1, uint32_
 	}
 }
 
-static void draw_hand(struct fb_api *fb, int cx, int cy, int t60, int r_inner, int r_outer, int thick,
-		      uint32_t color)
-{
-	int sx = (sin_q16[t60] * r_outer) >> 16;
-	int sy = (cos_q16[t60] * r_outer) >> 16;
-	int ix = r_inner ? (sin_q16[t60] * r_inner) >> 16 : 0;
-	int iy = r_inner ? (cos_q16[t60] * r_inner) >> 16 : 0;
-	int i;
-
-	for (i = -thick; i <= thick; i++)
-		draw_line(fb, cx + ix + i, cy + iy, cx + sx + i, cy + sy, color);
-	for (i = -thick; i <= thick; i++)
-		draw_line(fb, cx + ix, cy + iy + i, cx + sx, cy + sy + i, color);
-}
-
 static void draw_circle(struct fb_api *fb, int cx, int cy, int r, uint32_t color)
 {
 	int x = r, y = 0, err = 0;
@@ -174,6 +159,21 @@ static void draw_disc(struct fb_api *fb, int cx, int cy, int r, uint32_t color)
 		for (int xx = -r; xx <= r; xx++)
 			if (xx * xx + yy * yy <= r * r)
 				put_pixel(fb, cx + xx, cy + yy, color);
+}
+
+static void draw_hand(struct fb_api *fb, int cx, int cy, int t60, int r_inner, int r_outer, int thick,
+		      uint32_t color)
+{
+	int sx = (sin_q16[t60] * r_outer) >> 16;
+	int sy = (cos_q16[t60] * r_outer) >> 16;
+	int ix = r_inner ? (sin_q16[t60] * r_inner) >> 16 : 0;
+	int iy = r_inner ? (cos_q16[t60] * r_inner) >> 16 : 0;
+	int i;
+
+	for (i = -thick; i <= thick; i++)
+		draw_line(fb, cx + ix + i, cy + iy, cx + sx + i, cy + sy, color);
+	for (i = -thick; i <= thick; i++)
+		draw_line(fb, cx + ix, cy + iy + i, cx + sx, cy + sy + i, color);
 }
 
 static void draw_face(struct fb_api *fb, int cx, int cy, int r_outer, int r_tick, uint32_t color)
