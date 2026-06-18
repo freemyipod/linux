@@ -23,16 +23,14 @@ jobs:
         uses: actions/cache@v5
         with:
           path: freemyipod/initramfs-n31.cpio.gz
-          key: initramfs-${{ hashFiles('freemyipod/build-initramfs-n31.sh') }}-apple-n31
+          key: initramfs-${{ hashFiles('freemyipod/initramfs/*') }}-apple-n31
 
       - name: Build initramfs if cache miss
         if: steps.cache-initramfs-apple-n31.outputs.cache-hit != 'true'
         run: |
           set -e
-          sudo apt-get update
-          sudo apt-get install -y qemu-user-static systemd-container
-          chmod +x freemyipod/build-initramfs-n31.sh
-          freemyipod/build-initramfs-n31.sh
+          cd freemyipod/initramfs
+          make BOARD=n31
 
       - name: Upload initramfs artifact
         uses: actions/upload-artifact@v7
