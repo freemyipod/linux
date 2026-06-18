@@ -6,3 +6,4 @@ uImage-*
 kernel_fdt_*.itb
 busybox-*
 rootfs
+rootfs.stamp
