@@ -10,64 +10,91 @@ BOARD ?= n31
 CONF := apple_$(BOARD)_defconfig
 OUT_FILENAME := initramfs-$(BOARD).cpio
 ROOTFS_DIR := rootfs
+ROOTFS_STAMP_FILENAME := rootfs.stamp
 
 BB_FILE := $(THIS_DIR)/$(BUSYBOX_FILENAME)
 BB := $(THIS_DIR)/$(BUSYBOX_DIR)
-FS := $(THIS_DIR)/$(ROOTFS_DIR)
+BB_EXTRACTED := $(BB)/.extracted
+BB_CONFIG := $(BB)/.config
+BB_BINARY := $(BB)/busybox
+ROOTFS := $(THIS_DIR)/$(ROOTFS_DIR)
+ROOTFS_STAMP := $(THIS_DIR)/$(ROOTFS_STAMP_FILENAME)
+ROOTFS_BB_BINARY := $(ROOTFS)/bin/busybox
 OUT := $(THIS_DIR)/$(OUT_FILENAME)
 OUT_Z := $(OUT).gz
+
+ROOTFS_BASE_DEPS := \
+    $(ROOTFS_BB_BINARY) \
+    $(ROOTFS)/etc/inittab \
+    $(ROOTFS)/etc/init.d/rcS \
+    $(ROOTFS)/init
+
+ROOTFS_APP_DEPS := \
+    $(ROOTFS)/usr/bin/fbclock
+
+ROOTFS_DEPS := $(ROOTFS_BASE_DEPS) $(ROOTFS_APP_DEPS)
 
 all: rootfs-compress
 
 bb-download: $(BB_FILE)
-bb-extract: $(BB)/.extracted
-bb-config: $(BB)/.config
-bb-build: $(BB)/busybox
-bb-install: $(FS)/bin/busybox
-rootfs-install: $(FS)/bin/busybox $(FS)/etc/inittab $(FS)/etc/init.d/rcS $(FS)/init
+bb-extract: $(BB_EXTRACTED)
+bb-config: $(BB_CONFIG)
+bb-build: $(BB_BINARY)
+bb-install: $(ROOTFS_BB_BINARY)
+
+apps-install: $(ROOTFS_APP_DEPS)
+
+rootfs-install: $(ROOTFS_STAMP)
 rootfs-pack: $(OUT)
 rootfs-compress: $(OUT_Z)
 
 $(BB_FILE):
 	curl -L -o $@ $(BUSYBOX_URL)
 
-$(BB)/.extracted: $(BB_FILE)
+$(BB_EXTRACTED): $(BB_FILE)
 	tar -xjvf $<
 	touch $@
 
-$(BB)/.config: $(CONF) $(BB)/.extracted
+$(BB_CONFIG): $(CONF) $(BB_EXTRACTED)
 	cp $< $@
 	yes '' | $(MAKE) -C $(BB) oldconfig
 
-$(BB)/busybox: $(BB)/.config
+$(BB_BINARY): $(BB_CONFIG)
 	$(MAKE) -C $(BB)
 
-$(FS)/bin/busybox: $(BB)/busybox
-	$(MAKE) -C $(BB) CONFIG_PREFIX=$(FS) install
+$(ROOTFS_BB_BINARY): $(BB_BINARY)
+	$(MAKE) -C $(BB) CONFIG_PREFIX=$(ROOTFS) install
 
-$(FS)/etc/inittab: $(THIS_DIR)/inittab
+$(ROOTFS)/etc/inittab: $(THIS_DIR)/inittab
 	mkdir -p $(dir $@)
 	cp $< $@
 
-$(FS)/etc/init.d/rcS: $(THIS_DIR)/rcS
+$(ROOTFS)/etc/init.d/rcS: $(THIS_DIR)/rcS
 	mkdir -p $(dir $@)
 	cp $< $@
 	chmod +x $@
 
-$(FS)/init: $(THIS_DIR)/init
+$(ROOTFS)/init: $(THIS_DIR)/init
 	cp $< $@
 	chmod +x $@
 
-$(OUT): rootfs-install
-	cd $(FS) && find . -print0 | sort -z | cpio --quiet --null --format=newc --owner 0:0 --create > $@
+$(ROOTFS)/usr/bin/fbclock: ../fbclock.c
+	arm-linux-gnueabihf-cc -mcpu=cortex-a5 -static -O2 -Wall -o $@ $<
+	arm-linux-gnueabihf-strip $@
+
+$(ROOTFS_STAMP): $(ROOTFS_DEPS)
+	touch $@
+
+$(OUT): $(ROOTFS_STAMP)
+	cd $(ROOTFS) && find . -print0 | sort -z | cpio --quiet --null --format=newc --owner 0:0 --create > $@
 
 $(OUT_Z): $(OUT)
 	gzip -9 < $< > $@
 
 clean:
-	rm -rf $(FS) $(BB)
+	rm -rf $(ROOTFS) $(BB) $(ROOTFS_STAMP)
 
-distclean:
-	rm -rf $(FS) $(BB) $(BB_FILE)
+distclean: clean
+	rm -f $(BB_FILE)
 
-.PHONY: all bb-extract bb-config bb-build bb-install rootfs-install rootfs-pack rootfs-compress clean distclean
+.PHONY: all bb-extract bb-config bb-build bb-install apps-install rootfs-install rootfs-pack rootfs-compress clean distclean
