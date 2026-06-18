@@ -75,10 +75,12 @@ $(ROOTFS)/etc/init.d/rcS: $(THIS_DIR)/rcS
 	chmod +x $@
 
 $(ROOTFS)/init: $(THIS_DIR)/init
+	mkdir -p $(dir $@)
 	cp $< $@
 	chmod +x $@
 
 $(ROOTFS)/usr/bin/fbclock: ../fbclock.c
+	mkdir -p $(dir $@)
 	arm-linux-gnueabihf-cc -mcpu=cortex-a5 -static -O2 -Wall -o $@ $<
 	arm-linux-gnueabihf-strip $@
 
@@ -97,4 +99,4 @@ clean:
 distclean: clean
 	rm -f $(BB_FILE)
 
-.PHONY: all bb-extract bb-config bb-build bb-install apps-install rootfs-install rootfs-pack rootfs-compress clean distclean
+.PHONY: all bb-download bb-extract bb-config bb-build bb-install apps-install rootfs-install rootfs-pack rootfs-compress clean distclean
