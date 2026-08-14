@@ -1,0 +1,193 @@
+// SPDX-License-Identifier: GPL-2.0+
+/*
+ * Apple S5L8723 SoC
+ * Board name: N20
+ * Product name: iPod nano (6th generation)
+ */
+/dts-v1/;
+
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/clock/samsung,s5l8702-clock.h>
+
+/ {
+    #address-cells = <1>;
+    #size-cells = <1>;
+    model = "Apple iPod nano (6th generation)";
+    compatible = "apple,n20", "samsung,s5l8723";
+
+    aliases {
+        serial0 = &uart0;
+        console = &uart0;
+    };
+
+    chosen {
+        stdout-path = "serial0";
+    };
+
+    nclk: external_clock {
+        compatible = "fixed-clock";
+        #clock-cells = <0>;
+        clock-frequency = <140000000>;
+        clock-output-names = "nclk";
+    };
+
+    // pclk: clock-ref {
+    //     compatible = "fixed-clock";
+    //     #clock-cells = <0>;
+    //     clock-frequency = <6000000>;
+    //     clock-output-names = "pclk";
+    // };
+
+    cpus {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        cpu@0 {
+            device_type = "cpu";
+            reg = <0>;
+            compatible = "arm,arm1176jzf-s";
+        };
+    };
+
+    memory@8000000 {
+        device_type = "memory";
+        reg = <0x08000000 0x04000000>;
+    };
+
+    soc {
+        compatible = "simple-bus";
+        #address-cells = <1>;
+        #size-cells = <1>;
+        ranges;
+
+        vic0: interrupt-controller@38e00000 {
+            compatible = "arm,pl192-vic";
+            interrupt-controller;
+            reg = <0x38e00000 0x1000>;
+            #interrupt-cells = <1>;
+        };
+
+        vic1: interrupt-controller@38e01000 {
+            compatible = "arm,pl192-vic";
+            interrupt-controller;
+            reg = <0x38e01000 0x1000>;
+            #interrupt-cells = <1>;
+        };
+
+        timer: timer@3c700000 {
+            compatible = "samsung,s5l8720-timer";
+            reg = <0x3c700000 0x20000>;
+            interrupt-parent = <&vic0>;
+            interrupts = <7>;
+        };
+
+        uart0: serial@3cc00000 {
+            compatible = "apple,s5l-uart";
+            reg = <0x3cc00000 0x3c>;
+            clocks = <&nclk>, <&nclk>;
+            clock-names = "uart", "clk_uart_baud0";
+            reg-io-width = <4>;
+            interrupt-parent = <&vic0>;
+            interrupts = <24>;
+            status = "okay";
+        };
+
+        usbphy: usbphy@3c400000 {
+            compatible = "apple,s5l8702-otgphy";
+            reg = <0x3c400000 0x100>;
+            status = "okay";
+            #phy-cells = <0>;
+        };
+
+        usbotg_hs: usb@38400000 {
+            compatible = "apple,s5l87xx-usb";
+            reg = <0x38400000 0x40000>;
+            interrupt-parent = <&vic0>;
+            interrupts = <19>;
+            phys = <&usbphy>;
+            phy-names = "usb2-phy";
+            clocks = <&nclk>;
+            clock-names = "otg";
+            g-rx-fifo-size = <256>;
+            g-np-tx-fifo-size = <32>;
+            g-tx-fifo-size = <256 256 512 512 512 768 768>;
+            status = "okay";
+            dr_mode = "peripheral";
+        };
+
+        wdt: watchdog@3c800000 {
+            compatible = "apple,s5l8723-syscon", "syscon", "simple-mfd";
+            reg = <0x3c800000 0x8>;
+
+            reboot: syscon-reboot@3c800000 {
+                compatible = "syscon-reboot";
+                offset = <0x0>;
+                value = <0x100000>;
+            };
+        };
+
+        i2c0: i2c@3c600000 {
+            compatible = "samsung,s5l8702-i2c";
+            reg = <0x3c600000 0x100>;
+            clock-frequency = <100000>;  /* UPDATE ME */
+            interrupt-parent = <&vic0>;
+            interrupts = <21>;
+            status = "okay";
+        };
+
+        i2c1: i2c@3c900000 {
+            compatible = "samsung,s5l8702-i2c";
+            #address-cells = <1>;
+            #size-cells = <0>;
+            reg = <0x3c900000 0x100>;
+            clock-frequency = <100000>; /* UPDATE ME */
+            interrupt-parent = <&vic0>;
+            interrupts = <22>;
+            status = "okay";
+
+            lis3dc: lis331dlh@18 {
+                compatible = "st,lis3lv02d";
+                reg = <0x18>;
+            };
+
+            d1830: pmic@73 {
+                compatible = "dlg,d1830-gpio";
+                reg = <0x73>;
+                gpio-controller;
+                #gpio-cells = <2>;
+                dlg,gpio-map = <0x07 4>, /* Home button */
+                               <0x07 5>, /* Power button */
+                               <0x08 1>; /* Play/pause button */
+            };
+        };
+
+        clkctrl: clock-controller@3c500000 {
+            compatible = "samsung,s5l8702-clock";
+            reg = <0x3c500000 0x100>;
+
+            #clock-cells = <1>;
+        };
+
+        sha1: sha1@38000000 {
+            compatible = "samsung,s5l8702-sha1";
+            reg = <0x38000000 0x100>;
+            clocks = <&clkctrl CLK_SHA1>;
+            clock-names = "sha1";
+        };
+
+        aes: aes@38c00000 {
+            compatible = "samsung,s5l8702-aes";
+            reg = <0x38c00000 0x100>;
+            clocks = <&clkctrl CLK_AES>;
+            clock-names = "aes";
+        };
+
+        prng: prng@3c100000 {
+            compatible = "samsung,s5l8702-prng";
+            reg = <0x3c100000 0x100>;
+            clocks = <&clkctrl CLK_PRNG>;
+            clock-names = "prng";
+        };
+    };
+};

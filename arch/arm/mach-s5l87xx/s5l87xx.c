@@ -57,6 +57,7 @@ static void __init s5l87xx_map_io(void)
 
 static const char * const s5l87xx_compat[] = {
 	"samsung,s5l8702",
+	"samsung,s5l8723",
 	"samsung,s5l8740",
 	"samsung,s5l87xx",
 	NULL,
