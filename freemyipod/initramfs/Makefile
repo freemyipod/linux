@@ -23,6 +23,9 @@ ROOTFS_BB_BINARY := $(ROOTFS)/bin/busybox
 OUT := $(THIS_DIR)/$(OUT_FILENAME)
 OUT_Z := $(OUT).gz
 
+APP_CROSS_COMPILE := arm-linux-gnueabihf-
+APP_CFLAGS := -mcpu=cortex-a5+nosimd -static -O2 -Wall
+
 ROOTFS_BASE_DEPS := \
     $(ROOTFS_BB_BINARY) \
     $(ROOTFS)/etc/inittab \
@@ -79,10 +82,10 @@ $(ROOTFS)/init: $(THIS_DIR)/init
 	cp $< $@
 	chmod +x $@
 
-$(ROOTFS)/usr/bin/fbclock: ../fbclock.c
+$(ROOTFS)/usr/bin/%: ../%.c
 	mkdir -p $(dir $@)
-	arm-linux-gnueabihf-gcc -mcpu=cortex-a5+nosimd -static -O2 -Wall -o $@ $<
-	arm-linux-gnueabihf-strip $@
+	$(APP_CROSS_COMPILE)gcc $(APP_CFLAGS) -o $@ $<
+	$(APP_CROSS_COMPILE)strip $@
 
 $(ROOTFS_STAMP): $(ROOTFS_DEPS)
 	touch $@
