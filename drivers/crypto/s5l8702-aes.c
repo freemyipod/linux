@@ -160,19 +160,10 @@ static inline int s5l8702_aes_write_key(struct s5l8702_aes_dev *aes_dev, const u
 			s5l8702_aes_writel(aes_dev, S5L8702_AES_KEY_L, get_unaligned_le32(key + offset));
 		break;
 		default:
-			dev_err(aes_dev->dev, "Invalid key size: %u\n", keylen);
 			return -EINVAL;
 	}
 
 	return 0;
-}
-
-static inline void s5l8702_aes_read_iv(struct s5l8702_aes_dev *aes_dev, void *iv)
-{
-	put_unaligned_le32(s5l8702_aes_readl(aes_dev, S5L8702_AES_IV_1), iv);
-	put_unaligned_le32(s5l8702_aes_readl(aes_dev, S5L8702_AES_IV_2), iv + sizeof(u32));
-	put_unaligned_le32(s5l8702_aes_readl(aes_dev, S5L8702_AES_IV_3), iv + sizeof(u32) * 2);
-	put_unaligned_le32(s5l8702_aes_readl(aes_dev, S5L8702_AES_IV_4), iv + sizeof(u32) * 3);
 }
 
 static inline void s5l8702_aes_write_iv(struct s5l8702_aes_dev *aes_dev, const void *iv)
@@ -253,6 +244,135 @@ static int s5l8702_aes_setkey(struct crypto_skcipher *tfm, const u8 *key, unsign
 	return 0;
 }
 
+static void s5l8702_aes_hw_exit(struct s5l8702_aes_dev *aes_dev)
+{
+	s5l8702_aes_clear_state(aes_dev);
+	s5l8702_aes_writel(aes_dev, S5L8702_AES_IRQ_MASK, S5L8702_AES_IRQ_ALL); // disable all interrupts
+	s5l8702_aes_writel(aes_dev, S5L8702_AES_POWER, 0);
+	clk_disable_unprepare(aes_dev->clk);
+}
+
+static int s5l8702_aes_hw_init(struct s5l8702_aes_ctx *ctx, const u8 *iv, bool encrypt)
+{
+	struct s5l8702_aes_dev *aes_dev = ctx->aes_dev;
+	struct device *dev = aes_dev->dev;
+	u32 compliment, cfg;
+	int ret, hw_key_type;
+
+	ret = clk_prepare_enable(aes_dev->clk);
+	if (ret) {
+		dev_err(dev, "clk_prepare_enable failed: %d\n", ret);
+		return ret;
+	}
+
+	// init
+	s5l8702_aes_reset(aes_dev); // skipped on zero key, we'll do it anyway
+	s5l8702_aes_writel(aes_dev, S5L8702_AES_POWER, 1);
+	s5l8702_aes_writel(aes_dev, S5L8702_AES_IRQ_MASK, 0); // enable all interrupts
+	s5l8702_aes_clear_state(aes_dev);
+
+	// key type
+	if (ctx->type == S5L8702_AES_KEY_TYPE_USER_DEFINE && !memchr_inv(ctx->key, 0, ctx->keylen))
+		hw_key_type = S5L8702_AES_KEY_TYPE_ZERO;
+	else
+		hw_key_type = ctx->type;
+
+	s5l8702_aes_writel(aes_dev, S5L8702_AES_CIPHERKEY_SEL, hw_key_type);
+
+	// compliment
+	compliment = ~s5l8702_aes_readl(aes_dev, S5L8702_AES_CIPHERKEY_SEL);
+	s5l8702_aes_writel(aes_dev, S5L8702_AES_COMPLIMENT, compliment);
+
+	// user-defined key
+	if (hw_key_type == S5L8702_AES_KEY_TYPE_USER_DEFINE) {
+		ret = s5l8702_aes_write_key(aes_dev, ctx->key, ctx->keylen);
+		if (ret) {
+			dev_err(dev, "Invalid key size: %u\n", ctx->keylen);
+			goto err_hw;
+		}
+	}
+
+	// unknown register
+	s5l8702_aes_writel(aes_dev, S5L8702_AES_UNK8C, 0);
+
+	// config
+	cfg = s5l8702_aes_readl(aes_dev, S5L8702_AES_CFG);
+
+	// encrypt/decrypt
+	if (encrypt)
+		cfg |= BIT(0);
+	else
+		cfg &= ~BIT(0);
+
+	// pause engine
+	cfg |= S5L8702_AES_CFG_PAUSE;
+
+	// chaining mode
+	if (ctx->cbc) {
+		// CBC
+		cfg |= BIT(3);
+
+		// IV
+		s5l8702_aes_write_iv(aes_dev, iv);
+	} else {
+		// ECB
+		cfg &= ~BIT(3);
+	}
+
+	// key size
+	cfg &= ~S5L8702_AES_CFG_KEYSIZE;
+
+	switch (ctx->keylen) {
+		case AES_KEYSIZE_128:
+			cfg |= FIELD_PREP(S5L8702_AES_CFG_KEYSIZE, S5L8702_AES_KEY_SIZE_128);
+			break;
+		case AES_KEYSIZE_192:
+			cfg |= FIELD_PREP(S5L8702_AES_CFG_KEYSIZE, S5L8702_AES_KEY_SIZE_192);
+			break;
+		case AES_KEYSIZE_256:
+			cfg |= FIELD_PREP(S5L8702_AES_CFG_KEYSIZE, S5L8702_AES_KEY_SIZE_256);
+			break;
+		default:
+			dev_err(dev, "Invalid key length: %u\n", ctx->keylen);
+			ret = -EINVAL;
+			goto err_hw;
+	}
+
+	s5l8702_aes_writel(aes_dev, S5L8702_AES_CFG, cfg);
+
+	return 0;
+
+err_hw:
+	s5l8702_aes_hw_exit(aes_dev);
+	return ret;
+}
+
+static int s5l8702_aes_hw_crypt(struct s5l8702_aes_dev *aes_dev, dma_addr_t src, dma_addr_t dst, unsigned int len)
+{
+	struct device *dev = aes_dev->dev;
+	u32 irq;
+	int ret;
+
+	// set src/dst buffer addresses and size
+	s5l8702_aes_write_buf(aes_dev, src, dst, len);
+
+	// go!
+	s5l8702_aes_writel(aes_dev, S5L8702_AES_COMMAND, S5L8702_AES_CMD_START);
+
+	// wait for completion
+	ret = readl_poll_timeout(aes_dev->regs + S5L8702_AES_IRQ, irq,
+				 irq & S5L8702_AES_IRQ_ALL, 2, S5L8702_AES_POLL_TIMEOUT_US);
+	if (ret) {
+		dev_err(dev, "AES timed out (IRQ=0x%08x)\n", irq);
+		return ret;
+	}
+
+	// clear all pending IRQs
+	s5l8702_aes_writel(aes_dev, S5L8702_AES_IRQ, S5L8702_AES_IRQ_ALL);
+
+	return 0;
+}
+
 static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 {
 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
@@ -260,10 +380,6 @@ static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 	struct s5l8702_aes_dev *aes_dev = ctx->aes_dev;
 	struct device *dev = aes_dev->dev;
 	struct skcipher_walk walk;
-	void *key = ctx->key;
-	u32 key_len = ctx->keylen;
-	u32 compliment;
-	u32 cfg, irq;
 	int ret;
 
 	if (ctx->cbc && !req->iv)
@@ -275,147 +391,47 @@ static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 
 	mutex_lock(&aes_dev->lock);
 
-	ret = clk_prepare_enable(aes_dev->clk);
-	if (ret) {
-		dev_err(dev, "clk_prepare_enable failed: %d\n", ret);
-		goto out;
-	}
+	ret = s5l8702_aes_hw_init(ctx, walk.iv, encrypt);
+	if (ret)
+		goto out_unlock;
 
-	// init
-	s5l8702_aes_reset(aes_dev); // skipped on zero key, we'll do it anyway
-	s5l8702_aes_writel(aes_dev, S5L8702_AES_POWER, 1);
-	s5l8702_aes_writel(aes_dev, S5L8702_AES_IRQ_MASK, 0); // enable all interrupts
-	s5l8702_aes_clear_state(aes_dev);
-
-	// key type
-	if (ctx->type == S5L8702_AES_KEY_TYPE_USER_DEFINE && !memchr_inv(key, 0, key_len)) {
-		ctx->type = S5L8702_AES_KEY_TYPE_ZERO;
-	}
-
-	s5l8702_aes_writel(aes_dev, S5L8702_AES_CIPHERKEY_SEL, ctx->type);
-
-	// compliment
-	compliment = ~s5l8702_aes_readl(aes_dev, S5L8702_AES_CIPHERKEY_SEL);
-	s5l8702_aes_writel(aes_dev, S5L8702_AES_COMPLIMENT, compliment);
-
-	// user-defined key
-	if (ctx->type == S5L8702_AES_KEY_TYPE_USER_DEFINE) {
-		ret = s5l8702_aes_write_key(aes_dev, key, key_len);
-		if (ret)
-			goto out;
-	}
-
-	// unknown register
-	s5l8702_aes_writel(aes_dev, S5L8702_AES_UNK8C, 0);
-
-	// config
-	cfg = s5l8702_aes_readl(aes_dev, S5L8702_AES_CFG);
-
-	// encrypt/decrypt
-	if (encrypt) {
-		cfg |= BIT(0);
-	}
-	else {
-		cfg &= ~BIT(0);
-	}
-
-	// pause engine
-	cfg |= S5L8702_AES_CFG_PAUSE;
-
-	// chaining mode
-	if (ctx->cbc) {
-		// CBC
-		cfg |= BIT(3);
-
-		// IV
-		s5l8702_aes_write_iv(aes_dev, walk.iv);
-	}
-	else {
-		// ECB
-		cfg &= ~BIT(3);
-	}
-
-	// key size
-	cfg &= ~S5L8702_AES_CFG_KEYSIZE;
-
-	switch (key_len) {
-		case AES_KEYSIZE_128:
-			cfg |= FIELD_PREP(S5L8702_AES_CFG_KEYSIZE, S5L8702_AES_KEY_SIZE_128);
-			break;
-		case AES_KEYSIZE_192:
-			cfg |= FIELD_PREP(S5L8702_AES_CFG_KEYSIZE, S5L8702_AES_KEY_SIZE_192);
-			break;
-		case AES_KEYSIZE_256:
-			cfg |= FIELD_PREP(S5L8702_AES_CFG_KEYSIZE, S5L8702_AES_KEY_SIZE_256);
-			break;
-		default:
-			dev_err(dev, "Invalid key length: %u\n", key_len);
-			ret = -EINVAL;
-			goto out;
-	}
-
-	s5l8702_aes_writel(aes_dev, S5L8702_AES_CFG, cfg);
-
-	while (walk.nbytes > 0) {
+	while (walk.nbytes) {
 		dma_addr_t src, dst;
-		unsigned int chunk_len = round_down(walk.nbytes, AES_BLOCK_SIZE);
-
-		if (chunk_len == 0)
-			break;
 
 		// map addresses
-		src = dma_map_single(dev, walk.src.virt.addr, chunk_len, DMA_TO_DEVICE);
+		src = dma_map_single(dev, walk.src.virt.addr, walk.nbytes, DMA_TO_DEVICE);
 		if (dma_mapping_error(dev, src)) {
 			ret = -ENOMEM;
-			goto out;
+			break;
 		}
 
-		dst = dma_map_single(dev, walk.dst.virt.addr, chunk_len, DMA_FROM_DEVICE);
+		dst = dma_map_single(dev, walk.dst.virt.addr, walk.nbytes, DMA_FROM_DEVICE);
 		if (dma_mapping_error(dev, dst)) {
-			dma_unmap_single(dev, src, chunk_len, DMA_TO_DEVICE);
+			dma_unmap_single(dev, src, walk.nbytes, DMA_TO_DEVICE);
 			ret = -ENOMEM;
-			goto out;
+			break;
 		}
 
-		// set src/dst buffer addresses and size
-		s5l8702_aes_write_buf(aes_dev, src, dst, chunk_len);
-
-		// go!
-		s5l8702_aes_writel(aes_dev, S5L8702_AES_COMMAND, S5L8702_AES_CMD_START);
-
-		// wait for completion
-		ret = readl_poll_timeout(aes_dev->regs + S5L8702_AES_IRQ, irq,
-					 irq & S5L8702_AES_IRQ_ALL, 2, S5L8702_AES_POLL_TIMEOUT_US);
-		if (ret) {
-			dev_err(dev, "AES timed out (IRQ=0x%08x)\n", irq);
-
-			dma_unmap_single(dev, src, chunk_len, DMA_TO_DEVICE);
-			dma_unmap_single(dev, dst, chunk_len, DMA_FROM_DEVICE);
-
-			goto out;
-		}
-
-		// clear all pending IRQs
-		s5l8702_aes_writel(aes_dev, S5L8702_AES_IRQ, S5L8702_AES_IRQ_ALL);
+		ret = s5l8702_aes_hw_crypt(aes_dev, src, dst, walk.nbytes);
 
 		// unmap addresses
-		dma_unmap_single(dev, src, chunk_len, DMA_TO_DEVICE);
-		dma_unmap_single(dev, dst, chunk_len, DMA_FROM_DEVICE);
+		dma_unmap_single(dev, dst, walk.nbytes, DMA_FROM_DEVICE);
+		dma_unmap_single(dev, src, walk.nbytes, DMA_TO_DEVICE);
+
+		if (ret)
+			break;
 
 		// update remaining bytes and process next chunk
-		ret = skcipher_walk_done(&walk, walk.nbytes - chunk_len);
+		ret = skcipher_walk_done(&walk, 0);
 		if (ret)
-			goto out;
+			break;
 	}
 
-	ret = 0;
+	s5l8702_aes_hw_exit(aes_dev);
 
-out:
-	s5l8702_aes_clear_state(aes_dev);
-	s5l8702_aes_writel(aes_dev, S5L8702_AES_IRQ_MASK, S5L8702_AES_IRQ_ALL); // disable all interrupts
-	s5l8702_aes_writel(aes_dev, S5L8702_AES_POWER, 0);
-	clk_disable_unprepare(aes_dev->clk);
+out_unlock:
 	mutex_unlock(&aes_dev->lock);
+
 	return ret;
 }
 
