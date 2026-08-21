@@ -73,7 +73,11 @@
 #define S5L8702_AES_CFG_KEYSIZE	GENMASK(5, 4)
 #define S5L8702_AES_CFG_PAUSE	GENMASK(2, 1)
 
-#define S5L8702_AES_IRQ_ALL	GENMASK(3, 0)
+#define S5L8702_AES_IRQ_ALL				GENMASK(3, 0)
+#define S5L8702_AES_IRQ_XFR_DONE	BIT(0)
+#define S5L8702_AES_IRQ_TBUF_FULL	BIT(1)
+#define S5L8702_AES_IRQ_SBUF_EMPTY	BIT(2)
+#define S5L8702_AES_IRQ_ILLEGAL_OP	BIT(3)
 
 #define S5L8702_AES_POLL_TIMEOUT_US 500000
 
@@ -367,10 +371,29 @@ static int s5l8702_aes_hw_crypt(struct s5l8702_aes_dev *aes_dev, dma_addr_t src,
 		return ret;
 	}
 
+	if (irq & S5L8702_AES_IRQ_ILLEGAL_OP) {
+		dev_err(dev, "AES illegal operation (IRQ=0x%08x)\n", irq);
+		ret = -EIO;
+		goto out_clear_irq;
+	}
+
+	if (irq & S5L8702_AES_IRQ_TBUF_FULL) {
+		dev_err(dev, "AES target buffer full (IRQ=0x%08x)\n", irq);
+		ret = -EIO;
+		goto out_clear_irq;
+	}
+
+	if (irq & S5L8702_AES_IRQ_SBUF_EMPTY) {
+		dev_err(dev, "AES source buffer empty (IRQ=0x%08x)\n", irq);
+		ret = -EIO;
+		goto out_clear_irq;
+	}
+
+out_clear_irq:
 	// clear all pending IRQs
 	s5l8702_aes_writel(aes_dev, S5L8702_AES_IRQ, S5L8702_AES_IRQ_ALL);
 
-	return 0;
+	return ret;
 }
 
 static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
