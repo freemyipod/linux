@@ -320,6 +320,9 @@ static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 	if (ctx->cbc) {
 		// CBC
 		cfg |= BIT(3);
+
+		// IV
+		s5l8702_aes_write_iv(aes_dev, walk.iv);
 	}
 	else {
 		// ECB
@@ -353,10 +356,6 @@ static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 
 		if (chunk_len == 0)
 			break;
-
-		// set IV for CBC
-		if (ctx->cbc)
-			s5l8702_aes_write_iv(aes_dev, walk.iv);
 
 		// map addresses
 		src = dma_map_single(dev, walk.src.virt.addr, chunk_len, DMA_TO_DEVICE);
@@ -396,10 +395,6 @@ static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 		// unmap addresses
 		dma_unmap_single(dev, src, chunk_len, DMA_TO_DEVICE);
 		dma_unmap_single(dev, dst, chunk_len, DMA_FROM_DEVICE);
-
-		// update IV
-		if (ctx->cbc)
-			s5l8702_aes_read_iv(aes_dev, walk.iv);
 
 		// update remaining bytes and process next chunk
 		ret = skcipher_walk_done(&walk, walk.nbytes - chunk_len);
