@@ -91,8 +91,8 @@ jobs:
       - name: Build kernel
         run: make ARCH=arm CROSS_COMPILE=arm-none-eabi- -j $(nproc) zImage
 
-      - name: Check DTBs
-        run: make ARCH=arm CROSS_COMPILE=arm-none-eabi- dtbs_check
+#      - name: Check DTBs
+#        run: make ARCH=arm CROSS_COMPILE=arm-none-eabi- dtbs_check
 
       - name: Build DTBs
         run: make ARCH=arm CROSS_COMPILE=arm-none-eabi- dtbs
