@@ -5,7 +5,7 @@ BUSYBOX_DIR := busybox-$(BUSYBOX_VERSION)
 BUSYBOX_FILENAME := $(BUSYBOX_DIR).tar.bz2
 BUSYBOX_URL := https://busybox.net/downloads/$(BUSYBOX_FILENAME)
 
-APPS := fbclock
+APPS := fbclock aes-test rng-test sha1-test
 APP_CROSS_COMPILE := arm-linux-gnueabihf-
 APP_CFLAGS := -mcpu=cortex-a5+nosimd -static -O2 -Wall
 
