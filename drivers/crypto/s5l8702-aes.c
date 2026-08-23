@@ -377,18 +377,6 @@ static int s5l8702_aes_hw_crypt(struct s5l8702_aes_dev *aes_dev, dma_addr_t src,
 		goto out_clear_irq;
 	}
 
-	if (irq & S5L8702_AES_IRQ_TBUF_FULL) {
-		dev_err(dev, "AES target buffer full (IRQ=0x%08x)\n", irq);
-		ret = -EIO;
-		goto out_clear_irq;
-	}
-
-	if (irq & S5L8702_AES_IRQ_SBUF_EMPTY) {
-		dev_err(dev, "AES source buffer empty (IRQ=0x%08x)\n", irq);
-		ret = -EIO;
-		goto out_clear_irq;
-	}
-
 out_clear_irq:
 	// clear all pending IRQs
 	s5l8702_aes_writel(aes_dev, S5L8702_AES_IRQ, S5L8702_AES_IRQ_ALL);
