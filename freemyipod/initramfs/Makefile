@@ -10,6 +10,7 @@ BOARD ?= n31
 CONF := apple_$(BOARD)_defconfig
 OUT_FILENAME := initramfs-$(BOARD).cpio
 ROOTFS_DIR := rootfs
+ROOTFS_TEMPLATE_DIR := rootfs-template
 ROOTFS_STAMP_FILENAME := rootfs.stamp
 
 BB_FILE := $(THIS_DIR)/$(BUSYBOX_FILENAME)
@@ -18,6 +19,7 @@ BB_EXTRACTED := $(BB)/.extracted
 BB_CONFIG := $(BB)/.config
 BB_BINARY := $(BB)/busybox
 ROOTFS := $(THIS_DIR)/$(ROOTFS_DIR)
+ROOTFS_TEMPLATE := $(THIS_DIR)/$(ROOTFS_TEMPLATE_DIR)
 ROOTFS_STAMP := $(THIS_DIR)/$(ROOTFS_STAMP_FILENAME)
 ROOTFS_BB_BINARY := $(ROOTFS)/bin/busybox
 OUT := $(THIS_DIR)/$(OUT_FILENAME)
@@ -26,16 +28,10 @@ OUT_Z := $(OUT).gz
 APP_CROSS_COMPILE := arm-linux-gnueabihf-
 APP_CFLAGS := -mcpu=cortex-a5+nosimd -static -O2 -Wall
 
-ROOTFS_BASE_DEPS := \
-    $(ROOTFS_BB_BINARY) \
-    $(ROOTFS)/etc/inittab \
-    $(ROOTFS)/etc/init.d/rcS \
-    $(ROOTFS)/init
-
-ROOTFS_APP_DEPS := \
-    $(ROOTFS)/usr/bin/fbclock
-
-ROOTFS_DEPS := $(ROOTFS_BASE_DEPS) $(ROOTFS_APP_DEPS)
+ROOTFS_TEMPLATE_FILES := $(shell find $(ROOTFS_TEMPLATE) -type f)
+ROOTFS_TEMPLATE_DEPS := $(patsubst $(ROOTFS_TEMPLATE)/%,$(ROOTFS)/%,$(ROOTFS_TEMPLATE_FILES))
+ROOTFS_APP_DEPS := $(ROOTFS)/usr/bin/fbclock
+ROOTFS_DEPS := $(ROOTFS_BB_BINARY) $(ROOTFS_TEMPLATE_DEPS) $(ROOTFS_APP_DEPS)
 
 all: rootfs-compress
 
@@ -68,19 +64,9 @@ $(BB_BINARY): $(BB_CONFIG)
 $(ROOTFS_BB_BINARY): $(BB_BINARY)
 	$(MAKE) -C $(BB) CONFIG_PREFIX=$(ROOTFS) install
 
-$(ROOTFS)/etc/inittab: $(THIS_DIR)/inittab
+$(ROOTFS)/%: $(ROOTFS_TEMPLATE)/%
 	mkdir -p $(dir $@)
-	cp $< $@
-
-$(ROOTFS)/etc/init.d/rcS: $(THIS_DIR)/rcS
-	mkdir -p $(dir $@)
-	cp $< $@
-	chmod +x $@
-
-$(ROOTFS)/init: $(THIS_DIR)/init
-	mkdir -p $(dir $@)
-	cp $< $@
-	chmod +x $@
+	cp -p $< $@
 
 $(ROOTFS)/usr/bin/%: ../%.c
 	mkdir -p $(dir $@)
