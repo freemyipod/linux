@@ -492,4 +492,12 @@ config BACKLIGHT_LED
 
 endif # BACKLIGHT_CLASS_DEVICE
 
+
+config BACKLIGHT_S5L8740
+	tristate "Samsung/Apple S5L8740 backlight"
+	depends on BACKLIGHT_CLASS_DEVICE
+	help
+	  LCD backlight MMIO at 0x3E000000 for iPod nano 7G (N31).
+	  Does not touch LCDIF CON/PHTIME.
+
 endmenu
