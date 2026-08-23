@@ -39,8 +39,8 @@ int main(int argc, char *argv[]) {
     struct sockaddr_alg salg;
     memset(&salg, 0, sizeof(salg));
     salg.salg_family = AF_ALG;
-    strncpy(salg.salg_type, "hash", sizeof(salg.salg_type) - 1);
-    strncpy(salg.salg_name, "sha1", sizeof(salg.salg_name) - 1);
+    memcpy(salg.salg_type, "hash", sizeof("hash"));
+    memcpy(salg.salg_name, "sha1", sizeof("sha1"));
 
     if (bind(ctrl_fd, (struct sockaddr *)&salg, sizeof(salg)) < 0) {
         perror("bind");

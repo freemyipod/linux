@@ -3,10 +3,7 @@
 // Simple AF_ALG skcipher encrypt/decrypt filter.
 // - argv[1] = 0 => decrypt
 // - argv[1] = 1 => encrypt
-// - argv[2] = 0 => ECB
-// - argv[2] = 1 => CBC
-// - argv[2] = 2 => CBC-GID
-// - argv[2] = 3 => CBC-UID
+// - argv[2] = algorithm name
 // - reads stdin in 4096-byte chunks
 // - writes raw output to stdout
 // - key is all zeroes
@@ -16,10 +13,10 @@
 //   gcc -O2 -Wall aes-test.c -o aes-test
 //
 // Encrypt:
-//   cat plain.bin | ./aes-test 1 0 > enc.bin
+//   cat plain.bin | ./aes-test 1 'ecb(aes)' > enc.bin
 //
 // Decrypt:
-//   cat enc.bin | ./aes-test 0 0 > dec.bin
+//   cat enc.bin | ./aes-test 0 'ecb(aes)' > dec.bin
 //
 // Notes:
 // - Input size must be a multiple of AES block size (16 bytes).
@@ -48,28 +45,27 @@ static void die(const char *msg)
 int main(int argc, char **argv)
 {
     int tfmfd, opfd;
-    int enc;
-    char *salg_names[] = { "ecb(aes)", "cbc(aes)", "cbc(aes-gid)", "cbc(aes-uid)" };
+    int encrypt;
     struct sockaddr_alg sa;
     uint8_t key[KEYLEN];
     uint8_t inbuf[CHUNK];
     uint8_t outbuf[CHUNK];
 
     if (argc != 3) {
-        fprintf(stderr, "usage: %s <0|1> <0|1>\n", argv[0]);
-	fprintf(stderr, "0 = decrypt, 1 = encrypt\n");
-	fprintf(stderr, "0 = ECB, 1 = CBC, 2 = CBC-GID, 3 = CBC-UID\n");
+        fprintf(stderr, "usage: %s <0|1> <algo>\n", argv[0]);
+	    fprintf(stderr, "0 = decrypt, 1 = encrypt\n");
+	    fprintf(stderr, "algos: ecb(aes), cbc(aes), cbc(aes-gid), cbc(aes-uid)\n");
         return 1;
     }
 
-    enc = atoi(argv[1]) ? ALG_OP_ENCRYPT : ALG_OP_DECRYPT;
+    encrypt = atoi(argv[1]) ? ALG_OP_ENCRYPT : ALG_OP_DECRYPT;
 
     memset(key, 0, sizeof(key));
     memset(&sa, 0, sizeof(sa));
 
     sa.salg_family = AF_ALG;
     strcpy((char *)sa.salg_type, "skcipher");
-    strcpy((char *)sa.salg_name, salg_names[atoi(argv[2])]);
+    strcpy((char *)sa.salg_name, argv[2]);
 
     tfmfd = socket(AF_ALG, SOCK_SEQPACKET, 0);
     if (tfmfd < 0)
@@ -78,8 +74,7 @@ int main(int argc, char **argv)
     if (bind(tfmfd, (struct sockaddr *)&sa, sizeof(sa)) < 0)
         die("bind");
 
-    if (setsockopt(tfmfd, SOL_ALG, ALG_SET_KEY,
-                   key, sizeof(key)) < 0)
+    if (setsockopt(tfmfd, SOL_ALG, ALG_SET_KEY, key, sizeof(key)) < 0)
         die("setsockopt(ALG_SET_KEY)");
 
     opfd = accept(tfmfd, NULL, 0);
@@ -118,7 +113,7 @@ int main(int argc, char **argv)
         cmsg->cmsg_type = ALG_SET_OP;
         cmsg->cmsg_len = CMSG_LEN(sizeof(uint32_t));
 
-        *((uint32_t *)CMSG_DATA(cmsg)) = enc;
+        *((uint32_t *)CMSG_DATA(cmsg)) = encrypt;
 
         if (sendmsg(opfd, &msg, 0) < 0)
             die("sendmsg");
@@ -130,9 +125,7 @@ int main(int argc, char **argv)
         ssize_t off = 0;
 
         while (off < n) {
-            ssize_t w = write(STDOUT_FILENO,
-                              outbuf + off,
-                              n - off);
+            ssize_t w = write(STDOUT_FILENO, outbuf + off, n - off);
             if (w < 0)
                 die("write");
 
