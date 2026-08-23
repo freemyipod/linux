@@ -9,6 +9,7 @@
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/clock/samsung,s5l8702-clock.h>
+#include <dt-bindings/interrupt-controller/irq.h>
 
 / {
     #address-cells = <1>;
@@ -75,6 +76,18 @@
             #interrupt-cells = <1>;
         };
 
+        /* GPIO → EIC → VIC EXTn. EXT1 = Vol 40/41; EXT3 = PMIC GPIO86. */
+        eic: interrupt-controller@39700000 {
+            compatible = "apple,s5l8740-eic", "samsung,s5l8740-eic";
+            reg = <0x39700000 0x1000>;
+            interrupt-controller;
+            #interrupt-cells = <2>;
+            interrupt-parent = <&vic0>;
+            interrupts = <1>, <3>;
+            apple,eic-groups = <1>, <2>;
+            status = "okay";
+        };
+
         timer: timer@3c700000 {
             compatible = "samsung,s5l8720-timer";
             reg = <0x3c700000 0x20000>;
@@ -129,14 +142,14 @@
         };
 
         usbphy: usbphy@3c400000 {
-            compatible = "apple,s5l8720-otgphy";
+            compatible = "apple,s5l8740-otgphy", "apple,s5l87xx-otgphy";
             reg = <0x3c400000 0x100>;
             status = "okay";
             #phy-cells = <0>;
         };
 
         usbotg_hs: usb@38400000 {
-            compatible = "apple,s5l87xx-usb";
+            compatible = "apple,s5l8740-usb", "apple,s5l87xx-usb";
             reg = <0x38400000 0x40000>;
             interrupt-parent = <&vic0>;
             interrupts = <19>;
@@ -149,11 +162,20 @@
             g-tx-fifo-size = <256 256 512 512 512 768 768>;
             status = "okay";
             dr_mode = "peripheral";
+            maximum-speed = "high-speed";
         };
 
         lcdif: lcdif@38300000 {
             compatible = "samsung,s5l8740-lcdif";
             reg = <0x38300000 0x10000>;
+        };
+
+        /* MMIO backlight only. Never LCDIF CON/PHTIME. */
+        backlight: backlight@3e000000 {
+            compatible = "apple,s5l8740-backlight", "samsung,s5l8740-backlight";
+            reg = <0x3e000000 0x100>;
+            default-brightness = <62>;
+            status = "okay";
         };
 
         wdt: watchdog@3c800000 {
@@ -164,16 +186,31 @@
                 compatible = "syscon-reboot";
                 offset = <0x0>;
                 value = <0x100000>;
+                /* 0x100000 arms the WDT. Leave off until reboot is proven. */
+                status = "disabled";
             };
         };
 
-        gpio5: gpio@3cf00000 {
+        /* 2-line hack kept disabled; Vol± use full banked GPIO. */
+        gpio5: gpio-hack@3cf000a4 {
             compatible = "brcm,bcm6345-gpio";
             reg-names = "dat";
             reg = <0x3cf000a4 0x4>;
             #gpio-cells = <2>;
             gpio-controller;
             ngpios = <2>;
+            status = "disabled";
+        };
+
+        gpio: gpio@3cf00000 {
+            compatible = "apple,s5l8740-gpio", "samsung,s5l8740-gpio";
+            reg = <0x3cf00000 0x400>;
+            apple,eic = <&eic>;
+            apple,skip-sec-pinmux;
+            #gpio-cells = <2>;
+            gpio-controller;
+            ngpios = <128>;
+            status = "okay";
         };
 
         i2c0: i2c@3c600000 {
@@ -205,9 +242,12 @@
                 reg = <0x73>;
                 gpio-controller;
                 #gpio-cells = <2>;
-                dlg,gpio-map = <0x07 4>, /* Home button */
-                               <0x07 5>, /* Power button */
-                               <0x08 1>; /* Play/pause button */
+                dlg,gpio-map = <0x07 4>, /* Home  OSOS ID 1 */
+                               <0x07 5>, /* Sleep OSOS ID 9 */
+                               <0x08 1>; /* Play  OSOS ID 6 */
+                /* SoC GPIO 86 → EIC group2 → VIC EXT3 */
+                interrupt-parent = <&eic>;
+                interrupts = <86 IRQ_TYPE_LEVEL_LOW>;
             };
         };
 
@@ -240,12 +280,15 @@
         };
     };
 
+    /* Home/Sleep/Play come from gpio-d1830 + nIRQ, not this node.
+     * gpio-keys-polled on Vol± issues GPIOCMD 0xFFFE and the pads
+     * go quiet. gpio-s5l8740 polls DIN and reports the keys.
+     */
     gpio-keys {
         compatible = "gpio-keys-polled";
+        status = "disabled";
         poll-interval = <50>;
 
-        /* these hammer the i2c bus and the driver breaks
-           at some point, disable them for now */
         button-home {
             label = "Home Button";
             gpios = <&d1830 0 GPIO_ACTIVE_LOW>;
@@ -269,14 +312,16 @@
 
         button-volup {
             label = "Volume Up";
-            gpios = <&gpio5 0 GPIO_ACTIVE_LOW>;
+            gpios = <&gpio 40 GPIO_ACTIVE_LOW>;
             linux,code = <KEY_VOLUMEUP>;
+            status = "disabled";
         };
 
         button-voldown {
             label = "Volume Down";
-            gpios = <&gpio5 1 GPIO_ACTIVE_LOW>;
+            gpios = <&gpio 41 GPIO_ACTIVE_LOW>;
             linux,code = <KEY_VOLUMEDOWN>;
+            status = "disabled";
         };
     };
 };
