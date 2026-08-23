@@ -56,6 +56,15 @@ config ARM_NVIC
 	select IRQ_DOMAIN_HIERARCHY
 	select GENERIC_IRQ_CHIP
 
+config S5L8740_EIC
+	bool "S5L8740 GPIO External Interrupt Controller"
+	depends on OF && ARM_VIC
+	select IRQ_DOMAIN
+	help
+	  GPIO EIC at 0x39700000 on Apple S5L8740 (iPod nano 7G).
+	  Groups map to PL192 VIC EXT lines. Chain only the parents
+	  listed in the device tree.
+
 config ARM_VIC
 	bool
 	select IRQ_DOMAIN
