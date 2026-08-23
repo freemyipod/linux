@@ -1,36 +1,39 @@
-THIS_MAKEFILE := $(abspath $(lastword $(MAKEFILE_LIST)))
-THIS_DIR := $(dir $(THIS_MAKEFILE))
+BOARD ?= n31
 
 BUSYBOX_VERSION := 1.36.1
 BUSYBOX_DIR := busybox-$(BUSYBOX_VERSION)
 BUSYBOX_FILENAME := $(BUSYBOX_DIR).tar.bz2
 BUSYBOX_URL := https://busybox.net/downloads/$(BUSYBOX_FILENAME)
 
-BOARD ?= n31
-CONF := apple_$(BOARD)_defconfig
-OUT_FILENAME := initramfs-$(BOARD).cpio
-ROOTFS_DIR := rootfs
-ROOTFS_TEMPLATE_DIR := rootfs-template
-ROOTFS_STAMP_FILENAME := rootfs.stamp
+APPS := fbclock
+APP_CROSS_COMPILE := arm-linux-gnueabihf-
+APP_CFLAGS := -mcpu=cortex-a5+nosimd -static -O2 -Wall
 
+THIS_MAKEFILE := $(abspath $(lastword $(MAKEFILE_LIST)))
+THIS_DIR := $(dir $(THIS_MAKEFILE))
+
+CONF := apple_$(BOARD)_defconfig
 BB_FILE := $(THIS_DIR)/$(BUSYBOX_FILENAME)
 BB := $(THIS_DIR)/$(BUSYBOX_DIR)
 BB_EXTRACTED := $(BB)/.extracted
 BB_CONFIG := $(BB)/.config
 BB_BINARY := $(BB)/busybox
+
+ROOTFS_DIR := rootfs
+ROOTFS_TEMPLATE_DIR := rootfs-template
+ROOTFS_STAMP_FILENAME := rootfs.stamp
 ROOTFS := $(THIS_DIR)/$(ROOTFS_DIR)
 ROOTFS_TEMPLATE := $(THIS_DIR)/$(ROOTFS_TEMPLATE_DIR)
 ROOTFS_STAMP := $(THIS_DIR)/$(ROOTFS_STAMP_FILENAME)
 ROOTFS_BB_BINARY := $(ROOTFS)/bin/busybox
+
+OUT_FILENAME := initramfs-$(BOARD).cpio
 OUT := $(THIS_DIR)/$(OUT_FILENAME)
 OUT_Z := $(OUT).gz
 
-APP_CROSS_COMPILE := arm-linux-gnueabihf-
-APP_CFLAGS := -mcpu=cortex-a5+nosimd -static -O2 -Wall
-
 ROOTFS_TEMPLATE_FILES := $(shell find $(ROOTFS_TEMPLATE) -type f)
 ROOTFS_TEMPLATE_DEPS := $(patsubst $(ROOTFS_TEMPLATE)/%,$(ROOTFS)/%,$(ROOTFS_TEMPLATE_FILES))
-ROOTFS_APP_DEPS := $(ROOTFS)/usr/bin/fbclock
+ROOTFS_APP_DEPS := $(patsubst %,$(ROOTFS)/usr/bin/%,$(APPS))
 ROOTFS_DEPS := $(ROOTFS_BB_BINARY) $(ROOTFS_TEMPLATE_DEPS) $(ROOTFS_APP_DEPS)
 
 all: rootfs-compress
