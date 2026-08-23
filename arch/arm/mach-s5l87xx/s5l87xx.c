@@ -7,8 +7,34 @@
  */
 
 #include <linux/init.h>
+#include <linux/io.h>
+#include <linux/printk.h>
 #include <asm/mach/arch.h>
 #include <asm/mach/map.h>
+
+
+#define S5L8740_WDT_PHYS	0x3c800000ul
+
+/*
+ * WTF/U-Boot leave the SEC watchdog armed. A bigger zImage loses the race.
+ * CON=0 then CNT=0. Never CLKCON+0x50.
+ */
+static int __init s5l87xx_wdt_disarm(void)
+{
+	void __iomem *wdt = ioremap(S5L8740_WDT_PHYS, 8);
+
+	if (!wdt)
+		return 0;
+	writel(0, wdt);
+	writel(0, wdt + 4);
+	writel(0, wdt);
+	writel(0, wdt + 4);
+	pr_info("s5l87xx: WDT disarmed con=%08x cnt=%08x\n",
+		readl(wdt), readl(wdt + 4));
+	iounmap(wdt);
+	return 0;
+}
+early_initcall(s5l87xx_wdt_disarm);
 
 /*
  * Map the debug UART into a fixed virtual address so earlyprintk works
