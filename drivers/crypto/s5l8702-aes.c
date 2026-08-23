@@ -248,6 +248,20 @@ static int s5l8702_aes_setkey(struct crypto_skcipher *tfm, const u8 *key, unsign
 	return 0;
 }
 
+static inline int s5l8702_aes_check_fused_key_length(struct crypto_skcipher *tfm, const u8 *key, unsigned int keylen)
+{
+	struct s5l8702_aes_ctx *ctx = crypto_skcipher_ctx(tfm);
+	struct s5l8702_aes_dev *aes_dev = ctx->aes_dev;
+	struct device *dev = aes_dev->dev;
+
+	if (keylen != AES_KEYSIZE_128) {
+		dev_err(dev, "cbc-uid and cbc-gid algorithms can only be used with AES-128, received key size %u\n", keylen);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static void s5l8702_aes_hw_exit(struct s5l8702_aes_dev *aes_dev)
 {
 	s5l8702_aes_clear_state(aes_dev);
@@ -510,10 +524,11 @@ static const struct s5l8702_aes_alg s5l8702_aes_alg_template[] = {
 				.cra_module			= THIS_MODULE,
 			},
 			.init			= s5l8702_aes_init_cbc_gid,
+			.setkey			= s5l8702_aes_check_fused_key_length,
 			.encrypt		= s5l8702_aes_encrypt,
 			.decrypt		= s5l8702_aes_decrypt,
-			.min_keysize	= AES_MIN_KEY_SIZE,
-			.max_keysize	= AES_MAX_KEY_SIZE,
+			.min_keysize	= AES_KEYSIZE_128,
+			.max_keysize	= AES_KEYSIZE_128,
 			.ivsize			= AES_BLOCK_SIZE,
 		},
 	},
@@ -529,10 +544,11 @@ static const struct s5l8702_aes_alg s5l8702_aes_alg_template[] = {
 				.cra_module			= THIS_MODULE,
 			},
 			.init			= s5l8702_aes_init_cbc_uid,
+			.setkey			= s5l8702_aes_check_fused_key_length,
 			.encrypt		= s5l8702_aes_encrypt,
 			.decrypt		= s5l8702_aes_decrypt,
-			.min_keysize	= AES_MIN_KEY_SIZE,
-			.max_keysize	= AES_MAX_KEY_SIZE,
+			.min_keysize	= AES_KEYSIZE_128,
+			.max_keysize	= AES_KEYSIZE_128,
 			.ivsize			= AES_BLOCK_SIZE,
 		},
 	},
