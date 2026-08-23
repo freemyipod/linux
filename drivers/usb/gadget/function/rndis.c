@@ -256,10 +256,7 @@ static int gen_ndis_query_resp(struct rndis_params *params, u32 OID, u8 *buf,
 	case RNDIS_OID_GEN_LINK_SPEED:
 		if (rndis_debug > 1)
 			pr_debug("%s: RNDIS_OID_GEN_LINK_SPEED\n", __func__);
-		if (params->media_state == RNDIS_MEDIA_STATE_DISCONNECTED)
-			*outbuf = cpu_to_le32(0);
-		else
-			*outbuf = cpu_to_le32(params->speed);
+		*outbuf = cpu_to_le32(params->speed);
 		retval = 0;
 		break;
 
@@ -325,7 +322,7 @@ static int gen_ndis_query_resp(struct rndis_params *params, u32 OID, u8 *buf,
 	case RNDIS_OID_GEN_MEDIA_CONNECT_STATUS:
 		if (rndis_debug > 1)
 			pr_debug("%s: RNDIS_OID_GEN_MEDIA_CONNECT_STATUS\n", __func__);
-		*outbuf = cpu_to_le32(params->media_state);
+		*outbuf = cpu_to_le32(RNDIS_MEDIA_STATE_CONNECTED);
 		retval = 0;
 		break;
 
@@ -813,8 +810,16 @@ int rndis_msg_parser(struct rndis_params *params, u8 *buf)
 	case RNDIS_MSG_INIT:
 		pr_debug("%s: RNDIS_MSG_INIT\n",
 			__func__);
-		params->state = RNDIS_INITIALIZED;
-		return rndis_init_response(params, (rndis_init_msg_type *)buf);
+		{
+			int ret;
+
+			params->state = RNDIS_INITIALIZED;
+			params->media_state = RNDIS_MEDIA_STATE_CONNECTED;
+			ret = rndis_init_response(params,
+				(rndis_init_msg_type *)buf);
+			rndis_signal_connect(params);
+			return ret;
+		}
 
 	case RNDIS_MSG_HALT:
 		pr_debug("%s: RNDIS_MSG_HALT\n",

@@ -585,6 +585,9 @@ static int rndis_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 
 		rndis_set_param_dev(rndis->params, net,
 				&rndis->port.cdc_filter);
+		rndis_set_param_medium(rndis->params, RNDIS_MEDIUM_802_3,
+			gether_bitrate(cdev->gadget) / 100);
+		rndis_signal_connect(rndis->params);
 	} else
 		goto fail;
 
@@ -680,6 +683,9 @@ rndis_bind(struct usb_configuration *c, struct usb_function *f)
 	rndis_iad_descriptor.bFunctionClass = rndis_opts->class;
 	rndis_iad_descriptor.bFunctionSubClass = rndis_opts->subclass;
 	rndis_iad_descriptor.bFunctionProtocol = rndis_opts->protocol;
+	rndis_control_intf.bInterfaceClass = rndis_opts->class;
+	rndis_control_intf.bInterfaceSubClass = rndis_opts->subclass;
+	rndis_control_intf.bInterfaceProtocol = rndis_opts->protocol;
 
 	/*
 	 * in drivers/usb/gadget/configfs.c:configfs_composite_bind()
