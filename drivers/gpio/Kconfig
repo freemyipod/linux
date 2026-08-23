@@ -1333,7 +1333,16 @@ config GPIO_CS5535
 
 	  If unsure, say N.
 
-config GPIO_D1830
+config GPIO_S5L8740
+	bool "Samsung/Apple S5L8740 banked GPIO"
+	depends on OF && GPIOLIB
+	select GPIO_GENERIC
+	help
+	  Banked GPIO at 0x3CF00000 plus the GPIOCMD latch at +0x1E0.
+	  Used on iPod nano 7G for Vol± and as the parent for EIC
+	  to_irq. Do not use gpio-keys-polled on the Vol pads; that
+	  path issues GPIOCMD 0xFFFE and the DIN lines stop moving.
+
 	tristate "Dialog Semiconductor D1830 PMIC GPIO (read-only, I2C)"
 	depends on I2C
 	depends on GPIOLIB
