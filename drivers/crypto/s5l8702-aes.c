@@ -270,7 +270,7 @@ static void s5l8702_aes_hw_exit(struct s5l8702_aes_dev *aes_dev)
 	clk_disable_unprepare(aes_dev->clk);
 }
 
-static int s5l8702_aes_hw_init(struct s5l8702_aes_ctx *ctx, const u8 *iv, bool encrypt)
+static int s5l8702_aes_hw_init(struct s5l8702_aes_ctx *ctx, bool encrypt)
 {
 	struct s5l8702_aes_dev *aes_dev = ctx->aes_dev;
 	struct device *dev = aes_dev->dev;
@@ -326,16 +326,10 @@ static int s5l8702_aes_hw_init(struct s5l8702_aes_ctx *ctx, const u8 *iv, bool e
 	cfg |= S5L8702_AES_CFG_PAUSE;
 
 	// chaining mode
-	if (ctx->cbc) {
-		// CBC
-		cfg |= BIT(3);
-
-		// IV
-		s5l8702_aes_write_iv(aes_dev, iv);
-	} else {
-		// ECB
-		cfg &= ~BIT(3);
-	}
+	if (ctx->cbc)
+		cfg |= BIT(3);	// CBC
+	else
+		cfg &= ~BIT(3);	// ECB
 
 	// key size
 	cfg &= ~S5L8702_AES_CFG_KEYSIZE;
@@ -398,6 +392,17 @@ out_clear_irq:
 	return ret;
 }
 
+static void s5l8702_aes_update_walk_iv(struct skcipher_walk *walk, unsigned int nbytes, bool encrypt)
+{
+    const u8 *src = walk->src.virt.addr;
+    const u8 *dst = walk->dst.virt.addr;
+
+    if (encrypt)
+        memcpy(walk->iv, dst + nbytes - AES_BLOCK_SIZE, AES_BLOCK_SIZE);
+    else
+        memcpy(walk->iv, src + nbytes - AES_BLOCK_SIZE, AES_BLOCK_SIZE);
+}
+
 static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 {
 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
@@ -416,12 +421,16 @@ static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 
 	mutex_lock(&aes_dev->lock);
 
-	ret = s5l8702_aes_hw_init(ctx, walk.iv, encrypt);
+	ret = s5l8702_aes_hw_init(ctx, encrypt);
 	if (ret)
 		goto out_unlock;
 
 	while (walk.nbytes) {
 		dma_addr_t src, dst;
+
+		// set IV for the current operation if needed
+		if (ctx->cbc)
+			s5l8702_aes_write_iv(aes_dev, walk.iv);
 
 		// map addresses
 		src = dma_map_single(dev, walk.src.virt.addr, walk.nbytes, DMA_TO_DEVICE);
@@ -445,6 +454,10 @@ static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 
 		if (ret)
 			break;
+
+		// prepare IV for the next operation if needed
+		if (ctx->cbc)
+			s5l8702_aes_update_walk_iv(&walk, walk.nbytes, encrypt);
 
 		// update remaining bytes and process next chunk
 		ret = skcipher_walk_done(&walk, 0);
