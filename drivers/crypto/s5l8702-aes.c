@@ -334,21 +334,24 @@ static int s5l8702_aes_hw_init(struct s5l8702_aes_ctx *ctx, bool encrypt)
 	// key size
 	cfg &= ~S5L8702_AES_CFG_KEYSIZE;
 
-	switch (ctx->keylen) {
-		case AES_KEYSIZE_128:
-			cfg |= FIELD_PREP(S5L8702_AES_CFG_KEYSIZE, S5L8702_AES_KEY_SIZE_128);
-			break;
-		case AES_KEYSIZE_192:
-			cfg |= FIELD_PREP(S5L8702_AES_CFG_KEYSIZE, S5L8702_AES_KEY_SIZE_192);
-			break;
-		case AES_KEYSIZE_256:
-			cfg |= FIELD_PREP(S5L8702_AES_CFG_KEYSIZE, S5L8702_AES_KEY_SIZE_256);
-			break;
-		default:
-			dev_err(dev, "Invalid key length: %u\n", ctx->keylen);
-			ret = -EINVAL;
-			goto err_hw;
+	if (hw_key_type == S5L8702_AES_KEY_TYPE_USER_DEFINE) {
+		switch (ctx->keylen) {
+			case AES_KEYSIZE_128:
+				cfg |= FIELD_PREP(S5L8702_AES_CFG_KEYSIZE, S5L8702_AES_KEY_SIZE_128);
+				break;
+			case AES_KEYSIZE_192:
+				cfg |= FIELD_PREP(S5L8702_AES_CFG_KEYSIZE, S5L8702_AES_KEY_SIZE_192);
+				break;
+			case AES_KEYSIZE_256:
+				cfg |= FIELD_PREP(S5L8702_AES_CFG_KEYSIZE, S5L8702_AES_KEY_SIZE_256);
+				break;
+			default:
+				dev_err(dev, "Invalid key length: %u\n", ctx->keylen);
+				ret = -EINVAL;
+				goto err_hw;
+		}
 	}
+	// else i.e. for key types UID and GID, key size is set to 0 - nothing to do
 
 	s5l8702_aes_writel(aes_dev, S5L8702_AES_CFG, cfg);
 
