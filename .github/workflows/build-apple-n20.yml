@@ -19,27 +19,27 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup initramfs cache so it's restored and saved if modified
-        id: cache-initramfs-apple-n31
+        id: cache-initramfs-apple-n20
         uses: actions/cache@v5
         with:
-          path: freemyipod/initramfs-n31.cpio.gz
-          key: initramfs-${{ hashFiles('freemyipod/initramfs/*') }}-apple-n31
+          path: freemyipod/initramfs-n20.cpio.gz
+          key: initramfs-${{ hashFiles('freemyipod/initramfs/*') }}-apple-n20
 
       - name: Build initramfs if cache miss
-        if: steps.cache-initramfs-apple-n31.outputs.cache-hit != 'true'
+        if: steps.cache-initramfs-apple-n20.outputs.cache-hit != 'true'
         run: |
           set -e
           sudo apt-get update
           sudo apt-get install -y gcc-arm-linux-gnueabihf
           cd freemyipod/initramfs
-          make BOARD=n31
-          cp initramfs-n31.cpio.gz ..
+          make BOARD=n20
+          cp initramfs-n20.cpio.gz ..
 
       - name: Upload initramfs artifact
         uses: actions/upload-artifact@v7
         with:
-          name: initramfs-apple-n31
-          path: freemyipod/initramfs-n31.cpio.gz
+          name: initramfs-apple-n20
+          path: freemyipod/initramfs-n20.cpio.gz
 
   build-kernel:
     runs-on: ubuntu-24.04
@@ -74,7 +74,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.ccache
-          key: ccache-kernel-apple-n31
+          key: ccache-kernel-apple-n20
 
       - name: Setup ccache
         run: |
@@ -126,7 +126,7 @@ jobs:
       - name: Download initramfs artifact
         uses: actions/download-artifact@v8
         with:
-          name: initramfs-apple-n31
+          name: initramfs-apple-n20
           path: freemyipod
 
       - name: Download kernel artifacts
@@ -148,7 +148,7 @@ jobs:
           required_files=(
             "zImage-n20"
             "s5l8723-n20.dtb"
-            "initramfs-n31.cpio.gz"
+            "initramfs-n20.cpio.gz"
             "kernel_fdt_n20.its"
           )
           for file in "${required_files[@]}"; do
