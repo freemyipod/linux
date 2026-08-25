@@ -16,14 +16,15 @@ THIS_DIR := $(dir $(THIS_MAKEFILE))
 
 CONF := apple_$(BOARD)_defconfig
 BB_FILE := $(THIS_DIR)/$(BUSYBOX_FILENAME)
-BB := $(THIS_DIR)/$(BUSYBOX_DIR)
+BB_INITIAL_DIR := $(THIS_DIR)/$(BUSYBOX_DIR)
+BB := $(BB_INITIAL_DIR)-$(BOARD)
 BB_EXTRACTED := $(BB)/.extracted
 BB_CONFIG := $(BB)/.config
 BB_BINARY := $(BB)/busybox
 
-ROOTFS_DIR := rootfs
+ROOTFS_DIR := rootfs-$(BOARD)
 ROOTFS_TEMPLATE_DIR := rootfs-template
-ROOTFS_STAMP_FILENAME := rootfs.stamp
+ROOTFS_STAMP_FILENAME := rootfs-$(BOARD).stamp
 ROOTFS := $(THIS_DIR)/$(ROOTFS_DIR)
 ROOTFS_TEMPLATE := $(THIS_DIR)/$(ROOTFS_TEMPLATE_DIR)
 ROOTFS_STAMP := $(THIS_DIR)/$(ROOTFS_STAMP_FILENAME)
@@ -57,6 +58,7 @@ $(BB_FILE):
 
 $(BB_EXTRACTED): $(BB_FILE)
 	tar -xjvf $<
+	mv $(BB_INITIAL_DIR) $(BB)
 	touch $@
 
 $(BB_CONFIG): $(CONF) $(BB_EXTRACTED)

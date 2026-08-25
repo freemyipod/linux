@@ -5,5 +5,5 @@ zImage-*
 uImage-*
 kernel_fdt_*.itb
 busybox-*
-rootfs
+rootfs-*
 rootfs.stamp
