@@ -511,6 +511,8 @@ static int gen_ndis_set_resp(struct rndis_params *params, u32 OID,
 		 *	MULTICAST, ALL_MULTICAST, BROADCAST
 		 */
 		*params->filter = (u16)get_unaligned_le32(buf);
+		pr_info("s5l87xx rndis filter ndis=0x%x\n",
+			*params->filter);
 		pr_debug("%s: RNDIS_OID_GEN_CURRENT_PACKET_FILTER %08x\n",
 			__func__, *params->filter);
 
@@ -818,6 +820,7 @@ int rndis_msg_parser(struct rndis_params *params, u8 *buf)
 			ret = rndis_init_response(params,
 				(rndis_init_msg_type *)buf);
 			rndis_signal_connect(params);
+			pr_info("s5l87xx rndis INIT connected (tx after SET)\n");
 			return ret;
 		}
 

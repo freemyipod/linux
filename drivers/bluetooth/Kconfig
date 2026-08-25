@@ -518,3 +518,9 @@ config BT_INTEL_PCIE
 	  Say Y here to compiler support for Intel Bluetooth PCIe device into
 	  the kernel or say M to compile it as module (btintel_pcie)
 endmenu
+
+config BT_BCM2078_N31
+	tristate "Broadcom BCM2078 power companion (N31)"
+	depends on BT && OF && HAS_IOMEM
+	help
+	  Power/GPIO + Vincent patchram HCD companion for BCM2078 on N31.

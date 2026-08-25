@@ -102,8 +102,7 @@ static int s5l8702_clk_probe(struct platform_device *pdev)
 	if (IS_ERR(clk_data->regs))
 		return PTR_ERR(clk_data->regs);
 
-	if (of_machine_is_compatible("samsung,s5l8740"))
-		s5l8740_ungate_all(dev, clk_data->regs);
+	s5l8740_ungate_all(dev, clk_data->regs);
 
 	hw_data = devm_kzalloc(dev, struct_size(hw_data, hws, num_clks), GFP_KERNEL);
 	if (!hw_data)

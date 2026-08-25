@@ -343,3 +343,4 @@ config USB_ONBOARD_DEV_USB5744
 	  during hub start-up configuration stage. It is must to enable this
 	  option on AMD Kria KR260 Robotics Starter Kit as this hub is
 	  connected to USB-SD converter which mounts the root filesystem.
+

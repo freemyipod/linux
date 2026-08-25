@@ -580,14 +580,19 @@ static int rndis_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
 
 		DBG(cdev, "RNDIS RX/TX early activation ... \n");
 		net = gether_connect(&rndis->port);
-		if (IS_ERR(net))
+		if (IS_ERR(net)) {
+			pr_info("s5l87xx gether_connect err=%ld\n",
+				PTR_ERR(net));
 			return PTR_ERR(net);
+		}
+		pr_info("s5l87xx gether_connect ok\n");
 
 		rndis_set_param_dev(rndis->params, net,
 				&rndis->port.cdc_filter);
 		rndis_set_param_medium(rndis->params, RNDIS_MEDIUM_802_3,
 			gether_bitrate(cdev->gadget) / 100);
 		rndis_signal_connect(rndis->params);
+		pr_info("s5l87xx rndis set_alt signal_connect\n");
 	} else
 		goto fail;
 

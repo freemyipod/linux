@@ -473,8 +473,9 @@ static void d1830_trace_work(struct work_struct *work)
 
 /*
  * OSOS 3477C + 347E4 + 2C778(3, 5). Channel 3 is VBAT. 10-bit sample
- * averaged 5×. Scale: 10-bit × 6 mV (6 V FS). 439A98 then >>2; that
- * is logged, not used for µV. No writes to 87/88 (158C82 bitfields).
+ * averaged 5×. Scale is 10-bit * 6 V FS / 1023 (emcore / OSOS).
+ * 439A98 then >>2 — logged only. RetailOS UI cache at 0x891DB18
+ * is still unmapped. No writes to 87/88. Never write reg 13 here.
  */
 static int d1830_adc_once(struct d1830_gpio *gpio_dev, int *adc,
 			  u8 *r48, u8 *r49, u8 *r50)
@@ -737,6 +738,27 @@ static int d1830_rmw(struct i2c_client *client, u8 reg, u8 clear, u8 set)
 		return v;
 	return i2c_smbus_write_byte_data(client, reg, (u8)((v & ~clear) | set));
 }
+
+/*
+ * OSOS sub_20766(1) → 439B00(1) → 6644(4) → 7484(pmic, 9, on):
+ * RMW D1830 register 16 bit 5. Targeted Nimbus rail — not the SEC seq.
+ */
+int d1830_nimbus_rail(bool on)
+{
+	struct i2c_client *client = d1830_poweroff_client;
+	int before, ret;
+
+	if (!client)
+		return -ENODEV;
+	before = i2c_smbus_read_byte_data(client, 16);
+	if (before < 0)
+		return before;
+	ret = d1830_rmw(client, 16, BIT(5), on ? BIT(5) : 0);
+	dev_info(&client->dev, "nimbus rail reg16 0x%02x -> bit5=%d ret=%d\n",
+		 before, on, ret);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(d1830_nimbus_rail);
 
 /*
  * IpodSec PMIC rail / charge bring-up:

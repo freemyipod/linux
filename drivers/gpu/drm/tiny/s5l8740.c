@@ -39,6 +39,7 @@
 
 #define S5L8740_LCD_STATUS_BUSY	0x10
 
+/* GATE0: 1us was too short (stride/FIFO); 100ms wait, pitch-aware blit */
 #define S5L8740_LCD_TIMEOUT_US 100000
 
 #define WIDTH 240
@@ -253,10 +254,25 @@ static int s5l8740_probe(struct platform_device *pdev)
     if (IS_ERR(sdev->lcdif))
         return PTR_ERR(sdev->lcdif);
 
-    /* U-Boot already programmed CON/PHTIME. Do not rewrite them. */
+    /* GATE0: log WTF handoff, never rewrite CON/PHTIME */
     drm_info(dev, "LCDIF handoff CON=%08x PHTIME=%08x (untouched)\n",
 	     readl(sdev->lcdif + S5L8740_LCD_CON),
 	     readl(sdev->lcdif + S5L8740_LCD_PHTIME));
+
+    /* CON first (stage0). Print so glass shows whether WDT is still live. */
+    {
+	void __iomem *wdt = ioremap(0x3c800000, 8);
+
+	if (wdt) {
+		writel(0, wdt);
+		writel(0, wdt + 4);
+		writel(0, wdt);
+		writel(0, wdt + 4);
+		drm_info(dev, "WDT CON=%08x CNT=%08x (disarmed)\n",
+			 readl(wdt), readl(wdt + 4));
+		iounmap(wdt);
+	}
+    }
 
     /*
 	 * Modesetting

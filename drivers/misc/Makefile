@@ -75,3 +75,7 @@ lan966x-pci-objs		:= lan966x_pci.o
 lan966x-pci-objs		+= lan966x_pci.dtbo.o
 obj-$(CONFIG_MCHP_LAN966X_PCI)	+= lan966x-pci.o
 obj-y				+= keba/
+obj-$(CONFIG_APPLE_TRISTAR_CBTL1609)	+= apple-tristar-cbtl1609.o
+obj-$(CONFIG_S5L8740_IIS2_MMIO)	+= s5l8740-iis2-mmio.o
+obj-$(CONFIG_FMSS_S5L8740)	+= fmss-s5l8740.o
+obj-$(CONFIG_FTL_S5L8740)	+= ftl-s5l8740.o

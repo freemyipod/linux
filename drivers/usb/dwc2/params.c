@@ -110,24 +110,21 @@ static void dwc2_set_s5l8702_params(struct dwc2_hsotg *hsotg)
 {
 	struct dwc2_core_params *p = &hsotg->params;
 
+	/* Nano 3G (S5L8702) — lemonjesus bring-up. Do NOT share blindly with N20/N31. */
 	p->speed = DWC2_SPEED_PARAM_HIGH;
 	p->otg_caps.hnp_support = true;
 	p->otg_caps.srp_support = true;
 	p->phy_utmi_width = 16;
-	// If we enable DMA, we get BULK packet corruption, eg. in the CDC EEM
-	// gadget, eg.:
-	// [    5.530000] g_ether gadget.0: invalid EEM CRC
-	// I _think_ this is a DMA mechanism built into the DWC2 core, and not using
-	// the kernel DMAEngine, as that seems to be working fine (and this happens
-	// even if we have no DMA controllers).
+	/* DWC2 internal DMA corrupts BULK on this core (CDC EEM CRC). */
 	p->g_dma = false;
-	// The hardware expects USBRST/ENUMDONE/IEPInt/OEPInt/USBSUSP/WKUPINT/etc.
-	// masked until SessReqInt/ConIDStsChng signals session-valid. Without
-	// this gating, these bits fire during disconnect and the OTG state
-	// machine has no opportunity to make progress.
+	/* Gate device IRQs until SessReqInt/ConIDStsChng — Nano3-specific. */
 	p->session_valid_gintmsk_quirk = true;
 }
 
+/*
+ * Nano 6G/7G (S5L872x/8740). Same g_dma caution; omit Nano3 GINTMSK gating
+ * until proven required (Slackware/INIT: Nano3 PHY/dwc2 deltas broke N7).
+ */
 static void dwc2_set_s5l87xx_params(struct dwc2_hsotg *hsotg)
 {
 	struct dwc2_core_params *p = &hsotg->params;
@@ -477,8 +474,10 @@ const struct of_device_id dwc2_of_match_table[] = {
 	{ .compatible = "snps,dwc2" },
 	{ .compatible = "samsung,s3c6400-hsotg",
 	  .data = dwc2_set_s3c6400_params },
-	{ .compatible = "apple,s5l87xx-usb",
+	{ .compatible = "apple,s5l8702-usb",
 	  .data = dwc2_set_s5l8702_params },
+	{ .compatible = "apple,s5l87xx-usb",
+	  .data = dwc2_set_s5l87xx_params },
 	{ .compatible = "apple,s5l8740-usb",
 	  .data = dwc2_set_s5l87xx_params },
 	{ .compatible = "amlogic,meson8-usb",
