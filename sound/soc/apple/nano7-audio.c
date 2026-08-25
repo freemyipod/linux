@@ -41,32 +41,33 @@ static int nano7_audio_probe(struct platform_device *pdev)
 	int ret;
 
 	cpu_np = of_parse_phandle(dev->of_node, "apple,cpu", 0);
-	if (cpu_np) {
-		nano7_dais[0].cpus->of_node = cpu_np;
-		nano7_dais[0].cpus->dai_name = NULL;
-		nano7_dais[0].platforms->of_node = cpu_np;
-		nano7_dais[0].platforms->name = NULL;
+	if (!cpu_np) {
+		dev_err(dev, "missing apple,cpu phandle (IIS0)\n");
+		return -EINVAL;
 	}
+	nano7_dais[0].cpus->of_node = cpu_np;
+	nano7_dais[0].cpus->dai_name = NULL;
+	/* dmaengine PCM lives on the IIS platform device */
+	nano7_dais[0].platforms->of_node = cpu_np;
+	nano7_dais[0].platforms->name = NULL;
 
 	codec_np = of_parse_phandle(dev->of_node, "apple,codec", 0);
 	if (!codec_np)
 		codec_np = of_find_compatible_node(NULL, NULL, "cirrus,cs42l81");
-	if (codec_np) {
-		nano7_dais[0].codecs->of_node = codec_np;
-		nano7_dais[0].codecs->name = NULL;
-		nano7_dais[0].codecs->dai_name = "cs42l81-hifi";
-	} else {
-		nano7_dais[0].codecs->name = "spi0.0";
-		nano7_dais[0].codecs->dai_name = "cs42l81-hifi";
+	if (!codec_np) {
+		dev_err(dev, "missing apple,codec / cirrus,cs42l81\n");
+		of_node_put(cpu_np);
+		return -EINVAL;
 	}
+	nano7_dais[0].codecs->of_node = codec_np;
+	nano7_dais[0].codecs->name = NULL;
+	nano7_dais[0].codecs->dai_name = "cs42l81-hifi";
 
 	nano7_card.dev = dev;
 	ret = devm_snd_soc_register_card(dev, &nano7_card);
 	if (ret) {
-		if (cpu_np)
-			of_node_put(cpu_np);
-		if (codec_np)
-			of_node_put(codec_np);
+		of_node_put(cpu_np);
+		of_node_put(codec_np);
 		if (ret == -EPROBE_DEFER)
 			return ret;
 		dev_err(dev, "snd_soc_register_card failed: %d\n", ret);
