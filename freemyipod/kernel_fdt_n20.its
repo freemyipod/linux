@@ -32,7 +32,7 @@
 
         ramdisk {
             description = "Gzipped Initramfs";
-            data = /incbin/("initramfs-n31.cpio.gz");
+            data = /incbin/("initramfs-n20.cpio.gz");
             type = "ramdisk";
             arch = "arm";
             os = "linux";

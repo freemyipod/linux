@@ -1,4 +1,4 @@
-BOARD ?= n31
+BOARD ?= n31  # or n20
 
 BUSYBOX_VERSION := 1.36.1
 BUSYBOX_DIR := busybox-$(BUSYBOX_VERSION)
@@ -12,7 +12,7 @@ APP_CFLAGS := -mcpu=cortex-a5+nosimd -static -O2 -Wall
 THIS_MAKEFILE := $(abspath $(lastword $(MAKEFILE_LIST)))
 THIS_DIR := $(dir $(THIS_MAKEFILE))
 
-CONF := apple_$(BOARD)_defconfig
+CONF := apple_$(BOARD)_config
 BB_FILE := $(THIS_DIR)/$(BUSYBOX_FILENAME)
 BB := $(THIS_DIR)/$(BUSYBOX_DIR)
 BB_EXTRACTED := $(BB)/.extracted
