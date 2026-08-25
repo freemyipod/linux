@@ -90,3 +90,4 @@ obj-y += qcom/
 obj-y += stm32/
 obj-y += ti/
 obj-y += xilinx/
+obj-$(CONFIG_S5L8740_PL080) += dma-s5l8740-pl080.o

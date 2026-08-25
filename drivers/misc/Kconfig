@@ -650,3 +650,33 @@ source "drivers/misc/pvpanic/Kconfig"
 source "drivers/misc/mchp_pci1xxxx/Kconfig"
 source "drivers/misc/keba/Kconfig"
 endmenu
+
+config FMSS_S5L8740
+	tristate "S5L8740 FMSS NAND (N31 WhimoryPPN CS path)"
+	depends on HAS_IOMEM
+	help
+	  Flash Memory Subsystem driver for iPod nano 7G (S5L8740).
+	  Provides CS DMA page reads, META weave/LBA scan, and sysfs
+	  hooks used by the FTL bring-up path.
+
+config FTL_S5L8740
+	tristate "S5L8740 FTL helper (N31)"
+	depends on FMSS_S5L8740
+	help
+	  Higher-level FTL helper layered on FMSS_S5L8740 for N31
+	  restore / LBA mapping experiments.
+
+config APPLE_TRISTAR_CBTL1609
+	tristate "Apple Lightning Tristar (CBTL1609A1) mux"
+	depends on I2C
+	help
+	  I2C driver for NXP CBTL1609A1 Lightning charge/data mux (Tristar)
+	  on iPod nano 7G. Lives under misc because N31 is gadget-only
+	  (CONFIG_USB host is off, so drivers/usb/misc is invisible).
+
+config S5L8740_IIS2_MMIO
+	tristate "S5L8740 IIS2 FM MMIO hook (N31)"
+	depends on HAS_IOMEM
+	help
+	  IIS2 @0x3D400000 FM digital RX hook — MMIO regs sysfs only.
+	  Capture PCM register model still OPEN per N31 RE.

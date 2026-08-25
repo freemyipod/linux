@@ -110,22 +110,152 @@ static void dwc2_set_s5l8702_params(struct dwc2_hsotg *hsotg)
 {
 	struct dwc2_core_params *p = &hsotg->params;
 
+	/* Nano 3G (S5L8702) — lemonjesus bring-up. Do NOT share blindly with N20/N31. */
 	p->speed = DWC2_SPEED_PARAM_HIGH;
 	p->otg_caps.hnp_support = true;
 	p->otg_caps.srp_support = true;
 	p->phy_utmi_width = 16;
-	// If we enable DMA, we get BULK packet corruption, eg. in the CDC EEM
-	// gadget, eg.:
-	// [    5.530000] g_ether gadget.0: invalid EEM CRC
-	// I _think_ this is a DMA mechanism built into the DWC2 core, and not using
-	// the kernel DMAEngine, as that seems to be working fine (and this happens
-	// even if we have no DMA controllers).
+	/* DWC2 internal DMA corrupts BULK on this core (CDC EEM CRC). */
 	p->g_dma = false;
-	// The hardware expects USBRST/ENUMDONE/IEPInt/OEPInt/USBSUSP/WKUPINT/etc.
-	// masked until SessReqInt/ConIDStsChng signals session-valid. Without
-	// this gating, these bits fire during disconnect and the OTG state
-	// machine has no opportunity to make progress.
+	/* Gate device IRQs until SessReqInt/ConIDStsChng — Nano3-specific. */
 	p->session_valid_gintmsk_quirk = true;
+}
+
+/*
+ * Nano 6G/7G (S5L872x/8740). Same g_dma caution; omit Nano3 GINTMSK gating
+ * until proven required (Slackware/INIT: Nano3 PHY/dwc2 deltas broke N7).
+ */
+static void dwc2_set_s5l87xx_params(struct dwc2_hsotg *hsotg)
+{
+	struct dwc2_core_params *p = &hsotg->params;
+	struct dwc2_hw_params *hw = &hsotg->hw_params;
+	unsigned n_ep, n_fifo, dirs, ctrl, v1, v3, i, t;
+	unsigned total, rx, np, left, first, rest, share, stubs;
+	u32 hwcfg4;
+
+	p->speed = DWC2_SPEED_PARAM_HIGH;
+	p->otg_caps.hnp_support = true;
+	p->otg_caps.srp_support = true;
+	p->phy_utmi_width = 16;
+	p->g_dma = true;
+	/*
+	 * RetailOS sub_1B5254 writes GAHBCFG=0x2B (DMA+INCR8) and
+	 * never sets DCFG_DESCDMA. Descriptor-DMA IN is a common
+	 * DWC2 TX-only failure when the ROM used buffer DMA.
+	 */
+	p->g_dma_desc = false;
+	p->ahbcfg = GAHBCFG_HBSTLEN_INCR8 << GAHBCFG_HBSTLEN_SHIFT;
+	/*
+	 * N31 glass 2026-08-22: quirk-on left USBRST/EP0 masked until
+	 * SessReqInt. That IRQ does not arrive after PHY reset, so Windows
+	 * GET_DESCRIPTOR dies as VID_0000&PID_0002 Code 43. Nano3 gating
+	 * stays on dwc2_set_s5l8702_params only.
+	 */
+	p->session_valid_gintmsk_quirk = false;
+
+	total = hw->total_fifo_size;
+	dev_info(hsotg->dev,
+		 "s5l87xx GHWCFG3[31:16] fifo_words=%u (total DFIFO)\n",
+		 total);
+	dev_info(hsotg->dev,
+		 "s5l87xx dwc2 num_dev_ep=%u perio_in=%u in_eps=%u dyn=%u ded=%u\n",
+		 hw->num_dev_ep, hw->num_dev_perio_in_ep, hw->num_dev_in_eps,
+		 hw->enable_dynamic_fifo, hw->en_multiple_tx_fifo);
+
+	/* RetailOS sub_1B543A — only when dynamic FIFO is set. */
+	if (!hw->enable_dynamic_fifo)
+		return;
+
+	n_ep = hw->num_dev_ep;
+	if (n_ep + 1 > 9)
+		n_ep = 8;
+	dirs = hw->dev_ep_dirs;
+	v1 = 0;
+	v3 = 0;
+	for (i = 1; i < n_ep; i++) {
+		t = (dirs >> (2 * i)) & 3;
+		if (t == 0) {
+			v1++;
+			v3++;
+		} else if (t == 2) {
+			v1++;
+		} else if (t == 1) {
+			v3++;
+		}
+	}
+
+	hwcfg4 = dwc2_readl(hsotg, GHWCFG4);
+	ctrl = (hwcfg4 & GHWCFG4_NUM_DEV_MODE_CTRL_EP_MASK) >>
+	       GHWCFG4_NUM_DEV_MODE_CTRL_EP_SHIFT;
+	rx = 4 * ctrl + 2 * v1 + 272;
+	if (hw->rx_fifo_size && rx > hw->rx_fifo_size)
+		rx = hw->rx_fifo_size;
+	np = hw->en_multiple_tx_fifo ? 32 : 256;
+	if (rx + np > total) {
+		if (total > rx + 16)
+			np = total - rx - 16;
+		else
+			np = 16;
+	}
+	p->g_rx_fifo_size = rx;
+	p->g_np_tx_fifo_size = np;
+	/* check_params CHECK_RANGE uses these as max. */
+	if (hw->rx_fifo_size < rx)
+		hw->rx_fifo_size = rx;
+	if (hw->dev_nperio_tx_fifo_size < np)
+		hw->dev_nperio_tx_fifo_size = np;
+	left = (total > rx + np) ? total - rx - np : 0;
+
+	n_fifo = hw->num_dev_in_eps;
+	if (n_fifo < 1)
+		n_fifo = 1;
+	if (n_fifo > 15)
+		n_fifo = 15;
+	if (!v3)
+		v3 = n_fifo;
+	if (v3 > n_fifo)
+		v3 = n_fifo;
+
+	stubs = 16 * (n_fifo - v3);
+	if (left > stubs)
+		left -= stubs;
+	else
+		stubs = 0;
+
+	first = left;
+	if (first > 512)
+		first = 512;
+	/* HS bulk MP=512 B needs a dedicated FIFO >= 128 words. */
+	if (first && first < 128)
+		first = (left >= 128) ? 128 : left;
+	memset(p->g_tx_fifo_size, 0, sizeof(p->g_tx_fifo_size));
+	p->g_tx_fifo_size[1] = first ? first : 16;
+	rest = (left > first) ? left - first : 0;
+	if (v3 > 1) {
+		share = rest / (v3 - 1);
+		if (share < 128 && rest >= (unsigned)(128 * (v3 - 1)))
+			share = 128;
+		if (!share)
+			share = 16;
+		for (i = 2; i <= v3; i++) {
+			unsigned sz = (i == v3) ? rest : share;
+
+			if (!sz)
+				sz = 16;
+			p->g_tx_fifo_size[i] = sz;
+			if (i != v3 && rest >= share)
+				rest -= share;
+		}
+	}
+	for (i = v3 + 1; i <= n_fifo; i++)
+		p->g_tx_fifo_size[i] = 16;
+	for (i = 1; i <= n_fifo; i++)
+		if (p->g_tx_fifo_size[i] > hw->g_tx_fifo_size[i])
+			hw->g_tx_fifo_size[i] = p->g_tx_fifo_size[i];
+
+	dev_info(hsotg->dev,
+		 "s5l87xx retailos fifo rx=%u np=%u in1=%u n=%u v1=%u v3=%u ctrl=%u\n",
+		 rx, np, p->g_tx_fifo_size[1], n_fifo, v1, v3, ctrl);
 }
 
 static void dwc2_set_socfpga_agilex_params(struct dwc2_hsotg *hsotg)
@@ -344,8 +474,12 @@ const struct of_device_id dwc2_of_match_table[] = {
 	{ .compatible = "snps,dwc2" },
 	{ .compatible = "samsung,s3c6400-hsotg",
 	  .data = dwc2_set_s3c6400_params },
-	{ .compatible = "apple,s5l87xx-usb",
+	{ .compatible = "apple,s5l8702-usb",
 	  .data = dwc2_set_s5l8702_params },
+	{ .compatible = "apple,s5l87xx-usb",
+	  .data = dwc2_set_s5l87xx_params },
+	{ .compatible = "apple,s5l8740-usb",
+	  .data = dwc2_set_s5l87xx_params },
 	{ .compatible = "amlogic,meson8-usb",
 	  .data = dwc2_set_amlogic_params },
 	{ .compatible = "amlogic,meson8b-usb",

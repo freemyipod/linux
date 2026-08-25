@@ -52,7 +52,12 @@ static inline s32 lis3_i2c_write(struct lis3lv02d *lis3, int reg, u8 value)
 static inline s32 lis3_i2c_read(struct lis3lv02d *lis3, int reg, u8 *v)
 {
 	struct i2c_client *c = lis3->bus_priv;
-	*v = i2c_smbus_read_byte_data(c, reg);
+	s32 ret = i2c_smbus_read_byte_data(c, reg);
+
+	/* Do not store errno in *v — (u8)(-ETIMEDOUT/-110) is 0x92. */
+	if (ret < 0)
+		return ret;
+	*v = (u8)ret;
 	return 0;
 }
 
@@ -71,9 +76,15 @@ static int lis3_i2c_init(struct lis3lv02d *lis3)
 
 	lis3_reg_ctrl(lis3, LIS3_REG_ON);
 
-	lis3->read(lis3, WHO_AM_I, &reg);
+	ret = lis3->read(lis3, WHO_AM_I, &reg);
+	if (ret < 0) {
+		printk(KERN_ERR "lis3: WHO_AM_I read failed %d\n", ret);
+		return ret;
+	}
+	printk(KERN_INFO "lis3: WHO_AM_I=0x%02x expect=0x%02x\n",
+	       reg, lis3->whoami);
 	if (reg != lis3->whoami)
-		printk(KERN_ERR "lis3: power on failure\n");
+		printk(KERN_ERR "lis3: power on failure (WHO_AM_I mismatch)\n");
 
 	/* power up the device */
 	ret = lis3->read(lis3, CTRL_REG1, &reg);
@@ -156,6 +167,23 @@ static int lis3lv02d_i2c_probe(struct i2c_client *client)
 	lis3_dev.pm_dev	  = &client->dev;
 
 	i2c_set_clientdata(client, &lis3_dev);
+
+	{
+		s32 id = i2c_smbus_read_byte_data(client, WHO_AM_I);
+
+		if (id < 0)
+			dev_info(&client->dev,
+				 "LIS3 WHO_AM_I read failed %d (7bit=0x%02x, -5=-EIO not a chip id; wire 0x31 is the 8-bit READ addr)\n",
+				 id, client->addr);
+		else
+			dev_info(&client->dev,
+				 "LIS3 WHO_AM_I=0x%02x 7bit=0x%02x (0x33=8-bit 3DC)\n",
+				 id, client->addr);
+		if (id < 0) {
+			ret = id;
+			goto fail2;
+		}
+	}
 
 	/* Provide power over the init call */
 	lis3_reg_ctrl(&lis3_dev, LIS3_REG_ON);

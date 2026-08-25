@@ -1391,3 +1391,7 @@ config TOUCHSCREEN_HIMAX_HX83112B
 	  module will be called himax_hx83112b.
 
 endif
+
+config TOUCHSCREEN_APPLE_NIMBUS
+	tristate "Apple Nimbus (iPod nano 7G) multitouch"
+	depends on SPI

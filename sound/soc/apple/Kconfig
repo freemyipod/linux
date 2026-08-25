@@ -6,3 +6,26 @@ config SND_SOC_APPLE_MCA
 	help
 	  This option enables an ASoC platform driver for MCA peripherals found
 	  on Apple Silicon SoCs.
+
+config SND_SOC_APPLE_NANO7
+	tristate "iPod nano 7G audio machine"
+	depends on SND_SOC
+	select SND_SOC_APPLE_S5L8740_I2S
+	select SND_SOC_APPLE_CS42L81_SPI
+	help
+	  Registers ASoC card: S5L8740 IIS0 CPU DAI + CS42L81 SPI codec.
+
+config SND_SOC_APPLE_S5L8740_I2S
+	tristate "S5L8740 IIS0 I2S CPU DAI"
+	depends on SND_SOC && HAS_IOMEM
+	select SND_SOC_GENERIC_DMAENGINE_PCM
+	select SND_DMAENGINE_PCM
+	help
+	  IIS0 @0x3CA00000 CPU DAI with optional PL080 dmaengine PCM.
+
+config SND_SOC_APPLE_CS42L81_SPI
+	tristate "CS42L81 / 338S1146 SPI codec (N31)"
+	depends on SPI && SND_SOC
+	help
+	  RetailOS-matched SPI0 framing (0x6C/0x6D), analog bring-up, and
+	  ASoC DAI (cs42l81-hifi). Sysfs reg/bringup/audio_on stay.

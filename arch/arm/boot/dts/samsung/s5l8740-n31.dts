@@ -9,6 +9,7 @@
 #include <dt-bindings/input/input.h>
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/clock/samsung,s5l8702-clock.h>
+#include <dt-bindings/interrupt-controller/irq.h>
 
 / {
     #address-cells = <1>;
@@ -22,6 +23,8 @@
     };
 
     chosen {
+        /* U-Boot CONFIG_BOOTARGS overrides this. g_ether is built-in (0525:a4a2). */
+        bootargs = "console=tty0 fbcon=font:MINI4x6 earlyprintk nohlt panic=-1 clk_ignore_unused init=/init";
         stdout-path = "serial0";
     };
 
@@ -73,6 +76,18 @@
             interrupt-controller;
             reg = <0x38e01000 0x1000>;
             #interrupt-cells = <1>;
+        };
+
+        /* GPIO → EIC → VIC EXTn. EXT1 = Vol 40/41; EXT3 = PMIC GPIO86. */
+        eic: interrupt-controller@39700000 {
+            compatible = "apple,s5l8740-eic", "samsung,s5l8740-eic";
+            reg = <0x39700000 0x1000>;
+            interrupt-controller;
+            #interrupt-cells = <2>;
+            interrupt-parent = <&vic0>;
+            interrupts = <1>, <3>;
+            apple,eic-groups = <1>, <2>;
+            status = "okay";
         };
 
         timer: timer@3c700000 {
@@ -129,14 +144,15 @@
         };
 
         usbphy: usbphy@3c400000 {
-            compatible = "apple,s5l8720-otgphy";
+            /* N31 = s5l87xx PHY. Do NOT use apple,s5l8702-otgphy (Nano3 ramp). */
+            compatible = "apple,s5l8740-otgphy", "apple,s5l87xx-otgphy";
             reg = <0x3c400000 0x100>;
             status = "okay";
             #phy-cells = <0>;
         };
 
         usbotg_hs: usb@38400000 {
-            compatible = "apple,s5l87xx-usb";
+            compatible = "apple,s5l8740-usb", "apple,s5l87xx-usb";
             reg = <0x38400000 0x40000>;
             interrupt-parent = <&vic0>;
             interrupts = <19>;
@@ -144,16 +160,29 @@
             phy-names = "usb2-phy";
             clocks = <&nclk>;
             clock-names = "otg";
+            /* Glass: GHWCFG3 DFIFO=2080 words, ded=1, in_eps=6.
+             * SoC setter applies RetailOS sub_1B543A (NP=32, first
+             * IN cap 512). These DT values are overwritten. */
             g-rx-fifo-size = <256>;
-            g-np-tx-fifo-size = <32>;
-            g-tx-fifo-size = <256 256 512 512 512 768 768>;
+            g-np-tx-fifo-size = <256>;
             status = "okay";
             dr_mode = "peripheral";
+            /* DMA on (g_dma=true) — HS was an IRQ storm only in slave PIO. */
+            maximum-speed = "high-speed";
         };
 
         lcdif: lcdif@38300000 {
             compatible = "samsung,s5l8740-lcdif";
             reg = <0x38300000 0x10000>;
+        };
+
+        /* MMIO backlight only. Never LCDIF CON/PHTIME. U-Boot already
+         * wrote 62 @ +0x08; this class device owns brightness after probe. */
+        backlight: backlight@3e000000 {
+            compatible = "apple,s5l8740-backlight", "samsung,s5l8740-backlight";
+            reg = <0x3e000000 0x100>;
+            default-brightness = <62>;
+            status = "okay";
         };
 
         wdt: watchdog@3c800000 {
@@ -164,25 +193,54 @@
                 compatible = "syscon-reboot";
                 offset = <0x0>;
                 value = <0x100000>;
+                /* 0x100000 is the WDT arm/reset poke — do not probe until poweroff is proven. */
+                status = "disabled";
             };
         };
 
-        gpio5: gpio@3cf00000 {
+        /* 2-line hack kept disabled; Vol± use full banked GPIO + EIC. */
+        gpio5: gpio-hack@3cf000a4 {
             compatible = "brcm,bcm6345-gpio";
             reg-names = "dat";
             reg = <0x3cf000a4 0x4>;
             #gpio-cells = <2>;
             gpio-controller;
             ngpios = <2>;
+            status = "disabled";
+        };
+
+        gpio: gpio@3cf00000 {
+            compatible = "apple,s5l8740-gpio", "samsung,s5l8740-gpio";
+            reg = <0x3cf00000 0x400>;
+            apple,eic = <&eic>;
+            apple,skip-sec-pinmux;
+            #gpio-cells = <2>;
+            gpio-controller;
+            ngpios = <128>;
+            status = "okay";
         };
 
         i2c0: i2c@3c600000 {
             compatible = "samsung,s5l8702-i2c";
+            #address-cells = <1>;
+            #size-cells = <0>;
             reg = <0x3c600000 0x100>;
             clock-frequency = <100000>;  /* UPDATE ME */
             interrupt-parent = <&vic0>;
             interrupts = <21>;
             status = "okay";
+
+            /*
+             * CBTL1609A1 — public 0x34/0x35 is 8-bit; Linux 7-bit is 0x1a.
+             * RetailOS writes no Dx mux map. U-Boot DFU already routes
+             * Lightning USB; do not invent apple,init-sequence. Probe
+             * skips I2C ACK (reads still return the address byte).
+             */
+            tristar: lightning-mux@1a {
+                compatible = "apple,tristar-cbtl1609", "nxp,cbtl1609a1";
+                reg = <0x1a>;
+                status = "okay";
+            };
         };
 
         i2c1: i2c@3c900000 {
@@ -197,17 +255,31 @@
 
             lis3dc: lis331dlh@18 {
                 compatible = "st,lis3lv02d";
+                /* Linux DT 7-bit. Wire 8-bit is 0x30 write / 0x31 read. */
                 reg = <0x18>;
+                status = "okay";
             };
 
             d1830: pmic@73 {
                 compatible = "dlg,d1830-gpio";
+                /* Linux DT 7-bit. SEC sub_1C8C(115). Wire 8-bit 0xE6/0xE7. */
                 reg = <0x73>;
                 gpio-controller;
                 #gpio-cells = <2>;
-                dlg,gpio-map = <0x07 4>, /* Home button */
-                               <0x07 5>, /* Power button */
-                               <0x08 1>; /* Play/pause button */
+                /* OSOS sub_26520 packs PMIC regs 5-8; sub_3B3100 + sub_FFA*:
+                 *   ID 1 Home  = reg7 bit4  (status bit 16)
+                 *   ID 9 Sleep = reg7 bit5  (status bit 17)
+                 *   ID 6 Play  = reg8 bit1  (status bit 19)
+                 * Key path is active-low: sub_4195D8(id, bit==0).
+                 * GPIOButtonManager has only GPIO 40/41 — not these.
+                 */
+                dlg,gpio-map = <0x07 4>, /* Home  OSOS ID 1 */
+                               <0x07 5>, /* Sleep OSOS ID 9 */
+                               <0x08 1>; /* Play  OSOS ID 6 (side, between Vol±) */
+                /* SoC GPIO 86 → EIC group2 → VIC EXT3 */
+                interrupt-parent = <&eic>;
+                interrupts = <86 IRQ_TYPE_LEVEL_LOW>;
+                monitored-battery = <&battery>;
             };
         };
 
@@ -223,6 +295,7 @@
             reg = <0x38000000 0x100>;
             clocks = <&clkctrl CLK_SHA1>;
             clock-names = "sha1";
+            status = "okay";
         };
 
         aes: aes@38c00000 {
@@ -230,6 +303,7 @@
             reg = <0x38c00000 0x100>;
             clocks = <&clkctrl CLK_AES>;
             clock-names = "aes";
+            status = "okay";
         };
 
         prng: prng@3c100000 {
@@ -237,15 +311,98 @@
             reg = <0x3c100000 0x100>;
             clocks = <&clkctrl CLK_PRNG>;
             clock-names = "prng";
+            status = "okay";
+        };
+
+        /*
+         * SPI0 @0x3C300000 — CS42L81 / 338S1146 control (RetailOS).
+         * Panel pixels are LCDIF@383, not this bus. Pads 0–3 are the
+         * SEC/gpio-s5l8740 SPI0 group (PCON 0x2222 in the SPI driver).
+         */
+        spi0: spi@3c300000 {
+            compatible = "apple,s5l8702-spi", "samsung,s5l8740-spi",
+                         "samsung,s5l8702-spi";
+            reg = <0x3c300000 0x100>;
+            /* CLKCON already ungate-all; SPI driver also clears PWRCON1 SPI0. */
+            #address-cells = <1>;
+            #size-cells = <0>;
+            status = "okay";
+
+            cs42l81: codec@0 {
+                compatible = "cirrus,cs42l81", "apple,338s1146";
+                reg = <0>;
+                spi-max-frequency = <1000000>;
+                #sound-dai-cells = <0>;
+                status = "okay";
+            };
+        };
+
+        /*
+         * SPI2 @0x3D200000 — TI 343S0538 Nimbus. Pads 87/5, 88/3, 89/3,
+         * 90/3 (OSOS 20690). EN 14, RST 39, IRQ 38. No clocks= — CCF
+         * only publishes SHA/AES/PRNG; ungate-all + SPI PWRCON poke.
+         */
+        spi2: spi@3d200000 {
+            compatible = "apple,s5l8702-spi", "samsung,s5l8740-spi",
+                         "samsung,s5l8702-spi";
+            reg = <0x3d200000 0x100>;
+            #address-cells = <1>;
+            #size-cells = <0>;
+            status = "okay";
+
+            nimbus: touchscreen@0 {
+                compatible = "apple,nimbus";
+                reg = <0>;
+                spi-max-frequency = <1000000>;
+                enable-gpios = <&gpio 14 GPIO_ACTIVE_HIGH>;
+                reset-gpios = <&gpio 39 GPIO_ACTIVE_LOW>;
+                attn-gpios = <&gpio 38 GPIO_ACTIVE_LOW>;
+                /* GPIO38 → EIC group1 → VIC EXT1 */
+                interrupts-extended = <&eic 38 IRQ_TYPE_LEVEL_LOW>;
+                status = "okay";
+            };
+        };
+
+        /* PL080 pair from OSOS. Peri 12/13 = IIS0. Not 0x384 (DWC2). */
+        dmac: dma-controller@38200000 {
+            compatible = "apple,s5l8740-pl080", "arm,pl080";
+            reg = <0x38200000 0x1000>, <0x38700000 0x1000>;
+            interrupt-parent = <&vic0>;
+            interrupts = <16>, <17>;
+            #dma-cells = <2>;
+            status = "okay";
+        };
+
+        i2s0: i2s@3ca00000 {
+            compatible = "apple,s5l8740-i2s", "samsung,s5l8740-i2s";
+            reg = <0x3ca00000 0x1000>;
+            dmas = <&dmac 10 0>, <&dmac 11 0>;
+            dma-names = "tx", "rx";
+            #sound-dai-cells = <0>;
+            status = "okay";
+        };
+
+        nano7_audio: audio {
+            compatible = "apple,n31-audio";
+            apple,cpu = <&i2s0>;
+            apple,codec = <&cs42l81>;
+            status = "okay";
         };
     };
 
-    gpio-keys {
-        compatible = "gpio-keys-polled";
-        poll-interval = <50>;
+    /* Design pack only. Voltage comes from D1830 OSOS ADC, not this node. */
+    battery: battery {
+        compatible = "simple-battery";
+        voltage-min-design-microvolt = <3300000>;
+        voltage-max-design-microvolt = <4200000>;
+        energy-full-design-microwatt-hours = <740000>;
+        charge-full-design-microamp-hours = <200000>;
+    };
 
-        /* these hammer the i2c bus and the driver breaks
-           at some point, disable them for now */
+    gpio-keys {
+        compatible = "gpio-keys";
+        status = "disabled";
+
         button-home {
             label = "Home Button";
             gpios = <&d1830 0 GPIO_ACTIVE_LOW>;
@@ -266,16 +423,27 @@
             linux,code = <KEY_PLAYPAUSE>;
             status = "disabled";
         };
+    };
+
+    /* Disabled so gpio-keys-polled cannot direction_input/0xFFFE Vol pads.
+     * gpio-s5l8740 polls DIN itself and reports KEY_VOLUMEUP/DOWN.
+     */
+    gpio-keys-vol {
+        compatible = "gpio-keys-polled";
+        status = "disabled";
+        poll-interval = <50>;
 
         button-volup {
+            /* OSOS id 8, GPIO 0x28. Glass: Vol+. */
             label = "Volume Up";
-            gpios = <&gpio5 0 GPIO_ACTIVE_LOW>;
+            gpios = <&gpio 40 GPIO_ACTIVE_LOW>;
             linux,code = <KEY_VOLUMEUP>;
         };
 
         button-voldown {
+            /* OSOS id 7, GPIO 0x29. Glass: Vol-. */
             label = "Volume Down";
-            gpios = <&gpio5 1 GPIO_ACTIVE_LOW>;
+            gpios = <&gpio 41 GPIO_ACTIVE_LOW>;
             linux,code = <KEY_VOLUMEDOWN>;
         };
     };

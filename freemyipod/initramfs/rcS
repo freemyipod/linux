@@ -1,0 +1,20 @@
+#!/bin/sh
+
+# Bring up USB gadget network. g_ether may take a moment to register usb0
+# after the host enumerates the device, so retry briefly.
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    if ifconfig usb0 192.168.7.2 netmask 255.255.255.0 up 2>/dev/null; then
+        echo "usb0 up at 192.168.7.2 (host: 192.168.7.1)"
+        break
+    fi
+    sleep 1
+done
+
+# No-auth root shell over telnet for development.
+telnetd -l /bin/sh && echo "telnetd listening on :23"
+
+# Sleep/KEY_POWER → poweroff when power-watch is present in rootfs
+if [ -x /usr/bin/power-watch ] || [ -x /bin/power-watch ]; then
+    (command -v power-watch >/dev/null && power-watch) &
+    echo "power-watch: KEY_POWER → poweroff -f"
+fi

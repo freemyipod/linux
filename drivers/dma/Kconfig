@@ -787,3 +787,11 @@ config DMA_ENGINE_RAID
 	bool
 
 endif
+
+config S5L8740_PL080
+	tristate "S5L8740 PL080 DMAC probe (N31)"
+	depends on ARM
+	select DMA_ENGINE
+	select DMA_VIRTUAL_CHANNELS
+	help
+	  PL080 dmaengine at 0x38200000 / 0x38700000 for iPod nano 7G.

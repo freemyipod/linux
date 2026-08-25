@@ -493,3 +493,9 @@ config BACKLIGHT_LED
 endif # BACKLIGHT_CLASS_DEVICE
 
 endmenu
+
+config BACKLIGHT_S5L8740
+	tristate "Samsung/Apple S5L8740 LCD backlight"
+	depends on BACKLIGHT_CLASS_DEVICE && HAS_IOMEM
+	help
+	  Backlight controller at 0x3E000000 for iPod nano 7G (N31).

@@ -89,9 +89,14 @@ static void vic_init2(void __iomem *base)
 {
 	int i;
 
-	for (i = 0; i < 16; i++) {
-		void __iomem *reg = base + VIC_VECT_CNTL0 + (i * 4);
-		writel(VIC_VECT_CNTL_ENABLE | i, reg);
+	/*
+	 * PL190 has 16 vectored slots; PL192 has 32. Linux used to program
+	 * only 0..15, so sources 16..31 (N31 IIC is family 21/22) kept the
+	 * bootloader VECTADDR. Zero every slot, then enable all 32.
+	 */
+	for (i = 0; i < 32; i++) {
+		writel(0, base + VIC_VECT_ADDR0 + (i * 4));
+		writel(VIC_VECT_CNTL_ENABLE | i, base + VIC_VECT_CNTL0 + (i * 4));
 	}
 
 	writel(32, base + VIC_PL190_DEF_VECT_ADDR);
@@ -391,6 +396,9 @@ static void __init vic_clear_interrupts(void __iomem *base)
 		value = readl(base + VIC_PL190_VECT_ADDR);
 		writel(value, base + VIC_PL190_VECT_ADDR);
 	}
+	/* PL192 EOI is +0xF00. U-Boot/SEC may have taken a vector without EOI. */
+	for (i = 0; i < 32; i++)
+		writel(0, base + VIC_PL192_VECT_ADDR);
 }
 
 /*

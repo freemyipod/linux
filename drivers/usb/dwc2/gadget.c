@@ -356,6 +356,12 @@ static void dwc2_hsotg_init_fifo(struct dwc2_hsotg *hsotg)
 	dwc2_writel(hsotg, hsotg->hw_params.total_fifo_size |
 		    addr << GDFIFOCFG_EPINFOBASE_SHIFT,
 		    GDFIFOCFG);
+	dev_info(hsotg->dev,
+		 "s5l87xx hwfifo rx=%u np=%u d1=%u d2=%u d3=%u d4=%u d5=%u d6=%u\n",
+		 hsotg->params.g_rx_fifo_size, hsotg->params.g_np_tx_fifo_size,
+		 hsotg->params.g_tx_fifo_size[1], hsotg->params.g_tx_fifo_size[2],
+		 hsotg->params.g_tx_fifo_size[3], hsotg->params.g_tx_fifo_size[4],
+		 hsotg->params.g_tx_fifo_size[5], hsotg->params.g_tx_fifo_size[6]);
 	/*
 	 * according to p428 of the design guide, we need to ensure that
 	 * all fifos are flushed before continuing
@@ -4210,8 +4216,13 @@ static int dwc2_hsotg_ep_enable(struct usb_ep *ep,
 			val = (val >> FIFOSIZE_DEPTH_SHIFT) * 4;
 			if (val < size)
 				continue;
-			/* Search for smallest acceptable fifo */
-			if (val < fifo_size) {
+			/* Notify (8 B) keeps a stub. HS bulk takes the largest. */
+			if (size >= 64) {
+				if (!fifo_index || val > fifo_size) {
+					fifo_size = val;
+					fifo_index = i;
+				}
+			} else if (val < fifo_size) {
 				fifo_size = val;
 				fifo_index = i;
 			}
@@ -4227,6 +4238,9 @@ static int dwc2_hsotg_ep_enable(struct usb_ep *ep,
 		epctrl |= DXEPCTL_TXFNUM(fifo_index);
 		hs_ep->fifo_index = fifo_index;
 		hs_ep->fifo_size = fifo_size;
+		dev_info(hsotg->dev,
+			 "s5l87xx ep%u in fifo=%u bytes=%u mp=%u\n",
+			 index, fifo_index, fifo_size, size);
 	}
 
 	/* for non control endpoints, set PID to D0 */

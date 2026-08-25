@@ -91,7 +91,7 @@
 		};
 
 		usbotg: usb@38400000 {
-			compatible = "apple,s5l87xx-usb";
+			compatible = "apple,s5l8702-usb", "apple,s5l87xx-usb";
 			reg = <0x38400000 0x40000>;
 			interrupt-parent = <&vic0>;
 			interrupts = <19>;

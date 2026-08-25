@@ -6,9 +6,55 @@
  *        S5L8740 (Cortex-A5, iPod nano 7g)
  */
 
+#include <linux/fs.h>
 #include <linux/init.h>
+#include <linux/io.h>
+#include <linux/namei.h>
+#include <linux/path.h>
+#include <linux/printk.h>
 #include <asm/mach/arch.h>
 #include <asm/mach/map.h>
+
+#define S5L8740_WDT_PHYS	0x3c800000ul
+
+/*
+ * WTF/U-Boot leave the SEC watchdog armed. A bigger zImage loses the race.
+ * Stage0 sequence only — never CLKCON+0x50 (fatal latch).
+ */
+static int __init s5l87xx_wdt_disarm(void)
+{
+	void __iomem *wdt = ioremap(S5L8740_WDT_PHYS, 8);
+
+	if (!wdt)
+		return 0;
+	writel(0, wdt);
+	writel(0, wdt + 4);
+	writel(0, wdt);
+	writel(0, wdt + 4);
+	pr_info("s5l87xx: WDT disarmed con=%08x cnt=%08x\n",
+		readl(wdt), readl(wdt + 4));
+	iounmap(wdt);
+	return 0;
+}
+early_initcall(s5l87xx_wdt_disarm);
+
+/* Print before Run /init so glass shows whether rootfs actually has PID 1. */
+static int __init n31_init_witness(void)
+{
+	struct path path;
+	int err = kern_path("/init", LOOKUP_FOLLOW, &path);
+
+	if (err) {
+		pr_err("n31: /init missing (%d) — initramfs not in rootfs\n", err);
+		return 0;
+	}
+	pr_info("n31: /init present mode=%o size=%lld\n",
+		path.dentry->d_inode->i_mode,
+		(long long)i_size_read(path.dentry->d_inode));
+	path_put(&path);
+	return 0;
+}
+late_initcall(n31_init_witness);
 
 /*
  * Map the debug UART into a fixed virtual address so earlyprintk works

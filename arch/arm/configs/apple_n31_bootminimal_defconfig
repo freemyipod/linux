@@ -1,0 +1,41 @@
+# N31 boot-minimal — LCD + timer + clk only (bisect ~500ms OSOS reset)
+CONFIG_ARCH_S5L87XX=y
+CONFIG_CPU_S5L8740=y
+CONFIG_CMDLINE="console=tty0 fbcon=font:MINI4x6 vt.global_cursor_default=0 loglevel=8 panic=-1 nohlt"
+CONFIG_CMDLINE_FORCE=y
+CONFIG_PRINTK_TIME=y
+CONFIG_S5L8720_TIMER=y
+CONFIG_SERIAL_SAMSUNG=y
+# CONFIG_SERIAL_SAMSUNG_CONSOLE is not set
+CONFIG_VFP=y
+CONFIG_TMPFS=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_DRM=y
+CONFIG_TINYDRM_S5L8740=y
+CONFIG_FB=y
+CONFIG_FRAMEBUFFER_CONSOLE=y
+CONFIG_DRM_FBDEV_EMULATION=y
+CONFIG_FONTS=y
+CONFIG_FONT_8x8=y
+CONFIG_FONT_MINI_4x6=y
+CONFIG_CLK_S5L8702=y
+CONFIG_ARM_VIC=y
+CONFIG_BACKLIGHT_CLASS_DEVICE=y
+CONFIG_BACKLIGHT_S5L8740=y
+CONFIG_BLK_DEV_INITRD=y
+# No panic→reboot (was masking oops before fbcon ready)
+# CONFIG_POWER_RESET is not set
+# CONFIG_POWER_RESET_SYSCON is not set
+# Peripheral drivers compiled out — DT disabled alone was not enough
+# CONFIG_USB is not set
+# CONFIG_NET is not set
+# CONFIG_I2C is not set
+# CONFIG_SPI is not set
+# CONFIG_CRYPTO is not set
+# CONFIG_GPIOLIB is not set
+# CONFIG_GPIO_S5L8740 is not set
+# CONFIG_S5L8740_EIC is not set
+# CONFIG_INPUT is not set
+# CONFIG_SND is not set
+# CONFIG_DMA_ENGINE is not set

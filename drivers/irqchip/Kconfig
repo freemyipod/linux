@@ -762,3 +762,10 @@ config SUNPLUS_SP7021_INTC
 	  the primary controller on C-Chip.
 
 endmenu
+
+config S5L8740_EIC
+	bool "Samsung/Apple S5L8740 GPIO EIC"
+	depends on ARM || COMPILE_TEST
+	select IRQ_DOMAIN
+	help
+	  External interrupt controller at 0x39700000 feeding PL192 VIC EXTn.

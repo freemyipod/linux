@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 
 #include <linux/iopoll.h>
+#include <linux/io.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
 
@@ -38,7 +39,8 @@
 
 #define S5L8740_LCD_STATUS_BUSY	0x10
 
-#define S5L8740_LCD_TIMEOUT_US 1
+/* GATE0: 1us was too short (stride/FIFO); 100ms wait, pitch-aware blit */
+#define S5L8740_LCD_TIMEOUT_US 100000
 
 #define WIDTH 240
 #define HEIGHT 432
@@ -108,22 +110,29 @@ static void s5l8740_primary_plane_helper_atomic_update(struct drm_plane *plane,
     if (!drm_dev_enter(dev, &idx))
         goto out_drm_gem_fb_end_cpu_access;
 
-    unsigned int count = fb->width * fb->height;
-    int *src = shadow_plane_state->data[0].vaddr;
+    unsigned int x, y, pitch_px;
+    u32 *src = shadow_plane_state->data[0].vaddr;
 
-    for (int i = 0; i < count; i++) {
-    	int ret;
-    	u32 status;
+    pitch_px = fb->pitches[0] / 4;
+    if (!pitch_px)
+	pitch_px = fb->width;
 
-    	ret = readl_poll_timeout_atomic(sdev->lcdif + S5L8740_LCD_STATUS, status,
-				!(status & S5L8740_LCD_STATUS_BUSY), 0, S5L8740_LCD_TIMEOUT_US);
+    for (y = 0; y < fb->height; y++) {
+	const u32 *row = src + y * pitch_px;
 
-    	if (unlikely(ret)) {
-    		drm_warn(dev, "S5L8740_LCD_STATUS_BUSY timeout\n");
+	for (x = 0; x < fb->width; x++) {
+		int ret;
+		u32 status;
+
+		ret = readl_poll_timeout_atomic(sdev->lcdif + S5L8740_LCD_STATUS, status,
+					!(status & S5L8740_LCD_STATUS_BUSY), 0,
+					S5L8740_LCD_TIMEOUT_US);
+		if (unlikely(ret)) {
+			drm_warn_once(dev, "S5L8740_LCD_STATUS_BUSY timeout\n");
 			goto out_drm_dev_exit;
-    	}
-
-    	s5l8740_lcd_writel(sdev, S5L8740_LCD_WDATA, src[i]);
+		}
+		s5l8740_lcd_writel(sdev, S5L8740_LCD_WDATA, row[x]);
+	}
     }
 
 out_drm_dev_exit:
@@ -242,6 +251,28 @@ static int s5l8740_probe(struct platform_device *pdev)
     drm_dbg(dev, "using I/O memory framebuffer at %pr\n", res);
 
     sdev->lcdif = devm_ioremap_resource(&pdev->dev, res);
+    if (IS_ERR(sdev->lcdif))
+        return PTR_ERR(sdev->lcdif);
+
+    /* GATE0: log WTF handoff, never rewrite CON/PHTIME */
+    drm_info(dev, "LCDIF handoff CON=%08x PHTIME=%08x (untouched)\n",
+	     readl(sdev->lcdif + S5L8740_LCD_CON),
+	     readl(sdev->lcdif + S5L8740_LCD_PHTIME));
+
+    /* CON first (stage0). Print so glass shows whether WDT is still live. */
+    {
+	void __iomem *wdt = ioremap(0x3c800000, 8);
+
+	if (wdt) {
+		writel(0, wdt);
+		writel(0, wdt + 4);
+		writel(0, wdt);
+		writel(0, wdt + 4);
+		drm_info(dev, "WDT CON=%08x CNT=%08x (disarmed)\n",
+			 readl(wdt), readl(wdt + 4));
+		iounmap(wdt);
+	}
+    }
 
     /*
 	 * Modesetting
