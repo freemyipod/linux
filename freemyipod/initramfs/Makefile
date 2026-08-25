@@ -1,4 +1,6 @@
-BOARD ?= n31  # or n20
+ifndef BOARD
+    $(error BOARD is not set. Please run: make target BOARD=value. Possible values: n20, n31)
+endif
 
 BUSYBOX_VERSION := 1.36.1
 BUSYBOX_DIR := busybox-$(BUSYBOX_VERSION)
