@@ -1,0 +1,20 @@
+#!/bin/sh
+
+set -e
+
+dd if=/dev/zero of=16z bs=1024 count=16
+dd if=/dev/random of=16r bs=1024 count=16
+
+for ALGO in 'ecb(aes)' 'cbc(aes)' 'cbc(aes-gid)' 'cbc(aes-uid)'
+do
+  for F in 16z 16r
+  do
+    echo "Processing ${F} using ${ALGO}..."
+    # encrypt
+    aes-test 1 "${ALGO}" < "${F}" > "${F}-${ALGO}-encrypted"
+    # decrypt
+    aes-test 0 "${ALGO}" < "${F}-${ALGO}-encrypted" > "${F}-${ALGO}-plain"
+
+    diff -s "${F}" "${F}-${ALGO}-plain" || true
+  done
+done
