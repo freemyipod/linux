@@ -90,7 +90,7 @@ $(OUT_Z): $(OUT)
 	gzip -9 < $< > $@
 
 clean:
-	rm -rf $(ROOTFS) $(BB) $(ROOTFS_STAMP)
+	rm -rf $(ROOTFS) $(BB) $(ROOTFS_STAMP) $(OUT) $(OUT_Z)
 
 distclean: clean
 	rm -f $(BB_FILE)
