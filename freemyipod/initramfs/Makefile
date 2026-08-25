@@ -12,7 +12,7 @@ APP_CROSS_COMPILE := arm-linux-gnueabihf-
 APP_CFLAGS := -mcpu=cortex-a5+nosimd -static -O2 -Wall
 
 THIS_MAKEFILE := $(abspath $(lastword $(MAKEFILE_LIST)))
-THIS_DIR := $(dir $(THIS_MAKEFILE))
+THIS_DIR := $(patsubst %/,%,$(dir $(THIS_MAKEFILE)))
 
 CONF := apple_$(BOARD)_defconfig
 BB_FILE := $(THIS_DIR)/$(BUSYBOX_FILENAME)
