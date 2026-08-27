@@ -175,10 +175,9 @@
             interrupt-parent = <&vic0>;
             interrupts = <26>;
             /*
-             * MikeyBus (GPIO 66/67). uart3 stays first (samsung port 0).
-             * Do NOT serdev_device_open() at probe. Do NOT live-add s5l-uart
-             * (pinmux-then-probe locked glass 2026-08-27). uart_open sysfs
-             * only for remote RX after boot.
+             * MikeyBus on UART2. GPIO 66/67 = pad mux ONLY (not DIN detect).
+             * Resistor/model = OSOS cmd 3/0x8D/ch3 (backend TBD).
+             * force_plugged until resistor backend; RX = raw+osos rings.
              */
             status = "okay";
 
@@ -282,20 +281,12 @@
             clock-frequency = <100000>;  /* UPDATE ME */
             interrupt-parent = <&vic0>;
             interrupts = <21>;
-            status = "okay";
-
             /*
-             * CBTL1609A1 — public 0x34/0x35 is 8-bit; Linux 7-bit is 0x1a.
-             * RetailOS writes no Dx mux map. U-Boot DFU already routes
-             * Lightning USB; do not invent apple,init-sequence. Probe
-             * skips I2C ACK (reads still return the address byte).
+             * Glass 2026-08-27: IIC0 emcore-TX never completes (VIC21 irq
+             * count stays 0). Keep the controller for RE; no children until
+             * pinmux/clock path is proven.
              */
-            tristar: lightning-mux@1a {
-                compatible = "apple,tristar-cbtl1609", "nxp,cbtl1609a1",
-                             "apple,n31-tristar";
-                reg = <0x1a>;
-                status = "okay";
-            };
+            status = "okay";
         };
 
         i2c1: i2c@3c900000 {
@@ -307,6 +298,18 @@
             interrupt-parent = <&vic0>;
             interrupts = <22>;
             status = "okay";
+
+            /*
+             * CBTL1609A1 — public 0x34/0x35 is 8-bit; Linux 7-bit is 0x1a.
+             * Glass: lives on IIC1 (3c900000), NOT IIC0. Non-flat dump with
+             * IDBUS 0x75 proven via i2cdump. RetailOS writes no Dx mux map.
+             */
+            tristar: lightning-mux@1a {
+                compatible = "apple,tristar-cbtl1609", "nxp,cbtl1609a1",
+                             "apple,n31-tristar";
+                reg = <0x1a>;
+                status = "okay";
+            };
 
             lis3dc: lis331dlh@18 {
                 compatible = "st,lis3lv02d";

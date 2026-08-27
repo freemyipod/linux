@@ -2,8 +2,10 @@
 /*
  * Apple Lightning Tristar mux — NXP CBTL1609A1 (iPod nano 7G / N31)
  *
- * Transport (proven): I2C0 7-bit 0x1a. Public 0x34 write / 0x35 read is
- * the 8-bit form of that address (nyansatan).
+ * Transport (proven on glass 2026-08-27): I2C1 7-bit 0x1a
+ * (controller 3c900000). I2C0/IIC0 does not complete emcore-TX here —
+ * do not bind Tristar there. Public 0x34 write / 0x35 read is the
+ * 8-bit form of that address (nyansatan).
  *
  * Routing is IDBUS inside the chip, not Linux Dx register writes.
  * RetailOS N31 RE observed zero Dx/mux I2C writes. The 0x75 accessory

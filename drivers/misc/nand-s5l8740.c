@@ -1,20 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * S5L8740 FMSS/FMC NAND peek — N31
+ * S5L8740 FMSS/FMC NAND controller driver (N31).
  *
- * Stage A: dump controller regs and issue OSOS READ ID (cmd 0x90).
- * Stage B: PPN FIL page read (sub_50D960 / 12ECCC). 3 x 1024 PIO.
- * Does not write NAND array data. Do not call the 10453C reset
- * sequence from probe — peek first. Do not port 50DC34 (program)
- * or 4ED258 (erase).
+ * Provides FIL primitives used by the FTL: READ ID, parameter page, page
+ * read (PIO and CS command-list paths), and geometry helpers. Array
+ * program and erase are not implemented.
  *
- * Cookbook (RetailOS 1.0.2):
- *   41C738:  *(0x38A00008) = cmd
- *   4F11F4:  READ ID — FMCTRL0 CE bit, cmd 0x90, addr via 106594,
- *            8 bytes via 41AE38 / D622C @ +0x80
- *   50D960:  page read — cmd 0x0A, addr, cmd 0x37, 4F1CE8 ready,
- *            cmd 0x7A, 3 x (optional 53-byte parity + 1024 data)
- *   D6388:   PIO data port is +0x80 (write path; unused here)
+ * CS physical reads use span-4 / 4112-byte records with four 4096+16 slots
+ * per page. True metadata DMA remains optional and disabled by default.
  */
 #include <linux/completion.h>
 #include <linux/delay.h>
@@ -35,8 +28,8 @@
 #include <linux/unaligned.h>
 #include <asm/cacheflush.h>
 
-#include "fmss-seq-read.h"
-#include "fmss-s5l8740-api.h"
+#include "nand-s5l8740-seq.h"
+#include "nand-s5l8740.h"
 #include "whimory-ftl.h"
 
 #define FMSS_PHYS		0x38A00000ul
@@ -80,7 +73,7 @@
 
 /*
  * PPN address packing — OSOS 5173CA / Sogeti PPNVFL:
- *   page | (block << page_bits) | (cau << (page_bits+block_bits)) | (slc << ...)
+ * page | (block << page_bits) | (cau << (page_bits+block_bits)) | (slc <<...)
  * Param page: page_bits=7, block_bits=12, cau_bits=1.
  * VFL context lives in the last ~5% of each CAU, SLC page 0
  * (spare type 0x20, index 0xFFFF). SFTL context spare type 0x1F.
@@ -101,7 +94,7 @@
 #define FMSS_L2V_DEFAULT_BLOCKS	256
 /* Map is keyed by page LPN (YaFTL); full LBA map preferred for block I/O. */
 #define FMSS_L2V_DEFAULT_MAX_LPN \
-	((FMSS_FTL_DEFAULT_CAPACITY / FMSS_FTL_SECTORS_PER_LPN) + 64)
+	((NAND_FTL_DEFAULT_CAPACITY / NAND_FTL_SECTORS_PER_LPN) + 64)
 
 /* Classic Whimory mount (freemyipod) adapted for N31 PPN geometry. */
 #define WMR_PAGES_PER_BLOCK	128u
@@ -110,7 +103,7 @@
 #define WMR_FTLCTRL_MAX		3u
 
 /* Packed L2V entry:
- *   valid|ce[1:0]|cau[1:0]|PHYS|sec[1:0]|block[11:0]|page[6:0]
+ * valid|ce[1:0]|cau[1:0]|PHYS|sec[1:0]|block[11:0]|page[6:0]
  * sec = 4K index within the NAND page (SFTL VBA). 0x3 = “use LBA%4”.
  * PHYS: block is already physical (BTOC/BTE/META/carve) — do NOT VFL-remap.
  */
@@ -171,9 +164,9 @@ module_param(quiet, int, 0644);
 MODULE_PARM_DESC(quiet, "1=minimal logs, skip ECC diag (faster FTL scans, default on)");
 
 #define fmss_info(fmt, ...) \
-	do { if (!quiet) pr_info("s5l8740-fmss: " fmt, ##__VA_ARGS__); } while (0)
+	do { if (!quiet) pr_info("s5l8740-nand: " fmt, ##__VA_ARGS__); } while (0)
 
-#define fmss_dev_info(dev, fmt, ...) \
+#define nand_dev_info(dev, fmt, ...) \
 	do { if (!quiet) dev_info(dev, fmt, ##__VA_ARGS__); } while (0)
 
 static unsigned int vfl_build_blocks = 32;
@@ -212,11 +205,11 @@ static unsigned int l2v_meta_hits;
  * Full LBA → packed phys+sec map (SFTL BTE / boot carve). Preferred over LPN
  * dense map for block I/O.
  *
- * WARNING: FMSS_FTL_DEFAULT_CAPACITY is ~3.8M *sectors* (~15GB media). A dense
+ * WARNING: NAND_FTL_DEFAULT_CAPACITY is ~3.8M *sectors* (~15GB media). A dense
  * map of that size is ~50MB+ RAM (u32+u64+u8) and OOMs N31 before RNDIS.
  * Cap with lba_map_max (default 262144 ≈ 1GB LBA space ≈ 3.4MB RAM).
  */
-#define FMSS_LBA_MAP_HARDMAX	FMSS_FTL_DEFAULT_CAPACITY
+#define FMSS_LBA_MAP_HARDMAX	NAND_FTL_DEFAULT_CAPACITY
 static unsigned int lba_map_max = 262144;
 module_param(lba_map_max, uint, 0644);
 MODULE_PARM_DESC(lba_map_max,
@@ -273,7 +266,7 @@ MODULE_PARM_DESC(l2v_auto_blocks,
  */
 static bool fmss_legacy_meta_ingest;
 
-static int (*fmss_ftl_read_hook)(u64 lba, void *buf);
+static int (*nand_ftl_read_hook)(u64 lba, void *buf);
 
 /* Root-dir physical page when LPN(DataStart) is otherwise unmapped. */
 static bool root_dir_valid;
@@ -288,7 +281,7 @@ static unsigned int vfl_map_count;
 static unsigned int vfl_ctx_cau[FMSS_NUM_CAU];
 static unsigned int vfl_ctx_block[FMSS_NUM_CAU];
 
-/* Classic Whimory FTL block map + mount status (Stage C). */
+/* Classic Whimory FTL block map + mount status (phase). */
 static u16 *wmr_block_map;
 static unsigned int wmr_block_map_n;
 static unsigned int wmr_dis_hits;
@@ -310,7 +303,7 @@ static u32 fmss_ppn_addr(unsigned int cau, unsigned int block,
 	     | ((slc ? 1u : 0u) << (FMSS_PAGE_BITS + FMSS_BLOCK_BITS + FMSS_CAU_BITS));
 }
 
-struct fmss_n31 {
+struct nand_s5l8740 {
 	void __iomem *base;
 	struct mutex lock;
 	u8 last_id[8];
@@ -355,7 +348,7 @@ struct fmss_n31 {
 	u32 last_vic_en;
 };
 
-static struct fmss_n31 *fmss_dev;
+static struct nand_s5l8740 *nand_dev;
 
 /* 12ED9C: PPN >= 0x10500 uses 4 address cycles. */
 static unsigned int addr_cycles = 4;
@@ -426,7 +419,7 @@ MODULE_PARM_DESC(dma_nsect, "DMA span (# logical LBAs) per CS read (default 1)")
 
 /*
  * Decomp wants command-list META. Live CS kick (C00=0xFFF5) still wedges
- * the SoC on glass — keep default off until that path is safe. Callers that
+ * the SoC in testing — keep default off until that path is safe. Callers that
  * ask for meta with this off get -EOPNOTSUPP (never PIO fake spare).
  */
 static bool meta_dma_read;
@@ -434,10 +427,20 @@ module_param(meta_dma_read, bool, 0644);
 MODULE_PARM_DESC(meta_dma_read,
 		 "Use command-list data+meta read for metadata callers (default N — CS kick wedges)");
 
-static bool meta_dma_reset_before = true;
+/*
+ * PIO page path uses the legacy reset/reinit sequence.
+ * CS command-list path is a separate sequencer path and should not assume
+ * hard reset immediately before kick. in testing this sequence can wedge.
+ */
+static bool meta_dma_reset_before;
 module_param(meta_dma_reset_before, bool, 0644);
 MODULE_PARM_DESC(meta_dma_reset_before,
 		 "Reset NAND controller before command-list metadata read");
+
+static bool dma_reset_before;
+module_param(dma_reset_before, bool, 0644);
+MODULE_PARM_DESC(dma_reset_before,
+		 "Reset NAND controller before manual CS DMA read");
 
 /*
  * PPN physical page = N × (4096 DATA + 16 META) records (N=2 or 4).
@@ -469,13 +472,26 @@ static unsigned int dma_kick = 0xfff5;
 module_param(dma_kick, uint, 0644);
 MODULE_PARM_DESC(dma_kick, "FMSEQ (C00) kick value (OSOS D39EC = 0xFFF5)");
 
-static bool dma_dry;
+/* Default Y: program descriptors without C00 kick until glass preflight passes. */
+static bool dma_dry = true;
 module_param(dma_dry, bool, 0644);
-MODULE_PARM_DESC(dma_dry, "program CS regs/descriptors but do not write C00 (default N)");
+MODULE_PARM_DESC(dma_dry,
+		 "program CS regs/descriptors but do not write C00 (default Y)");
+
+static bool dma_armed;
+module_param(dma_armed, bool, 0644);
+MODULE_PARM_DESC(dma_armed, "Allow one hazardous CS DMA kick");
+
+static bool dma_one_shot = true;
+module_param(dma_one_shot, bool, 0644);
+MODULE_PARM_DESC(dma_one_shot, "Disarm CS DMA after one kick");
+
+/* Canary path: one page, no FTL/lba_map ingest. */
+static bool dma_skip_ingest;
 
 /*
  * D39EC: if 0x8982448 then C6C=0 + pulse C60; else C6C=16.
- * Pulse never raised C64 on glass. Default matches the else path.
+ * Pulse never raised C64 in testing. Default matches the else path.
  */
 static bool dma_pulse;
 module_param(dma_pulse, bool, 0644);
@@ -505,7 +521,7 @@ static u32 fmss_page_ctrl0(unsigned int ce)
 }
 
 /* 1858DC: poll FMSTAT48 bit(s), then W1C. */
-static int fmss_wait48_n(struct fmss_n31 *f, u32 mask, unsigned int loops)
+static int fmss_wait48_n(struct nand_s5l8740 *f, u32 mask, unsigned int loops)
 {
 	unsigned int i;
 	u32 st;
@@ -526,19 +542,19 @@ static int fmss_wait48_n(struct fmss_n31 *f, u32 mask, unsigned int loops)
 	return -ETIMEDOUT;
 }
 
-static int fmss_wait48(struct fmss_n31 *f, u32 mask)
+static int fmss_wait48(struct nand_s5l8740 *f, u32 mask)
 {
 	return fmss_wait48_n(f, mask, 20000);
 }
 
-static int fmss_cmd(struct fmss_n31 *f, u8 cmd)
+static int fmss_cmd(struct nand_s5l8740 *f, u8 cmd)
 {
 	writel(cmd, f->base + FMCMD);
 	return fmss_wait48(f, 2);
 }
 
 /* D622C: drain PIO FIFO at +0x80. Must read +0x80 first (OSOS + live ID). */
-static int fmss_pio_read(struct fmss_n31 *f, void *dst, unsigned int len)
+static int fmss_pio_read(struct nand_s5l8740 *f, void *dst, unsigned int len)
 {
 	u8 *p = dst;
 	unsigned int n = 0, words = len >> 2, spins = 0;
@@ -565,7 +581,7 @@ static int fmss_pio_read(struct fmss_n31 *f, void *dst, unsigned int len)
 }
 
 /* 41AE38: NAND→controller beat then D622C PIO. len <= M2_BYTES_PER_SECTOR. */
-static int fmss_data_in(struct fmss_n31 *f, void *dst, unsigned int len)
+static int fmss_data_in(struct nand_s5l8740 *f, void *dst, unsigned int len)
 {
 	if (len < 1 || len > 0x400)
 		return -EINVAL;
@@ -574,7 +590,7 @@ static int fmss_data_in(struct fmss_n31 *f, void *dst, unsigned int len)
 	writel(0, f->base + FMUNK24);
 	writel(34, f->base + FMCTRL1);
 	if (fmss_wait48(f, 8)) {
-		pr_info("s5l8740-fmss: data_in wait48(8) timeout len=%u st=%08x\n",
+		pr_info("s5l8740-nand: data_in wait48(8) timeout len=%u st=%08x\n",
 			len, f->last_stat48);
 		return -ETIMEDOUT;
 	}
@@ -582,7 +598,7 @@ static int fmss_data_in(struct fmss_n31 *f, void *dst, unsigned int len)
 }
 
 /* 41DA70: wait NANDSTAT ready after 0x77/0x7D. */
-static int fmss_wait_status(struct fmss_n31 *f, unsigned int loops, u8 *nandstat)
+static int fmss_wait_status(struct nand_s5l8740 *f, unsigned int loops, u8 *nandstat)
 {
 	int ret;
 
@@ -595,7 +611,7 @@ static int fmss_wait_status(struct fmss_n31 *f, unsigned int loops, u8 *nandstat
 	return ret;
 }
 
-static int fmss_addr_n(struct fmss_n31 *f, u32 addr, unsigned int cycles)
+static int fmss_addr_n(struct nand_s5l8740 *f, u32 addr, unsigned int cycles)
 {
 	if (cycles < 1 || cycles > 8)
 		cycles = 1;
@@ -605,7 +621,7 @@ static int fmss_addr_n(struct fmss_n31 *f, u32 addr, unsigned int cycles)
 	return fmss_wait48(f, 4);
 }
 
-static int fmss_addr1(struct fmss_n31 *f, u32 addr)
+static int fmss_addr1(struct nand_s5l8740 *f, u32 addr)
 {
 	return fmss_addr_n(f, addr, 1);
 }
@@ -614,7 +630,7 @@ static int fmss_addr1(struct fmss_n31 *f, u32 addr)
  * D6388 + 112A7C: PIO write to +0x80 then kick. Used only for SET FEATURES
  * (NAND device registers), never for array program (50DC34).
  */
-static int fmss_pio_write(struct fmss_n31 *f, const void *src, unsigned int len)
+static int fmss_pio_write(struct nand_s5l8740 *f, const void *src, unsigned int len)
 {
 	const u32 *p = src;
 	unsigned int i, words;
@@ -640,7 +656,7 @@ static int fmss_pio_write(struct fmss_n31 *f, const void *src, unsigned int len)
 }
 
 /* 1303B4: PPN SET FEATURES (cmd 0xEF). */
-static int fmss_set_feature(struct fmss_n31 *f, unsigned int ce, u16 feat, u32 val)
+static int fmss_set_feature(struct nand_s5l8740 *f, unsigned int ce, u16 feat, u32 val)
 {
 	u8 st = 0;
 	u32 feat_word = feat;
@@ -670,7 +686,7 @@ static u16 last_feat_id;
 static int last_feat_ce = -1;
 static int last_feat_ret = -1;
 
-static int fmss_get_feature(struct fmss_n31 *f, unsigned int ce, u16 feat,
+static int fmss_get_feature(struct nand_s5l8740 *f, unsigned int ce, u16 feat,
 			    void *dst, unsigned int len)
 {
 	u8 st = 0;
@@ -703,8 +719,8 @@ static int fmss_get_feature(struct fmss_n31 *f, unsigned int ce, u16 feat,
 	return ret;
 }
 
-/* sub_4F11F4(ce, addr=0, buf): READ ID, no 10453C reset. */
-static int fmss_read_id(struct fmss_n31 *f, unsigned int ce)
+/*(ce, addr=0, buf): READ ID, no 10453C reset. */
+static int fmss_read_id(struct nand_s5l8740 *f, unsigned int ce)
 {
 	u8 *dst = f->last_id;
 
@@ -719,7 +735,7 @@ static int fmss_read_id(struct fmss_n31 *f, unsigned int ce)
 	fmss_cmd(f, 0x90);
 
 	if (fmss_addr1(f, 0))
-		pr_info("s5l8740-fmss: wait48(4) after addr timed out st=%08x\n",
+		pr_info("s5l8740-nand: wait48(4) after addr timed out st=%08x\n",
 			readl(f->base + FMSTAT48));
 
 	if (fmss_data_in(f, dst, 8)) {
@@ -733,7 +749,7 @@ static int fmss_read_id(struct fmss_n31 *f, unsigned int ce)
 }
 
 /* 4F1CE8: cmd 0x77/0x7D then wait NAND ready (STAT48 bit 0x800000). */
-static int fmss_wait_ready(struct fmss_n31 *f)
+static int fmss_wait_ready(struct nand_s5l8740 *f)
 {
 	int ret;
 
@@ -745,7 +761,7 @@ static int fmss_wait_ready(struct fmss_n31 *f)
 	writel(32, f->base + FMCTRL1);
 	writel(0x800000u, f->base + FMSTAT48);
 	if (ret)
-		pr_info("s5l8740-fmss: ready timeout NANDSTAT=%08x STAT48=%08x\n",
+		pr_info("s5l8740-nand: ready timeout NANDSTAT=%08x STAT48=%08x\n",
 			f->last_nandstat, f->last_stat48);
 	return ret;
 }
@@ -756,7 +772,7 @@ MODULE_PARM_DESC(ecc_before_drain,
 		 "Run OSOS 4EB458 ECC/descramble before PIO drain (default Y)");
 
 /*
- * 0 = diagnostic sub_50D960: FMLEN=52 FMCE=16 CTRL1=34 then data FMCE=1
+ * 0 = diagnostic: FMLEN=52 FMCE=16 CTRL1=34 then data FMCE=1
  * 1 = production-seq style: FMLEN=15 FMCE=0x102 CTRL1=0x1E2, data FMCE=0x201 +0x18=2
  */
 static unsigned int xfer_style;
@@ -783,8 +799,8 @@ module_param(xfer_ctrl1, uint, 0644);
 MODULE_PARM_DESC(xfer_ctrl1, "FMCTRL1 for parity/data beats (default 34)");
 
 /*
- * OSOS sub_4EB458(a1=0, len=1024): kick FMSS ECC/descramble engine.
- * Must run AFTER parity+data transfer waits, BEFORE FIFO drain (sub_D622C).
+ * OSOS(a1=0, len=1024): kick FMSS ECC/descramble engine.
+ * Must run AFTER parity+data transfer waits, BEFORE FIFO drain.
  *
  * Exact RetailOS order — do NOT clear +0x810 before kick (preload stays
  * 0x3f1f73af). Poll bit0 of +0x810 for completion; if preload already has
@@ -792,7 +808,7 @@ MODULE_PARM_DESC(xfer_ctrl1, "FMCTRL1 for parity/data beats (default 34)");
  *
  * Returns 0 OK, 1 clean/erased page, -ETIMEDOUT / -EIO on hard fail.
  */
-static int fmss_ecc_chunk(struct fmss_n31 *f, unsigned int seed_a1)
+static int fmss_ecc_chunk(struct nand_s5l8740 *f, unsigned int seed_a1)
 {
 	u32 ecc, hist, st;
 	unsigned int t;
@@ -813,7 +829,7 @@ static int fmss_ecc_chunk(struct fmss_n31 *f, unsigned int seed_a1)
 		udelay(1);
 	}
 	if (t >= 20000) {
-		pr_info("s5l8740-fmss: 4EB458 timeout st=%08x\n", st);
+		pr_info("s5l8740-nand: 4EB458 timeout st=%08x\n", st);
 		return -ETIMEDOUT;
 	}
 	ecc = readl(f->base + 0x80c);
@@ -830,15 +846,15 @@ static int fmss_ecc_chunk(struct fmss_n31 *f, unsigned int seed_a1)
 }
 
 /*
- * sub_50D960(ce, page_addr, buf, with_parity).
+ *(ce, page_addr, buf, with_parity).
  * Per 1KiB chunk: parity beat → data xfer wait → 4EB458 → PIO drain.
  * Linux previously drained before ECC — that left DATA pages whitened.
  */
-static void fmss_meta_ingest_spare(struct fmss_n31 *f, unsigned int ce,
+static void fmss_meta_ingest_spare(struct nand_s5l8740 *f, unsigned int ce,
 				   unsigned int cau, unsigned int block,
 				   unsigned int page, unsigned int slot0);
 
-static int fmss_page_read(struct fmss_n31 *f, unsigned int ce, u32 addr)
+static int fmss_page_read(struct nand_s5l8740 *f, unsigned int ce, u32 addr)
 {
 	int i, ret = -EIO, ecc_ret;
 	u8 *dst = f->last_page;
@@ -871,19 +887,19 @@ static int fmss_page_read(struct fmss_n31 *f, unsigned int ce, u32 addr)
 	writel(addr, f->base + FMADDR);
 	writel(1, f->base + FMCTRL1);
 	if (fmss_wait48(f, 4)) {
-		pr_info("s5l8740-fmss: addr cycle timeout ce=%u addr=%08x st=%08x nand=%08x\n",
+		pr_info("s5l8740-nand: addr cycle timeout ce=%u addr=%08x st=%08x nand=%08x\n",
 			ce, addr, f->last_stat48, f->last_nandstat);
 		goto fail_ctrl0;
 	}
 
 	if (fmss_cmd(f, 0x37)) {
-		pr_info("s5l8740-fmss: cmd 0x37 timeout ce=%u addr=%08x st=%08x\n",
+		pr_info("s5l8740-nand: cmd 0x37 timeout ce=%u addr=%08x st=%08x\n",
 			ce, addr, f->last_stat48);
 		goto fail_ctrl0;
 	}
 
 	if (fmss_wait_ready(f)) {
-		pr_info("s5l8740-fmss: not ready after read cmd ce=%u addr=%08x\n",
+		pr_info("s5l8740-nand: not ready after read cmd ce=%u addr=%08x\n",
 			ce, addr);
 		goto fail_ctrl0;
 	}
@@ -902,24 +918,24 @@ static int fmss_page_read(struct fmss_n31 *f, unsigned int ce, u32 addr)
 				writel(0x1e2, f->base + FMCTRL1);
 			} else {
 				/* OSOS 50D960 parity: FMLEN=52 FMCE=16 +0x24=0 CTRL1=34
-				 * — do not touch +0x18 or +0x28 here.
-				 */
+ * — do not touch +0x18 or +0x28 here.
+ */
 				writel(52, f->base + FMLEN);
 				writel(parity_fmce, f->base + FMCE);
 				writel(0, f->base + FMUNK24);
 				writel(xfer_ctrl1, f->base + FMCTRL1);
 			}
 			if (fmss_wait48(f, 8)) {
-				pr_info("s5l8740-fmss: parity xfer timeout ce=%u addr=%08x chunk=%d st=%08x style=%u\n",
+				pr_info("s5l8740-nand: parity xfer timeout ce=%u addr=%08x chunk=%d st=%08x style=%u\n",
 					ce, addr, i, f->last_stat48, xfer_style);
 				goto fail_ctrl0;
 			}
 			/*
-			 * Live: after FMCE=16 FMLEN=52, D622C can read bytes
-			 * (head often 02 …) — parity lands on the DATA FIFO.
-			 * Never drain it when ecc_before_drain=1 (OSOS leaves
-			 * it for 4EB458). Optional strip only when ECC off.
-			 */
+ * Live: after FMCE=16 FMLEN=52, D622C can read bytes
+ * (head often 02 …) — parity lands on the DATA FIFO.
+ * Never drain it when ecc_before_drain=1 (OSOS leaves
+ * it for 4EB458). Optional strip only when ECC off.
+ */
 			if (xfer_style == 0 && !ecc_before_drain) {
 				u8 dig[64];
 
@@ -928,9 +944,9 @@ static int fmss_page_read(struct fmss_n31 *f, unsigned int ce, u32 addr)
 					memcpy(f->last_parity[i], dig, 53);
 					f->last_parity_len[i] = 53;
 					/*
-					 * Host-visible spare is the first 16 of
-					 * the 53-byte beat, once per 4K slot.
-					 */
+ * Host-visible spare is the first 16 of
+ * the 53-byte beat, once per 4K slot.
+ */
 					if ((i & 3) == 0) {
 						unsigned int slot = (unsigned int)i / 4u;
 						unsigned int pick = 0;
@@ -966,7 +982,7 @@ static int fmss_page_read(struct fmss_n31 *f, unsigned int ce, u32 addr)
 			writel(xfer_ctrl1, f->base + FMCTRL1);
 		}
 		if (fmss_wait48(f, 8)) {
-			pr_info("s5l8740-fmss: data xfer timeout ce=%u addr=%08x chunk=%d st=%08x nand=%08x style=%u\n",
+			pr_info("s5l8740-nand: data xfer timeout ce=%u addr=%08x chunk=%d st=%08x nand=%08x style=%u\n",
 				ce, addr, i, f->last_stat48, f->last_nandstat,
 				xfer_style);
 			goto fail_ctrl0;
@@ -976,11 +992,11 @@ static int fmss_page_read(struct fmss_n31 *f, unsigned int ce, u32 addr)
 			ecc_ret = fmss_ecc_chunk(f, 0);
 			if (ecc_ret == 1) {
 				/*
-				 * Chunk is erased/clean — leave zeros and
-				 * keep going. Aborting the whole page on
-				 * chunk0 made FPart/VFL miss SLC specials
-				 * (glass: 4096 tail reads, tag30=0).
-				 */
+ * Chunk is erased/clean — leave zeros and
+ * keep going. Aborting the whole page on
+ * chunk0 made FPart/VFL miss SLC specials
+ * (glass: 4096 tail reads, tag30=0).
+ */
 				f->last_clean_chunks++;
 				continue;
 			}
@@ -993,17 +1009,17 @@ static int fmss_page_read(struct fmss_n31 *f, unsigned int ce, u32 addr)
 			}
 		}
 		if (fmss_pio_read(f, dst + i * FMSS_CHUNK, FMSS_CHUNK)) {
-			pr_info("s5l8740-fmss: PIO drain timeout ce=%u addr=%08x chunk=%d\n",
+			pr_info("s5l8740-nand: PIO drain timeout ce=%u addr=%08x chunk=%d\n",
 				ce, addr, i);
 			goto fail_ctrl0;
 		}
 	}
 
 	/*
-	 * Trailing fmss_data_in(64) after 16×1K is an empty FIFO (zeros) and
-	 * must not be treated as META (that polluted lba_map with type 0x00).
-	 * Extra style-1 FMLEN=15 beats after this path desynced the next page.
-	 */
+ * Trailing fmss_data_in(64) after 16×1K is an empty FIFO (zeros) and
+ * must not be treated as META (that polluted lba_map with type 0x00).
+ * Extra style-1 FMLEN=15 beats after this path desynced the next page.
+ */
 
 	fmss_cmd(f, 0x77);
 	writel(0, f->base + FMCTRL0);
@@ -1030,7 +1046,7 @@ fail_ctrl0:
  * FIL needs both descrambled data (pass 1, ECC) and 16B Sogeti META
  * (pass 2, drain 53-byte parity FIFO). Mutex is already held.
  */
-static int fmss_page_read_with_meta(struct fmss_n31 *f, unsigned int ce,
+static int fmss_page_read_with_meta(struct nand_s5l8740 *f, unsigned int ce,
 				    u32 addr)
 {
 	static u8 page_bak[FMSS_PAGE_LEN];
@@ -1044,9 +1060,9 @@ static int fmss_page_read_with_meta(struct fmss_n31 *f, unsigned int ce,
 	if (ret || !meta_pass)
 		return ret;
 	/*
-	 * Erased PPN page: all 16 chunks ECC-clean. Spare is 0xFF; a second
-	 * 50D960 only burns the controller (tail+brute are mostly empty).
-	 */
+ * Erased PPN page: all 16 chunks ECC-clean. Spare is 0xFF; a second
+ * 50D960 only burns the controller (tail+brute are mostly empty).
+ */
 	if (f->last_clean_chunks &&
 	    f->last_clean_chunks >= (page_chunks ? page_chunks : 16)) {
 		memset(f->last_spare, 0xff, sizeof(f->last_spare));
@@ -1071,7 +1087,7 @@ static int fmss_page_read_with_meta(struct fmss_n31 *f, unsigned int ce,
 	f->last_page_chunk = saved_chunk;
 	f->last_page_ret = ret;
 	if (ret2 && !quiet)
-		pr_info("s5l8740-fmss: meta pass ce=%u addr=%08x ret=%d (data kept)\n",
+		pr_info("s5l8740-nand: meta pass ce=%u addr=%08x ret=%d (data kept)\n",
 			ce, addr, ret2);
 	return ret;
 }
@@ -1081,16 +1097,22 @@ static int fmss_page_read_with_meta(struct fmss_n31 *f, unsigned int ce,
  * Sequence program is the OSOS blob at 0x8980EA0 (embedded).
  * 16-byte PPN spare per 4K sector lands in the spare DMA buffer
  * (Sogeti type/bank/weaveSeq/lpn). Status bytes go to stbuf.
+ *
+ * Treat CS as a peripheral sequencer (not PL080): clear status, prove
+ * idle, program pointers, read back posted MMIO, kick last. USB OTG
+ * already proves SoC bus-master DMA / coherent buffers work.
  */
-static int fmss_wait_cs(struct fmss_n31 *f, unsigned int loops)
+static int fmss_wait_cs_poll(struct nand_s5l8740 *f, unsigned int loops)
 {
 	unsigned int i;
 	u32 irq;
 
 	for (i = 0; i < loops; i++) {
 		irq = readl(f->base + FMSEQIRQ);
-		if ((irq & 0xd) == 1)
+		if ((irq & 0xd) == 1) {
+			f->last_dma_c0c = irq;
 			return 0;
+		}
 		if (irq & 0xc) {
 			f->last_dma_c0c = irq;
 			return -EIO;
@@ -1101,7 +1123,40 @@ static int fmss_wait_cs(struct fmss_n31 *f, unsigned int loops)
 	return -ETIMEDOUT;
 }
 
-static void fmss_dma_teardown(struct fmss_n31 *f)
+static bool fmss_cs_preflight(struct nand_s5l8740 *f)
+{
+	u32 c08, c0c, c00;
+
+	c00 = readl(f->base + FMSEQ);
+	c08 = readl(f->base + FMSEQSTAT);
+	c0c = readl(f->base + FMSEQIRQ);
+
+	f->last_dma_c00 = c00;
+	f->last_dma_c0c = c0c;
+
+	/* Clear stale completion/error before programming. */
+	if (c0c & 0x0d) {
+		writel(c0c & 0x0d, f->base + FMSEQIRQ);
+		readl(f->base + FMSEQIRQ);
+		udelay(10);
+		c0c = readl(f->base + FMSEQIRQ);
+		f->last_dma_c0c = c0c;
+	}
+
+	/*
+ * Conservative idle gate. Adjust allowed states only after glass logs.
+ * Avoid kick if status already advertises completion/error/busy noise.
+ */
+	if (c0c & 0x0d)
+		return false;
+
+	if (c08 != 0 && c08 != 3)
+		return false;
+
+	return true;
+}
+
+static void fmss_dma_teardown(struct nand_s5l8740 *f)
 {
 	struct device *dev = f->dev;
 
@@ -1128,14 +1183,27 @@ static void fmss_dma_teardown(struct fmss_n31 *f)
 
 static irqreturn_t fmss_cs_irq(int irq, void *data)
 {
-	struct fmss_n31 *f = data;
+	struct nand_s5l8740 *f = data;
+	u32 st;
 
-	f->last_dma_c0c = readl(f->base + FMSEQIRQ);
+	st = readl(f->base + FMSEQIRQ);
+	f->last_dma_c0c = st;
+
+	/*
+ * Level-style VIC source: clear peripheral before parent EOI, or it
+ * can retrigger/stick. Snapshot first — waiter must not require C0C
+ * to remain asserted after W1C.
+ */
+	if (st & 0x0d) {
+		writel(st & 0x0d, f->base + FMSEQIRQ);
+		readl(f->base + FMSEQIRQ);
+	}
+
 	complete(&f->cs_irq);
 	return IRQ_HANDLED;
 }
 
-static void fmss_peek_vic1(struct fmss_n31 *f)
+static void fmss_peek_vic1(struct nand_s5l8740 *f)
 {
 	void __iomem *vic1;
 
@@ -1147,7 +1215,7 @@ static void fmss_peek_vic1(struct fmss_n31 *f)
 	iounmap(vic1);
 }
 
-static int fmss_dma_setup(struct fmss_n31 *f, struct device *dev)
+static int fmss_dma_setup(struct nand_s5l8740 *f, struct device *dev)
 {
 	int ret;
 
@@ -1163,7 +1231,7 @@ static int fmss_dma_setup(struct fmss_n31 *f, struct device *dev)
 	f->spare = dma_alloc_coherent(dev, FMSS_DMA_SPARE_LEN, &f->spare_dma, GFP_KERNEL);
 	f->stbuf = dma_alloc_coherent(dev, FMSS_DMA_STATUS_LEN, &f->stbuf_dma, GFP_KERNEL);
 	if (!f->seq || !f->cmdl || !f->data || !f->spare || !f->stbuf) {
-		fmss_dev_info(dev, "DMA coherent alloc failed, PIO only\n");
+		nand_dev_info(dev, "DMA coherent alloc failed, PIO only\n");
 		fmss_dma_teardown(f);
 		return -ENOMEM;
 	}
@@ -1182,11 +1250,11 @@ static int fmss_dma_setup(struct fmss_n31 *f, struct device *dev)
 			f->irq = 0;
 		} else {
 			f->irq = dma_irq;
-			fmss_dev_info(dev, "CS IRQ %d (OSOS 54 / VIC1 22)\n", f->irq);
+			nand_dev_info(dev, "CS IRQ %d (OSOS 54 / VIC1 22)\n", f->irq);
 		}
 	}
 
-	fmss_dev_info(dev, "DMA seq_phys=0x%08lx cmdl=0x%08lx data=0x%08lx seq0=%02x %02x %02x %02x coherent=1\n",
+	nand_dev_info(dev, "DMA seq_phys=0x%08lx cmdl=0x%08lx data=0x%08lx seq0=%02x %02x %02x %02x coherent=1\n",
 		 (unsigned long)f->seq_dma, (unsigned long)f->cmdl_dma,
 		 (unsigned long)f->data_dma,
 		 ((u8 *)f->seq)[0], ((u8 *)f->seq)[1],
@@ -1194,15 +1262,17 @@ static int fmss_dma_setup(struct fmss_n31 *f, struct device *dev)
 	return 0;
 }
 
-static int fmss_dma_page_read(struct fmss_n31 *f, unsigned int ce, u32 addr)
+static int fmss_dma_page_read(struct nand_s5l8740 *f, unsigned int ce, u32 addr)
 {
 	u32 *cl;
 	u32 ce_bit;
 	unsigned int nsect = dma_nsect;
 	unsigned int i, spare_bytes;
 	u8 *dp;
-	int ret;
+	int ret = 0;
 	u32 dregs[32];
+
+	memset(dregs, 0, sizeof(dregs));
 
 	if (!f->dma_ok)
 		return -ENODEV;
@@ -1220,18 +1290,18 @@ static int fmss_dma_page_read(struct fmss_n31 *f, unsigned int ce, u32 addr)
 	ce_bit = 1u << (16 + ce);
 
 	/*
-	 * 4EDDDC one-page descriptor list:
-	 *   desc0: CE-select  dword0=1<<(ce+16), later |0x80000000 if last for CE
-	 *          dword2/3 = packed physical address (v40: low in [2])
-	 *   desc1: transfer   dword0=(1<<(ce+16))|1, [1]=span, [2]=meta, [3]=data
-	 *   term:  0x00010002
-	 */
+ * 4EDDDC one-page descriptor list:
+ * desc0: CE-select dword0=1<<(ce+16), later |0x80000000 if last for CE
+ * dword2/3 = packed physical address (v40: low in [2])
+ * desc1: transfer dword0=(1<<(ce+16))|1, [1]=span, [2]=meta, [3]=data
+ * term: 0x00010002
+ */
 	/*
-	 * 4EDDDC address qword from 5172A0 (READ, v40 / multi-LBA page):
-	 *   lo = (rec * span) | ((rec * slot) << 16)   // length | column<<16
-	 *   hi = encoded_ppn (5173CA, mode 0)
-	 * desc[2]=lo, desc[3]=hi when dma_d14>=7 (v40).
-	 */
+ * 4EDDDC address qword from 5172A0 (READ, v40 / multi-LBA page):
+ * lo = (rec * span) | ((rec * slot) << 16) // length | column<<16
+ * hi = encoded_ppn (5173CA, mode 0)
+ * desc[2]=lo, desc[3]=hi when dma_d14>=7 (v40).
+ */
 	cl[0] = ce_bit;
 	cl[1] = 0;
 	{
@@ -1294,6 +1364,15 @@ static int fmss_dma_page_read(struct fmss_n31 *f, unsigned int ce, u32 addr)
 		writel(0x0b00, f->base + 0xc4c);
 	}
 
+	/*
+ * Clear/idle before programming D-regs / C04 (USB/PL080 pattern:
+ * clear status, prove idle, program pointers, kick last).
+ */
+	if (!fmss_cs_preflight(f)) {
+		ret = -EBUSY;
+		goto dma_done;
+	}
+
 	/* 4EDDDC register skeleton — bus addresses only. */
 	writel(page_ctrl0_or, f->base + FMGEN1);		/* D04 timing template */
 	writel((u32)f->cmdl_dma, f->base + FMGEN2);	/* D08 descriptor list */
@@ -1302,14 +1381,15 @@ static int fmss_dma_page_read(struct fmss_n31 *f, unsigned int ce, u32 addr)
 	writel(dma_d14, f->base + FMGEN5);		/* D14 = addr_cycles-1 */
 	writel((u32)f->seq_dma, f->base + FMSEQBASE);	/* C04 = seq program */
 	/*
-	 * Do NOT poke +0x81C here — that is 4EB458 ECC, not in 4EDDDC/D39EC.
-	 * A spurious 81C write before CS previously correlated with SoC wedges.
-	 */
+ * Do NOT poke +0x81C here — that is 4EB458 ECC, not in 4EDDDC/D39EC.
+ * A spurious 81C write before CS previously correlated with SoC wedges.
+ */
 	/* D39EC: C00 = 0xFFF5. Do NOT use 0x80000 (reset) here. */
 	reinit_completion(&f->cs_irq);
-	fmss_info("dma kick ce=%u addr=%08x seq=%08x cmdl=%08x data=%08x meta=%08x st=%08x d14=%u kick=%04x dry=%d\n",
+	fmss_info("dma kick ce=%u addr=%08x seq=%08x cmdl=%08x data=%08x meta=%08x st=%08x d14=%u kick=%04x dry=%d armed=%d\n",
 		  ce, addr, (u32)f->seq_dma, (u32)f->cmdl_dma, (u32)f->data_dma,
-		  (u32)f->spare_dma, (u32)f->stbuf_dma, dma_d14, dma_kick, dma_dry);
+		  (u32)f->spare_dma, (u32)f->stbuf_dma, dma_d14, dma_kick,
+		  dma_dry, dma_armed);
 	if (dma_dry) {
 		f->last_dma_c0c = readl(f->base + FMSEQIRQ);
 		f->last_dma_d00 = readl(f->base + FMGEN0);
@@ -1317,17 +1397,53 @@ static int fmss_dma_page_read(struct fmss_n31 *f, unsigned int ce, u32 addr)
 		ret = -EAGAIN;
 		goto dma_done;
 	}
-	writel(dma_kick, f->base + FMSEQ);
+	if (!dma_armed) {
+		ret = -EPERM;
+		goto dma_done;
+	}
+	if (dma_one_shot)
+		dma_armed = false;
 
 	/*
-	 * Prefer short poll of C0C. IRQ wait alone can hang the process context
-	 * if VIC routing is wrong; poll always bounds the wait.
-	 */
-	ret = fmss_wait_cs(f, 20000);
-	if (ret && f->irq > 0 &&
-	    try_wait_for_completion(&f->cs_irq))
-		ret = ((f->last_dma_c0c & 0xd) == 1) ? 0 : ret;
-	f->last_dma_c0c = readl(f->base + FMSEQIRQ);
+ * Device-visible descriptor/data/status buffers before CS fetch.
+ * Coherent allocs do not need explicit cache flushes; ordering does.
+ */
+	dma_wmb();
+	wmb();
+
+	/* Flush posted MMIO programming before the sequencer kick. */
+	readl(f->base + FMGEN2);
+	readl(f->base + FMGEN3);
+	readl(f->base + FMGEN4);
+	readl(f->base + FMGEN5);
+	readl(f->base + FMSEQBASE);
+
+	writel(dma_kick, f->base + FMSEQ);
+	readl(f->base + FMSEQ); /* posted write flush */
+
+	/*
+ * Prefer IRQ completion snapshot (ISR already W1C'd C0C). Fall back
+ * to short poll only when no IRQ or completion never arrived.
+ */
+	if (f->irq > 0) {
+		if (wait_for_completion_timeout(&f->cs_irq,
+						msecs_to_jiffies(200))) {
+			ret = 0;
+		} else {
+			ret = fmss_wait_cs_poll(f, 2000);
+		}
+	} else {
+		ret = fmss_wait_cs_poll(f, 20000);
+	}
+
+	/*
+ * Avoid require C0C to still be live — ISR clears it for VIC EOI.
+ * Trust the saved snapshot from ISR or poll.
+ */
+	if (!ret && f->last_dma_c0c &&
+	    ((f->last_dma_c0c & 0x0d) != 1))
+		ret = -EIO;
+
 	f->last_dma_d00 = readl(f->base + FMGEN0);
 	f->last_dma_c00 = readl(f->base + FMSEQ);
 	fmss_peek_vic1(f);
@@ -1395,7 +1511,7 @@ dma_done:
 		  cl[0], cl[1], cl[2], cl[3], cl[4], cl[5], cl[6], cl[7], cl[8],
 		  (u32)f->seq_dma, (u32)f->cmdl_dma, (u32)f->data_dma,
 		  (u32)f->spare_dma);
-	if (!ret && f->last_spare_len >= 16) {
+	if (!ret && !dma_skip_ingest && f->last_spare_len >= 16) {
 		unsigned int pg = addr & L2V_PAGE_MASK;
 		unsigned int blk = (addr >> FMSS_PAGE_BITS) & L2V_BLOCK_MASK;
 		unsigned int cau = (addr >> (FMSS_PAGE_BITS + FMSS_BLOCK_BITS)) &
@@ -1407,10 +1523,10 @@ dma_done:
 }
 
 /*
- * sub_12FA84: PPN parameter page, 512 bytes via 41AE38.
+ *: PPN parameter page, 512 bytes via 41AE38.
  * cmd 0x92, addr 0, cmd 0x97, 0x77/0x7D, 41DA70, cmd 0x7A, 512 PIO.
  */
-static int fmss_param_read(struct fmss_n31 *f, unsigned int ce)
+static int fmss_param_read(struct nand_s5l8740 *f, unsigned int ce)
 {
 	u8 st = 0;
 	int ret;
@@ -1422,24 +1538,24 @@ static int fmss_param_read(struct fmss_n31 *f, unsigned int ce)
 
 	writel(fmss_ctrl0(ce), f->base + FMCTRL0);
 	if (fmss_cmd(f, 0x92)) {
-		pr_info("s5l8740-fmss: param cmd 0x92 timeout\n");
+		pr_info("s5l8740-nand: param cmd 0x92 timeout\n");
 		ret = -ETIMEDOUT;
 		goto out_idle;
 	}
 	if (fmss_addr1(f, 0)) {
-		pr_info("s5l8740-fmss: param addr timeout st=%08x\n", f->last_stat48);
+		pr_info("s5l8740-nand: param addr timeout st=%08x\n", f->last_stat48);
 		ret = -ETIMEDOUT;
 		goto out_idle;
 	}
 	if (fmss_cmd(f, 0x97)) {
-		pr_info("s5l8740-fmss: param cmd 0x97 timeout\n");
+		pr_info("s5l8740-nand: param cmd 0x97 timeout\n");
 		ret = -ETIMEDOUT;
 		goto out_idle;
 	}
 	fmss_cmd(f, 0x77);
 	fmss_cmd(f, 0x7d);
 	if (fmss_wait_status(f, 100000, &st)) {
-		pr_info("s5l8740-fmss: param ready timeout NANDSTAT=%02x st48=%08x\n",
+		pr_info("s5l8740-nand: param ready timeout NANDSTAT=%02x st48=%08x\n",
 			st, f->last_stat48);
 		ret = -ETIMEDOUT;
 		goto out_idle;
@@ -1458,10 +1574,10 @@ out_idle:
 }
 
 /*
- * sub_10453C: controller reset only (no NAND array write).
+ *: controller reset only (no NAND array write).
  * Followed by per-CE cmd 0xFF as in 130060(a3=1).
  */
-static int fmss_ctrl_reset(struct fmss_n31 *f)
+static int fmss_ctrl_reset(struct nand_s5l8740 *f)
 {
 	unsigned int i;
 	u32 v;
@@ -1504,7 +1620,7 @@ static int fmss_ctrl_reset(struct fmss_n31 *f)
 		udelay(1);
 	}
 	if (!(readl(f->base + FMCTRL1) & 0x40000000u)) {
-		pr_info("s5l8740-fmss: 10453C FMCTRL1 bit30 timeout v=%08x\n",
+		pr_info("s5l8740-nand: 10453C FMCTRL1 bit30 timeout v=%08x\n",
 			readl(f->base + FMCTRL1));
 		return -ETIMEDOUT;
 	}
@@ -1514,7 +1630,7 @@ static int fmss_ctrl_reset(struct fmss_n31 *f)
 }
 
 /* 130060: 10453C, then NAND RESET (0xFF) on CE0/CE1. */
-static int fmss_nand_reset(struct fmss_n31 *f)
+static int fmss_nand_reset(struct nand_s5l8740 *f)
 {
 	unsigned int ce;
 	int ret;
@@ -1533,7 +1649,7 @@ static int fmss_nand_reset(struct fmss_n31 *f)
 		writel((2u * (1u << ce)) | 0xFF001u, f->base + FMCTRL0);
 		writel(2, f->base + FMSTAT48);
 		if (fmss_cmd(f, 0xff))
-			pr_info("s5l8740-fmss: cmd 0xFF timeout ce=%u st=%08x\n",
+			pr_info("s5l8740-nand: cmd 0xFF timeout ce=%u st=%08x\n",
 				ce, f->last_stat48);
 	}
 	msleep(50);
@@ -1558,7 +1674,7 @@ static u32 fmss_le32(const u8 *p, unsigned int off)
 static ssize_t regs_show(struct device *dev, struct device_attribute *attr,
 			 char *buf)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	static const u32 offs[] = {
 		FMCTRL0, FMCTRL1, FMCMD, FMADDR, FMCE, FMUNK18, FMUNK24, FMUNK28,
 		FMCYCLES, FMLEN, FMUNK38, FMSTAT48, NANDSTAT, FMDATA, FMSEQ, FMSEQSTAT,
@@ -1578,7 +1694,7 @@ static DEVICE_ATTR_RO(regs);
 static ssize_t id_show(struct device *dev, struct device_attribute *attr,
 		       char *buf)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 
 	if (!f)
 		return -ENODEV;
@@ -1593,7 +1709,7 @@ static DEVICE_ATTR_RO(id);
 static ssize_t read_id_store(struct device *dev, struct device_attribute *attr,
 			     const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int ce;
 	int ret;
 
@@ -1604,7 +1720,7 @@ static ssize_t read_id_store(struct device *dev, struct device_attribute *attr,
 	mutex_lock(&f->lock);
 	ret = fmss_read_id(f, ce);
 	mutex_unlock(&f->lock);
-	fmss_dev_info(dev, "read_id ce=%u ret=%d id=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+	nand_dev_info(dev, "read_id ce=%u ret=%d id=%02x%02x%02x%02x%02x%02x%02x%02x\n",
 		 ce, ret,
 		 f->last_id[0], f->last_id[1], f->last_id[2], f->last_id[3],
 		 f->last_id[4], f->last_id[5], f->last_id[6], f->last_id[7]);
@@ -1615,7 +1731,7 @@ static DEVICE_ATTR_WO(read_id);
 static ssize_t page_status_show(struct device *dev, struct device_attribute *attr,
 			       char *buf)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 
 	if (!f)
 		return -ENODEV;
@@ -1631,7 +1747,7 @@ static DEVICE_ATTR_RO(page_status);
 static ssize_t page_hex_show(struct device *dev, struct device_attribute *attr,
 			     char *buf)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	int i, n = 0;
 
 	if (!f)
@@ -1647,7 +1763,7 @@ static DEVICE_ATTR_RO(page_hex);
 static ssize_t spare_hex_show(struct device *dev, struct device_attribute *attr,
 			      char *buf)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	int i, n = 0;
 
 	if (!f)
@@ -1677,7 +1793,7 @@ static u8 fmss_meta_type(const u8 *m, unsigned int len)
 static ssize_t parity_hex_show(struct device *dev, struct device_attribute *attr,
 			       char *buf)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int i, j, n = 0;
 
 	if (!f)
@@ -1703,7 +1819,7 @@ static DEVICE_ATTR_RO(parity_hex);
 static ssize_t page_read_store(struct device *dev, struct device_attribute *attr,
 			      const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int ce, a, b, c, d, cycles;
 	u32 addr;
 	int nf, ret;
@@ -1738,7 +1854,7 @@ static DEVICE_ATTR_WO(page_read);
 static ssize_t dma_read_store(struct device *dev, struct device_attribute *attr,
 			      const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int ce, a, b, c, d, cycles;
 	u32 addr;
 	int nf, ret;
@@ -1758,8 +1874,10 @@ static ssize_t dma_read_store(struct device *dev, struct device_attribute *attr,
 			return -EINVAL;
 	}
 	mutex_lock(&f->lock);
-	/* Always re-init PPN before CS — cold CS kick can bus-hang the SoC. */
-	fmss_nand_reset(f);
+
+	if (dma_reset_before)
+		fmss_nand_reset(f);
+
 	ret = fmss_dma_page_read(f, ce, addr);
 	f->pages_since_reset++;
 	mutex_unlock(&f->lock);
@@ -1767,11 +1885,481 @@ static ssize_t dma_read_store(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_WO(dma_read);
 
+/*
+ * CS descriptor ABI canary — no FTL ingest / no lba_map mutation.
+ *
+ * Physical page: ce=0 cau=0 block=63 page=88 slc=0
+ *
+ * PIO may show *UOKJIHC at non-aligned offset 7816 — that is a raw
+ * positive-control artifact only. CS full-page shows sector-aligned
+ * boot-like payloads at 0 and 8192 (= 2×4096). Prefer rec=4112
+ * (4096 data + 16 meta). Span4 is the primary trusted CS path;
+ * sub-slot is optional.
+ */
+#define CS_CANARY_MARK		"*UOKJIHC"
+#define CS_CANARY_MARK_LEN	8
+#define CS_CANARY_CE		0u
+#define CS_CANARY_CAU		0u
+#define CS_CANARY_BLOCK		63u
+#define CS_CANARY_PAGE		88u
+#define CS_CANARY_SLC		0u
+#define CS_CANARY_PIO_OFF	7816u	/* PIO-only artifact; not CS expect */
+#define CS_CANARY_SLOT2_OFF	8192u
+#define CS_CANARY_OEM_DELTA	3u
+#define CS_CANARY_SECTOR	4096u
+#define CS_CANARY_META		16u
+
+static char cs_canary_log[8192];
+
+static int fmss_find_bytes(const u8 *p, unsigned int n,
+			   const char *s, unsigned int sl)
+{
+	unsigned int i;
+
+	if (!sl || sl > n)
+		return -1;
+	for (i = 0; i + sl <= n; i++) {
+		if (!memcmp(p + i, s, sl))
+			return (int)i;
+	}
+	return -1;
+}
+
+static bool fmss_meta_nonblank(const u8 *m, unsigned int n)
+{
+	unsigned int i;
+
+	for (i = 0; i < n; i++) {
+		if (m[i] != 0x00 && m[i] != 0xff)
+			return true;
+	}
+	return false;
+}
+
+static bool fmss_looks_like_bpb(const u8 *p)
+{
+	return (p[0] == 0xeb || p[0] == 0xe9) &&
+	       (p[2] == 0x90 || p[2] == 0x00);
+}
+
+/* Sector-aligned CS hit: BPB jump at expect_off and/or OEM at +3. */
+static bool fmss_cs_canary_hit(const u8 *dp, unsigned int data_len,
+			       unsigned int expect_off, int *mark_off)
+{
+	int hit;
+
+	hit = fmss_find_bytes(dp, data_len, CS_CANARY_MARK, CS_CANARY_MARK_LEN);
+	if (mark_off)
+		*mark_off = hit;
+	if (expect_off + 3 <= data_len && fmss_looks_like_bpb(dp + expect_off))
+		return true;
+	if (hit == (int)(expect_off + CS_CANARY_OEM_DELTA))
+		return true;
+	return false;
+}
+
+static u64 fmss_le48(const u8 *p)
+{
+	return (u64)p[0] | ((u64)p[1] << 8) | ((u64)p[2] << 16) |
+	       ((u64)p[3] << 24) | ((u64)p[4] << 32) | ((u64)p[5] << 40);
+}
+
+static int fmss_cs_slot_report(const u8 *dp, const u8 *mp,
+			       unsigned int slot, char *out, size_t out_sz)
+{
+	const u8 *d = dp + slot * CS_CANARY_SECTOR;
+	const u8 *m = mp + slot * CS_CANARY_META;
+	u16 bps = (u16)d[11] | ((u16)d[12] << 8);
+	u8 spc = d[13];
+	u32 lba = (u32)m[8] | ((u32)m[9] << 8) |
+		  ((u32)m[10] << 16) | ((u32)m[11] << 24);
+	int mark = fmss_find_bytes(d, CS_CANARY_SECTOR,
+				   CS_CANARY_MARK, CS_CANARY_MARK_LEN);
+
+	return scnprintf(out, out_sz,
+			 "  slot%u data[0..15]=%*ph oem=%*ph bpb=%d "
+			 "bps=%u spc=%u mark_off=%d\n"
+			 "  slot%u meta=%*ph type=%02x flags=%02x "
+			 "weave=%012llx lba=%u aux=%*ph nb=%d\n",
+			 slot, 16, d, 8, d + 3, fmss_looks_like_bpb(d),
+			 bps, spc, mark,
+			 slot, 16, m, m[0], m[1],
+			 (unsigned long long)fmss_le48(m + 2), lba,
+			 4, m + 12, fmss_meta_nonblank(m, 16));
+}
+
+static int fmss_cs_canary_one(struct nand_s5l8740 *f, unsigned int ce, u32 addr,
+			      unsigned int slot, unsigned int span,
+			      unsigned int rec, unsigned int expect_off,
+			      bool slot_report, char *out, size_t out_sz)
+{
+	unsigned int saved_slot = dma_slot;
+	unsigned int saved_nsect = dma_nsect;
+	unsigned int saved_rec = dma_rec;
+	bool saved_armed = dma_armed;
+	int ret, hit, n, s;
+	bool pass;
+	u8 *dp, *sp, *st;
+	unsigned int data_len;
+
+	dma_slot = slot;
+	dma_nsect = span;
+	dma_rec = rec;
+
+	if (dma_reset_before)
+		fmss_nand_reset(f);
+
+	if (!dma_dry)
+		dma_armed = true;
+
+	dma_skip_ingest = true;
+	ret = fmss_dma_page_read(f, ce, addr);
+	dma_skip_ingest = false;
+
+	dma_slot = saved_slot;
+	dma_nsect = saved_nsect;
+	dma_rec = saved_rec;
+	if (dma_dry)
+		dma_armed = saved_armed;
+
+	dp = f->last_page;
+	sp = f->last_spare;
+	st = f->stbuf ? f->stbuf : f->last_spare;
+	data_len = f->last_page_len;
+	if (data_len > FMSS_PAGE_LEN)
+		data_len = FMSS_PAGE_LEN;
+
+	pass = (expect_off != 0xffffffffu) &&
+	       fmss_cs_canary_hit(dp, data_len, expect_off, &hit);
+	if (expect_off == 0xffffffffu)
+		fmss_cs_canary_hit(dp, data_len, 0, &hit);
+
+	n = scnprintf(out, out_sz,
+		      "case slot=%u span=%u rec=%u ret=%d dry=%d expect_off=%u "
+		      "mark_off=%d meta_nb=%d\n"
+		      "  c00=%08x c04=%08x c08=%08x c0c=%08x c6c=%08x\n"
+		      "  d00=%08x d04=%08x d08=%08x d0c=%08x d10=%08x d14=%08x\n"
+		      "  st[0..15]=%*ph\n"
+		      "  meta[0..15]=%*ph\n"
+		      "  data[0..15]=%*ph\n",
+		      slot, span, rec, ret, dma_dry,
+		      expect_off == 0xffffffffu ? 0 : expect_off, hit,
+		      fmss_meta_nonblank(sp, 16),
+		      f->last_dma_c00, readl(f->base + FMSEQBASE),
+		      readl(f->base + FMSEQSTAT), f->last_dma_c0c,
+		      readl(f->base + 0xc6c),
+		      f->last_dma_d00, readl(f->base + FMGEN1),
+		      readl(f->base + FMGEN2), readl(f->base + FMGEN3),
+		      readl(f->base + FMGEN4), readl(f->base + FMGEN5),
+		      16, st, 16, sp, 16, dp);
+
+	if (expect_off != 0xffffffffu && expect_off < data_len) {
+		n += scnprintf(out + n, out_sz - n,
+			       "  data@expect=%*ph%s\n",
+			       16, dp + expect_off,
+			       pass ? " HIT" :
+			       (hit >= 0) ? " ELSEWHERE" : " MISS");
+	}
+	if (slot_report && span == 4 && data_len >= FMSS_PAGE_LEN) {
+		for (s = 0; s < 4; s++)
+			n += fmss_cs_slot_report(dp, sp, s,
+						 out + n, out_sz - n);
+	}
+	if (pass)
+		n += scnprintf(out + n, out_sz - n, "  RESULT=PASS_MARKER\n");
+	else if (hit >= 0)
+		n += scnprintf(out + n, out_sz - n,
+			       "  RESULT=MARKER_AT_%d\n", hit);
+	else if (!ret || ret == -EAGAIN)
+		n += scnprintf(out + n, out_sz - n, "  RESULT=NO_MARKER\n");
+	else
+		n += scnprintf(out + n, out_sz - n, "  RESULT=ERR\n");
+
+	return n;
+}
+
+static ssize_t cs_canary_read_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
+{
+	if (!cs_canary_log[0])
+		return sysfs_emit(buf, "no canary yet\n");
+	return sysfs_emit(buf, "%s", cs_canary_log);
+}
+
+static ssize_t cs_canary_read_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct nand_s5l8740 *f = nand_dev;
+	unsigned int ce, a, b, c, d;
+	unsigned int slot = 0, span = 1, rec = FMSS_PPN_REC;
+	unsigned int expect_off = 0xffffffffu;
+	u32 addr;
+	int nf, n;
+
+	if (!f)
+		return -ENODEV;
+	if (!f->dma_ok)
+		return -ENODEV;
+
+	nf = sscanf(buf, "%u %i %u %u %u %u %u %u",
+		    &ce, &a, &b, &c, &d, &slot, &span, &rec);
+	if (nf >= 5) {
+		if (a > 1 || b >= FMSS_BLOCKS_PER_CAU || c > FMSS_BTOC_PAGE)
+			return -EINVAL;
+		addr = fmss_ppn_addr(a, b, c, d);
+		if (nf < 6)
+			slot = dma_slot;
+		if (nf < 7)
+			span = 1;
+		if (nf < 8)
+			rec = dma_rec ? dma_rec : FMSS_PPN_REC;
+	} else {
+		nf = sscanf(buf, "%u %i %u %u %u",
+			    &ce, &addr, &slot, &span, &rec);
+		if (nf < 2)
+			return -EINVAL;
+		if (nf < 3)
+			slot = dma_slot;
+		if (nf < 4)
+			span = 1;
+		if (nf < 5)
+			rec = dma_rec ? dma_rec : FMSS_PPN_REC;
+	}
+
+	if (slot > 3 || span < 1 || span > 4 || slot + span > 4)
+		return -EINVAL;
+	if (rec != 4096 && rec != 4112)
+		return -EINVAL;
+
+	/* Sector-aligned expects only. */
+	if (span == 1)
+		expect_off = 0;
+	else if (span == 4 && slot == 0)
+		expect_off = CS_CANARY_SLOT2_OFF; /* Apple boot in slot2 */
+
+	if (!dma_dry && !dma_armed)
+		return -EPERM;
+
+	mutex_lock(&f->lock);
+	n = scnprintf(cs_canary_log, sizeof(cs_canary_log),
+		      "cs_canary ce=%u addr=%08x slot=%u span=%u rec=%u\n",
+		      ce, addr, slot, span, rec);
+	n += fmss_cs_canary_one(f, ce, addr, slot, span, rec, expect_off,
+				span == 4, cs_canary_log + n,
+				sizeof(cs_canary_log) - n);
+	f->pages_since_reset++;
+	nand_dev_info(dev, "%s", cs_canary_log);
+	mutex_unlock(&f->lock);
+	return count;
+}
+static DEVICE_ATTR_RW(cs_canary_read);
+
+static ssize_t cs_canary_matrix_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	size_t len;
+
+	if (!cs_canary_log[0])
+		return sysfs_emit(buf,
+				  "usage: echo 1 > cs_canary_matrix\n"
+				  "page ce=%u cau=%u blk=%u pg=%u\n"
+				  "PIO artifact off=%u (not CS expect)\n"
+				  "E slot2/span1/rec4112 expect data@0 BPB/OEM\n"
+				  "F slot2/span1/rec4096 (meta-in-data check)\n"
+				  "G slot0/span4/rec4112 per-slot BPB+meta\n"
+				  "A/B slot1 legacy; C/D span4 legacy\n"
+				  "(full log also in dmesg)\n",
+				  CS_CANARY_CE, CS_CANARY_CAU, CS_CANARY_BLOCK,
+				  CS_CANARY_PAGE, CS_CANARY_PIO_OFF);
+	len = strnlen(cs_canary_log, sizeof(cs_canary_log));
+	if (len >= PAGE_SIZE)
+		len = PAGE_SIZE - 1;
+	memcpy(buf, cs_canary_log, len);
+	buf[len] = '\0';
+	return len;
+}
+
+static ssize_t cs_canary_matrix_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct nand_s5l8740 *f = nand_dev;
+	u32 addr;
+	unsigned int on = 0;
+	int n;
+	struct {
+		unsigned int slot, span, rec, expect;
+		bool slot_report;
+		char tag;
+	} cases[] = {
+		/* Primary: sector-aligned slot2 + span4 decode. */
+		{ 2, 1, 4112, 0, false, 'E' },
+		{ 2, 1, 4096, 0, false, 'F' },
+		{ 0, 4, 4112, CS_CANARY_SLOT2_OFF, true, 'G' },
+	};
+	unsigned int i;
+
+	if (!f)
+		return -ENODEV;
+	if (!f->dma_ok)
+		return -ENODEV;
+	if (kstrtouint(buf, 0, &on) || !on)
+		return -EINVAL;
+	if (!dma_dry && !dma_armed)
+		return -EPERM;
+
+	addr = fmss_ppn_addr(CS_CANARY_CAU, CS_CANARY_BLOCK,
+			     CS_CANARY_PAGE, CS_CANARY_SLC);
+
+	mutex_lock(&f->lock);
+	n = scnprintf(cs_canary_log, sizeof(cs_canary_log),
+		      "cs_canary_matrix ce=%u cau=%u blk=%u pg=%u addr=%08x "
+		      "dry=%d\n"
+		      "note: PIO off=%u is artifact; CS expect sector @0/@8192\n",
+		      CS_CANARY_CE, CS_CANARY_CAU, CS_CANARY_BLOCK,
+		      CS_CANARY_PAGE, addr, dma_dry, CS_CANARY_PIO_OFF);
+
+	/* PIO control — proves page exists; do not require CS at 7816. */
+	{
+		int pret, phit;
+		unsigned int saved_chunks = page_chunks;
+		unsigned int plen;
+
+		page_chunks = FMSS_MAX_CHUNKS;
+		pret = fmss_page_read(f, CS_CANARY_CE, addr);
+		page_chunks = saved_chunks;
+		plen = f->last_page_len;
+		if (plen > FMSS_PAGE_LEN)
+			plen = FMSS_PAGE_LEN;
+		phit = fmss_find_bytes(f->last_page, plen,
+				       CS_CANARY_MARK, CS_CANARY_MARK_LEN);
+		n += scnprintf(cs_canary_log + n, sizeof(cs_canary_log) - n,
+			       "PIO ret=%d mark_off=%d (artifact expect~%u) %s\n",
+			       pret, phit, CS_CANARY_PIO_OFF,
+			       (phit >= 0) ? "PASS_CONTROL" : "FAIL_CONTROL");
+		if (pret || phit < 0) {
+			nand_dev_info(dev, "%s", cs_canary_log);
+			mutex_unlock(&f->lock);
+			return -EIO;
+		}
+	}
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		n += scnprintf(cs_canary_log + n, sizeof(cs_canary_log) - n,
+			       "\n=== %c ===\n", cases[i].tag);
+		n += fmss_cs_canary_one(f, CS_CANARY_CE, addr,
+					cases[i].slot, cases[i].span,
+					cases[i].rec, cases[i].expect,
+					cases[i].slot_report,
+					cs_canary_log + n,
+					sizeof(cs_canary_log) - n);
+		f->pages_since_reset++;
+	}
+
+	nand_dev_info(dev, "%s", cs_canary_log);
+	mutex_unlock(&f->lock);
+	return count;
+}
+static DEVICE_ATTR_RW(cs_canary_matrix);
+
+static char cs_phys_log[2048];
+
+static ssize_t cs_phys_read_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	if (!cs_phys_log[0])
+		return sysfs_emit(buf,
+				  "usage: echo CE CAU BLK PG [fmss_lba] > cs_phys_read\n"
+				  "CS span4/rec4112 physical page; optional fmss_lba pick\n"
+				  "requires dma_dry=0 dma_armed=1; no lba_map ingest\n");
+	return sysfs_emit(buf, "%s", cs_phys_log);
+}
+
+static ssize_t cs_phys_last_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	return cs_phys_read_show(dev, attr, buf);
+}
+static DEVICE_ATTR_RO(cs_phys_last);
+
+static ssize_t cs_phys_read_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct nand_s5l8740 *f = nand_dev;
+	unsigned int ce, cau, block, page;
+	u32 want_lba = 0xffffffffu;
+	struct s5l8740_cs_page *pg;
+	int nf, ret, n, s, pick;
+
+	if (!f || !f->dma_ok)
+		return -ENODEV;
+	/* Accept optional trailing SLC (ignored; CS phys is always MLC=0). */
+	nf = sscanf(buf, "%u %u %u %u %u",
+		    &ce, &cau, &block, &page, &want_lba);
+	if (nf < 4)
+		return -EINVAL;
+	/*
+ * Legacy: "ce cau blk pg slc [lba]" — if 5th token is 0/1 treat as
+ * SLC and take optional 6th as fmss_lba.
+ */
+	if (nf == 5 && want_lba <= 1) {
+		unsigned int slc_ignored = want_lba;
+		u32 lba6 = 0xffffffffu;
+		int n6 = sscanf(buf, "%u %u %u %u %u %u",
+				&ce, &cau, &block, &page, &slc_ignored, &lba6);
+		(void)slc_ignored;
+		want_lba = (n6 >= 6) ? lba6 : 0xffffffffu;
+	}
+
+	pg = kzalloc(sizeof(*pg), GFP_KERNEL);
+	if (!pg)
+		return -ENOMEM;
+
+	ret = s5l8740_nand_cs_phys_read(ce, cau, block, page, pg);
+	n = scnprintf(cs_phys_log, sizeof(cs_phys_log),
+		      "cs_phys_read ce=%u cau=%u blk=%u pg=%u ret=%d "
+		      "rec=%u span=4\n",
+		      ce, cau, block, page, ret, N31_CS_REC_SIZE);
+	if (!ret) {
+		for (s = 0; s < N31_DATA_SLOTS; s++) {
+			const struct s5l8740_meta_decoded *sm = &pg->meta[s];
+
+			n += scnprintf(cs_phys_log + n, sizeof(cs_phys_log) - n,
+				       "slot%u data=%*ph bpb=%d meta type=%02x "
+				       "weave=%012llx fmss_lba=%u valid=%d "
+				       "data_rec=%d\n",
+				       s, 8, pg->data[s],
+				       (pg->data[s][0] == 0xeb ||
+					pg->data[s][0] == 0xe9),
+				       sm->type, (unsigned long long)sm->weave,
+				       sm->lba, sm->valid,
+				       n31_meta_is_data_record(sm));
+		}
+		if (want_lba != 0xffffffffu) {
+			pick = s5l8740_nand_meta_pick_lba(pg, want_lba);
+			n += scnprintf(cs_phys_log + n, sizeof(cs_phys_log) - n,
+				       "pick_fmss_lba=%u -> slot=%d weave=%012llx "
+				       "type=%02x\n",
+				       want_lba, pick,
+				       pick >= 0 ?
+				       (unsigned long long)pg->meta[pick].weave :
+				       0ULL,
+				       pick >= 0 ? pg->meta[pick].type : 0);
+		}
+	}
+	nand_dev_info(dev, "%s", cs_phys_log);
+	kfree(pg);
+	return ret && ret != -EAGAIN && ret != -EPERM ? ret : count;
+}
+static DEVICE_ATTR_RW(cs_phys_read);
+
 static int fmss_page_blankish(const u8 *p, unsigned int n);
 
 /*
  * PPN DATA spare (CS META stream, type 0x01):
- *   +0 type, +1 bank/flags, +2..+7 weaveSeq48, +8..+11 LBA LE, +12..+15 aux.
+ * +0 type, +1 bank/flags, +2..+7 weaveSeq48, +8..+11 LBA LE, +12..+15 aux.
  * Whimory chooses the newest weave claimant before FMSS; manual phys reads
  * can hit stale historical LBA copies. lba_weave_scan lists them newest-first.
  */
@@ -1801,7 +2389,7 @@ static unsigned int lba_claim_be_alt; /* BE@+8 matched a target */
 static char lba_claim_log[PAGE_SIZE];
 static unsigned int lba_claim_log_len;
 
-/* N31 META: weave[15:0]@+2 LE16 | weave[47:16]@+4 LE32  (5688C4 / 568ED4) */
+/* N31 META: weave[15:0]@+2 LE16 | weave[47:16]@+4 LE32 (5688C4 / 568ED4) */
 static u64 fmss_ppn_weave48(const u8 *m)
 {
 	return (u64)get_unaligned_le16(m + 2) |
@@ -1849,7 +2437,7 @@ static void fmss_lba_claim_insert(const struct fmss_lba_claim *c)
 	lba_claims[i] = *c;
 }
 
-static void fmss_lba_claim_note_page(struct fmss_n31 *f, unsigned int ce,
+static void fmss_lba_claim_note_page(struct nand_s5l8740 *f, unsigned int ce,
 				     unsigned int cau, unsigned int block,
 				     unsigned int page, u32 ppn)
 {
@@ -1867,9 +2455,9 @@ static void fmss_lba_claim_note_page(struct fmss_n31 *f, unsigned int ce,
 
 		meta = f->last_spare + s * 16;
 		/*
-		 * Diagnostic: any type whose LE LBA matches a target.
-		 * Production mapping still prefers type 0x01.
-		 */
+ * Diagnostic: any type whose LE LBA matches a target.
+ * Production mapping still prefers type 0x01.
+ */
 		lba_le = fmss_ppn_meta_lba(meta);
 		lba_be = get_unaligned_be32(meta + 8);
 		if (meta[0] == 0x01 && lba_le < 4096u)
@@ -1890,7 +2478,7 @@ static void fmss_lba_claim_note_page(struct fmss_n31 *f, unsigned int ce,
 		fmss_lba_claim_insert(&c);
 		lba_claim_hits++;
 		/* Raw META for positive-control / endian debug. */
-		pr_info("s5l8740-fmss: META hit lba=%u typ=%02x weave=%012llx ce=%u cau=%u blk=%u pg=%u slot=%u meta=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+		pr_info("s5l8740-nand: META hit lba=%u typ=%02x weave=%012llx ce=%u cau=%u blk=%u pg=%u slot=%u meta=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
 			lba_le, meta[0], (unsigned long long)c.weave,
 			ce, cau, block, page, s,
 			meta[0], meta[1], meta[2], meta[3],
@@ -1918,7 +2506,7 @@ static int fmss_page_erased(const u8 *p, unsigned int n)
  * echo "121,122,123 [START [NBLOCKS]]" > lba_weave_scan
  * Default: START=0 NBLOCKS=256 (user area; skip VFL tail).
  */
-static int fmss_lba_weave_scan(struct fmss_n31 *f, unsigned int start,
+static int fmss_lba_weave_scan(struct nand_s5l8740 *f, unsigned int start,
 			       unsigned int nblocks)
 {
 	unsigned int ce, cau, b, pg;
@@ -1979,7 +2567,7 @@ static int fmss_lba_weave_scan(struct fmss_n31 *f, unsigned int start,
 						break;
 				}
 				if ((b & 7) == 0) {
-					pr_info("s5l8740-fmss: lba_weave_scan prog targets=%u scanned=%u hits=%u small=%u be_alt=%u ce=%u cau=%u blk=%u\n",
+					pr_info("s5l8740-nand: lba_weave_scan prog targets=%u scanned=%u hits=%u small=%u be_alt=%u ce=%u cau=%u blk=%u\n",
 						lba_claim_ntargets,
 						lba_claim_scanned, lba_claim_hits,
 						lba_claim_small, lba_claim_be_alt,
@@ -2018,7 +2606,7 @@ static int fmss_lba_weave_scan(struct fmss_n31 *f, unsigned int start,
 			b, c->lba, (unsigned long long)c->weave, c->ce, c->cau,
 			c->block, c->page, c->slot, c->ppn);
 	}
-	pr_info("s5l8740-fmss: lba_weave_scan %s", lba_claim_log);
+	pr_info("s5l8740-nand: lba_weave_scan %s", lba_claim_log);
 	return 0;
 }
 
@@ -2063,7 +2651,7 @@ static ssize_t lba_weave_scan_store(struct device *dev,
 				    struct device_attribute *attr,
 				    const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int start = 0, nblocks = 256;
 	int ret;
 
@@ -2091,7 +2679,7 @@ static DEVICE_ATTR_RW(lba_weave_scan);
 static ssize_t seq_kick_store(struct device *dev, struct device_attribute *attr,
 			      const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int cmd;
 
 	if (!f)
@@ -2099,10 +2687,16 @@ static ssize_t seq_kick_store(struct device *dev, struct device_attribute *attr,
 	if (kstrtouint(buf, 0, &cmd))
 		return -EINVAL;
 	mutex_lock(&f->lock);
+	if (!dma_armed) {
+		mutex_unlock(&f->lock);
+		return -EPERM;
+	}
+	if (dma_one_shot)
+		dma_armed = false;
 	writel(cmd, f->base + FMSEQ);
 	f->last_dma_c00 = readl(f->base + FMSEQ);
 	f->last_dma_c0c = readl(f->base + FMSEQIRQ);
-	fmss_dev_info(dev, "seq_kick wrote 0x%x now c00=%08x c08=%08x c0c=%08x c04=%08x c38=%08x\n",
+	nand_dev_info(dev, "seq_kick wrote 0x%x now c00=%08x c08=%08x c0c=%08x c04=%08x c38=%08x\n",
 		 cmd, f->last_dma_c00, readl(f->base + FMSEQSTAT),
 		 f->last_dma_c0c, readl(f->base + FMSEQBASE),
 		 readl(f->base + 0xc38));
@@ -2284,7 +2878,7 @@ static bool fmss_btoc_prefer_le(const u8 *btoc)
 	return false;
 }
 
-/* D: probe 2026-08-24: EB 3C 90 OEM "*UOKJIHC", vol "AISPOD       FAT32"
+/* D: probe 2026-08-24: EB 3C 90 OEM "*UOKJIHC", vol "AISPOD FAT32"
  * Live copy may have 55AA at 0x1C9 rather than 510 — match OEM, patch on carve.
  */
 static bool fmss_apple_fat_sig(const u8 *s)
@@ -2346,7 +2940,7 @@ static unsigned int fmss_bpb_data_start(const u8 *bpb)
 	if (!nfats || nfats > 4 || !fatz)
 		return 1916;
 	start = (unsigned int)rsvd + (unsigned int)nfats * fatz;
-	if (!start || start > FMSS_FTL_DEFAULT_CAPACITY)
+	if (!start || start > NAND_FTL_DEFAULT_CAPACITY)
 		return 1916;
 	return start;
 }
@@ -2448,7 +3042,7 @@ static int fmss_lba_map_ensure(void)
 		fmss_lba_map_free();
 		return -ENOMEM;
 	}
-	pr_info("fmss-s5l8740: LBA dense map cap=%u (~%u KiB)\n",
+	pr_info("nand-s5l8740: LBA dense map cap=%u (~%u KiB)\n",
 		cap, (cap * (4 + 8 + 1)) / 1024);
 	return 0;
 }
@@ -2559,7 +3153,7 @@ static void fmss_l2v_set_ex(unsigned int lpn, unsigned int ce, unsigned int cau,
 		l2v_mapped++;
 	fmss_l2v_index_note(lpn, ce, cau, block, page);
 	if (!quiet && l2v_mapped <= 8)
-		pr_info("s5l8740-fmss: l2v_set lpn=%u src=%u phys=%d ce=%u cau=%u blk=%u pg=%u weave=%llx\n",
+		pr_info("s5l8740-nand: l2v_set lpn=%u src=%u phys=%d ce=%u cau=%u blk=%u pg=%u weave=%llx\n",
 			lpn, src, phys, ce, cau, block, page,
 			(unsigned long long)weave);
 }
@@ -2587,7 +3181,7 @@ static void fmss_lba_set(unsigned int lba, unsigned int ce, unsigned int cau,
 	if (!(prev & L2V_VALID))
 		lba_mapped++;
 	if (!quiet && lba_mapped <= 8)
-		pr_info("s5l8740-fmss: lba_set lba=%u src=%u phys=%d ce=%u cau=%u blk=%u pg=%u sec=%u weave=%llx\n",
+		pr_info("s5l8740-nand: lba_set lba=%u src=%u phys=%d ce=%u cau=%u blk=%u pg=%u sec=%u weave=%llx\n",
 			lba, src, phys, ce, cau, block, page, sec & 3u,
 			(unsigned long long)weave);
 }
@@ -2642,7 +3236,7 @@ static void fmss_early_lba_free(void)
  * Pass 2: promote PIO/DMA META slots into full lba_map.
  * type 0x01 data records; weave newest-wins via fmss_lba_set.
  */
-static void fmss_meta_ingest_spare(struct fmss_n31 *f, unsigned int ce,
+static void fmss_meta_ingest_spare(struct nand_s5l8740 *f, unsigned int ce,
 				   unsigned int cau, unsigned int block,
 				   unsigned int page, unsigned int slot0)
 {
@@ -2798,11 +3392,11 @@ static bool fmss_btoc_ingestible(const u8 *btoc)
 	return false;
 }
 
-static int fmss_boot_carve_try(struct fmss_n31 *f, unsigned int ce,
+static int fmss_boot_carve_try(struct nand_s5l8740 *f, unsigned int ce,
 			       unsigned int cau, unsigned int block,
 			       unsigned int page);
 
-static void fmss_l2v_ingest_btoc(struct fmss_n31 *f, unsigned int ce,
+static void fmss_l2v_ingest_btoc(struct nand_s5l8740 *f, unsigned int ce,
 				 unsigned int cau, unsigned int block,
 				 const u8 *btoc, unsigned int max_lpn)
 {
@@ -2822,10 +3416,10 @@ static void fmss_l2v_ingest_btoc(struct fmss_n31 *f, unsigned int ce,
 			continue;
 		if (lpn == 0) {
 			/*
-			 * Do not fmss_boot_carve_try here — nested full-page
-			 * reads during the BTOC walk wedge FMSS. Discover
-			 * handles BTOC[0]==0 after the walk.
-			 */
+ * Avoid fmss_boot_carve_try here — nested full-page
+ * reads during the BTOC walk wedge FMSS. Discover
+ * handles BTOC[0]==0 after the walk.
+ */
 			continue;
 		}
 		fmss_l2v_set_ex(lpn, ce, cau, block, p, true, L2V_SRC_BTOC, 0);
@@ -2843,8 +3437,8 @@ static void fmss_l2v_ingest_btoc(struct fmss_n31 *f, unsigned int ce,
 
 /*
  * SFTL on-flash BTOC (meta type 28): 16-byte BE records
- *   +0 weaveSeqAdd, +4 aux, +8 lba, +12 … +15 span in low byte (live:
- *   00 00 00 00 | a7 00 00 1d | 00 00 00 79 | 05 00 00 02 → lba=121 span=2).
+ * +0 weaveSeqAdd, +4 aux, +8 lba, +12 … +15 span in low byte (live:
+ * 00 00 00 00 | a7 00 00 1d | 00 00 00 79 | 05 00 00 02 → lba=121 span=2).
  * Used when YaFTL u32 LPN table is not ingestible.
  */
 static bool fmss_page_looks_bte(const u8 *page)
@@ -2869,7 +3463,7 @@ static bool fmss_page_looks_bte(const u8 *page)
 	return true;
 }
 
-static void fmss_l2v_ingest_bte(struct fmss_n31 *f, unsigned int ce,
+static void fmss_l2v_ingest_bte(struct nand_s5l8740 *f, unsigned int ce,
 				unsigned int cau, unsigned int block,
 				const u8 *page, unsigned int max_lpn)
 {
@@ -2964,9 +3558,9 @@ static unsigned int fmss_vfl_phys(unsigned int cau, unsigned int virt);
 static unsigned int fmss_vfl_resolve(unsigned int cau, unsigned int virt);
 static unsigned int fmss_map_to_phys(unsigned int cau, unsigned int block,
 				    u32 packed);
-static int fmss_vfl_ingest(struct fmss_n31 *f, unsigned int cau,
+static int fmss_vfl_ingest(struct nand_s5l8740 *f, unsigned int cau,
 			   unsigned int block, const u8 *hdr);
-static int fmss_read_lpn_page(struct fmss_n31 *f, unsigned int ce,
+static int fmss_read_lpn_page(struct nand_s5l8740 *f, unsigned int ce,
 			      unsigned int cau, unsigned int block,
 			      unsigned int page, u8 *dst, unsigned int dst_len);
 
@@ -3087,7 +3681,7 @@ static bool fmss_wmr_vpage_to_phys(u32 vpage, unsigned int *ce,
 	}
 }
 
-static void fmss_wmr_maybe_reset(struct fmss_n31 *f)
+static void fmss_wmr_maybe_reset(struct nand_s5l8740 *f)
 {
 	if (reset_every && f->pages_since_reset >= reset_every) {
 		fmss_nand_reset(f);
@@ -3096,7 +3690,7 @@ static void fmss_wmr_maybe_reset(struct fmss_n31 *f)
 }
 
 /* Bounded DEVICEINFOSIGN hunt: early blocks + VFL tail, page 0 only. */
-static void fmss_wmr_scan_deviceinfo(struct fmss_n31 *f, unsigned int nblocks)
+static void fmss_wmr_scan_deviceinfo(struct nand_s5l8740 *f, unsigned int nblocks)
 {
 	unsigned int ce, cau, b, saved;
 	unsigned int start_tail;
@@ -3158,7 +3752,7 @@ static void fmss_wmr_scan_deviceinfo(struct fmss_n31 *f, unsigned int nblocks)
 }
 
 /* Tail VFL wrmx/xrmw ingest + optional classic ftlctrlblocks. */
-static void fmss_wmr_scan_vfl(struct fmss_n31 *f, unsigned int nblocks)
+static void fmss_wmr_scan_vfl(struct nand_s5l8740 *f, unsigned int nblocks)
 {
 	unsigned int ce, cau, i, saved, start;
 	u16 ctrl[3];
@@ -3207,7 +3801,7 @@ static void fmss_wmr_scan_vfl(struct fmss_n31 *f, unsigned int nblocks)
 	page_chunks = saved;
 }
 
-static void fmss_wmr_try_load_bmap(struct fmss_n31 *f, unsigned int ce,
+static void fmss_wmr_try_load_bmap(struct nand_s5l8740 *f, unsigned int ce,
 				   unsigned int cau, unsigned int block,
 				   unsigned int *dst_off)
 {
@@ -3228,7 +3822,7 @@ static void fmss_wmr_try_load_bmap(struct fmss_n31 *f, unsigned int ce,
 }
 
 /* Probe ftlctrl blocks + bounded early/tail for type-0x44-like maps. */
-static void fmss_wmr_scan_block_maps(struct fmss_n31 *f, unsigned int nblocks)
+static void fmss_wmr_scan_block_maps(struct nand_s5l8740 *f, unsigned int nblocks)
 {
 	unsigned int ce, cau, b, i, saved, dst = 0;
 	unsigned int start_tail;
@@ -3298,7 +3892,7 @@ static unsigned int fmss_wmr_fill_l2v(unsigned int max_lpn)
 			continue;
 		if (!fmss_wmr_vpage_to_phys(vpage, &ce, &cau, &block, &page))
 			continue;
-		/* Do not clobber denser BTOC hits already present. */
+		/* Avoid clobber denser BTOC hits already present. */
 		if (l2v_map && lpn < l2v_map_size &&
 		    (l2v_map[lpn] & L2V_VALID))
 			continue;
@@ -3314,9 +3908,9 @@ static unsigned int fmss_wmr_fill_l2v(unsigned int max_lpn)
  * Classic freemyipod Whimory mount adapted for N31 PPN.
  * Does not clear existing l2v_build / boot_carve results.
  * Usage: echo 1 > whimory_mount
- *        echo "NBLOCKS [MAX_LPN]" > whimory_mount
+ * echo "NBLOCKS [MAX_LPN]" > whimory_mount
  */
-static int fmss_whimory_mount(struct fmss_n31 *f, unsigned int nblocks,
+static int fmss_whimory_mount(struct nand_s5l8740 *f, unsigned int nblocks,
 			      unsigned int max_lpn)
 {
 	if (!max_lpn)
@@ -3338,7 +3932,7 @@ static int fmss_whimory_mount(struct fmss_n31 *f, unsigned int nblocks,
 	else
 		wmr_mount_ret = 0;
 
-	fmss_dev_info(f->dev,
+	nand_dev_info(f->dev,
 		      "whimory_mount n=%u max_lpn=%u dis=%u vfl=%u ftlctrl=%u bmap_pages=%u map_ents=%u filled=%u ret=%d\n",
 		      nblocks, max_lpn, wmr_dis_hits, wmr_vfl_hits,
 		      wmr_ftlctrl_hits, wmr_bmap_pages, wmr_block_map_n,
@@ -3384,7 +3978,7 @@ static unsigned int fmss_vfl_resolve(unsigned int cau, unsigned int virt)
 		if (vfl_map[i].cau == cau && vfl_map[i].virt == virt) {
 			vfl_remap_applied++;
 			if (!quiet && vfl_remap_applied <= 32)
-				pr_info("s5l8740-fmss: vfl_remap mode=%s cau=%u in=%u out=%u idx=%u\n",
+				pr_info("s5l8740-nand: vfl_remap mode=%s cau=%u in=%u out=%u idx=%u\n",
 					vfl_remap_mode, cau, virt, phys, i);
 			return phys;
 		}
@@ -3406,7 +4000,7 @@ static unsigned int fmss_map_to_phys(unsigned int cau, unsigned int block,
  * wrmx/xrmw VFLCxt: 512-byte header, u32 remap table begins @ +0x100.
  * Live pod: entries are LE phys block numbers (e.g. 0x827 = 2087).
  */
-static int fmss_vfl_ingest(struct fmss_n31 *f, unsigned int cau,
+static int fmss_vfl_ingest(struct nand_s5l8740 *f, unsigned int cau,
 			   unsigned int block, const u8 *hdr)
 {
 	unsigned int i, virt, phys, added = 0;
@@ -3440,12 +4034,12 @@ static int fmss_vfl_ingest(struct fmss_n31 *f, unsigned int cau,
 			added++;
 		}
 	}
-	fmss_dev_info(f->dev, "vfl_ingest cau=%u blk=%u magic=%s entries=%u total=%u\n",
+	nand_dev_info(f->dev, "vfl_ingest cau=%u blk=%u magic=%s entries=%u total=%u\n",
 		 cau, block, magic, added, vfl_map_count);
 	return added;
 }
 
-static void fmss_vfl_format_log(struct fmss_n31 *f, unsigned int ce,
+static void fmss_vfl_format_log(struct nand_s5l8740 *f, unsigned int ce,
 				unsigned int cau, unsigned int block, u32 addr)
 {
 	unsigned int i, off = 0;
@@ -3530,12 +4124,12 @@ static DEVICE_ATTR_RO(lpn_index);
 
 /*
  * Read one VFL context page (SLC page 0) and capture 512-byte header in vfl_log.
- * Usage: echo "CE CAU BLOCK" > vfl_dump   (CE/CAU default 0)
+ * Usage: echo "CE CAU BLOCK" > vfl_dump (CE/CAU default 0)
  */
 static ssize_t vfl_dump_store(struct device *dev, struct device_attribute *attr,
 			      const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int ce = 0, cau = 0, block;
 	unsigned int saved;
 	u32 addr;
@@ -3571,16 +4165,16 @@ static ssize_t vfl_dump_store(struct device *dev, struct device_attribute *attr,
 	if (!ret)
 		fmss_vfl_ingest(f, cau, block, f->last_page);
 	mutex_unlock(&f->lock);
-	fmss_dev_info(dev, "vfl_dump ce=%u cau=%u blk=%u ret=%d\n", ce, cau, block, ret);
+	nand_dev_info(dev, "vfl_dump ce=%u cau=%u blk=%u ret=%d\n", ce, cau, block, ret);
 	return ret ? ret : count;
 }
 static DEVICE_ATTR_WO(vfl_dump);
 
-static int fmss_find_lpn(struct fmss_n31 *f, unsigned int target_lpn,
+static int fmss_find_lpn(struct nand_s5l8740 *f, unsigned int target_lpn,
 			 unsigned int *oce, unsigned int *ocau,
 			 unsigned int *oblock, unsigned int *opage);
 
-static int fmss_lpn_resolve(struct fmss_n31 *f, unsigned int target_lpn,
+static int fmss_lpn_resolve(struct nand_s5l8740 *f, unsigned int target_lpn,
 			    unsigned int *oce, unsigned int *ocau,
 			    unsigned int *oblock, unsigned int *opage)
 {
@@ -3601,7 +4195,7 @@ static int fmss_lpn_resolve(struct fmss_n31 *f, unsigned int target_lpn,
 	return fmss_find_lpn(f, target_lpn, oce, ocau, oblock, opage);
 }
 
-static int fmss_read_lpn_page(struct fmss_n31 *f, unsigned int ce,
+static int fmss_read_lpn_page(struct nand_s5l8740 *f, unsigned int ce,
 			      unsigned int cau, unsigned int block,
 			      unsigned int page, u8 *dst, unsigned int dst_len)
 {
@@ -3609,7 +4203,7 @@ static int fmss_read_lpn_page(struct fmss_n31 *f, unsigned int ce,
 	u32 addr;
 	int ret;
 
-	/* Callers pass physical scan blocks (find_lpn / BTOC). Do not VFL-remap. */
+	/* Callers pass physical scan blocks (find_lpn / BTOC). Avoid VFL-remap. */
 	pblock = fmss_map_to_phys(cau, block, L2V_PHYS);
 	saved = page_chunks;
 	page_chunks = 16;
@@ -3635,7 +4229,7 @@ static int fmss_read_lpn_page(struct fmss_n31 *f, unsigned int ce,
 	return ret;
 }
 
-static int fmss_find_lpn(struct fmss_n31 *f, unsigned int target_lpn,
+static int fmss_find_lpn(struct nand_s5l8740 *f, unsigned int target_lpn,
 			 unsigned int *oce, unsigned int *ocau,
 			 unsigned int *oblock, unsigned int *opage)
 {
@@ -3701,7 +4295,7 @@ static int fmss_find_lpn(struct fmss_n31 *f, unsigned int target_lpn,
 	return found ? 0 : -ENOENT;
 }
 
-static void fmss_boot_apply_bpb(struct fmss_n31 *f, unsigned int ce,
+static void fmss_boot_apply_bpb(struct nand_s5l8740 *f, unsigned int ce,
 				unsigned int cau, unsigned int block,
 				unsigned int page, const u8 *bpb)
 {
@@ -3725,7 +4319,7 @@ static void fmss_boot_apply_bpb(struct fmss_n31 *f, unsigned int ce,
 	/* L2V[0] / LBA0 must point at this real boot page (physical). */
 	fmss_l2v_set_ex(0, ce, cau, block, page, true, L2V_SRC_CARVE, 0);
 	fmss_lba_set(0, ce, cau, block, page, 0, true, L2V_SRC_CARVE, 0);
-	fmss_dev_info(f->dev,
+	nand_dev_info(f->dev,
 		      "boot_sb ce=%u cau=%u blk=%u pg=%u DataStart=%u rsv=%u fatz=%u\n",
 		      ce, cau, block, page, boot_data_start,
 		      boot_reserved_sects, boot_fat_sects);
@@ -3735,7 +4329,7 @@ static void fmss_boot_apply_bpb(struct fmss_n31 *f, unsigned int ce,
  * Accept ONLY an aligned live boot sector: BPB at page offset 0 with
  * 55AA@510. Mid-page *UOKJIHC (e.g. off=7816) is a file copy — reject.
  */
-static int fmss_boot_carve_try(struct fmss_n31 *f, unsigned int ce,
+static int fmss_boot_carve_try(struct nand_s5l8740 *f, unsigned int ce,
 			       unsigned int cau, unsigned int block,
 			       unsigned int page)
 {
@@ -3755,7 +4349,7 @@ static int fmss_boot_carve_try(struct fmss_n31 *f, unsigned int ce,
 /*
  * Try aligned BPB on page p; on success ingest the saved BTOC table.
  */
-static int fmss_boot_try_btoc_page(struct fmss_n31 *f, unsigned int ce,
+static int fmss_boot_try_btoc_page(struct nand_s5l8740 *f, unsigned int ce,
 				   unsigned int cau, unsigned int block,
 				   const u8 *btoc_page, unsigned int page)
 {
@@ -3780,7 +4374,7 @@ static int fmss_boot_try_btoc_page(struct fmss_n31 *f, unsigned int ce,
  * BTOC[0]==0 && BTOC[1] in {1,vbas_per_page}), then aligned BPB on that page.
  * Falls back to page-0 aligned BPB scan (never mid-page OEM).
  */
-static int fmss_boot_carve_discover(struct fmss_n31 *f, unsigned int start,
+static int fmss_boot_carve_discover(struct nand_s5l8740 *f, unsigned int start,
 				    unsigned int nblocks)
 {
 	unsigned int ce, cau, b, p, saved;
@@ -3796,7 +4390,7 @@ static int fmss_boot_carve_discover(struct fmss_n31 *f, unsigned int start,
 					boot_carve_page_param ?
 						boot_carve_page_param : 0))
 			return 0;
-		fmss_dev_info(f->dev,
+		nand_dev_info(f->dev,
 			      "cached boot_sb blk%u miss — scanning BTOC LPN0\n",
 			      boot_carve_block_param);
 	}
@@ -3829,10 +4423,10 @@ static int fmss_boot_carve_discover(struct fmss_n31 *f, unsigned int start,
 				l1 = use_le ? fmss_btoc_entry_le(f->last_page, 1)
 					    : fmss_btoc_entry_be(f->last_page, 1);
 				/*
-				 * LPN0 candidate: BTOC[0]==0 (even if [1] is junk —
-				 * live ce1/cau1/blk63). Do not scan every random
-				 * zero dword in non-ingestible pages (wedges NAND).
-				 */
+ * LPN0 candidate: BTOC[0]==0 (even if [1] is junk —
+ * live ce1/cau1/blk63). Avoid scan every random
+ * zero dword in non-ingestible pages (wedges NAND).
+ */
 				if (l0 == 0) {
 					page_chunks = 16;
 					if (fmss_boot_try_btoc_page(f, ce, cau, b,
@@ -3866,9 +4460,9 @@ static int fmss_boot_carve_discover(struct fmss_n31 *f, unsigned int start,
 	}
 
 	/*
-	 * Aligned BPB: page0 of each block, then all pages of open SBs
-	 * (page0 programmed && page127 not closed BTOC/BTE). Never mid-page OEM.
-	 */
+ * Aligned BPB: page0 of each block, then all pages of open SBs
+ * (page0 programmed && page127 not closed BTOC/BTE). Never mid-page OEM.
+ */
 	page_chunks = 16;
 	{
 		unsigned int boot_scan = nblocks ? nblocks : 256;
@@ -3941,7 +4535,7 @@ static int fmss_boot_carve_discover(struct fmss_n31 *f, unsigned int start,
 							fmss_lba_set(0, ce, cau, b, pg, sec,
 								     true, L2V_SRC_CARVE, 0);
 							page_chunks = saved;
-							fmss_dev_info(f->dev,
+							nand_dev_info(f->dev,
 								      "boot_sb open-SB sec=%u ce=%u cau=%u blk=%u pg=%u\n",
 								      sec, ce, cau, b, pg);
 							return 0;
@@ -3980,14 +4574,14 @@ static bool fmss_page_has_n31os_dirent(const u8 *page, unsigned int len)
 	return false;
 }
 
-static int fmss_root_dir_discover(struct fmss_n31 *f, unsigned int start,
+static int fmss_root_dir_discover(struct nand_s5l8740 *f, unsigned int start,
 				  unsigned int nblocks)
 {
 	unsigned int ce, cau, b, p, lpn;
 	unsigned int saved, pages = 0;
 	const unsigned int page_cap = 4096;
 
-	lpn = boot_data_start / FMSS_FTL_SECTORS_PER_LPN;
+	lpn = boot_data_start / NAND_FTL_SECTORS_PER_LPN;
 	if (!fmss_l2v_lookup(lpn, &ce, &cau, &b, &p)) {
 		root_dir_valid = true;
 		root_dir_ce = ce;
@@ -4029,7 +4623,7 @@ static int fmss_root_dir_discover(struct fmss_n31 *f, unsigned int start,
 					fmss_l2v_set_ex(lpn, ce, cau, b, p, true,
 							L2V_SRC_CARVE, 0);
 					page_chunks = saved;
-					fmss_dev_info(f->dev,
+					nand_dev_info(f->dev,
 						      "root_dir N31OS ce=%u cau=%u blk=%u pg=%u lpn=%u\n",
 						      ce, cau, b, p, lpn);
 					return 0;
@@ -4042,7 +4636,7 @@ out:
 	return -ENOENT;
 }
 
-static void fmss_l2v_try_block_map_page(struct fmss_n31 *f, unsigned int ce,
+static void fmss_l2v_try_block_map_page(struct nand_s5l8740 *f, unsigned int ce,
 					unsigned int cau, unsigned int block,
 					unsigned int max_lpn)
 {
@@ -4098,7 +4692,7 @@ static void fmss_l2v_try_block_map_page(struct fmss_n31 *f, unsigned int ce,
  * Build dense L2V from BTOC page 127 (+ optional classic block-map pages).
  * Bounded: [start, start+nblocks) per CE/CAU. Also carve boot + root dir.
  */
-static int fmss_l2v_build(struct fmss_n31 *f, unsigned int max_lpn,
+static int fmss_l2v_build(struct nand_s5l8740 *f, unsigned int max_lpn,
 			  unsigned int start, unsigned int nblocks)
 {
 	unsigned int ce, cau, b, saved;
@@ -4175,10 +4769,10 @@ static int fmss_l2v_build(struct fmss_n31 *f, unsigned int max_lpn,
 								     max_lpn);
 					else if (fmss_page_looks_bte(f->last_page)) {
 						/*
-						 * Pass 2: BTE needs the full
-						 * 16 KiB page; walk used 1-chunk
-						 * probe — re-read full page.
-						 */
+ * Pass 2: BTE needs the full
+ * 16 KiB page; walk used 1-chunk
+ * probe — re-read full page.
+ */
 						unsigned int saved2 = page_chunks;
 
 						page_chunks = 16;
@@ -4194,9 +4788,9 @@ static int fmss_l2v_build(struct fmss_n31 *f, unsigned int max_lpn,
 				}
 
 				/*
-				 * Classic block-map heuristic only when BTOC is
-				 * blank — capped probes to avoid wedging.
-				 */
+ * Classic block-map heuristic only when BTOC is
+ * blank — capped probes to avoid wedging.
+ */
 				if (!btoc_ok && bmap_probes < 32) {
 					page_chunks = 16;
 					fmss_l2v_try_block_map_page(f, ce, cau,
@@ -4216,7 +4810,7 @@ static int fmss_l2v_build(struct fmss_n31 *f, unsigned int max_lpn,
 
 	fmss_legacy_meta_ingest = false;
 
-	fmss_dev_info(f->dev,
+	nand_dev_info(f->dev,
 		      "l2v_build max_lpn=%u range=%u+%u mapped=%u btoc=%u bmap=%u boot=%d root=%d ecc_soft=%u\n",
 		      max_lpn, start, nblocks, l2v_mapped, l2v_btoc_hits,
 		      l2v_bmap_hits, boot_carve_valid, root_dir_valid,
@@ -4224,7 +4818,7 @@ static int fmss_l2v_build(struct fmss_n31 *f, unsigned int max_lpn,
 	return 0;
 }
 
-static int fmss_build_lpn_index(struct fmss_n31 *f, unsigned int max_lpn)
+static int fmss_build_lpn_index(struct nand_s5l8740 *f, unsigned int max_lpn)
 {
 	unsigned int nblocks = l2v_scan_blocks;
 
@@ -4238,7 +4832,7 @@ static int fmss_build_lpn_index(struct fmss_n31 *f, unsigned int max_lpn)
 static ssize_t lpn_build_store(struct device *dev, struct device_attribute *attr,
 			       const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int max_lpn = 32;
 	int ret;
 
@@ -4255,14 +4849,14 @@ static DEVICE_ATTR_WO(lpn_build);
 
 /*
  * Explicit dense L2V build (bounded). Usage:
- *   echo 1 > l2v_build
- *   echo "NBLOCKS" > l2v_build
- *   echo "START NBLOCKS [MAX_LPN]" > l2v_build
+ * echo 1 > l2v_build
+ * echo "NBLOCKS" > l2v_build
+ * echo "START NBLOCKS [MAX_LPN]" > l2v_build
  */
 static ssize_t l2v_build_store(struct device *dev, struct device_attribute *attr,
 			       const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int start = 0, nblocks = 0, max_lpn = 0;
 	int nf, ret;
 
@@ -4347,15 +4941,15 @@ static DEVICE_ATTR_RO(whimory_status);
 
 /*
  * Classic Whimory mount (bounded). Usage:
- *   echo 1 > whimory_mount
- *   echo "NBLOCKS" > whimory_mount
- *   echo "NBLOCKS MAX_LPN" > whimory_mount
+ * echo 1 > whimory_mount
+ * echo "NBLOCKS" > whimory_mount
+ * echo "NBLOCKS MAX_LPN" > whimory_mount
  */
 static ssize_t whimory_mount_store(struct device *dev,
 				   struct device_attribute *attr,
 				   const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int nblocks = 0, max_lpn = 0;
 	int nf, ret;
 
@@ -4390,14 +4984,14 @@ static DEVICE_ATTR_WO(whimory_mount);
  * Uses dense L2V / root-dir cache only — no on-demand BTOC scan (avoids wedging
  * the device on sparse unmapped reads). Returns -ENOENT if unmapped.
  */
-static int fmss_ftl_read_lpn_locked(struct fmss_n31 *f, unsigned int target_lpn,
+static int nand_ftl_read_lpn_locked(struct nand_s5l8740 *f, unsigned int target_lpn,
 				    unsigned int sector, u8 *buf)
 {
 	unsigned int ce, cau, block, page, pblock, off, saved;
 	u32 addr, packed = L2V_PHYS;
 	int ret;
 
-	if (sector > FMSS_FTL_SECTORS_PER_LPN - 1)
+	if (sector > NAND_FTL_SECTORS_PER_LPN - 1)
 		return -EINVAL;
 
 	if (root_dir_valid && target_lpn == root_dir_lpn) {
@@ -4437,12 +5031,12 @@ static int fmss_ftl_read_lpn_locked(struct fmss_n31 *f, unsigned int target_lpn,
 
 /*
  * Read logical page N (BTOC LPN) and expose 4 KiB sector via sector_hex.
- * Usage: echo "LPN [sector_in_page]" > lpn_read  (sector 0..3, default 0)
+ * Usage: echo "LPN [sector_in_page]" > lpn_read (sector 0..3, default 0)
  */
 static ssize_t lpn_read_store(struct device *dev, struct device_attribute *attr,
 			      const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int target_lpn, sector = 0;
 	unsigned int i, ce, cau, block, page, poff, saved;
 	u8 *secbuf;
@@ -4511,7 +5105,7 @@ static ssize_t lpn_read_store(struct device *dev, struct device_attribute *attr,
 					    ((i + 1) % 16) ? " " : "\n");
 	}
 
-	fmss_dev_info(dev,
+	nand_dev_info(dev,
 		 "lpn=%u sector=%u head=%02x%02x%02x%02x\n",
 		 target_lpn, sector, secbuf[0], secbuf[1], secbuf[2], secbuf[3]);
 	kfree(secbuf);
@@ -4532,7 +5126,7 @@ static ssize_t read_sector_dense_store(struct device *dev,
 				       struct device_attribute *attr,
 				       const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int lba;
 	u8 *secbuf;
 	int ret;
@@ -4544,7 +5138,7 @@ static ssize_t read_sector_dense_store(struct device *dev,
 	secbuf = kmalloc(FMSS_SECTOR_LEN, GFP_KERNEL);
 	if (!secbuf)
 		return -ENOMEM;
-	ret = fmss_ftl_read_sector(lba, secbuf);
+	ret = nand_ftl_read_sector(lba, secbuf);
 	dev_info(dev, "read_sector_dense LBA=%u ret=%d %s",
 		 lba, ret, resolve_log);
 	kfree(secbuf);
@@ -4556,7 +5150,7 @@ static ssize_t read_sector_slow_store(struct device *dev,
 				      struct device_attribute *attr,
 				      const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int lba, lpn, sec, ce, cau, block, page, pblock, saved;
 	u8 *secbuf;
 	u32 addr, packed = L2V_PHYS;
@@ -4571,15 +5165,15 @@ static ssize_t read_sector_slow_store(struct device *dev,
 		return -ENOMEM;
 
 	/* Try dense first. */
-	ret = fmss_ftl_read_sector(lba, secbuf);
+	ret = nand_ftl_read_sector(lba, secbuf);
 	if (!ret) {
 		dev_info(dev, "read_sector_slow LBA=%u via dense OK\n", lba);
 		kfree(secbuf);
 		return count;
 	}
 
-	lpn = lba / FMSS_FTL_SECTORS_PER_LPN;
-	sec = lba % FMSS_FTL_SECTORS_PER_LPN;
+	lpn = lba / NAND_FTL_SECTORS_PER_LPN;
+	sec = lba % NAND_FTL_SECTORS_PER_LPN;
 	mutex_lock(&f->lock);
 	ret = fmss_l2v_lookup_ex(lpn, &ce, &cau, &block, &page, &packed);
 	if (ret) {
@@ -4615,7 +5209,7 @@ static ssize_t read_sector_phys_store(struct device *dev,
 				      struct device_attribute *attr,
 				      const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int ce, cau, block, page, sec = 0, saved;
 	u8 *secbuf;
 	u32 addr;
@@ -4671,13 +5265,13 @@ static DEVICE_ATTR_RO(grep_log);
 /*
  * Walk FTL superblocks and search page data for a short ASCII needle.
  * Usage: echo "START N_BLOCKS NEEDLE" > ftl_grep
- *        echo "32 24 N31OS" > ftl_grep   (defaults: start=32, n=24, N31OS)
+ * echo "32 24 N31OS" > ftl_grep (defaults: start=32, n=24, N31OS)
  * Caps N_BLOCKS at FMSS_GREP_MAX_BLOCKS per call to avoid RetailOS watchdog.
  */
 static ssize_t ftl_grep_store(struct device *dev, struct device_attribute *attr,
 			      const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int ce, cau, b, p, saved, start = 32, nblocks = 16;
 	unsigned int pages_done = 0, hits = 0;
 	char needle[48] = "N31OS";
@@ -4713,10 +5307,10 @@ static ssize_t ftl_grep_store(struct device *dev, struct device_attribute *attr,
 					f->pages_since_reset = 0;
 				}
 				/*
-				 * Do not require BTOC page 127 — Apple FAT clusters
-				 * live in data pages even when BTOC looks blank.
-				 * (Root cause: old code skipped whole superblocks.)
-				 */
+ * Avoid require BTOC page 127 — Apple FAT clusters
+ * live in data pages even when BTOC looks blank.
+ * (Root cause: old code skipped whole superblocks.)
+ */
 				for (p = 0; p < FMSS_BTOC_PAGE; p++) {
 					unsigned int off = 0, show, flags;
 					u32 lpn = ~0u;
@@ -4733,7 +5327,7 @@ static ssize_t ftl_grep_store(struct device *dev, struct device_attribute *attr,
 					if (!flags)
 						continue;
 					hits++;
-					fmss_dev_info(dev,
+					nand_dev_info(dev,
 						 "grep hit ce=%u cau=%u blk=%u pg=%u off=%u enc=%s\n",
 						 ce, cau, b, p, off,
 						 fmss_match_enc_name(flags));
@@ -4771,7 +5365,7 @@ static ssize_t ftl_grep_store(struct device *dev, struct device_attribute *attr,
 		grep_log_len = scnprintf(grep_log, sizeof(grep_log),
 					 "NO HIT needle=%s pages=%u (tried ascii/utf16le/utf16be/bswap16)\n",
 					 needle, pages_done);
-	fmss_dev_info(dev, "ftl_grep start=%u n=%u needle=%s pages=%u hits=%u\n",
+	nand_dev_info(dev, "ftl_grep start=%u n=%u needle=%s pages=%u hits=%u\n",
 		 start, nblocks, needle, pages_done, hits);
 	return count;
 }
@@ -4779,12 +5373,12 @@ static DEVICE_ATTR_WO(ftl_grep);
 
 /*
  * Dump ASCII from a specific FTL page offset (after ftl_grep locates a file).
- * Usage: echo "CE CAU BLK PG OFF LEN" > ftl_ascii  (LEN default 512, max 2048)
+ * Usage: echo "CE CAU BLK PG OFF LEN" > ftl_ascii (LEN default 512, max 2048)
  */
 static ssize_t readme_read_store(struct device *dev, struct device_attribute *attr,
 				 const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int ce, cau, b, p, saved, start = 32, nblocks = 48;
 	unsigned int pages_done = 0;
 	const char *needle = "N31OS boot files on the RetailOS FAT volume";
@@ -4841,7 +5435,7 @@ static ssize_t readme_read_store(struct device *dev, struct device_attribute *at
 						"OK ce=%u cau=%u blk=%u pg=%u off=%u len=%u pages=%u\n%.*s\n",
 						ce, cau, b, p, off, dump, pages_done,
 						dump, f->last_page + off);
-					fmss_dev_info(dev, "readme_read FOUND ce=%u cau=%u blk=%u pg=%u off=%u\n",
+					nand_dev_info(dev, "readme_read FOUND ce=%u cau=%u blk=%u pg=%u off=%u\n",
 						   ce, cau, b, p, off);
 				}
 			}
@@ -4863,10 +5457,10 @@ static DEVICE_ATTR_WO(readme_read);
 
 /*
  * Locate Apple FAT32 boot sector by scanning FTL pages for EB3C90 *UOKJIHC.
- * PIO only (fast). Usage: echo 1 > boot_read  or  echo "START N_BLOCKS" > boot_read
+ * PIO only (fast). Usage: echo 1 > boot_read or echo "START N_BLOCKS" > boot_read
  * Result in grep_log + sector_hex (512 B boot sector).
  */
-static int fmss_read_ftl_page_pio(struct fmss_n31 *f, unsigned int ce,
+static int fmss_read_ftl_page_pio(struct nand_s5l8740 *f, unsigned int ce,
 				  unsigned int cau, unsigned int block,
 				  unsigned int page)
 {
@@ -4892,7 +5486,7 @@ static int fmss_read_ftl_page_pio(struct fmss_n31 *f, unsigned int ce,
 static ssize_t boot_read_store(struct device *dev, struct device_attribute *attr,
 			       const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int ce, cau, b, saved, start = 32, nblocks = 32;
 	unsigned int fat_off = 0, sector_off = 0;
 	unsigned int pages_done = 0;
@@ -4969,7 +5563,7 @@ static DEVICE_ATTR_WO(boot_read);
 static ssize_t ftl_ascii_store(struct device *dev, struct device_attribute *attr,
 			       const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int ce, cau, block, page, off = 0, len = 512;
 	int ret;
 
@@ -5002,7 +5596,7 @@ static ssize_t ftl_ascii_store(struct device *dev, struct device_attribute *attr
 				  "%.*s\n",
 				  len, f->last_page + off);
 	mutex_unlock(&f->lock);
-	fmss_dev_info(dev, "ftl_ascii ce=%u cau=%u blk=%u pg=%u off=%u len=%u\n",
+	nand_dev_info(dev, "ftl_ascii ce=%u cau=%u blk=%u pg=%u off=%u len=%u\n",
 		 ce, cau, block, page, off, len);
 	return count;
 }
@@ -5016,7 +5610,7 @@ static DEVICE_ATTR_WO(ftl_ascii);
 static ssize_t vfl_scan_store(struct device *dev, struct device_attribute *attr,
 			      const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int ce, cau, i, saved_chunks;
 	unsigned int start = FMSS_BLOCKS_PER_CAU - FMSS_VFL_TAIL;
 	int hits = 0, xrmw = 0;
@@ -5062,7 +5656,7 @@ static ssize_t vfl_scan_store(struct device *dev, struct device_attribute *attr,
 				    f->last_page[2] == 'm' && f->last_page[3] == 'x')
 					xrmw++;
 				fmss_vfl_ingest(f, cau, i, f->last_page);
-				fmss_dev_info(dev,
+				nand_dev_info(dev,
 					 "vfl ce=%u cau=%u blk=%u addr=0x%08x %02x %02x %02x %02x %02x %02x %02x %02x +256 %08x %08x %08x %08x\n",
 					 ce, cau, i, addr,
 					 f->last_page[0], f->last_page[1],
@@ -5076,7 +5670,7 @@ static ssize_t vfl_scan_store(struct device *dev, struct device_attribute *attr,
 	}
 	page_chunks = saved_chunks;
 	mutex_unlock(&f->lock);
-	fmss_dev_info(dev, "vfl_scan start_blk=%u hits=%d xrmw=%d\n", start, hits, xrmw);
+	nand_dev_info(dev, "vfl_scan start_blk=%u hits=%d xrmw=%d\n", start, hits, xrmw);
 	return count;
 }
 static DEVICE_ATTR_WO(vfl_scan);
@@ -5102,13 +5696,13 @@ static DEVICE_ATTR_RO(vfl_map);
 
 /*
  * Walk VFL tail (SLC page 0) on each CAU and ingest wrmx/xrmw remap tables.
- * Usage: echo 1 > vfl_build   (last vfl_build_blocks blocks, default 32)
- *        echo "START COUNT" > vfl_build  (COUNT capped at FMSS_VFL_TAIL)
+ * Usage: echo 1 > vfl_build (last vfl_build_blocks blocks, default 32)
+ * echo "START COUNT" > vfl_build (COUNT capped at FMSS_VFL_TAIL)
  */
 static ssize_t vfl_build_store(struct device *dev, struct device_attribute *attr,
 			       const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int ce, cau, i, saved, start, nblocks, scanned = 0;
 	int ingested = 0, ret;
 
@@ -5165,7 +5759,7 @@ static ssize_t vfl_build_store(struct device *dev, struct device_attribute *attr
 	}
 	page_chunks = saved;
 	mutex_unlock(&f->lock);
-	fmss_dev_info(dev, "vfl_build start=%u n=%u scanned=%u ingested=%d map=%u\n",
+	nand_dev_info(dev, "vfl_build start=%u n=%u scanned=%u ingested=%d map=%u\n",
 		 start, nblocks, scanned, ingested, vfl_map_count);
 	return count;
 }
@@ -5192,7 +5786,7 @@ static DEVICE_ATTR_RO(btoc_log);
 static ssize_t btoc_scan_store(struct device *dev, struct device_attribute *attr,
 			       const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int ce, cau, i, saved, start = 0, n = FMSS_BLOCKS_PER_CAU;
 	int hits = 0, lpn0 = 0;
 	u32 addr, a, b;
@@ -5234,7 +5828,7 @@ static ssize_t btoc_scan_store(struct device *dev, struct device_attribute *attr
 				if (a == 0)
 					lpn0++;
 				if (a < 0x100000 && (b == a + 1 || a == 0)) {
-					fmss_dev_info(dev,
+					nand_dev_info(dev,
 						 "btoc ce=%u cau=%u blk=%u addr=0x%08x lpn0=%u lpn1=%u %02x %02x %02x %02x\n",
 						 ce, cau, i, addr, a, b,
 						 f->last_page[0], f->last_page[1],
@@ -5251,7 +5845,7 @@ static ssize_t btoc_scan_store(struct device *dev, struct device_attribute *attr
 	}
 	page_chunks = saved;
 	mutex_unlock(&f->lock);
-	fmss_dev_info(dev, "btoc_scan start=%u n=%u hits=%d lpn0=%d\n", start, n, hits, lpn0);
+	nand_dev_info(dev, "btoc_scan start=%u n=%u hits=%d lpn0=%d\n", start, n, hits, lpn0);
 	return count;
 }
 static DEVICE_ATTR_WO(btoc_scan);
@@ -5259,7 +5853,7 @@ static DEVICE_ATTR_WO(btoc_scan);
 static ssize_t fat_scan_store(struct device *dev, struct device_attribute *attr,
 			      const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int ce, cau, i, saved, start = 0, n = FMSS_BLOCKS_PER_CAU;
 	int hits = 0;
 	u32 addr;
@@ -5297,7 +5891,7 @@ static ssize_t fat_scan_store(struct device *dev, struct device_attribute *attr,
 				    (f->last_page_len >= 512 &&
 				     fmss_apple_fat_boot(f->last_page))) {
 					hits++;
-					fmss_dev_info(dev,
+					nand_dev_info(dev,
 						 "fat ce=%u cau=%u blk=%u addr=0x%08x %02x %02x %02x %02x %02x %02x %02x %02x\n",
 						 ce, cau, i, addr,
 						 f->last_page[0], f->last_page[1],
@@ -5318,7 +5912,7 @@ static ssize_t fat_scan_store(struct device *dev, struct device_attribute *attr,
 	}
 	page_chunks = saved;
 	mutex_unlock(&f->lock);
-	fmss_dev_info(dev, "fat_scan start=%u n=%u hits=%d\n", start, n, hits);
+	nand_dev_info(dev, "fat_scan start=%u n=%u hits=%d\n", start, n, hits);
 	return count;
 }
 static DEVICE_ATTR_WO(fat_scan);
@@ -5330,7 +5924,7 @@ static DEVICE_ATTR_WO(fat_scan);
 static ssize_t fat_boot_scan_store(struct device *dev, struct device_attribute *attr,
 				   const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int ce, cau, b, p, saved, start = 32, nblocks = 24;
 	int hits = 0;
 
@@ -5366,7 +5960,7 @@ static ssize_t fat_boot_scan_store(struct device *dev, struct device_attribute *
 							       "FAT32", 5))
 							continue;
 						hits++;
-						fmss_dev_info(dev,
+						nand_dev_info(dev,
 							 "fat_boot ce=%u cau=%u blk=%u pg=%u off=%u oem=%.8s\n",
 							 ce, cau, b, p, off, s + 3);
 						if (grep_log_len < sizeof(grep_log) - 96)
@@ -5383,7 +5977,7 @@ static ssize_t fat_boot_scan_store(struct device *dev, struct device_attribute *
 	}
 	page_chunks = saved;
 	mutex_unlock(&f->lock);
-	fmss_dev_info(dev, "fat_boot_scan start=%u n=%u hits=%d\n", start, nblocks, hits);
+	nand_dev_info(dev, "fat_boot_scan start=%u n=%u hits=%d\n", start, nblocks, hits);
 	return count;
 }
 static DEVICE_ATTR_WO(fat_boot_scan);
@@ -5391,7 +5985,7 @@ static DEVICE_ATTR_WO(fat_boot_scan);
 static ssize_t scan_store(struct device *dev, struct device_attribute *attr,
 			 const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int ce, start, n, i;
 	u32 addr;
 	int nonempty = 0;
@@ -5410,14 +6004,14 @@ static ssize_t scan_store(struct device *dev, struct device_attribute *attr,
 		}
 		addr = (start + i) * 128u;
 		if (fmss_page_read(f, ce, addr)) {
-			fmss_dev_info(dev, "scan ce=%u blk=%u FAIL\n", ce, start + i);
+			nand_dev_info(dev, "scan ce=%u blk=%u FAIL\n", ce, start + i);
 			f->pages_since_reset++;
 			continue;
 		}
 		f->pages_since_reset++;
 		if (f->last_page[0] != 0xff && f->last_page[0] != 0x00) {
 			nonempty++;
-			fmss_dev_info(dev,
+			nand_dev_info(dev,
 				 "scan ce=%u blk=%u p0 %02x %02x %02x %02x %02x %02x %02x %02x\n",
 				 ce, start + i,
 				 f->last_page[0], f->last_page[1], f->last_page[2],
@@ -5426,7 +6020,7 @@ static ssize_t scan_store(struct device *dev, struct device_attribute *attr,
 		}
 	}
 	mutex_unlock(&f->lock);
-	fmss_dev_info(dev, "scan ce=%u start=%u n=%u nonempty_head=%d\n",
+	nand_dev_info(dev, "scan ce=%u start=%u n=%u nonempty_head=%d\n",
 		 ce, start, n, nonempty);
 	return count;
 }
@@ -5435,7 +6029,7 @@ static DEVICE_ATTR_WO(scan);
 static ssize_t param_hex_show(struct device *dev, struct device_attribute *attr,
 			      char *buf)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	int i, n = 0;
 
 	if (!f)
@@ -5451,7 +6045,7 @@ static DEVICE_ATTR_RO(param_hex);
 static ssize_t param_info_show(struct device *dev, struct device_attribute *attr,
 			       char *buf)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	const u8 *p;
 
 	if (!f)
@@ -5476,7 +6070,7 @@ static DEVICE_ATTR_RO(param_info);
 static ssize_t param_read_store(struct device *dev, struct device_attribute *attr,
 			       const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int ce = 0;
 	int ret;
 
@@ -5494,7 +6088,7 @@ static DEVICE_ATTR_WO(param_read);
 static ssize_t nand_reset_store(struct device *dev, struct device_attribute *attr,
 				const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	int ret;
 
 	if (!f)
@@ -5509,7 +6103,7 @@ static DEVICE_ATTR_WO(nand_reset);
 static ssize_t set_feature_store(struct device *dev, struct device_attribute *attr,
 				 const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int ce, feat, val;
 	int ret;
 
@@ -5527,7 +6121,7 @@ static DEVICE_ATTR_WO(set_feature);
 static ssize_t get_feature_store(struct device *dev, struct device_attribute *attr,
 				 const char *buf, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int ce, feat, len = 16;
 	int nf, ret;
 
@@ -5564,7 +6158,7 @@ static ssize_t page_data_read(struct file *filp, struct kobject *kobj,
 			     struct bin_attribute *attr, char *buf,
 			     loff_t off, size_t count)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 
 	if (!f)
 		return -ENODEV;
@@ -5583,6 +6177,10 @@ static struct attribute *fmss_attrs[] = {
 	&dev_attr_read_id.attr,
 	&dev_attr_page_read.attr,
 	&dev_attr_dma_read.attr,
+	&dev_attr_cs_canary_read.attr,
+	&dev_attr_cs_canary_matrix.attr,
+	&dev_attr_cs_phys_read.attr,
+	&dev_attr_cs_phys_last.attr,
 	&dev_attr_lba_weave_scan.attr,
 	&dev_attr_seq_kick.attr,
 	&dev_attr_scan.attr,
@@ -5630,15 +6228,15 @@ static struct bin_attribute *fmss_bin_attrs[] = {
 	NULL,
 };
 
-static const struct attribute_group fmss_group = {
+static const struct attribute_group nand_group = {
 	.attrs = fmss_attrs,
 	.bin_attrs = fmss_bin_attrs,
 };
-static const struct attribute_group *fmss_groups[] = { &fmss_group, NULL };
+static const struct attribute_group *nand_groups[] = { &nand_group, NULL };
 
 static int fmss_probe(struct platform_device *pdev)
 {
-	struct fmss_n31 *f;
+	struct nand_s5l8740 *f;
 
 	f = devm_kzalloc(&pdev->dev, sizeof(*f), GFP_KERNEL);
 	if (!f)
@@ -5653,7 +6251,7 @@ static int fmss_probe(struct platform_device *pdev)
 	f->last_param_ce = -1;
 	f->last_param_ret = -1;
 	fmss_dma_setup(f, &pdev->dev);
-	fmss_dev = f;
+	nand_dev = f;
 	platform_set_drvdata(pdev, f);
 	dev_info(&pdev->dev,
 		 "FMSS peek FMCTRL0=0x%08x NANDSTAT=0x%08x quiet=%d (read-only until read_id/page_read)\n",
@@ -5663,9 +6261,9 @@ static int fmss_probe(struct platform_device *pdev)
 
 static void fmss_remove(struct platform_device *pdev)
 {
-	struct fmss_n31 *f = platform_get_drvdata(pdev);
+	struct nand_s5l8740 *f = platform_get_drvdata(pdev);
 
-	fmss_dev = NULL;
+	nand_dev = NULL;
 	fmss_l2v_free();
 	fmss_early_lba_free();
 	boot_carve_valid = false;
@@ -5674,61 +6272,61 @@ static void fmss_remove(struct platform_device *pdev)
 		fmss_dma_teardown(f);
 }
 
-static struct platform_driver fmss_driver = {
+static struct platform_driver nand_driver = {
 	.probe = fmss_probe,
 	.remove = fmss_remove,
 	.driver = {
-		.name = "s5l8740-fmss",
-		.dev_groups = fmss_groups,
+		.name = "s5l8740-nand",
+		.dev_groups = nand_groups,
 	},
 };
 
-static struct platform_device *fmss_pdev;
+static struct platform_device *nand_pdev;
 
-static int __init fmss_init(void)
+static int __init nand_s5l8740_init(void)
 {
 	int ret;
 
-	ret = platform_driver_register(&fmss_driver);
+	ret = platform_driver_register(&nand_driver);
 	if (ret)
 		return ret;
-	fmss_pdev = platform_device_register_simple("s5l8740-fmss", -1, NULL, 0);
-	if (IS_ERR(fmss_pdev)) {
-		platform_driver_unregister(&fmss_driver);
-		return PTR_ERR(fmss_pdev);
+	nand_pdev = platform_device_register_simple("s5l8740-nand", -1, NULL, 0);
+	if (IS_ERR(nand_pdev)) {
+		platform_driver_unregister(&nand_driver);
+		return PTR_ERR(nand_pdev);
 	}
 	return 0;
 }
 
-static void __exit fmss_exit(void)
+static void __exit nand_s5l8740_exit(void)
 {
-	platform_device_unregister(fmss_pdev);
-	platform_driver_unregister(&fmss_driver);
+	platform_device_unregister(nand_pdev);
+	platform_driver_unregister(&nand_driver);
 }
 
 /* --- Exported read-only FTL sector API (ftl-s5l8740.ko) --- */
 
-bool fmss_ftl_present(void)
+bool nand_ftl_present(void)
 {
-	return fmss_dev != NULL;
+	return nand_dev != NULL;
 }
-EXPORT_SYMBOL_GPL(fmss_ftl_present);
+EXPORT_SYMBOL_GPL(nand_ftl_present);
 
-struct device *fmss_ftl_device(void)
+struct device *nand_ftl_device(void)
 {
-	return fmss_dev ? fmss_dev->dev : NULL;
+	return nand_dev ? nand_dev->dev : NULL;
 }
-EXPORT_SYMBOL_GPL(fmss_ftl_device);
+EXPORT_SYMBOL_GPL(nand_ftl_device);
 
-unsigned int fmss_ftl_lpn_count(void)
+unsigned int nand_ftl_lpn_count(void)
 {
 	return l2v_mapped ? l2v_mapped : lpn_index_count;
 }
-EXPORT_SYMBOL_GPL(fmss_ftl_lpn_count);
+EXPORT_SYMBOL_GPL(nand_ftl_lpn_count);
 
-int fmss_ftl_build_map(unsigned int max_lpn)
+int nand_ftl_build_map(unsigned int max_lpn)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int nblocks;
 	int ret;
 
@@ -5740,11 +6338,11 @@ int fmss_ftl_build_map(unsigned int max_lpn)
 	mutex_unlock(&f->lock);
 	return ret;
 }
-EXPORT_SYMBOL_GPL(fmss_ftl_build_map);
+EXPORT_SYMBOL_GPL(nand_ftl_build_map);
 
-int fmss_ftl_read_sector(u64 logical_sector, void *buf)
+int nand_ftl_read_sector(u64 logical_sector, void *buf)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int lpn, sec, ce, cau, block, page, pblock, off, saved;
 	u32 addr, packed;
 	int ret;
@@ -5754,10 +6352,10 @@ int fmss_ftl_read_sector(u64 logical_sector, void *buf)
 		return -ENODEV;
 
 	/*
-	 * Whimory registers the real LBA reader after FTL_Open. Call it
-	 * without the FMSS mutex — the FIL page_read wrapper takes that lock.
-	 */
-	hook = READ_ONCE(fmss_ftl_read_hook);
+ * Whimory registers the real LBA reader after FTL_Open. Call it
+ * without the FMSS mutex — the FIL page_read wrapper takes that lock.
+ */
+	hook = READ_ONCE(nand_ftl_read_hook);
 	if (hook)
 		return hook(logical_sector, buf);
 
@@ -5828,10 +6426,10 @@ int fmss_ftl_read_sector(u64 logical_sector, void *buf)
 		}
 	}
 
-	lpn = (unsigned int)(logical_sector / FMSS_FTL_SECTORS_PER_LPN);
-	sec = (unsigned int)(logical_sector % FMSS_FTL_SECTORS_PER_LPN);
+	lpn = (unsigned int)(logical_sector / NAND_FTL_SECTORS_PER_LPN);
+	sec = (unsigned int)(logical_sector % NAND_FTL_SECTORS_PER_LPN);
 
-	ret = fmss_ftl_read_lpn_locked(f, lpn, sec, buf);
+	ret = nand_ftl_read_lpn_locked(f, lpn, sec, buf);
 	if (!ret)
 		resolve_log_len = scnprintf(
 			resolve_log, sizeof(resolve_log),
@@ -5847,17 +6445,30 @@ int fmss_ftl_read_sector(u64 logical_sector, void *buf)
 	mutex_unlock(&f->lock);
 	return ret;
 }
-EXPORT_SYMBOL_GPL(fmss_ftl_read_sector);
+EXPORT_SYMBOL_GPL(nand_ftl_read_sector);
 
-int s5l8740_fmss_available(void)
+int s5l8740_nand_available(void)
 {
-	return fmss_dev != NULL;
+	return nand_dev != NULL;
 }
-EXPORT_SYMBOL_GPL(s5l8740_fmss_available);
+EXPORT_SYMBOL_GPL(s5l8740_nand_available);
 
-int s5l8740_fmss_hw_init(void)
+int s5l8740_nand_meta_transport_ok(void)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
+
+	/*
+ * Disk registration still requires meta_dma_read=1.
+ * Early CS phys helpers use s5l8740_nand_cs_phys_read() instead —
+ * glass-proven span4/rec4112, but FTL must not auto-open yet.
+ */
+	return f && f->dma_ok && meta_dma_read;
+}
+EXPORT_SYMBOL_GPL(s5l8740_nand_meta_transport_ok);
+
+int s5l8740_nand_hw_init(void)
+{
+	struct nand_s5l8740 *f = nand_dev;
 	int ret;
 
 	if (!f)
@@ -5869,11 +6480,11 @@ int s5l8740_fmss_hw_init(void)
 	mutex_unlock(&f->lock);
 	return ret;
 }
-EXPORT_SYMBOL_GPL(s5l8740_fmss_hw_init);
+EXPORT_SYMBOL_GPL(s5l8740_nand_hw_init);
 
-int s5l8740_fmss_query_geometry(struct s5l8740_fmss_geom *g)
+int s5l8740_nand_query_geometry(struct s5l8740_nand_geom *g)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	const u8 *p;
 	u32 caus, cau_bits, blocks, block_bits, pages, pages_slc;
 	u32 page_bits, page_size;
@@ -5931,15 +6542,15 @@ int s5l8740_fmss_query_geometry(struct s5l8740_fmss_geom *g)
 	mutex_unlock(&f->lock);
 
 	/*
-	 * FIL GetInfo (vtable +80, sub_12F83C):
-	 *   101 — NAND present / signature +0x34 geometry (WhimoryBoot.c:169,260)
-	 *         0 → "No NAND device found". Compared to sig[+0x34].
-	 *         Value stored at format is blocks_per_cau (sub_12ED9C → 0x8D102CC
-	 *         is the first geometry word copied from the param page).
-	 *   104 — BUF_Init data bytes (sub_D1960 first arg) = physical page size
-	 *   105 — BUF_Init meta bytes (sub_D1960 second arg) = 16 (sub_12ED9C)
-	 *   135 — stored at 0x8D0CE2C and unused after GetInfo
-	 */
+ * FIL GetInfo (vtable +80,:
+ * 101 — NAND present / signature +0x34 geometry (WhimoryBoot.c:169,260)
+ * 0 → "No NAND device found". Compared to sig[+0x34].
+ * Value stored at format is blocks_per_cau → 0x8D102CC
+ * is the first geometry word copied from the param page).
+ * 104 — BUF_Init data bytes first arg) = physical page size
+ * 105 — BUF_Init meta bytes second arg) = 16 
+ * 135 — stored at 0x8D0CE2C and unused after GetInfo
+ */
 	g->dev_id = g->blocks_per_cau;
 	g->geom_104 = g->page_size;
 	g->geom_105 = 16;
@@ -5948,13 +6559,13 @@ int s5l8740_fmss_query_geometry(struct s5l8740_fmss_geom *g)
 		return -ENODEV;
 	return 0;
 }
-EXPORT_SYMBOL_GPL(s5l8740_fmss_query_geometry);
+EXPORT_SYMBOL_GPL(s5l8740_nand_query_geometry);
 
-u32 s5l8740_fmss_fil_get_info(u32 selector)
+u32 s5l8740_nand_fil_get_info(u32 selector)
 {
-	struct s5l8740_fmss_geom g;
+	struct s5l8740_nand_geom g;
 
-	if (s5l8740_fmss_query_geometry(&g))
+	if (s5l8740_nand_query_geometry(&g))
 		return 0;
 	switch (selector) {
 	case 101:
@@ -5969,9 +6580,9 @@ u32 s5l8740_fmss_fil_get_info(u32 selector)
 		return 0;
 	}
 }
-EXPORT_SYMBOL_GPL(s5l8740_fmss_fil_get_info);
+EXPORT_SYMBOL_GPL(s5l8740_nand_fil_get_info);
 
-static int fmss_dma_page_read_records(struct fmss_n31 *f,
+static int fmss_dma_page_read_records(struct nand_s5l8740 *f,
 				      unsigned int ce, u32 addr,
 				      unsigned int slot,
 				      unsigned int span)
@@ -5988,7 +6599,7 @@ static int fmss_dma_page_read_records(struct fmss_n31 *f,
 
 	dma_slot = slot;
 	dma_nsect = span;
-	dma_rec = FMSS_PPN_REC; /* 4096 data + 16 meta */
+	dma_rec = FMSS_PPN_REC; /* 4096 data + 16 meta — glass ABI */
 
 	if (meta_dma_reset_before)
 		fmss_nand_reset(f);
@@ -6001,15 +6612,212 @@ static int fmss_dma_page_read_records(struct fmss_n31 *f,
 	return ret;
 }
 
-int s5l8740_fmss_page_read(unsigned int ce, unsigned int cau,
+void s5l8740_nand_meta_decode(const u8 *m16,
+			      struct s5l8740_meta_decoded *out)
+{
+	unsigned int i;
+	bool blank = true;
+
+	if (!out)
+		return;
+	memset(out, 0, sizeof(*out));
+	if (!m16)
+		return;
+
+	out->type = m16[0];
+	out->flags = m16[1];
+	out->weave = (u64)m16[2] | ((u64)m16[3] << 8) |
+		     ((u64)m16[4] << 16) | ((u64)m16[5] << 24) |
+		     ((u64)m16[6] << 32) | ((u64)m16[7] << 40);
+	out->lba = (u32)m16[8] | ((u32)m16[9] << 8) |
+		   ((u32)m16[10] << 16) | ((u32)m16[11] << 24);
+
+	for (i = 0; i < N31_META_SLOT_SIZE; i++) {
+		if (m16[i] != 0x00 && m16[i] != 0xff) {
+			blank = false;
+			break;
+		}
+	}
+	out->blank = blank;
+	out->valid = !blank;
+}
+EXPORT_SYMBOL_GPL(s5l8740_nand_meta_decode);
+
+void s5l8740_nand_meta_decode_legacy(const u8 *m16,
+				     struct s5l8740_nand_slot_meta *out)
+{
+	struct s5l8740_meta_decoded d;
+
+	if (!out)
+		return;
+	memset(out, 0, sizeof(*out));
+	s5l8740_nand_meta_decode(m16, &d);
+	out->type = d.type;
+	out->flags = d.flags;
+	out->weave48 = d.weave;
+	out->lba = d.lba;
+	if (m16)
+		memcpy(out->aux, m16 + 12, 4);
+	out->data_like = n31_meta_is_data_record(&d);
+}
+EXPORT_SYMBOL_GPL(s5l8740_nand_meta_decode_legacy);
+
+int s5l8740_nand_meta_pick_lba(const struct s5l8740_cs_page *page,
+			       u32 fmss_lba)
+{
+	int best = -ENOENT;
+	u64 best_weave = 0;
+	unsigned int s;
+
+	if (!page)
+		return -EINVAL;
+
+	for (s = 0; s < N31_DATA_SLOTS; s++) {
+		const struct s5l8740_meta_decoded *cur = &page->meta[s];
+
+		if (!n31_meta_is_data_record(cur) || cur->lba != fmss_lba)
+			continue;
+		if (best < 0 || n31_weave_newer(cur->weave, best_weave)) {
+			if (best >= 0 && page->meta[best].weave > cur->weave)
+				pr_info("s5l8740-nand: weave moved backward "
+					"fmss_lba=%u slot%u->%u "
+					"%012llx -> %012llx\n",
+					fmss_lba, best, s,
+					(unsigned long long)page->meta[best].weave,
+					(unsigned long long)cur->weave);
+			best = (int)s;
+			best_weave = cur->weave;
+		} else if (best >= 0 && cur->weave < best_weave) {
+			pr_info("s5l8740-nand: weave older skipped "
+				"fmss_lba=%u slot=%u weave=%012llx "
+				"best=%012llx\n",
+				fmss_lba, s,
+				(unsigned long long)cur->weave,
+				(unsigned long long)best_weave);
+		}
+	}
+	return best;
+}
+EXPORT_SYMBOL_GPL(s5l8740_nand_meta_pick_lba);
+
+/*
+ * FTL map CS physical read: always slot0/span4/rec4112.
+ * Fills struct s5l8740_cs_page. No lba_map ingest.
+ */
+int s5l8740_nand_cs_phys_read(u8 ce, u8 cau, u16 block, u8 page,
+			      struct s5l8740_cs_page *out)
+{
+	struct nand_s5l8740 *f = nand_dev;
+	u32 addr;
+	bool saved_armed;
+	int ret;
+	unsigned int s;
+
+	if (!f || !out)
+		return -ENODEV;
+	if (!f->dma_ok)
+		return -ENODEV;
+	if (ce >= FMSS_NUM_CE || cau >= FMSS_NUM_CAU ||
+	    block >= FMSS_BLOCKS_PER_CAU || page > FMSS_BTOC_PAGE)
+		return -EINVAL;
+	if (dma_dry)
+		return -EAGAIN;
+	if (!dma_armed)
+		return -EPERM;
+
+	memset(out, 0, sizeof(*out));
+	addr = fmss_ppn_addr(cau, block, page, 0);
+
+	mutex_lock(&f->lock);
+	saved_armed = dma_armed;
+	/* One-shot friendly: re-arm for this kick; disarm after if one_shot. */
+	dma_armed = true;
+	dma_skip_ingest = true;
+	ret = fmss_dma_page_read_records(f, ce, addr, 0, 4);
+	dma_skip_ingest = false;
+	if (!dma_one_shot)
+		dma_armed = saved_armed;
+	f->pages_since_reset++;
+
+	if (!ret) {
+		size_t dn = f->last_page_len;
+		size_t mn = f->last_spare_len;
+
+		if (dn > FMSS_PAGE_LEN)
+			dn = FMSS_PAGE_LEN;
+		if (mn > S5L8740_NAND_META_SIZE)
+			mn = S5L8740_NAND_META_SIZE;
+
+		for (s = 0; s < N31_DATA_SLOTS; s++) {
+			size_t doff = (size_t)s * N31_DATA_SLOT_SIZE;
+			size_t moff = (size_t)s * N31_META_SLOT_SIZE;
+
+			memset(out->data[s], 0xff, N31_DATA_SLOT_SIZE);
+			if (dn > doff) {
+				size_t n = N31_DATA_SLOT_SIZE;
+
+				if (dn - doff < n)
+					n = dn - doff;
+				memcpy(out->data[s], f->last_page + doff, n);
+			}
+			memset(out->meta_raw[s], 0xff, N31_META_SLOT_SIZE);
+			if (mn > moff) {
+				size_t n = N31_META_SLOT_SIZE;
+
+				if (mn - moff < n)
+					n = mn - moff;
+				memcpy(out->meta_raw[s], f->last_spare + moff, n);
+			}
+			s5l8740_nand_meta_decode(out->meta_raw[s], &out->meta[s]);
+		}
+	}
+	mutex_unlock(&f->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(s5l8740_nand_cs_phys_read);
+
+/* Batch CS sessions for map build: keep armed across many phys reads. */
+static struct {
+	bool saved;
+	bool dry;
+	bool armed;
+	bool one_shot;
+} fmss_dma_batch;
+
+int s5l8740_nand_dma_session_begin(void)
+{
+	if (fmss_dma_batch.saved)
+		return -EBUSY;
+	fmss_dma_batch.dry = dma_dry;
+	fmss_dma_batch.armed = dma_armed;
+	fmss_dma_batch.one_shot = dma_one_shot;
+	fmss_dma_batch.saved = true;
+	dma_dry = false;
+	dma_one_shot = false;
+	dma_armed = true;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(s5l8740_nand_dma_session_begin);
+
+void s5l8740_nand_dma_session_end(void)
+{
+	if (!fmss_dma_batch.saved)
+		return;
+	dma_dry = fmss_dma_batch.dry;
+	dma_armed = fmss_dma_batch.armed;
+	dma_one_shot = fmss_dma_batch.one_shot;
+	fmss_dma_batch.saved = false;
+}
+EXPORT_SYMBOL_GPL(s5l8740_nand_dma_session_end);
+
+int s5l8740_nand_page_read(unsigned int ce, unsigned int cau,
 			   unsigned int block, unsigned int page,
 			   unsigned int slc, unsigned int chunks,
 			   void *data, size_t data_len,
 			   void *meta, size_t meta_len)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	unsigned int saved;
-	unsigned int span;
 	u32 addr;
 	int ret;
 
@@ -6020,16 +6828,6 @@ int s5l8740_fmss_page_read(unsigned int ce, unsigned int cau,
 		return -EINVAL;
 	if (!chunks || chunks > FMSS_MAX_CHUNKS)
 		chunks = FMSS_MAX_CHUNKS;
-
-	/*
-	 * PIO chunks are 1024-byte units.
-	 * Metadata records are 4096-byte units.
-	 */
-	span = DIV_ROUND_UP(chunks, 4);
-	if (!span)
-		span = 1;
-	if (span > 4)
-		span = 4;
 
 	mutex_lock(&f->lock);
 
@@ -6044,15 +6842,23 @@ int s5l8740_fmss_page_read(unsigned int ce, unsigned int cau,
 
 	if (meta && meta_len) {
 		/*
-		 * Real metadata path. Do not fall back to PIO metadata,
-		 * because fake metadata poisons FPart/VFL/FTL/L2V.
-		 */
+ * Real metadata: always full-page CS span4/rec4112, then
+ * software-slice. Never invent PIO spare as Whimory meta.
+ */
 		if (!meta_dma_read || !f->dma_ok) {
 			ret = -EOPNOTSUPP;
 			goto out_restore;
 		}
-
-		ret = fmss_dma_page_read_records(f, ce, addr, 0, span);
+		if (dma_dry) {
+			ret = -EAGAIN;
+			goto out_restore;
+		}
+		if (!dma_armed) {
+			ret = -EPERM;
+			goto out_restore;
+		}
+		dma_armed = true;
+		ret = fmss_dma_page_read_records(f, ce, addr, 0, 4);
 	} else {
 		ret = fmss_page_read(f, ce, addr);
 	}
@@ -6063,15 +6869,15 @@ int s5l8740_fmss_page_read(unsigned int ce, unsigned int cau,
 		if (data && data_len) {
 			size_t have = f->last_page_len;
 
-			if (have > span * FMSS_SECTOR_LEN)
-				have = span * FMSS_SECTOR_LEN;
+			if (have > FMSS_PAGE_LEN)
+				have = FMSS_PAGE_LEN;
 			if (data_len > have)
 				data_len = have;
 			memcpy(data, f->last_page, data_len);
 		}
 
 		if (meta && meta_len) {
-			size_t have = span * 16;
+			size_t have = S5L8740_NAND_META_SIZE;
 
 			memset(meta, 0xff, meta_len);
 			if (have > f->last_spare_len)
@@ -6087,11 +6893,11 @@ out_restore:
 	mutex_unlock(&f->lock);
 	return ret;
 }
-EXPORT_SYMBOL_GPL(s5l8740_fmss_page_read);
+EXPORT_SYMBOL_GPL(s5l8740_nand_page_read);
 
-int s5l8740_fmss_nand_reset(void)
+int s5l8740_nand_reset(void)
 {
-	struct fmss_n31 *f = fmss_dev;
+	struct nand_s5l8740 *f = nand_dev;
 	int ret;
 
 	if (!f)
@@ -6101,16 +6907,16 @@ int s5l8740_fmss_nand_reset(void)
 	mutex_unlock(&f->lock);
 	return ret;
 }
-EXPORT_SYMBOL_GPL(s5l8740_fmss_nand_reset);
+EXPORT_SYMBOL_GPL(s5l8740_nand_reset);
 
-void s5l8740_fmss_register_ftl_read(int (*fn)(u64 lba, void *buf))
+void s5l8740_nand_register_ftl_read(int (*fn)(u64 lba, void *buf))
 {
-	WRITE_ONCE(fmss_ftl_read_hook, fn);
+	WRITE_ONCE(nand_ftl_read_hook, fn);
 }
-EXPORT_SYMBOL_GPL(s5l8740_fmss_register_ftl_read);
+EXPORT_SYMBOL_GPL(s5l8740_nand_register_ftl_read);
 
-module_init(fmss_init);
-module_exit(fmss_exit);
+module_init(nand_s5l8740_init);
+module_exit(nand_s5l8740_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("S5L8740 FMSS NAND controller (Whimory FIL, read-only)");
+MODULE_DESCRIPTION("S5L8740 NAND/FMSS controller (Whimory FIL, read-only)");
 MODULE_AUTHOR("n31");

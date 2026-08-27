@@ -1,18 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * S5L8740 Whimory PPN read-only block driver (N31).
+ * S5L8740 Whimory FTL — read-only block path (N31).
  *
- * FIL (fmss-s5l8740.ko)
- *   → FPart ReadSpecial type 0xC101 len 0x600 (chunked object; xrmw at payload+0)
- *   → GetInfo(101) vs sig[+0x34] hard gate
- *   → VFL_Open (type 0x20 CXT, identity VBN, bank bitmap)
- *   → FTL_Open / s_boot: classify → s_cxt_load → BTOC/META
- *   → L2V_Search (sub_428694)
- *   → VFL read + s_read META check (sub_56C328)
- *   → /dev/s5l8740-ftl  (4096-byte logical, read-only)
+ * Layers: NAND FIL → FPart → VFL → FTL/L2V → optional /dev/s5l8740-ftl.
+ * The CS-map front-end in ftl-s5l8740-csmap.c is the preferred RO disk path.
+ * This module retains the classic Whimory open/boot helpers.
  *
- * The disk is registered only after read_lba_4k(0) returns a metadata-
- * validated FAT32 boot sector. Empty L2V never yields a block device.
+ * The block device is registered only after FAT-critical validation succeeds.
+ * Empty or inconsistent maps never expose a disk.
  */
 #include <linux/bio.h>
 #include <linux/bitops.h>
@@ -32,6 +27,7 @@
 #include <linux/vmalloc.h>
 
 #include "whimory-s5l8740.h"
+#include "ftl-s5l8740-csmap.h"
 
 #define FTL_DISK_NAME		"s5l8740-ftl"
 #define FTL_IPOD_NAME		"s5l8740-ipod"
@@ -48,15 +44,15 @@ module_param(import_l2v_oracle, bool, 0644);
 MODULE_PARM_DESC(import_l2v_oracle,
 		 "Load L2V root/nodes/globals from /lib/firmware/apple/");
 
-static unsigned int scan_blocks;
-module_param(scan_blocks, uint, 0644);
-MODULE_PARM_DESC(scan_blocks,
-		 "User blocks per CE/CAU to classify (0 = all user blocks)");
-
-static unsigned int max_open_sbs;
+static unsigned int max_open_sbs = 16;
 module_param(max_open_sbs, uint, 0644);
 MODULE_PARM_DESC(max_open_sbs,
-		 "Max open superblocks to META-rebuild (0 = all)");
+		 "Max open superblocks to META-rebuild (0 = all; default 16)");
+
+static unsigned int scan_blocks = 256;
+module_param(scan_blocks, uint, 0644);
+MODULE_PARM_DESC(scan_blocks,
+		 "User blocks per CE/CAU to classify (0 = all; default 256)");
 
 static unsigned int meta0_scan_sbs = 4;
 module_param(meta0_scan_sbs, uint, 0644);
@@ -111,6 +107,74 @@ static u64 whimory_weave48(const u8 *m)
 {
 	return (u64)get_unaligned_le16(m + 2) |
 	       ((u64)get_unaligned_le32(m + 4) << 16);
+}
+
+/*
+ * CS span4/rec4112 page read — real 4× META (glass-proven). Used for
+ * classify / BTOC / open-SB / CXT / VBA reads when meta_dma_read=0.
+ */
+static int whimory_cs_read_page(struct whimory *w, unsigned int ce,
+				unsigned int cau, unsigned int block,
+				unsigned int page, void *data, size_t data_len,
+				void *meta, size_t meta_len)
+{
+	struct s5l8740_cs_page *csp;
+	unsigned int s;
+	int ret;
+
+	if (!w || !data || data_len < S5L8740_NAND_PAGE_SIZE)
+		return -EINVAL;
+	csp = w->sftl.cs_page;
+	if (!csp)
+		return -ENOMEM;
+
+	ret = s5l8740_nand_cs_phys_read((u8)ce, (u8)cau, (u16)block, (u8)page,
+					csp);
+	if (ret)
+		return ret;
+
+	for (s = 0; s < S5L8740_NAND_SLOTS_PER_PAGE; s++)
+		memcpy((u8 *)data + s * S5L8740_NAND_SLOT_DATA,
+		       csp->data[s], S5L8740_NAND_SLOT_DATA);
+
+	if (meta && meta_len) {
+		size_t copy = min_t(size_t, meta_len, S5L8740_NAND_META_SIZE);
+
+		memset(meta, 0xff, meta_len);
+		for (s = 0; s < S5L8740_NAND_SLOTS_PER_PAGE &&
+			     (s + 1) * WHIMORY_META_SIZE <= copy; s++)
+			memcpy((u8 *)meta + s * WHIMORY_META_SIZE,
+			       csp->meta_raw[s], WHIMORY_META_SIZE);
+	}
+	return 0;
+}
+
+static bool whimory_meta_any_btoc(const u8 *meta64)
+{
+	unsigned int s;
+
+	if (!meta64)
+		return false;
+	for (s = 0; s < WHIMORY_VBAS_PER_PAGE; s++) {
+		if (meta64[s * WHIMORY_META_SIZE] == WHIMORY_META_TYPE_BTOC)
+			return true;
+	}
+	return false;
+}
+
+static bool whimory_meta_slot0_or_any_cxt(const u8 *meta64)
+{
+	unsigned int s;
+
+	if (!meta64)
+		return false;
+	if (meta64[0] == WHIMORY_META_TYPE_SFTL_CXT)
+		return true;
+	for (s = 1; s < WHIMORY_VBAS_PER_PAGE; s++) {
+		if (meta64[s * WHIMORY_META_SIZE] == WHIMORY_META_TYPE_SFTL_CXT)
+			return true;
+	}
+	return false;
 }
 
 static bool whimory_page_blank(const u8 *p, unsigned int n)
@@ -171,12 +235,12 @@ static bool whimory_special_lba(u32 lba)
 static u32 whimory_vfl_phys(struct whimory *w, u32 cau, u32 virt)
 {
 	/*
-	 * sub_4EAE40: PBN = VBN (identity over blocks_per_cau).
-	 * The u16 table at CXT +0x200 is a VFL CXT copy journal
-	 * (sub_3D26D8: value = index | (gen<<15), 0xC070 = free), not
-	 * virt→phys. Failed user blocks keep the same VBN and switch
-	 * CAU via the bank bitmap (sub_3D1438 / sub_4EAD34).
-	 */
+ *: PBN = VBN (identity over blocks_per_cau).
+ * The u16 table at CXT +0x200 is a VFL CXT copy journal
+ * : value = index | (gen<<15), 0xC070 = free), not
+ * virt→phys. Failed user blocks keep the same VBN and switch
+ * CAU via the bank bitmap.
+ */
 	if (cau >= w->geom.num_cau || !w->vfl.remap[cau])
 		return virt;
 	if (virt >= w->geom.blocks_per_cau)
@@ -184,7 +248,7 @@ static u32 whimory_vfl_phys(struct whimory *w, u32 cau, u32 virt)
 	return w->vfl.remap[cau][virt];
 }
 
-/* sub_3D1438: banks that participate in this VBN. */
+/*: banks that participate in this VBN. */
 static u32 whimory_vfl_banks_in_vbn(struct whimory *w, u32 vbn, u8 *out,
 				    u32 out_max)
 {
@@ -217,7 +281,7 @@ static u32 whimory_vfl_banks_in_vbn(struct whimory *w, u32 vbn, u8 *out,
 			continue;
 		if (out && n < out_max)
 			out[n] = (u8)b;
-		if (n < S5L8740_FMSS_MAX_CAU)
+		if (n < S5L8740_NAND_MAX_CAU)
 			w->vfl.cached_banks[n] = (u8)b;
 		n++;
 	}
@@ -228,7 +292,7 @@ static u32 whimory_vfl_banks_in_vbn(struct whimory *w, u32 vbn, u8 *out,
 
 static u32 whimory_vfl_bank(struct whimory *w, u32 cau, u32 vblock)
 {
-	u8 banks[S5L8740_FMSS_MAX_CAU];
+	u8 banks[S5L8740_NAND_MAX_CAU];
 	u32 n, i;
 
 	n = whimory_vfl_banks_in_vbn(w, vblock, banks, ARRAY_SIZE(banks));
@@ -326,7 +390,7 @@ static void whimory_set_status(struct whimory *w, const char *fmt, ...)
 }
 
 /* ------------------------------------------------------------------ */
-/* Interval map: weave-order LBA→VBA, then packed into the L2V tree.  */
+/* Interval map: weave-order LBA→VBA, then packed into the L2V tree. */
 /* ------------------------------------------------------------------ */
 
 static struct whimory_range *whimory_range_find(struct rb_root *root, u32 lba)
@@ -510,7 +574,7 @@ static int whimory_range_update(struct whimory *w, u32 lba, u32 span, u32 vba)
 }
 
 /*
- * sub_3F8958 L2V_Update.c: split at 0x8000 root boundaries, then insert.
+ *L2V_Update.c: split at 0x8000 root boundaries, then insert.
  * The interval map is the RO observable of the live tree.
  */
 static int whimory_l2v_update(struct whimory *w, u32 lba, u32 span, u32 vba)
@@ -537,9 +601,9 @@ static int whimory_l2v_update(struct whimory *w, u32 lba, u32 span, u32 vba)
 					ver = 0;
 				put_unaligned_le16(ver + 1, rec + 4);
 				/*
-				 * sub_110734: whole-root unmap (off=0,
-				 * span=0x8000, vba=invalid) frees the tree.
-				 */
+ *: whole-root unmap (off=0,
+ * span=0x8000, vba=invalid) frees the tree.
+ */
 				if (!(lba & 0x7fff) &&
 				    chunk == WHIMORY_L2V_ROOT_SPAN &&
 				    vba >= w->l2v.invalid_vba) {
@@ -597,7 +661,7 @@ static void whimory_range_free(struct whimory *w)
 }
 
 /* ------------------------------------------------------------------ */
-/* L2V init / lookup / tree pack (sub_E8CA0, sub_428694)              */
+/* L2V init / lookup / tree pack , */
 /* ------------------------------------------------------------------ */
 
 static void whimory_l2v_free(struct whimory *w)
@@ -614,7 +678,7 @@ static void whimory_l2v_free(struct whimory *w)
 	w->l2v.free_count = 0;
 }
 
-/* L2V_Mem.c sub_3EB0DC / sub_3EAEC8 — intrusive free list in node[0]. */
+/* L2V_Mem.c— intrusive free list in node[0]. */
 static void whimory_l2v_mem_free(struct whimory_l2v *l2v, u32 idx)
 {
 	u8 *node;
@@ -920,7 +984,7 @@ static u32 whimory_l2v_collect_root(struct whimory *w, u32 ridx,
 	return nleaf;
 }
 
-/* sub_E8EC0 analogue: free this root's tree, pack from the interval map. */
+/*analogue: free this root's tree, pack from the interval map. */
 static int whimory_l2v_pack_root(struct whimory *w, u32 ridx)
 {
 	struct whimory_l2v *l2v = &w->l2v;
@@ -960,7 +1024,7 @@ static int whimory_l2v_pack_root(struct whimory *w, u32 ridx)
 	return 0;
 }
 
-/* sub_10FE4C: first insert into an empty root — one node, up to 3 leaves. */
+/*: first insert into an empty root — one node, up to 3 leaves. */
 static int whimory_l2v_grow_empty(struct whimory *w, u32 ridx, u32 off,
 				  u32 span, u32 vba)
 {
@@ -1084,7 +1148,7 @@ static int whimory_l2v_build_from_ranges(struct whimory *w)
 	return mapped_roots ? 0 : -ENOENT;
 }
 
-/* L2V_FindFrag.c sub_10C344 — walk leaves, record fragment stats. */
+/* L2V_FindFrag.c— walk leaves, record fragment stats. */
 static void whimory_l2v_find_frag_node(struct whimory *w, u32 node_idx,
 				       u32 *count, u32 *maxspan, int depth)
 {
@@ -1297,18 +1361,18 @@ static int whimory_l2v_search(struct whimory *w, u32 lba,
 }
 
 /* ------------------------------------------------------------------ */
-/* FIL                                                                */
+/* FIL */
 /* ------------------------------------------------------------------ */
 
 static int whimory_fil_init(struct whimory *w)
 {
-	struct s5l8740_fmss_geom g;
+	struct s5l8740_nand_geom g;
 	int ret;
 
-	ret = s5l8740_fmss_hw_init();
+	ret = s5l8740_nand_hw_init();
 	if (ret)
 		return ret;
-	ret = s5l8740_fmss_query_geometry(&g);
+	ret = s5l8740_nand_query_geometry(&g);
 	if (ret)
 		return ret;
 	if (!g.dev_id)
@@ -1321,10 +1385,10 @@ static int whimory_fil_init(struct whimory *w)
 	w->geom.page_size = g.page_size;
 	w->geom.vfl_tail = g.vfl_tail;
 	w->geom.user_blocks = g.blocks_per_cau - g.vfl_tail;
-	w->geom.dev_id = s5l8740_fmss_fil_get_info(101);
-	w->geom.geom_104 = s5l8740_fmss_fil_get_info(104);
-	w->geom.geom_105 = s5l8740_fmss_fil_get_info(105);
-	w->geom.geom_135 = s5l8740_fmss_fil_get_info(135);
+	w->geom.dev_id = s5l8740_nand_fil_get_info(101);
+	w->geom.geom_104 = s5l8740_nand_fil_get_info(104);
+	w->geom.geom_105 = s5l8740_nand_fil_get_info(105);
+	w->geom.geom_135 = s5l8740_nand_fil_get_info(135);
 	if (!w->geom.dev_id)
 		return -ENODEV;
 	if (w->geom.geom_104 && w->geom.geom_104 != w->geom.page_size) {
@@ -1350,11 +1414,11 @@ static int whimory_fil_init(struct whimory *w)
 }
 
 /* ------------------------------------------------------------------ */
-/* FPart — signature from media (or oracle firmware file)             */
+/* FPart — signature from media (or oracle firmware file) */
 /* ------------------------------------------------------------------ */
 
 /*
- * sub_12F368 / sub_1122FC — FPart signature is NOT a user-page hunt.
+ *— FPart signature is NOT a user-page hunt.
  * OSOS: memset(sig, 0xA5, 0x600) then _fpart->op80(sig, 0x600, 0xC101).
  * READ ONLY — never AllocateSpecialBlock / WriteSpecial / erase.
  * Validate: magic 0x776d7278, ver<=6, +0x34 == FIL GetInfo(101).
@@ -1382,7 +1446,7 @@ static void whimory_log_sig_fields(struct whimory *w, const u8 *s,
 		 geom, w->geom.dev_id, vfl_arg, fpt_a, extra, cfg, s);
 }
 
-/* OSOS sub_1122FC checks — not the old ver>=1 / major<=16 heuristic. */
+/* OSOSchecks — not the old ver>=1 / major<=16 heuristic. */
 static int whimory_validate_signature(struct whimory *w, const u8 *sig)
 {
 	u32 magic = whimory_sig32(sig, 0x00);
@@ -1479,7 +1543,7 @@ static bool fpart_meta_is_assign(const u8 *meta, u16 *type_out);
 static bool fpart_has_xrmw(const u8 *page);
 
 /*
- * sub_3E5650 op=1 analogue. Special objects often live on SLC; try SLC
+ *op=1 analogue. Special objects often live on SLC; try SLC
  * then MLC. Full 16 KiB data + 64B META; special uses first 16 META bytes.
  */
 static int fpart_fil_read_page(struct whimory *w, u16 bank, u32 block,
@@ -1498,9 +1562,9 @@ static int fpart_fil_read_page(struct whimory *w, u16 bank, u32 block,
 	for (i = 0; i < 2; i++) {
 		int ret;
 
-		ret = s5l8740_fmss_page_read(ce, cau, block, page, slc_order[i],
+		ret = s5l8740_nand_page_read(ce, cau, block, page, slc_order[i],
 					     16, data, w->geom.page_size,
-					     meta, S5L8740_FMSS_META_SIZE);
+					     meta, S5L8740_NAND_META_SIZE);
 		if (ret)
 			continue;
 		last = 0;
@@ -1513,7 +1577,7 @@ static int fpart_fil_read_page(struct whimory *w, u16 bank, u32 block,
 	return last;
 }
 
-/* sub_4EB0CC — 16-byte META copy. LE type_word at +2 (RE). */
+/*— 16-byte META copy. LE type_word at +2 (RE). */
 static bool fpart_meta_special(const u8 *meta, u8 want_chunk, u16 *type_out)
 {
 	unsigned int slot;
@@ -1536,7 +1600,7 @@ static bool fpart_meta_special(const u8 *meta, u8 want_chunk, u16 *type_out)
 
 /*
  * Scanner: META tag 0x30 and class 1. Chunk-0 assignment pages use m[1]==0
- * with class in type_word[15:8]. Do not treat payload magic as a hit.
+ * with class in type_word[15:8]. Avoid treat payload magic as a hit.
  */
 static bool fpart_meta_is_assign(const u8 *meta, u16 *type_out)
 {
@@ -1723,7 +1787,7 @@ static int fpart_scan_region(struct whimory *w, u16 type,
 			     bool *matched)
 {
 	u8 *page;
-	u8 meta[S5L8740_FMSS_META_SIZE];
+	u8 meta[S5L8740_NAND_META_SIZE];
 	u16 bank, nbanks = fpart_num_banks(w);
 	u32 b, p;
 	int ret, reads = 0, tag30 = 0, xrmw = 0, wrmx = 0, fail = 0;
@@ -1739,7 +1803,7 @@ static int fpart_scan_region(struct whimory *w, u16 type,
 	if (page_hi >= w->geom.pages_per_block)
 		page_hi = w->geom.pages_per_block - 1;
 
-	s5l8740_fmss_nand_reset();
+	s5l8740_nand_reset();
 
 	for (bank = 0; bank < nbanks; bank++) {
 		for (b = block_hi; b > block_lo; b--) {
@@ -1864,7 +1928,7 @@ static int fpart_scan_region(struct whimory *w, u16 type,
 /*
  * fpart_locate_special_4EBBDC: cache by low byte, else scan tail assignment
  * pages (META 0x30 chunk 0). scanned=true after a full miss so we do not
- * rescan. sub_3E5650 op=4 bitmap is not ported — every tail block is read.
+ * rescan.op=4 bitmap is not ported — every tail block is read.
  */
 static bool fpart_locate_special(struct whimory *w, u16 *index, u16 type)
 {
@@ -1918,7 +1982,7 @@ static int fpart_read_special_copy(struct whimory *w, u8 *dst, u32 dst_len,
 {
 	struct fpart_special_entry *e;
 	u8 *page;
-	u8 meta[S5L8740_FMSS_META_SIZE];
+	u8 meta[S5L8740_NAND_META_SIZE];
 	u32 page_size, chunk_count = 1, copy_slots, chunk, slot;
 	u32 object_len = 0, copy_len = 0, generation = 0;
 	int ret = -ENOENT;
@@ -2144,7 +2208,7 @@ static int whimory_payload_read_page(struct whimory *w, u16 bank, u32 block,
 	for (i = 0; i < 2; i++) {
 		int ret;
 
-		ret = s5l8740_fmss_page_read(ce, cau, block, page, slc_order[i],
+		ret = s5l8740_nand_page_read(ce, cau, block, page, slc_order[i],
 					     16, data, w->geom.page_size,
 					     NULL, 0);
 		if (ret) {
@@ -2261,7 +2325,7 @@ static int whimory_payload_magic_scan(struct whimory *w)
 	if (!page)
 		return -ENOMEM;
 
-	s5l8740_fmss_nand_reset();
+	s5l8740_nand_reset();
 	hit = whimory_payload_scan_range(w, page, user, nblk, 0,
 					 w->geom.pages_per_block - 1,
 					 "tail", &reads);
@@ -2316,7 +2380,7 @@ static u32 n31_sftl_minor(struct whimory *w)
 }
 
 /* ------------------------------------------------------------------ */
-/* VFL                                                                */
+/* VFL */
 /* ------------------------------------------------------------------ */
 
 static int n31_vfl_init(struct whimory *w)
@@ -2382,11 +2446,11 @@ static int n31_vfl_ingest_ctx(struct whimory *w, unsigned int ce,
 	w->vfl.ctx_block[cau] = block;
 
 	/*
-	 * sub_4EB7E4: memcpy(cxt_copies, data+0x100, 4 * num_copies).
-	 * Each record is {le16 phys_block, u8 bank, u8 flags} — VFL CXT
-	 * copy locations in the tail, not a user virt→phys table.
-	 * Live glass: first u32 is often 0x827 (block 2087).
-	 */
+ *: memcpy(cxt_copies, data+0x100, 4 * num_copies).
+ * Each record is {le16 phys_block, u8 bank, u8 flags} — VFL CXT
+ * copy locations in the tail, not a user virt→phys table.
+ * Live glass: first u32 is often 0x827 (block 2087).
+ */
 	tab = page + 0x100;
 	for (i = 0; i < 64 && 0x100 + 4 * (i + 1) <= 0x200; i++) {
 		u16 blk = get_unaligned_le16(tab + i * 4);
@@ -2399,7 +2463,7 @@ static int n31_vfl_ingest_ctx(struct whimory *w, unsigned int ce,
 	}
 	w->vfl.cxt_loc_count += loc;
 
-	/* sub_4EB098: per-bank u16 CXT copy journal at +0x200 + 32*bank */
+	/*: per-bank u16 CXT copy journal at +0x200 + 32*bank */
 	if (page_len >= WHIMORY_VFL_CXT_HDR +
 	    WHIMORY_VFL_SPARE_STRIDE * w->geom.num_cau + 2) {
 		unsigned int b, j, n16 = w->vfl.cxt_u16_len;
@@ -2424,11 +2488,11 @@ static int n31_vfl_ingest_ctx(struct whimory *w, unsigned int ce,
 	}
 
 	/*
-	 * sub_3D1438 bitmap: one byte per VBN (stride 0x8D0D0F0 = 1 on N31),
-	 * bit = bank. Not in the 0x200 header / spare journal. Try the
-	 * remainder of this CXT page; reject if any byte has bits outside
-	 * num_cau (would be unrelated payload).
-	 */
+ *bitmap: one byte per VBN (stride 0x8D0D0F0 = 1 on N31),
+ * bit = bank. Not in the 0x200 header / spare journal. Try the
+ * remainder of this CXT page; reject if any byte has bits outside
+ * num_cau (would be unrelated payload).
+ */
 	{
 		unsigned int off = WHIMORY_VFL_CXT_HDR +
 				   WHIMORY_VFL_SPARE_STRIDE * w->geom.num_cau;
@@ -2454,10 +2518,10 @@ static int n31_vfl_ingest_ctx(struct whimory *w, unsigned int ce,
 	}
 
 	/*
-	 * User VBN→PBN is identity over blocks_per_cau (sub_4EAE40:
-	 * vbn < mcxt.dev.blocks_per_cau). Failed-block replacement lives
-	 * in the u16 tables, not in a 256-entry slice of +0x100.
-	 */
+ * User VBN→PBN is identity over blocks_per_cau :
+ * vbn < mcxt.dev.blocks_per_cau). Failed-block replacement lives
+ * in the u16 tables, not in a 256-entry slice of +0x100.
+ */
 	w->vfl.remap_count = w->geom.blocks_per_cau;
 	dev_info(w->dev,
 		 "VFL ingest ce=%u cau=%u blk=%u magic=%d type20=%d cxt_loc=%u identity=%u\n",
@@ -2469,15 +2533,15 @@ static int n31_vfl_ingest_ctx(struct whimory *w, unsigned int ce,
 static int n31_vfl_open(struct whimory *w)
 {
 	u8 *page;
-	u8 meta[S5L8740_FMSS_META_SIZE];
+	u8 meta[S5L8740_NAND_META_SIZE];
 	unsigned int ce, cau, b, start, pg, slc;
 	int hits = 0;
 
-	page = kvmalloc(S5L8740_FMSS_PAGE_SIZE, GFP_KERNEL);
+	page = kvmalloc(S5L8740_NAND_PAGE_SIZE, GFP_KERNEL);
 	if (!page)
 		return -ENOMEM;
 	start = w->geom.blocks_per_cau - w->geom.vfl_tail;
-	s5l8740_fmss_nand_reset();
+	s5l8740_nand_reset();
 	for (ce = 0; ce < w->geom.num_ce; ce++) {
 		for (cau = 0; cau < w->geom.num_cau; cau++) {
 			for (b = start; b < w->geom.blocks_per_cau; b++) {
@@ -2486,10 +2550,10 @@ static int n31_vfl_open(struct whimory *w)
 
 					cond_resched();
 					for (slc = 0; slc < 2; slc++) {
-						got = s5l8740_fmss_page_read(ce,
+						got = s5l8740_nand_page_read(ce,
 							cau, b, pg, slc, 16,
 							page,
-							S5L8740_FMSS_PAGE_SIZE,
+							S5L8740_NAND_PAGE_SIZE,
 							meta, sizeof(meta));
 						if (!got)
 							break;
@@ -2498,7 +2562,7 @@ static int n31_vfl_open(struct whimory *w)
 						continue;
 					if (n31_vfl_ingest_ctx(w, ce, cau, b,
 							       page,
-							       S5L8740_FMSS_PAGE_SIZE,
+							       S5L8740_NAND_PAGE_SIZE,
 							       meta))
 						hits++;
 				}
@@ -2531,7 +2595,7 @@ static int n31_vfl_read_vba(struct whimory *w, u32 vba, u32 count,
 	u32 i, ce, cau, vblock, page, slot, pblock;
 	u32 last_ce = ~0u, last_cau = ~0u, last_pblock = ~0u, last_page = ~0u;
 	u8 *pagebuf;
-	u8 spare[S5L8740_FMSS_META_SIZE];
+	u8 spare[S5L8740_NAND_META_SIZE];
 	int ret;
 
 	if (!count || count > WHIMORY_VBAS_PER_PAGE)
@@ -2554,10 +2618,10 @@ static int n31_vfl_read_vba(struct whimory *w, u32 vba, u32 count,
 		pblock = whimory_vfl_phys(w, cau, vblock);
 		if (ce != last_ce || cau != last_cau || pblock != last_pblock ||
 		    page != last_page) {
-			ret = s5l8740_fmss_page_read(ce, cau, pblock, page, 0,
-						     16, pagebuf,
-						     S5L8740_FMSS_PAGE_SIZE,
-						     spare, sizeof(spare));
+			ret = whimory_cs_read_page(w, ce, cau, pblock, page,
+						   pagebuf,
+						   S5L8740_NAND_PAGE_SIZE,
+						   spare, sizeof(spare));
 			if (ret)
 				return ret;
 			last_ce = ce;
@@ -2603,10 +2667,10 @@ static int whimory_vfl_open(struct whimory *w)
 }
 
 /* ------------------------------------------------------------------ */
-/* SFTL recovery — classify SBs, replay BTOC/META by weave            */
+/* SFTL recovery — classify SBs, replay BTOC/META by weave */
 /* ------------------------------------------------------------------ */
 
-/* sub_50CFA0: FFFF0001 payload is {count, [lba,span]...} → unmap. */
+/*: FFFF0001 payload is {count, [lba,span]...} → unmap. */
 static int whimory_sftl_apply_list(struct whimory *w, u32 vba)
 {
 	u8 *buf;
@@ -2906,14 +2970,14 @@ static int whimory_rebuild_open_sb(struct whimory *w, struct whimory_sb *sb)
 {
 	unsigned int pg, slot, vblock;
 	u8 *data = w->sftl.data_page;
-	u8 spare[S5L8740_FMSS_META_SIZE];
+	u8 spare[S5L8740_NAND_META_SIZE];
 	int ret, hits = 0;
 
 	vblock = whimory_vfl_virt(w, sb->cau, sb->block);
 	for (pg = 0; pg < WHIMORY_DATA_PAGES_PER_SB; pg++) {
-		ret = s5l8740_fmss_page_read(sb->ce, sb->cau, sb->block, pg, 0,
-					     16, data, S5L8740_FMSS_PAGE_SIZE,
-					     spare, sizeof(spare));
+		ret = whimory_cs_read_page(w, sb->ce, sb->cau, sb->block, pg,
+					   data, S5L8740_NAND_PAGE_SIZE,
+					   spare, sizeof(spare));
 		if (ret)
 			break;
 		if (whimory_page_blank(data, 64) &&
@@ -2972,7 +3036,7 @@ static int whimory_sb_cmp(const void *a, const void *b)
 	return 0;
 }
 
-/* sub_569D18 analogue: CXT SB VBAs are not L2V_Update'd (sub_5884D4). */
+/*analogue: CXT SB VBAs are not L2V_Update'd. */
 static bool whimory_vba_is_cxt(struct whimory *w, u32 vba)
 {
 	u32 ce, cau, vblock, page, slot, phys, i;
@@ -3071,7 +3135,7 @@ static int whimory_cxt_load_sb(struct whimory *w, u32 sb_idx)
 	u32 last_ce = ~0u, last_cau = ~0u, last_pblock = ~0u, last_page = ~0u;
 	u32 zone, n, i;
 	u8 *data, *gmeta;
-	u8 spare[S5L8740_FMSS_META_SIZE];
+	u8 spare[S5L8740_NAND_META_SIZE];
 	int ret, done = 0;
 
 	if (sb_idx >= s->num_sb)
@@ -3085,7 +3149,7 @@ static int whimory_cxt_load_sb(struct whimory *w, u32 sb_idx)
 
 	w->cxt_lba_valid = false;
 	w->cxt_next_lba = 0;
-	/* sub_4FDBE8: VFL_Read in chunks of sftl.gc.zoneSize into ED7C/ED80. */
+	/*: VFL_Read in chunks of sftl.gc.zoneSize into ED7C/ED80. */
 	for (ofs = 0; ofs < s->vbas_per_sb && !done; ofs += zone) {
 		n = min(zone, s->vbas_per_sb - ofs);
 		for (i = 0; i < n; i++) {
@@ -3098,12 +3162,11 @@ static int whimory_cxt_load_sb(struct whimory *w, u32 sb_idx)
 			pblock = whimory_vfl_phys(w, cau, vblock);
 			if (ce != last_ce || cau != last_cau ||
 			    pblock != last_pblock || page != last_page) {
-				ret = s5l8740_fmss_page_read(ce, cau, pblock,
-							     page, 0, 16,
-							     s->data_page,
-							     S5L8740_FMSS_PAGE_SIZE,
-							     spare,
-							     sizeof(spare));
+				ret = whimory_cs_read_page(w, ce, cau, pblock,
+							   page, s->data_page,
+							   S5L8740_NAND_PAGE_SIZE,
+							   spare,
+							   sizeof(spare));
 				if (ret)
 					return ret;
 				last_ce = ce;
@@ -3240,7 +3303,7 @@ static void whimory_print_recovery_stats(struct whimory *w)
 static void whimory_scan_closed_meta0(struct whimory *w, unsigned int nsb)
 {
 	unsigned int i, pg, scanned = 0, cap;
-	u8 spare[S5L8740_FMSS_META_SIZE];
+	u8 spare[S5L8740_NAND_META_SIZE];
 	u8 *data = w->sftl.data_page;
 
 	cap = meta0_scan_sbs;
@@ -3258,10 +3321,10 @@ static void whimory_scan_closed_meta0(struct whimory *w, unsigned int nsb)
 		for (pg = 0; pg < WHIMORY_DATA_PAGES_PER_SB; pg++) {
 			int ret;
 
-			ret = s5l8740_fmss_page_read(sb->ce, sb->cau, sb->block,
-						     pg, 0, 16, data,
-						     S5L8740_FMSS_PAGE_SIZE,
-						     spare, sizeof(spare));
+			ret = whimory_cs_read_page(w, sb->ce, sb->cau, sb->block,
+						   pg, data,
+						   S5L8740_NAND_PAGE_SIZE,
+						   spare, sizeof(spare));
 			if (ret)
 				break;
 			whimory_note_meta0(w, sb->ce, sb->cau, sb->block, pg,
@@ -3275,7 +3338,7 @@ static void whimory_scan_closed_meta0(struct whimory *w, unsigned int nsb)
 static void whimory_dump_vba_page(struct whimory *w, u32 vba)
 {
 	u32 ce, cau, vblock, page, slot, pblock;
-	u8 spare[S5L8740_FMSS_META_SIZE];
+	u8 spare[S5L8740_NAND_META_SIZE];
 	u8 *data = w->sftl.data_page;
 	int ret;
 
@@ -3291,9 +3354,9 @@ static void whimory_dump_vba_page(struct whimory *w, u32 vba)
 		 "BAD_VBA vba=%u sb=%u ofs=%u -> ce=%u cau=%u vblock=%u pbn=%u page=%u map_slot=%u\n",
 		 vba, s_g_vba_to_sb(w, vba), s_g_vba_to_ofs(w, vba),
 		 ce, cau, vblock, pblock, page, slot);
-	ret = s5l8740_fmss_page_read(ce, cau, pblock, page, 0, 16, data,
-				     S5L8740_FMSS_PAGE_SIZE, spare,
-				     sizeof(spare));
+	ret = whimory_cs_read_page(w, ce, cau, pblock, page, data,
+				   S5L8740_NAND_PAGE_SIZE, spare,
+				   sizeof(spare));
 	if (ret) {
 		dev_warn(w->dev, "BAD_VBA page read %d\n", ret);
 		return;
@@ -3314,8 +3377,8 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 {
 	struct whimory_sftl *s = &w->sftl;
 	unsigned int ce, cau, b, nscan, nsb = 0, i, open_done = 0;
-	u8 meta0[S5L8740_FMSS_META_SIZE];
-	u8 meta127[S5L8740_FMSS_META_SIZE];
+	u8 meta0[S5L8740_NAND_META_SIZE];
+	u8 meta127[S5L8740_NAND_META_SIZE];
 	u8 *p127;
 	int ret;
 
@@ -3343,16 +3406,16 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 					dev_info(w->dev,
 						 "SFTL classify ce=%u cau=%u blk=%u/%u nsb=%u\n",
 						 ce, cau, b, nscan, nsb);
-				r0 = s5l8740_fmss_page_read(ce, cau, b, 0, 0, 16,
-							    w->sftl.data_page,
-							    S5L8740_FMSS_PAGE_SIZE,
-							    meta0, sizeof(meta0));
-				r127 = s5l8740_fmss_page_read(ce, cau, b,
-							      WHIMORY_BTOC_PAGE,
-							      0, 16, p127,
-							      S5L8740_FMSS_PAGE_SIZE,
-							      meta127,
-							      sizeof(meta127));
+				r0 = whimory_cs_read_page(w, ce, cau, b, 0,
+							  w->sftl.data_page,
+							  S5L8740_NAND_PAGE_SIZE,
+							  meta0, sizeof(meta0));
+				r127 = whimory_cs_read_page(w, ce, cau, b,
+							    WHIMORY_BTOC_PAGE,
+							    p127,
+							    S5L8740_NAND_PAGE_SIZE,
+							    meta127,
+							    sizeof(meta127));
 				if (!r0)
 					whimory_note_meta0(w, ce, cau, b, 0,
 							   w->sftl.data_page,
@@ -3382,11 +3445,10 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 					sb->kind = WHIMORY_SB_CXT;
 					s->cxt_sbs++;
 					whimory_cxt_add_base(w, sb_idx, sb->weave);
-				} else if (!r0 &&
-					   meta0[0] == WHIMORY_META_TYPE_SFTL_CXT) {
+				} else if (!r0 && whimory_meta_slot0_or_any_cxt(meta0)) {
 					sb->kind = WHIMORY_SB_CXT;
 					s->cxt_sbs++;
-				} else if (!r127 && whimory_meta_is_btoc(meta127)) {
+				} else if (!r127 && whimory_meta_any_btoc(meta127)) {
 					sb->kind = WHIMORY_SB_CLOSED;
 					s->btoc_sbs++;
 				} else if ((!r0 && whimory_meta_is_data_raw(meta0)) ||
@@ -3427,11 +3489,11 @@ classify_done:
 		if (sb->kind == WHIMORY_SB_CLOSED) {
 			int ingested;
 
-			ret = s5l8740_fmss_page_read(sb->ce, sb->cau, sb->block,
-						     WHIMORY_BTOC_PAGE, 0, 16,
-						     s->btoc_page,
-						     S5L8740_FMSS_PAGE_SIZE,
-						     meta127, sizeof(meta127));
+			ret = whimory_cs_read_page(w, sb->ce, sb->cau, sb->block,
+						   WHIMORY_BTOC_PAGE,
+						   s->btoc_page,
+						   S5L8740_NAND_PAGE_SIZE,
+						   meta127, sizeof(meta127));
 			if (ret)
 				continue;
 			s->btoc_pages_read++;
@@ -3445,7 +3507,7 @@ classify_done:
 			s->claim_weave = sb->weave;
 			ingested = whimory_ingest_btoc_page(w, sb->ce, sb->cau,
 							    vblock, s->btoc_page,
-							    S5L8740_FMSS_PAGE_SIZE);
+							    S5L8740_NAND_PAGE_SIZE);
 			s->claim_weave = 0;
 			if (ingested)
 				s->btoc_pages_valid++;
@@ -3498,22 +3560,24 @@ static int whimory_sftl_alloc(struct whimory *w)
 	s->vba_factor_b = s->vbas_per_sb;
 	s->nodepool_bytes = WHIMORY_MIN_NODEPOOL_BYTES;
 
-	s->btoc_page = kvmalloc(S5L8740_FMSS_PAGE_SIZE, GFP_KERNEL);
-	s->data_page = kvmalloc(S5L8740_FMSS_PAGE_SIZE, GFP_KERNEL);
+	s->btoc_page = kvmalloc(S5L8740_NAND_PAGE_SIZE, GFP_KERNEL);
+	s->data_page = kvmalloc(S5L8740_NAND_PAGE_SIZE, GFP_KERNEL);
 	s->meta_page = kvmalloc(WHIMORY_META_SIZE * WHIMORY_VBAS_PER_PAGE *
 				(WHIMORY_DATA_PAGES_PER_SB + 1), GFP_KERNEL);
+	s->cs_page = kvmalloc(sizeof(*s->cs_page), GFP_KERNEL);
 	s->sbs = kvcalloc(nsb, sizeof(*s->sbs), GFP_KERNEL);
-	if (!s->btoc_page || !s->data_page || !s->meta_page || !s->sbs)
+	if (!s->btoc_page || !s->data_page || !s->meta_page || !s->cs_page ||
+	    !s->sbs)
 		return -ENOMEM;
 
 	/*
-	 * sub_56863C: max_pages_per_btoc =
-	 *   div(page_bytes + 16 * vbas_per_sb - 1, page_bytes) + 1
-	 * 16×512 BTE bytes fit in a 16KiB NAND page → 1; OSOS adds 1 → 2.
-	 */
+ *: max_pages_per_btoc =
+ * div(page_bytes + 16 * vbas_per_sb - 1, page_bytes) + 1
+ * 16×512 BTE bytes fit in a 16KiB NAND page → 1; OSOS adds 1 → 2.
+ */
 	{
 		u32 page_bytes = w->geom.page_size ?
-				 w->geom.page_size : S5L8740_FMSS_PAGE_SIZE;
+				 w->geom.page_size : S5L8740_NAND_PAGE_SIZE;
 		u32 i;
 
 		s->max_pages_per_btoc =
@@ -3532,11 +3596,11 @@ static int whimory_sftl_alloc(struct whimory *w)
 	}
 
 	/*
-	 * sub_56A328: zoneSize starts at 0x8D0EC98 * vbas_per_page and
-	 * doubles until >= 16. Minimum from the loop is 16; must be a
-	 * multiple of vbas_per_page. CXT load (sub_4FDBE8) reads this
-	 * many VBAs into gc_data / gc_meta.
-	 */
+ *: zoneSize starts at 0x8D0EC98 * vbas_per_page and
+ * doubles until >= 16. Minimum from the loop is 16; must be a
+ * multiple of vbas_per_page. CXT load reads this
+ * many VBAs into gc_data / gc_meta.
+ */
 	s->gc_zone_size = WHIMORY_GC_ZONE_MIN;
 	if (s->gc_zone_size % s->vbas_per_page)
 		return -EINVAL;
@@ -3547,13 +3611,13 @@ static int whimory_sftl_alloc(struct whimory *w)
 	if (!s->gc_data || !s->gc_meta)
 		return -ENOMEM;
 	/*
-	 * sub_130158 full-size FTL: num_superblocks * user VBAs per SB.
-	 * BTOC page is not host LBA space (DATA_VBAS_PER_SB).
-	 */
+ *full-size FTL: num_superblocks * user VBAs per SB.
+ * BTOC page is not host LBA space (DATA_VBAS_PER_SB).
+ */
 	{
 		u64 cap = (u64)nsb * WHIMORY_DATA_VBAS_PER_SB;
 
-		w->total_4k_sectors = cap ? cap : FMSS_FTL_DEFAULT_CAPACITY;
+		w->total_4k_sectors = cap ? cap : NAND_FTL_DEFAULT_CAPACITY;
 	}
 	return 0;
 }
@@ -3692,12 +3756,13 @@ static int whimory_l2v_selftest(struct whimory *w)
 static int n31_sftl_open(struct whimory *w)
 {
 	int ret;
+	int sess;
 
 	/*
-	 * OSOS FTL_Open: sub_56863C BTOC (6 slots / 2 open LBA maps),
-	 * sub_56A328 GC zone, sub_56B56C block tables, sub_56C7B8 SB
-	 * state, nodepool ≥ 0x80000, sub_E8CA0 L2V_Init, then s_boot.
-	 */
+ * OSOS FTL_Open:BTOC (6 slots / 2 open LBA maps),
+ *GC zone,block tables,SB
+ * state, nodepool ≥ 0x80000,L2V_Init, then s_boot.
+ */
 	ret = whimory_sftl_alloc(w);
 	if (ret)
 		return ret;
@@ -3718,7 +3783,14 @@ static int n31_sftl_open(struct whimory *w)
 		return ret;
 	whimory_l2v_selftest(w);
 
+	sess = s5l8740_nand_dma_session_begin();
+	if (sess && sess != -EBUSY) {
+		dev_warn(w->dev, "SFTL recover: DMA session %d\n", sess);
+		/* Continue — cs_phys_read may still one-shot arm. */
+	}
 	ret = whimory_sftl_recover_l2v_from_media(w);
+	if (sess == 0)
+		s5l8740_nand_dma_session_end();
 	if (ret)
 		return ret;
 	return 0;
@@ -3735,11 +3807,11 @@ static const struct whimory_ftl_ops n31_sftl_ops = {
 static int whimory_select_ops(struct whimory *w)
 {
 	/*
-	 * OSOS dispatches VFL/FTL by signature major through a table that
-	 * is not named in the static dump. N31 media is PPN VFL + SFTL;
-	 * those are the only ops this module implements. Log the majors
-	 * from the signature (when present) and bind the N31 ops.
-	 */
+ * OSOS dispatches VFL/FTL by signature major through a table that
+ * is not named in the static dump. N31 media is PPN VFL + SFTL;
+ * those are the only ops this module implements. Log the majors
+ * from the signature (when present) and bind the N31 ops.
+ */
 	w->vfl_ops = &n31_vfl_ops;
 	w->ftl = &n31_sftl_ops;
 	if (w->sig_ok) {
@@ -3782,7 +3854,7 @@ static int whimory_ftl_open(struct whimory *w)
 }
 
 /* ------------------------------------------------------------------ */
-/* Read path (sub_56AB3C / sub_56C328)                                */
+/* Read path */
 /* ------------------------------------------------------------------ */
 
 static int whimory_validate_meta(struct whimory *w,
@@ -3917,7 +3989,7 @@ out:
 }
 
 /* ------------------------------------------------------------------ */
-/* Block device                                                       */
+/* Block device */
 /* ------------------------------------------------------------------ */
 
 static void whimory_submit_bio_range(struct bio *bio, u64 start_4k,
@@ -4048,7 +4120,7 @@ static int whimory_register_disk(struct whimory *w)
 	gd = whimory_alloc_disk(w, FTL_IPOD_NAME, &whimory_ipod_ops);
 	if (!IS_ERR(gd))
 		w->ipod_disk = gd;
-	s5l8740_fmss_register_ftl_read(whimory_ftl_read_hook);
+	s5l8740_nand_register_ftl_read(whimory_ftl_read_hook);
 	dev_info(w->dev,
 		 "/dev/%s registered read-only (%llu x %uB)\n",
 		 FTL_DISK_NAME, w->total_4k_sectors, WHIMORY_LBA_SIZE);
@@ -4057,7 +4129,7 @@ static int whimory_register_disk(struct whimory *w)
 
 static void whimory_unregister_disk(struct whimory *w)
 {
-	s5l8740_fmss_register_ftl_read(NULL);
+	s5l8740_nand_register_ftl_read(NULL);
 	if (w->ipod_disk) {
 		del_gendisk(w->ipod_disk);
 		put_disk(w->ipod_disk);
@@ -4074,16 +4146,23 @@ static ssize_t whimory_status_show(struct device *dev,
 				   struct device_attribute *attr, char *buf)
 {
 	struct whimory *w = whimory_dev;
+	int meta_ok = s5l8740_nand_meta_transport_ok();
 
 	if (!w)
 		return sysfs_emit(buf, "no device\n");
 	return sysfs_emit(buf,
 			  "fil=%d sig=%d vfl=%d ftl=%d l2v=%d lba0=%d oracle=%d\n"
+			  "meta_transport=%s cs_dma_safe=%d pio_meta_trusted=0 "
+			  "disk_gate=%s\n"
 			  "mapped_roots=%u mapped_lbas=%u btoc_sbs=%u open_sbs=%u cxt_sbs=%u empty=%u recs=%u cxt_loaded=%d packed=%d\n"
 			  "lba0_vba=%u cap=%llu vbas_per_sb=%u hole=%u list=%u\n"
 			  "spare_applied=%u bitmap=%u frag=%u/%u gc_zone=%u btoc_pages=%u updates=%u gen=%u free=%u list_unmapped=%u\n%s\n",
 			  w->fil_ok, w->sig_ok, w->vfl_ok, w->ftl_ok,
 			  w->l2v_ok, w->lba0_ok, w->oracle_used,
+			  meta_ok ? "enabled" : "disabled",
+			  meta_ok ? 1 : 0,
+			  w->disk ? "registered" :
+			  (meta_ok ? "blocked_open" : "blocked_cs_phys_only"),
 			  w->sftl.mapped_roots, w->sftl.mapped_lbas,
 			  w->sftl.btoc_sbs, w->sftl.open_sbs, w->sftl.cxt_sbs,
 			  w->sftl.empty_sbs, w->sftl.btoc_recs,
@@ -4119,13 +4198,14 @@ static void whimory_free(struct whimory *w)
 	kvfree(w->sftl.btoc_page);
 	kvfree(w->sftl.data_page);
 	kvfree(w->sftl.meta_page);
+	kvfree(w->sftl.cs_page);
 	kvfree(w->sftl.sbs);
 	kvfree(w->sftl.gc_data);
 	kvfree(w->sftl.gc_meta);
 	kvfree(w->vfl.bank_mask);
 	for (cau = 0; cau < WHIMORY_BTOC_OPEN; cau++)
 		kvfree(w->sftl.btoc_lba[cau]);
-	for (cau = 0; cau < S5L8740_FMSS_MAX_CAU; cau++) {
+	for (cau = 0; cau < S5L8740_NAND_MAX_CAU; cau++) {
 		kvfree(w->vfl.remap[cau]);
 		kvfree(w->vfl.cxt_u16[cau]);
 	}
@@ -4142,6 +4222,23 @@ static int whimory_open_stack(struct whimory *w)
 		whimory_set_status(w, "FIL_Init failed %d", ret);
 		return ret;
 	}
+
+	/*
+	 * Without CS metadata DMA, classic Whimory open cannot validate
+	 * META via page_read. Recover is available via CS phys reads:
+	 * echo 1 > .../ftl_sftl_recover  (binds csmap disks to L2V).
+	 */
+	if (!s5l8740_nand_meta_transport_ok()) {
+		whimory_set_status(w,
+				   "CS metadata DMA disabled; "
+				   "use ftl_sftl_recover (CS META path) "
+				   "or meta_dma_read=1");
+		pr_info("s5l8740-ftl: Whimory auto-open deferred "
+			"(meta_dma_read=0); run ftl_sftl_recover for "
+			"CXT→BTOC→L2V on CS META\n");
+		return -EOPNOTSUPP;
+	}
+
 	ret = whimory_read_signature(w);
 	if (ret) {
 		whimory_set_status(w, "signature failed %d", ret);
@@ -4174,20 +4271,221 @@ static int whimory_open_stack(struct whimory *w)
 	return 0;
 }
 
+bool whimory_l2v_ready(void)
+{
+	return whimory_dev && whimory_dev->l2v_ok;
+}
+
+int whimory_read_fmss_lba(u32 lba, void *buf)
+{
+	struct whimory *w = whimory_dev;
+	int sess, ret;
+
+	if (!w || !buf)
+		return -EINVAL;
+	if (!w->l2v_ok || !w->ftl || !w->ftl->read_lba)
+		return -ENODEV;
+	sess = s5l8740_nand_dma_session_begin();
+	mutex_lock(&w->tree_lock);
+	ret = w->ftl->read_lba(w, lba, buf, false);
+	mutex_unlock(&w->tree_lock);
+	if (sess == 0)
+		s5l8740_nand_dma_session_end();
+	return ret;
+}
+
+int whimory_range_walk(int (*fn)(u32 start, u32 len, u32 vba, u64 weave,
+				 void *ctx),
+		       void *ctx)
+{
+	struct whimory *w = whimory_dev;
+	struct rb_node *n;
+	struct whimory_range *snap;
+	unsigned int i, count = 0;
+	int ret = 0;
+
+	if (!w || !fn)
+		return -EINVAL;
+
+	mutex_lock(&w->tree_lock);
+	count = w->sftl.range_nodes;
+	if (!count) {
+		mutex_unlock(&w->tree_lock);
+		return 0;
+	}
+	snap = kvmalloc_array(count, sizeof(*snap), GFP_KERNEL);
+	if (!snap) {
+		mutex_unlock(&w->tree_lock);
+		return -ENOMEM;
+	}
+	i = 0;
+	for (n = rb_first(&w->ranges); n && i < count; n = rb_next(n)) {
+		struct whimory_range *r = rb_entry(n, struct whimory_range, rb);
+
+		snap[i].start = r->start;
+		snap[i].len = r->len;
+		snap[i].vba = r->vba;
+		snap[i].weave = r->weave;
+		i++;
+	}
+	count = i;
+	mutex_unlock(&w->tree_lock);
+
+	for (i = 0; i < count; i++) {
+		ret = fn(snap[i].start, snap[i].len, snap[i].vba,
+			 snap[i].weave, ctx);
+		if (ret)
+			break;
+	}
+	kvfree(snap);
+	return ret;
+}
+
+int whimory_l2v_search_phys(u32 lba, u8 *ce, u8 *cau, u16 *blk, u8 *page,
+			    u8 *slot, u64 *weave)
+{
+	struct whimory *w = whimory_dev;
+	u32 vba = ~0u, span = 0, vce, vcau, vblock, vpage, vslot, pblock;
+	struct whimory_range *r;
+	int ret;
+
+	if (!w || !w->l2v_ok)
+		return -ENODEV;
+	mutex_lock(&w->tree_lock);
+	ret = whimory_l2v_search(w, lba, &vba, &span);
+	if (ret || vba >= w->l2v.invalid_vba) {
+		mutex_unlock(&w->tree_lock);
+		return ret ? ret : -ENOENT;
+	}
+	r = whimory_range_find(&w->ranges, lba);
+	if (weave)
+		*weave = r ? r->weave : 0;
+	ret = whimory_unpack_vba(w, vba, &vce, &vcau, &vblock, &vpage, &vslot);
+	if (ret) {
+		mutex_unlock(&w->tree_lock);
+		return ret;
+	}
+	vcau = whimory_vfl_bank(w, vcau, vblock);
+	pblock = whimory_vfl_phys(w, vcau, vblock);
+	mutex_unlock(&w->tree_lock);
+	if (ce)
+		*ce = (u8)vce;
+	if (cau)
+		*cau = (u8)vcau;
+	if (blk)
+		*blk = (u16)pblock;
+	if (page)
+		*page = (u8)vpage;
+	if (slot)
+		*slot = (u8)vslot;
+	return 0;
+}
+
+int whimory_sftl_recover_cs(void)
+{
+	struct whimory *w = whimory_dev;
+	int ret, sess;
+
+	if (!w)
+		return -ENODEV;
+
+	ret = whimory_fil_init(w);
+	if (ret) {
+		whimory_set_status(w, "FIL_Init failed %d", ret);
+		return ret;
+	}
+
+	ret = whimory_read_signature(w);
+	if (ret) {
+		dev_warn(w->dev,
+			 "signature %d; CS recover continues (identity VFL)\n",
+			 ret);
+	}
+
+	ret = whimory_select_ops(w);
+	if (ret)
+		return ret;
+
+	if (!w->vfl_ok) {
+		ret = whimory_vfl_open(w);
+		if (ret) {
+			whimory_set_status(w, "VFL_Open failed %d", ret);
+			return ret;
+		}
+	}
+
+	if (!w->ftl_ok) {
+		ret = whimory_ftl_open(w);
+		if (ret) {
+			whimory_set_status(w, "FTL_Open/recover failed %d",
+					   ret);
+			return ret;
+		}
+	} else {
+		/* Re-run recover on CS META (clear prior L2V). */
+		whimory_range_free(w);
+		if (w->l2v.root && w->l2v.num_roots)
+			memset(w->l2v.root, 0xff,
+			       WHIMORY_L2V_ROOT_REC_SIZE * w->l2v.num_roots);
+		whimory_l2v_mem_reset(&w->l2v);
+		w->l2v_ok = false;
+		w->sftl.cxt_loaded = false;
+		w->sftl.packed_ok = false;
+		w->n_cxt = 0;
+		w->cxt_base_weave = 0;
+		w->sftl.btoc_sbs = 0;
+		w->sftl.open_sbs = 0;
+		w->sftl.empty_sbs = 0;
+		w->sftl.cxt_sbs = 0;
+		w->sftl.unknown_sbs = 0;
+		w->sftl.btoc_pages_read = 0;
+		w->sftl.btoc_pages_valid = 0;
+		w->sftl.btoc_entries_seen = 0;
+		w->sftl.btoc_l2v_updates = 0;
+		w->sftl.open_slots_seen = 0;
+		w->sftl.open_slots_valid_meta = 0;
+		w->sftl.open_l2v_updates = 0;
+		w->sftl.range_nodes = 0;
+		w->sftl.cxt_l2v_updates = 0;
+
+		sess = s5l8740_nand_dma_session_begin();
+		if (sess && sess != -EBUSY)
+			dev_warn(w->dev, "re-recover DMA session %d\n", sess);
+		ret = whimory_sftl_recover_l2v_from_media(w);
+		if (sess == 0)
+			s5l8740_nand_dma_session_end();
+		if (ret) {
+			whimory_set_status(w, "re-recover failed %d", ret);
+			return ret;
+		}
+	}
+
+	if (!w->l2v_ok) {
+		whimory_set_status(w, "recover OK but l2v_ok=0");
+		return -EIO;
+	}
+	whimory_set_status(w,
+			   "CS recover OK mapped_ranges=%u btoc=%u open=%u",
+			   w->sftl.range_nodes, w->sftl.btoc_pages_valid,
+			   w->sftl.open_l2v_updates);
+	dev_info(w->dev, "%s\n", w->status);
+	return 0;
+}
+
 static int __init ftl_init(void)
 {
 	struct whimory *w;
 	int ret;
 
-	if (!s5l8740_fmss_available()) {
-		pr_err("s5l8740-ftl: load fmss-s5l8740.ko first\n");
+	if (!s5l8740_nand_available()) {
+		pr_err("s5l8740-ftl: load nand_s5l8740 first\n");
 		return -ENODEV;
 	}
 
 	w = kzalloc(sizeof(*w), GFP_KERNEL);
 	if (!w)
 		return -ENOMEM;
-	w->dev = fmss_ftl_device();
+	w->dev = nand_ftl_device();
 	mutex_init(&w->bounce_lock);
 	mutex_init(&w->tree_lock);
 	w->ranges = RB_ROOT;
@@ -4196,7 +4494,7 @@ static int __init ftl_init(void)
 		kfree(w);
 		return -ENOMEM;
 	}
-	w->total_4k_sectors = FMSS_FTL_DEFAULT_CAPACITY;
+	w->total_4k_sectors = NAND_FTL_DEFAULT_CAPACITY;
 	whimory_dev = w;
 
 	ftl_pdev = platform_device_register_simple("s5l8740-ftl", -1, NULL, 0);
@@ -4218,6 +4516,10 @@ static int __init ftl_init(void)
 		return ret;
 	}
 
+	ret = ftl_s5l8740_csmap_init(&ftl_pdev->dev);
+	if (ret)
+		dev_warn(&ftl_pdev->dev, "CS map init failed %d\n", ret);
+
 	ret = whimory_open_stack(w);
 	if (ret) {
 		dev_err(w->dev,
@@ -4225,9 +4527,9 @@ static int __init ftl_init(void)
 			ret, FTL_DISK_NAME, w->fil_ok, w->sig_ok, w->vfl_ok,
 			w->ftl_ok, w->l2v_ok, w->lba0_ok);
 		/*
-		 * Keep the platform device so sysfs status is visible.
-		 * The block disk is absent until LBA0 works.
-		 */
+ * Keep the platform device so sysfs status is visible.
+ * The block disk is absent until LBA0 works.
+ */
 		return 0;
 	}
 	return 0;
@@ -4238,6 +4540,7 @@ static void __exit ftl_exit(void)
 	struct whimory *w = whimory_dev;
 
 	if (ftl_pdev) {
+		ftl_s5l8740_csmap_exit(&ftl_pdev->dev);
 		sysfs_remove_group(&ftl_pdev->dev.kobj, &ftl_attr_group);
 		platform_device_unregister(ftl_pdev);
 		ftl_pdev = NULL;
@@ -4252,7 +4555,7 @@ module_exit(ftl_exit);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("S5L8740 Whimory PPN SFTL read-only block driver");
 MODULE_AUTHOR("n31");
-MODULE_SOFTDEP("pre: fmss_s5l8740");
+MODULE_SOFTDEP("pre: nand_s5l8740");
 MODULE_FIRMWARE(WHIMORY_ORACLE_SIG);
 MODULE_FIRMWARE(WHIMORY_ORACLE_ROOT);
 MODULE_FIRMWARE(WHIMORY_ORACLE_NODES);

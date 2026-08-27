@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0
 #
 # Makefile for misc devices that really don't fit anywhere else.
-#
 
 obj-$(CONFIG_IBM_ASM)		+= ibmasm/
 obj-$(CONFIG_IBMVMC)		+= ibmvmc.o
@@ -78,5 +77,7 @@ obj-y				+= keba/
 obj-$(CONFIG_APPLE_MIKEYBUS)		+= apple-mikeybus.o
 obj-$(CONFIG_APPLE_TRISTAR_CBTL1609)	+= apple-tristar-cbtl1609.o
 obj-$(CONFIG_S5L8740_IIS2_MMIO)	+= s5l8740-iis2-mmio.o
-obj-$(CONFIG_FMSS_S5L8740)	+= fmss-s5l8740.o
 obj-$(CONFIG_FTL_S5L8740)	+= ftl-s5l8740.o
+obj-m += nand-s5l8740.o
+obj-m += ftl-s5l8740.o
+ftl-s5l8740-y := ftl-s5l8740-core.o ftl-s5l8740-csmap.o ftl-s5l8740-vecmap.o

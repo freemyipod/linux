@@ -103,7 +103,7 @@
 #define NIMBUS_A34_BASE		0x2202fe00UL	/* sub_A34(idx) = 0x2202FE00+idx */
 #define NIMBUS_A34_ISYS_DESC	(NIMBUS_A34_BASE + 0x18)	/* sub_A34(24) */
 
-/* Whimory FTL (fmss-s5l8740.ko) — optional cal/FW from device NAND */
+/* Whimory FTL (nand-s5l8740.ko) — optional cal/FW from device NAND */
 #define NIMBUS_FTL_SECTOR_SIZE	4096U
 #define NIMBUS_GPFW_TAG		0x67706677u	/* 'gpfw' LE */
 
@@ -230,9 +230,9 @@ static unsigned int exec_word1 = 0x00000100;
 module_param(exec_word1, uint, 0644);
 MODULE_PARM_DESC(exec_word1, "2D54C EXEC word1 (OSOS 0x00000100)");
 
-/* fmss-s5l8740.ko exports (optional link). */
-bool fmss_ftl_present(void);
-int fmss_ftl_read_sector(u64 logical_sector, void *buf);
+/* nand-s5l8740.ko exports (optional link). */
+bool nand_ftl_present(void);
+int nand_ftl_read_sector(u64 logical_sector, void *buf);
 
 static bool nimbus_verbose = true;
 
@@ -1193,8 +1193,8 @@ static void nimbus_ftl_init_once(void)
 	if (nimbus_ftl_inited)
 		return;
 	nimbus_ftl_inited = true;
-	nimbus_ftl_present_fn = symbol_get(fmss_ftl_present);
-	nimbus_ftl_read_fn = symbol_get(fmss_ftl_read_sector);
+	nimbus_ftl_present_fn = symbol_get(nand_ftl_present);
+	nimbus_ftl_read_fn = symbol_get(nand_ftl_read_sector);
 }
 
 static bool nimbus_ftl_ready(void)

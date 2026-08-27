@@ -14,7 +14,7 @@
 #include <linux/types.h>
 #include <linux/unaligned.h>
 
-#include "fmss-s5l8740-api.h"
+#include "nand-s5l8740.h"
 
 #define WHIMORY_SIG_SIZE		0x600
 #define WHIMORY_SIG_MAGIC		0x776d7278u	/* "xrmw" LE — payload, not raw page+0 */
@@ -188,10 +188,10 @@ struct whimory_range {
 };
 
 struct whimory_vfl {
-	u32 *remap[S5L8740_FMSS_MAX_CAU];
-	u16 *cxt_u16[S5L8740_FMSS_MAX_CAU];
-	u32 ctx_ce[S5L8740_FMSS_MAX_CAU];
-	u32 ctx_block[S5L8740_FMSS_MAX_CAU];
+	u32 *remap[S5L8740_NAND_MAX_CAU];
+	u16 *cxt_u16[S5L8740_NAND_MAX_CAU];
+	u32 ctx_ce[S5L8740_NAND_MAX_CAU];
+	u32 ctx_block[S5L8740_NAND_MAX_CAU];
 	u32 remap_count;
 	u32 cxt_u16_len;
 	u32 cxt_loc_count;
@@ -202,7 +202,7 @@ struct whimory_vfl {
 	u8 *bank_mask;		/* [blocks_per_cau] bank bitmask; sub_3D1438 */
 	u16 cached_vbn;
 	u8 cached_n;
-	u8 cached_banks[S5L8740_FMSS_MAX_CAU];
+	u8 cached_banks[S5L8740_NAND_MAX_CAU];
 };
 
 struct whimory_sb {
@@ -225,6 +225,7 @@ struct whimory_sftl {
 	u8 *btoc_page;
 	u8 *data_page;
 	u8 *meta_page;
+	struct s5l8740_cs_page *cs_page; /* CS span4 scratch for recover/read */
 	struct whimory_sb *sbs;
 	u32 mapped_roots;
 	u32 mapped_lbas;
