@@ -179,6 +179,11 @@
             interrupt-parent = <&vic0>;
             interrupts = <26>;
             status = "okay";
+
+            mikeybus {
+                compatible = "apple,mikeybus", "apple,n31-mikeybus";
+                current-speed = <115200>;
+            };
         };
 
         usbphy: usbphy@3c400000 {

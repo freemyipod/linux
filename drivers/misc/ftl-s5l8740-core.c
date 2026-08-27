@@ -12,7 +12,9 @@
 #include <linux/bio.h>
 #include <linux/bitops.h>
 #include <linux/blkdev.h>
+#include <linux/delay.h>
 #include <linux/firmware.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/module.h>
@@ -53,6 +55,191 @@ static unsigned int scan_blocks = 256;
 module_param(scan_blocks, uint, 0644);
 MODULE_PARM_DESC(scan_blocks,
 		 "User blocks per CE/CAU to classify (0 = all; default 256)");
+
+/*
+ * BTOC meta-confirm re-reads every candidate data page over CS. Full-SB
+ * confirm across closed BTOCs wedges USB (~2min then reset). Cap confirms;
+ * open-META rebuild remains the bulk authority. 0 = unlimited (raise only
+ * after correctness passes; stage with scan_blocks).
+ */
+static bool btoc_meta_confirm = true;
+module_param(btoc_meta_confirm, bool, 0644);
+MODULE_PARM_DESC(btoc_meta_confirm,
+		 "CS-read data pages to take meta_lba as L2V key (default Y)");
+
+static unsigned int btoc_confirm_max = 512;
+module_param(btoc_confirm_max, uint, 0644);
+MODULE_PARM_DESC(btoc_confirm_max,
+		 "Max BTOC CS page confirms per recover (default 512; 0=unlimited)");
+/* Alias name from bring-up notes. */
+module_param_named(btoc_confirm_pages_cap, btoc_confirm_max, uint, 0644);
+
+/* Soft wall-clock budget for BTOC confirms (0 = ignore). */
+static unsigned int recover_budget_ms;
+module_param(recover_budget_ms, uint, 0644);
+MODULE_PARM_DESC(recover_budget_ms,
+		 "Stop BTOC confirms after this many ms (0=off)");
+
+/* Keep RNDIS/USB alive during long recover (default 2ms every 4 blocks). */
+static unsigned int recover_yield_us = 2000;
+module_param(recover_yield_us, uint, 0644);
+MODULE_PARM_DESC(recover_yield_us,
+		 "usleep between classify blocks to keep USB alive (0=off; default 2000)");
+
+/*
+ * Interval-map node budget. N31 glass has ~55 MiB of RAM total; each
+ * whimory_range is a kmalloc-64 slab object. Running out mid-recover is an
+ * OOM panic (panic=-1 → reboot to RetailOS), which costs a DFU cycle and
+ * loses the log. Stop adding mappings at the budget and report instead.
+ */
+static unsigned int max_range_nodes = 200000;
+module_param(max_range_nodes, uint, 0644);
+MODULE_PARM_DESC(max_range_nodes,
+		 "Interval-map node ceiling; stop mapping past it (0=unlimited)");
+
+/*
+ * The SFTL context is the authoritative FTL snapshot and only turns up
+ * once scan_blocks reaches the high blocks that hold it (~1960 on N31).
+ * It maps 600k+ LBAs in a few thousand coalesced ranges, but its VBAs do
+ * not yet resolve (sftl lba mismatch → no BPB in L2V). Off skips both the
+ * CXT load and the weave filter that suppresses replay of older SBs, so
+ * the brute-force BTOC/open rebuild still yields a mountable disk.
+ */
+/*
+ * Open-SB rebuild assigns each VBA its own weave, so adjacent LBAs landing
+ * in adjacent VBAs never merged and the map cost one 64-byte rb node per
+ * LBA — 46 MiB to replay every open SB on a 55 MiB device. Merging
+ * neighbours that are contiguous in both LBA and VBA and keeping the OLDER
+ * weave collapses sequentially written data; keeping the older weave means
+ * a later claim is never wrongly rejected as stale, it just splits the
+ * range again. 0 restores exact per-weave ranges.
+ */
+/*
+ * Closed superblocks currently cost the same 127 CS reads as open ones:
+ * the BTOC is used only to pick pages to re-read, and the per-slot meta is
+ * taken as the L2V key. Before trusting the BTOC records outright, measure
+ * whether they actually predict that metadata.
+ */
+static unsigned int btoc_verify_sbs;
+module_param(btoc_verify_sbs, uint, 0644);
+MODULE_PARM_DESC(btoc_verify_sbs,
+		 "Closed SBs to probe for BTOC-vs-meta agreement (0=off)");
+
+static unsigned int btoc_verify_pages = 6;
+module_param(btoc_verify_pages, uint, 0644);
+MODULE_PARM_DESC(btoc_verify_pages,
+		 "Pages sampled per verified BTOC (default 6)");
+
+/*
+ * Console logging is not free on this target: every dev_info goes out the
+ * serial console and measurably lengthens recover. Quiet by default; the
+ * deep bring-up dumps come back with diag=1.
+ */
+static bool ftl_diag;
+module_param_named(diag, ftl_diag, bool, 0644);
+MODULE_PARM_DESC(diag,
+		 "Per-LBA/BTOC/VBA diagnostic dumps (default N)");
+
+static bool ftl_progress = true;
+module_param_named(progress, ftl_progress, bool, 0644);
+MODULE_PARM_DESC(progress, "Periodic recover progress lines (default Y)");
+
+static unsigned int progress_ms = 5000;
+module_param(progress_ms, uint, 0644);
+MODULE_PARM_DESC(progress_ms, "Minimum ms between progress lines");
+
+/* Rate-limit: emit at most this many of a repeating diagnostic. */
+static unsigned int diag_max_lines = 3;
+module_param(diag_max_lines, uint, 0644);
+MODULE_PARM_DESC(diag_max_lines, "Cap on repeated read-miss/winner lines");
+
+/* True once per progress_ms window; keeps hot loops from flooding. */
+static bool ftl_progress_due(struct whimory *w)
+{
+	unsigned long now = jiffies;
+
+	if (!ftl_progress)
+		return false;
+	if (w->progress_jiffies &&
+	    time_before(now, w->progress_jiffies + msecs_to_jiffies(progress_ms)))
+		return false;
+	w->progress_jiffies = now;
+	return true;
+}
+
+static bool range_coalesce = true;
+module_param(range_coalesce, bool, 0644);
+MODULE_PARM_DESC(range_coalesce,
+		 "Merge LBA/VBA-contiguous ranges across weaves (default Y)");
+
+static bool use_cxt = true;
+module_param(use_cxt, bool, 0644);
+MODULE_PARM_DESC(use_cxt,
+		 "Load the SFTL CXT snapshot during recover (default Y)");
+
+/*
+ * A full rebuild used to be re-runnable at any time, so a stray write to
+ * ftl_sftl_recover could tear down a live map underneath a mounted disk.
+ */
+enum whimory_recovery_state {
+	RECOVERY_NONE = 0,
+	RECOVERY_RUNNING,
+	RECOVERY_VALID,
+	RECOVERY_FAILED,
+};
+
+static enum whimory_recovery_state recovery_state;
+static u32 recovery_params_key;
+
+static bool recover_force;
+module_param(recover_force, bool, 0644);
+MODULE_PARM_DESC(recover_force,
+		 "Allow rebuild when a map is already valid/bound (default N)");
+
+/* Changing any of these is a different map, so a repeat is not a no-op. */
+static u32 whimory_recover_key(void)
+{
+	return scan_blocks * 1000003u + max_open_sbs * 10007u +
+	       btoc_confirm_max * 101u + (use_cxt ? 2u : 0u) +
+	       (range_coalesce ? 1u : 0u) + max_range_nodes;
+}
+
+const char *whimory_recovery_state_name(void)
+{
+	switch (recovery_state) {
+	case RECOVERY_RUNNING:
+		return "running";
+	case RECOVERY_VALID:
+		return "valid";
+	case RECOVERY_FAILED:
+		return "failed";
+	default:
+		return "none";
+	}
+}
+EXPORT_SYMBOL_GPL(whimory_recovery_state_name);
+
+static bool audit_lba_winners;
+module_param(audit_lba_winners, bool, 0644);
+MODULE_PARM_DESC(audit_lba_winners,
+		 "Log duplicate-LBA winner decisions for critical fmss LBAs");
+
+/* Dump every winner decision for this absolute fmss_lba (0 = off). */
+static unsigned int l2v_trace_lba;
+module_param(l2v_trace_lba, uint, 0644);
+MODULE_PARM_DESC(l2v_trace_lba,
+		 "Log L2V winner old/new for this fmss_lba (0=off)");
+
+/* Apply BTOC FFFF0001 LIST unmaps during recover (default Y). */
+static bool btoc_apply_list = true;
+module_param(btoc_apply_list, bool, 0644);
+MODULE_PARM_DESC(btoc_apply_list,
+		 "Apply BTOC LIST (FFFF0001) unmap payloads during recover");
+
+static bool vba_page_dump;
+module_param(vba_page_dump, bool, 0644);
+MODULE_PARM_DESC(vba_page_dump,
+		 "Emit VBA_DIAG sibling slot dump on critical reads (default N)");
 
 static unsigned int meta0_scan_sbs = 4;
 module_param(meta0_scan_sbs, uint, 0644);
@@ -97,11 +284,16 @@ static struct whimory *whimory_dev;
 static struct platform_device *ftl_pdev;
 
 static void whimory_l2v_find_frag(struct whimory *w);
+static void whimory_l2v_cache_flush(struct whimory *w);
 static void whimory_l2v_free_tree(struct whimory *w, u32 node_idx, u32 root_idx);
 static int whimory_l2v_update_packed(struct whimory *w, u32 ridx, u32 off,
 				     u32 span, u32 vba);
 static int n31_sftl_read_lba(struct whimory *w, u32 lba, void *buf,
 			     bool allow_blank);
+static bool whimory_audit_fmss_lba(u32 fmss_lba);
+static void whimory_note_payload_strings(struct whimory *w, const u8 *data,
+					 unsigned int len);
+static void whimory_dump_vba_page(struct whimory *w, u32 vba, u32 fmss_lba);
 
 static u64 whimory_weave48(const u8 *m)
 {
@@ -235,12 +427,15 @@ static bool whimory_special_lba(u32 lba)
 static u32 whimory_vfl_phys(struct whimory *w, u32 cau, u32 virt)
 {
 	/*
- *: PBN = VBN (identity over blocks_per_cau).
- * The u16 table at CXT +0x200 is a VFL CXT copy journal
- * : value = index | (gen<<15), 0xC070 = free), not
- * virt→phys. Failed user blocks keep the same VBN and switch
- * CAU via the bank bitmap.
- */
+	 * The N31 VFL is an identity map over blocks_per_cau: physical
+	 * block number equals virtual block number.
+	 *
+	 * The u16 table at CXT +0x200 looks like a remap table but is not
+	 * one — it is the VFL context copy journal, where each value is
+	 * index | (generation << 15) and 0xC070 marks a free slot. A failed
+	 * user block keeps its VBN and moves to another CAU instead, which
+	 * the bank bitmap records.
+	 */
 	if (cau >= w->geom.num_cau || !w->vfl.remap[cau])
 		return virt;
 	if (virt >= w->geom.blocks_per_cau)
@@ -248,7 +443,7 @@ static u32 whimory_vfl_phys(struct whimory *w, u32 cau, u32 virt)
 	return w->vfl.remap[cau][virt];
 }
 
-/*: banks that participate in this VBN. */
+/* Collect the CAU banks that participate in this virtual block. */
 static u32 whimory_vfl_banks_in_vbn(struct whimory *w, u32 vbn, u8 *out,
 				    u32 out_max)
 {
@@ -410,6 +605,33 @@ static struct whimory_range *whimory_range_find(struct rb_root *root, u32 lba)
 	return NULL;
 }
 
+/*
+ * Leftmost range that can overlap [lba, ...) — i.e. the first with
+ * start + len > lba. Ranges are disjoint and keyed by start, so r_end is
+ * monotonic in tree order and the predicate is a valid binary search.
+ *
+ * Callers used to walk from rb_first(), which made every L2V update
+ * O(ranges) and the whole recover O(ranges^2). At wide scan_blocks that
+ * spins the CPU long enough to starve RNDIS and trip the watchdog.
+ */
+static struct whimory_range *whimory_range_lower(struct rb_root *root, u32 lba)
+{
+	struct rb_node *n = root->rb_node;
+	struct whimory_range *best = NULL;
+
+	while (n) {
+		struct whimory_range *r = rb_entry(n, struct whimory_range, rb);
+
+		if (r->start + r->len > lba) {
+			best = r;
+			n = n->rb_left;
+		} else {
+			n = n->rb_right;
+		}
+	}
+	return best;
+}
+
 static int whimory_range_link(struct rb_root *root, struct whimory_range *n)
 {
 	struct rb_node **link = &root->rb_node, *parent = NULL;
@@ -448,6 +670,7 @@ static int whimory_range_split(struct whimory *w, struct whimory_range *r,
 	r->len = left_len;
 	whimory_range_link(&w->ranges, right);
 	w->sftl.range_nodes++;
+	w->sftl.map_gen++;
 	return 0;
 }
 
@@ -455,6 +678,7 @@ static void whimory_range_erase(struct whimory *w, struct whimory_range *r)
 {
 	rb_erase(&r->rb, &w->ranges);
 	kfree(r);
+	w->sftl.map_gen++;
 	if (w->sftl.range_nodes)
 		w->sftl.range_nodes--;
 }
@@ -466,6 +690,10 @@ static int whimory_range_insert_new(struct whimory *w, u32 start, u32 len,
 
 	if (!len)
 		return 0;
+	if (max_range_nodes && w->sftl.range_nodes >= max_range_nodes) {
+		w->sftl.range_budget_stop++;
+		return 0;
+	}
 	n = kzalloc(sizeof(*n), GFP_KERNEL);
 	if (!n)
 		return -ENOMEM;
@@ -475,7 +703,17 @@ static int whimory_range_insert_new(struct whimory *w, u32 start, u32 len,
 	n->weave = w->sftl.claim_weave;
 	whimory_range_link(&w->ranges, n);
 	w->sftl.range_nodes++;
+	w->sftl.map_gen++;
 	return 0;
+}
+
+/* Merge r with either neighbour when both LBA and VBA stay contiguous. */
+static bool whimory_range_joinable(const struct whimory_range *a,
+				   const struct whimory_range *b)
+{
+	if (a->start + a->len != b->start || a->vba + a->len != b->vba)
+		return false;
+	return range_coalesce || a->weave == b->weave;
 }
 
 static void whimory_range_coalesce_at(struct whimory *w, u32 start)
@@ -489,10 +727,10 @@ static void whimory_range_coalesce_at(struct whimory *w, u32 start)
 	p = rb_prev(&r->rb);
 	if (p) {
 		prev = rb_entry(p, struct whimory_range, rb);
-		if (prev->start + prev->len == r->start &&
-		    prev->vba + prev->len == r->vba &&
-		    prev->weave == r->weave) {
+		if (whimory_range_joinable(prev, r)) {
 			prev->len += r->len;
+			if (r->weave < prev->weave)
+				prev->weave = r->weave;
 			whimory_range_erase(w, r);
 			r = prev;
 		}
@@ -500,10 +738,10 @@ static void whimory_range_coalesce_at(struct whimory *w, u32 start)
 	q = rb_next(&r->rb);
 	if (q) {
 		next = rb_entry(q, struct whimory_range, rb);
-		if (r->start + r->len == next->start &&
-		    r->vba + r->len == next->vba &&
-		    r->weave == next->weave) {
+		if (whimory_range_joinable(r, next)) {
 			r->len += next->len;
+			if (next->weave < r->weave)
+				r->weave = next->weave;
 			whimory_range_erase(w, next);
 		}
 	}
@@ -520,20 +758,21 @@ static int whimory_range_update(struct whimory *w, u32 lba, u32 span, u32 vba)
 		return 0;
 
 	{
-		u32 end = lba + span;
-		struct rb_node *node = rb_first(&w->ranges);
+		struct whimory_range *first = whimory_range_lower(&w->ranges,
+								 lba);
+		struct rb_node *node = first ? &first->rb : NULL;
 
 		while (node) {
 			struct whimory_range *r = rb_entry(node,
 							  struct whimory_range,
 							  rb);
-			u32 r_end = r->start + r->len;
 
 			if (r->start >= end)
 				break;
-			if (r_end > lba && r->start < end &&
-			    r->weave > w->sftl.claim_weave)
-				return 0;
+			if (r->weave > w->sftl.claim_weave) {
+				w->sftl.stale_mapping_rejected++;
+				return 1; /* stale — do not touch packed L2V */
+			}
 			node = rb_next(node);
 		}
 	}
@@ -553,7 +792,8 @@ static int whimory_range_update(struct whimory *w, u32 lba, u32 span, u32 vba)
 		}
 	}
 
-	node = rb_first(&w->ranges);
+	hit = whimory_range_lower(&w->ranges, lba);
+	node = hit ? &hit->rb : NULL;
 	while (node) {
 		struct whimory_range *r = rb_entry(node, struct whimory_range,
 						   rb);
@@ -564,6 +804,13 @@ static int whimory_range_update(struct whimory *w, u32 lba, u32 span, u32 vba)
 		if (r->start >= lba && r->start + r->len <= end)
 			whimory_range_erase(w, r);
 		node = next;
+		cond_resched();
+	}
+
+	/* True unmap: erase only; do not insert invalid_vba placeholders. */
+	if (vba >= w->l2v.invalid_vba) {
+		whimory_range_coalesce_at(w, lba);
+		return 0;
 	}
 
 	ret = whimory_range_insert_new(w, lba, span, vba);
@@ -574,14 +821,14 @@ static int whimory_range_update(struct whimory *w, u32 lba, u32 span, u32 vba)
 }
 
 /*
- *L2V_Update.c: split at 0x8000 root boundaries, then insert.
+ * L2V_Update: split at 0x8000 root boundaries, then insert.
  * The interval map is the RO observable of the live tree.
+ * Returns 0 on success (including stale-skip of a chunk), <0 on OOM/error.
  */
 static int whimory_l2v_update(struct whimory *w, u32 lba, u32 span, u32 vba)
 {
-	w->sftl.l2v_update_calls++;
-	if (vba >= w->l2v.invalid_vba)
-		w->sftl.l2v_unmap_calls++;
+	bool is_unmap = vba >= w->l2v.invalid_vba;
+
 	while (span) {
 		u32 chunk = WHIMORY_L2V_ROOT_SPAN -
 			    (lba & (WHIMORY_L2V_ROOT_SPAN - 1));
@@ -589,6 +836,22 @@ static int whimory_l2v_update(struct whimory *w, u32 lba, u32 span, u32 vba)
 
 		if (chunk > span)
 			chunk = span;
+		ret = whimory_range_update(w, lba, chunk, vba);
+		if (ret < 0)
+			return ret;
+		if (ret > 0) {
+			/* Stale reject: leave packed L2V alone for this chunk. */
+			span -= chunk;
+			lba += chunk;
+			if (vba < w->l2v.invalid_vba)
+				vba += chunk;
+			continue;
+		}
+
+		w->sftl.l2v_update_calls++;
+		if (is_unmap)
+			w->sftl.l2v_unmap_calls++;
+
 		if (w->l2v.root && w->l2v.num_roots) {
 			u32 ridx = lba >> 15;
 			u8 *rec;
@@ -601,12 +864,12 @@ static int whimory_l2v_update(struct whimory *w, u32 lba, u32 span, u32 vba)
 					ver = 0;
 				put_unaligned_le16(ver + 1, rec + 4);
 				/*
- *: whole-root unmap (off=0,
- * span=0x8000, vba=invalid) frees the tree.
- */
+				 * whole-root unmap (off=0, span=0x8000,
+				 * vba=invalid) frees the tree.
+				 */
 				if (!(lba & 0x7fff) &&
 				    chunk == WHIMORY_L2V_ROOT_SPAN &&
-				    vba >= w->l2v.invalid_vba) {
+				    is_unmap) {
 					node_idx = get_unaligned_le16(rec);
 					if (node_idx != WHIMORY_L2V_INVALID_ROOT)
 						whimory_l2v_free_tree(w,
@@ -621,14 +884,18 @@ static int whimory_l2v_update(struct whimory *w, u32 lba, u32 span, u32 vba)
 			if (w->l2v.updates >= WHIMORY_L2V_UPDATE_REPACK)
 				w->l2v.updates = 0;
 		}
-		ret = whimory_range_update(w, lba, chunk, vba);
-		if (ret)
-			return ret;
-		if (w->l2v.root && w->l2v.num_roots) {
+		/*
+		 * whimory_l2v_update_packed() repacks a whole root, and
+		 * collecting a root walks the interval map. Doing that per
+		 * update makes replay O(updates x ranges) — the tail of a full
+		 * recover crawled to ~14 s per superblock. The interval map is
+		 * the lookup authority; pack once at the end instead.
+		 */
+		if (w->l2v.root && w->l2v.num_roots && !w->l2v_defer_pack) {
 			u32 ridx = lba >> 15;
 			bool whole_unmap = !(lba & 0x7fff) &&
 				chunk == WHIMORY_L2V_ROOT_SPAN &&
-				vba >= w->l2v.invalid_vba;
+				is_unmap;
 
 			if (ridx < w->l2v.num_roots && !whole_unmap) {
 				ret = whimory_l2v_update_packed(w, ridx,
@@ -658,6 +925,8 @@ static void whimory_range_free(struct whimory *w)
 	}
 	w->ranges = RB_ROOT;
 	w->sftl.range_nodes = 0;
+	w->sftl.map_gen++;
+	whimory_l2v_cache_flush(w);
 }
 
 /* ------------------------------------------------------------------ */
@@ -949,9 +1218,10 @@ static u32 whimory_l2v_collect_root(struct whimory *w, u32 ridx,
 	u32 base = ridx * WHIMORY_L2V_ROOT_SPAN;
 	u32 win_end = base + WHIMORY_L2V_ROOT_SPAN;
 	u32 cursor = base, nleaf = 0;
+	struct whimory_range *first = whimory_range_lower(&w->ranges, base);
 	struct rb_node *n;
 
-	for (n = rb_first(&w->ranges); n; n = rb_next(n)) {
+	for (n = first ? &first->rb : NULL; n; n = rb_next(n)) {
 		struct whimory_range *rg = rb_entry(n, struct whimory_range, rb);
 		u32 s, e, vba, span;
 
@@ -984,7 +1254,7 @@ static u32 whimory_l2v_collect_root(struct whimory *w, u32 ridx,
 	return nleaf;
 }
 
-/*analogue: free this root's tree, pack from the interval map. */
+/* Discard this root's packed tree and rebuild it from the interval map. */
 static int whimory_l2v_pack_root(struct whimory *w, u32 ridx)
 {
 	struct whimory_l2v *l2v = &w->l2v;
@@ -1024,7 +1294,7 @@ static int whimory_l2v_pack_root(struct whimory *w, u32 ridx)
 	return 0;
 }
 
-/*: first insert into an empty root — one node, up to 3 leaves. */
+/* First insert into an empty root: one node holding up to three leaves. */
 static int whimory_l2v_grow_empty(struct whimory *w, u32 ridx, u32 off,
 				  u32 span, u32 vba)
 {
@@ -1344,19 +1614,54 @@ next_level:
 	return -ELOOP;
 }
 
+/*
+ * L2V_Search keeps a sequential hint; do the same here. VFAT walks a cluster
+ * one 4 KiB sector at a time, so consecutive lookups land in the same extent
+ * and the rbtree descent is pure overhead. Invalidated by map generation.
+ */
+static void whimory_l2v_cache_store(struct whimory *w,
+				    const struct whimory_range *r)
+{
+	w->search_start = r->start;
+	w->search_len = r->len;
+	w->search_vba = r->vba;
+	w->search_gen = w->sftl.map_gen;
+	w->search_valid = true;
+}
+
+static void whimory_l2v_cache_flush(struct whimory *w)
+{
+	if (w)
+		w->search_valid = false;
+}
+
 /* Prefer the interval map (L2V_Update result); packed tree is for Search. */
 static int whimory_l2v_search(struct whimory *w, u32 lba,
 			      u32 *vba_out, u32 *span_out)
 {
-	struct whimory_range *r = whimory_range_find(&w->ranges, lba);
+	struct whimory_range *r;
 
+	if (w->search_valid && w->search_gen == w->sftl.map_gen &&
+	    lba >= w->search_start && lba - w->search_start < w->search_len) {
+		u32 delta = lba - w->search_start;
+
+		*vba_out = w->search_vba + delta;
+		*span_out = w->search_len - delta;
+		w->sftl.search_cache_hits++;
+		return 0;
+	}
+
+	r = whimory_range_find(&w->ranges, lba);
 	if (r) {
 		u32 delta = lba - r->start;
 
+		whimory_l2v_cache_store(w, r);
+		w->sftl.search_cache_misses++;
 		*vba_out = r->vba + delta;
 		*span_out = r->len - delta;
 		return 0;
 	}
+	w->sftl.search_cache_misses++;
 	return whimory_l2v_lookup(w, lba, vba_out, span_out);
 }
 
@@ -2446,11 +2751,12 @@ static int n31_vfl_ingest_ctx(struct whimory *w, unsigned int ce,
 	w->vfl.ctx_block[cau] = block;
 
 	/*
- *: memcpy(cxt_copies, data+0x100, 4 * num_copies).
- * Each record is {le16 phys_block, u8 bank, u8 flags} — VFL CXT
- * copy locations in the tail, not a user virt→phys table.
- * Live glass: first u32 is often 0x827 (block 2087).
- */
+	 * Copy locations live at +0x100, one 4-byte record each:
+	 * {le16 phys_block, u8 bank, u8 flags}. These point at the VFL
+	 * context copies in the block tail; they are not a user
+	 * virtual-to-physical table. On the glass the first record is
+	 * usually 0x827 (block 2087).
+	 */
 	tab = page + 0x100;
 	for (i = 0; i < 64 && 0x100 + 4 * (i + 1) <= 0x200; i++) {
 		u16 blk = get_unaligned_le16(tab + i * 4);
@@ -2463,7 +2769,7 @@ static int n31_vfl_ingest_ctx(struct whimory *w, unsigned int ce,
 	}
 	w->vfl.cxt_loc_count += loc;
 
-	/*: per-bank u16 CXT copy journal at +0x200 + 32*bank */
+	/* Per-bank u16 context copy journal at +0x200 + 32 * bank. */
 	if (page_len >= WHIMORY_VFL_CXT_HDR +
 	    WHIMORY_VFL_SPARE_STRIDE * w->geom.num_cau + 2) {
 		unsigned int b, j, n16 = w->vfl.cxt_u16_len;
@@ -2488,11 +2794,11 @@ static int n31_vfl_ingest_ctx(struct whimory *w, unsigned int ce,
 	}
 
 	/*
- *bitmap: one byte per VBN (stride 0x8D0D0F0 = 1 on N31),
- * bit = bank. Not in the 0x200 header / spare journal. Try the
- * remainder of this CXT page; reject if any byte has bits outside
- * num_cau (would be unrelated payload).
- */
+	 *bitmap: one byte per VBN (stride 0x8D0D0F0 = 1 on N31),
+	 * bit = bank. Not in the 0x200 header / spare journal. Try the
+	 * remainder of this CXT page; reject if any byte has bits outside
+	 * num_cau (would be unrelated payload).
+	 */
 	{
 		unsigned int off = WHIMORY_VFL_CXT_HDR +
 				   WHIMORY_VFL_SPARE_STRIDE * w->geom.num_cau;
@@ -2518,10 +2824,10 @@ static int n31_vfl_ingest_ctx(struct whimory *w, unsigned int ce,
 	}
 
 	/*
- * User VBN→PBN is identity over blocks_per_cau :
- * vbn < mcxt.dev.blocks_per_cau). Failed-block replacement lives
- * in the u16 tables, not in a 256-entry slice of +0x100.
- */
+	 * User VBN→PBN is identity over blocks_per_cau :
+	 * vbn < mcxt.dev.blocks_per_cau). Failed-block replacement lives
+	 * in the u16 tables, not in a 256-entry slice of +0x100.
+	 */
 	w->vfl.remap_count = w->geom.blocks_per_cau;
 	dev_info(w->dev,
 		 "VFL ingest ce=%u cau=%u blk=%u magic=%d type20=%d cxt_loc=%u identity=%u\n",
@@ -2670,7 +2976,7 @@ static int whimory_vfl_open(struct whimory *w)
 /* SFTL recovery — classify SBs, replay BTOC/META by weave */
 /* ------------------------------------------------------------------ */
 
-/*: FFFF0001 payload is {count, [lba,span]...} → unmap. */
+/* FFFF0001 payload is {count, [lba,span]...} → unmap. */
 static int whimory_sftl_apply_list(struct whimory *w, u32 vba)
 {
 	u8 *buf;
@@ -2678,27 +2984,51 @@ static int whimory_sftl_apply_list(struct whimory *w, u32 vba)
 	struct whimory_meta meta;
 	int ret;
 
+	/*
+	 * Must not alias data_page: n31_vfl_read_vba uses data_page as the
+	 * page scratch. Prefer gc_data; else a stack-sized one-shot alloc.
+	 */
 	buf = w->sftl.gc_data;
-	if (!buf)
-		buf = w->sftl.data_page;
-	if (!buf || !w->vfl_ops || !w->vfl_ops->read_vba)
+	if (!buf) {
+		buf = kmalloc(WHIMORY_LBA_SIZE, GFP_KERNEL);
+		if (!buf)
+			return -ENOMEM;
+	}
+	if (!w->vfl_ops || !w->vfl_ops->read_vba) {
+		if (buf != w->sftl.gc_data)
+			kfree(buf);
 		return -ENOMEM;
+	}
 	ret = w->vfl_ops->read_vba(w, vba, 1, buf, &meta);
-	if (ret)
+	if (ret) {
+		if (buf != w->sftl.gc_data)
+			kfree(buf);
 		return ret;
+	}
 	count = get_unaligned_le32(buf);
-	if (!count || count > (WHIMORY_LBA_SIZE - 4) / 8)
+	if (!count || count > (WHIMORY_LBA_SIZE - 4) / 8) {
+		if (buf != w->sftl.gc_data)
+			kfree(buf);
 		return -EINVAL;
+	}
 	for (i = 0; i < count; i++) {
 		lba = get_unaligned_le32(buf + 4 + 8 * i);
 		span = get_unaligned_le32(buf + 8 + 8 * i);
-		if (!span || whimory_special_lba(lba))
+		/* Cap runaway garbage spans from misclassified tokens. */
+		if (!span || whimory_special_lba(lba) || lba >= 0x01000000u)
 			break;
+		if (span > WHIMORY_L2V_ROOT_SPAN)
+			span = WHIMORY_L2V_ROOT_SPAN;
 		ret = whimory_l2v_update(w, lba, span, w->l2v.invalid_vba);
-		if (ret)
+		if (ret) {
+			if (buf != w->sftl.gc_data)
+				kfree(buf);
 			return ret;
+		}
 		w->sftl.token_list_applied++;
 	}
+	if (buf != w->sftl.gc_data)
+		kfree(buf);
 	return 0;
 }
 
@@ -2748,6 +3078,142 @@ static bool whimory_btoc_looks_be_bte(const u8 *page)
 	return true;
 }
 
+
+/*
+ * BTOC is a physical-slot index only. Per-slot CS metadata is the L2V key.
+ * Never L2V_Update(btoc_lpn) — zeros/holes in BTOC were poisoning L2V[0].
+ */
+static int whimory_l2v_update_from_slot_meta(struct whimory *w,
+					     unsigned int ce, unsigned int cau,
+					     unsigned int vblock,
+					     unsigned int page, unsigned int slot,
+					     const u8 *meta16,
+					     u32 btoc_hint_lba)
+{
+	u32 meta_lba, vba;
+
+	if (!meta16)
+		return 0;
+	if (meta16[0] != WHIMORY_META_TYPE_DATA &&
+	    meta16[0] != WHIMORY_META_TYPE_DATA2)
+		return 0;
+	if (meta16[1] & 0x02)
+		return 0;
+	if (whimory_meta_erased(meta16, WHIMORY_META_SIZE))
+		return 0;
+	meta_lba = get_unaligned_le32(meta16 + 8);
+	if (whimory_special_lba(meta_lba) || meta_lba >= 0x01000000u)
+		return 0;
+	if (btoc_hint_lba != 0xffffffffu && btoc_hint_lba != meta_lba) {
+		w->sftl.btoc_meta_mismatch++;
+		dev_dbg(w->dev,
+			"btoc_meta_mismatch hint=%u meta_lba=%u ce=%u cau=%u vblock=%u pg=%u slot=%u\n",
+			btoc_hint_lba, meta_lba, ce, cau, vblock, page, slot);
+		/* Still trust metadata as authority. */
+	}
+	vba = whimory_pack_vba(w, ce, cau, vblock, page, slot);
+	w->sftl.claim_weave = whimory_weave48(meta16);
+	if (w->sftl.claim_source == 0)
+		w->sftl.claim_source = 1;
+	if ((audit_lba_winners && whimory_audit_fmss_lba(meta_lba)) ||
+	    (l2v_trace_lba && meta_lba == l2v_trace_lba)) {
+		struct whimory_range *prev =
+			whimory_range_find(&w->ranges, meta_lba);
+		u64 prev_weave = prev ? prev->weave : 0;
+		u32 prev_vba = prev ? prev->vba : ~0u;
+		bool win = !prev ||
+			   !(prev->weave > w->sftl.claim_weave);
+		const char *src = w->sftl.claim_source == 2 ? "open" :
+				  w->sftl.claim_source == 3 ? "CXT" :
+				  w->sftl.claim_source == 4 ? "LIST" :
+				  "BTOC/meta";
+
+		dev_info(w->dev,
+			 "LBA_WINNER fmss_lba=%u candidate vba=%u "
+			 "ce=%u cau=%u vblk=%u pg=%u slot=%u weave=%012llx "
+			 "prev_vba=%u prev_weave=%012llx selected=%s "
+			 "reason=%s source=%s\n",
+			 meta_lba, vba, ce, cau, vblock, page, slot,
+			 (unsigned long long)w->sftl.claim_weave,
+			 prev_vba, (unsigned long long)prev_weave,
+			 win ? "yes" : "no",
+			 win ? (prev ? "newer_or_equal_weave" : "first")
+			     : "older_weave_kept",
+			 src);
+	}
+	if (whimory_l2v_update(w, meta_lba, 1, vba)) {
+		w->sftl.claim_weave = 0;
+		return -ENOMEM;
+	}
+	w->sftl.claim_weave = 0;
+	w->sftl.btoc_meta_confirmed++;
+	w->sftl.btoc_l2v_updates++;
+	w->sftl.btoc_recs++;
+	return 1;
+}
+
+static int whimory_btoc_confirm_page(struct whimory *w, unsigned int ce,
+				     unsigned int cau, unsigned int vblock,
+				     unsigned int page, u32 btoc_hint_base,
+				     bool hint_is_page_lpn)
+{
+	u8 spare[S5L8740_NAND_META_SIZE];
+	u8 *data = w->sftl.data_page;
+	unsigned int slot;
+	u32 pblock;
+	int ret, hits = 0;
+
+	if (!btoc_meta_confirm)
+		return 0;
+	if (btoc_confirm_max &&
+	    w->sftl.btoc_confirm_pages >= btoc_confirm_max) {
+		w->sftl.btoc_confirm_capped++;
+		return 0;
+	}
+	if (recover_budget_ms && w->sftl.confirm_start_jiffies &&
+	    time_after(jiffies, w->sftl.confirm_start_jiffies +
+		       msecs_to_jiffies(recover_budget_ms))) {
+		w->sftl.btoc_confirm_budget_stop++;
+		return 0;
+	}
+	if (!data)
+		return -ENOMEM;
+	pblock = whimory_vfl_phys(w, cau, vblock);
+	ret = whimory_cs_read_page(w, ce, cau, pblock, page, data,
+				   S5L8740_NAND_PAGE_SIZE, spare,
+				   sizeof(spare));
+	if (ret)
+		return ret;
+	w->sftl.btoc_confirm_pages++;
+	if (recover_yield_us && (w->sftl.btoc_confirm_pages & 0x0f) == 0) {
+		cond_resched();
+		usleep_range(recover_yield_us, recover_yield_us + 500);
+	}
+	whimory_note_payload_strings(w, data, S5L8740_NAND_PAGE_SIZE);
+	if (whimory_page_blank(data, 64) && whimory_meta_erased(spare, 16))
+		return 0;
+	for (slot = 0; slot < WHIMORY_VBAS_PER_PAGE; slot++) {
+		u32 hint = 0xffffffffu;
+
+		if (btoc_hint_base != 0xffffffffu) {
+			if (hint_is_page_lpn)
+				hint = btoc_hint_base * WHIMORY_VBAS_PER_PAGE +
+				       slot;
+			else if (slot == 0)
+				hint = btoc_hint_base;
+		}
+		ret = whimory_l2v_update_from_slot_meta(w, ce, cau, vblock,
+							page, slot,
+							spare + slot *
+							WHIMORY_META_SIZE,
+							hint);
+		if (ret < 0)
+			return ret;
+		hits += ret;
+	}
+	return hits;
+}
+
 static bool whimory_btoc_parse_be_lpn(struct whimory *w, const u8 *page,
 				      unsigned int len, unsigned int ce,
 				      unsigned int cau, unsigned int vblock)
@@ -2766,7 +3232,8 @@ static bool whimory_btoc_parse_be_lpn(struct whimory *w, const u8 *page,
 	page_gran = valid > 0 && valid <= WHIMORY_DATA_PAGES_PER_SB;
 	if (w->sftl.btoc_pages_valid < 5)
 		dev_info(w->dev,
-			 "BTOC_BE_LPN valid=%u %s ce=%u cau=%u vblock=%u\n",
+			 "BTOC_BE_LPN valid=%u %s ce=%u cau=%u vblock=%u "
+			 "(meta-validated)\n",
 			 valid,
 			 page_gran ? "page-granularity x4" : "slot-granularity",
 			 ce, cau, vblock);
@@ -2775,40 +3242,47 @@ static bool whimory_btoc_parse_be_lpn(struct whimory *w, const u8 *page,
 		n = min(valid, (unsigned int)WHIMORY_DATA_PAGES_PER_SB);
 	for (i = 0; i < n; i++) {
 		u32 lpn = get_unaligned_be32(page + i * 4);
-		u32 vba;
-		unsigned int slot, pg;
+		unsigned int pg, slot;
+		int got;
 
 		w->sftl.btoc_entries_seen++;
-		if (lpn == 0xffffffff || lpn == WHIMORY_LBA_BLANK)
+		if (lpn == 0xffffffff || lpn == WHIMORY_LBA_BLANK) {
+			w->sftl.btoc_hole_entries++;
 			continue;
+		}
 		if (whimory_special_lba(lpn)) {
+			if (lpn == WHIMORY_LBA_HOLE)
+				w->sftl.btoc_hole_entries++;
+			else if (lpn == WHIMORY_LBA_DELETED ||
+				 lpn == WHIMORY_LBA_LIST)
+				w->sftl.btoc_unmap_entries++;
+			else
+				w->sftl.btoc_unknown_entries++;
 			w->sftl.token_hole++;
 			continue;
 		}
 		if (lpn >= 0x01000000u)
 			continue;
+		/* Zero BTOC slots are holes — never poison L2V[0]. */
+		if (lpn == 0) {
+			w->sftl.btoc_skipped_zero++;
+			continue;
+		}
 		if (page_gran) {
-			for (slot = 0; slot < WHIMORY_VBAS_PER_PAGE; slot++) {
-				vba = whimory_pack_vba(w, ce, cau, vblock, i,
-						       slot);
-				if (whimory_l2v_update(w,
-						       lpn * WHIMORY_VBAS_PER_PAGE +
-						       slot, 1, vba))
-					return hit > 0;
-				w->sftl.btoc_l2v_updates++;
-				w->sftl.btoc_recs++;
-				hit++;
-			}
+			got = whimory_btoc_confirm_page(w, ce, cau, vblock, i,
+							lpn, true);
 		} else {
 			pg = i / w->sftl.vbas_per_page;
 			slot = i % w->sftl.vbas_per_page;
-			vba = whimory_pack_vba(w, ce, cau, vblock, pg, slot);
-			if (whimory_l2v_update(w, lpn, 1, vba))
-				break;
-			w->sftl.btoc_l2v_updates++;
-			w->sftl.btoc_recs++;
-			hit++;
+			if (slot != 0)
+				continue;
+			got = whimory_btoc_confirm_page(w, ce, cau, vblock, pg,
+							lpn, false);
 		}
+		if (got < 0)
+			return hit > 0;
+		if (got > 0)
+			hit += got;
 	}
 	return hit > 0;
 }
@@ -2818,27 +3292,48 @@ static bool whimory_btoc_parse_be_bte(struct whimory *w, const u8 *page,
 				      unsigned int cau, unsigned int vblock)
 {
 	unsigned int i, recs, vba_ofs = 0, hit = 0;
+	unsigned int last_pg = ~0u;
 
 	recs = len / 16;
 	for (i = 0; i < recs; i++) {
 		const u8 *r = page + i * 16;
 		u32 lba = get_unaligned_be32(r + 8);
 		u32 span = r[15];
-		u32 vba;
-		int upd;
+		unsigned int s;
 
 		w->sftl.btoc_entries_seen++;
 		if (!span)
 			break;
 		if (whimory_special_lba(lba)) {
-			if (lba == WHIMORY_LBA_LIST)
+			if (lba == WHIMORY_LBA_LIST) {
+				u32 vba = whimory_pack_vba(w, ce, cau, vblock,
+						vba_ofs / w->sftl.vbas_per_page,
+						vba_ofs % w->sftl.vbas_per_page);
+
 				w->sftl.btoc_holelist_ffff0001++;
-			else if (lba == WHIMORY_LBA_HOLE)
+				w->sftl.btoc_unmap_entries++;
+				if (btoc_apply_list) {
+					w->sftl.claim_source = 4;
+					if (whimory_sftl_apply_list(w, vba))
+						dev_warn(w->dev,
+							 "BE BTE list token vba=%u failed\n",
+							 vba);
+					else
+						w->sftl.token_list++;
+					w->sftl.claim_source = 1;
+				}
+			} else if (lba == WHIMORY_LBA_HOLE) {
 				w->sftl.btoc_token_ffff0000++;
-			else if (lba == WHIMORY_LBA_DELETED)
+				w->sftl.btoc_hole_entries++;
+			} else if (lba == WHIMORY_LBA_DELETED) {
 				w->sftl.btoc_token_ffffff00++;
-			else if (lba == WHIMORY_LBA_BLANK)
+				w->sftl.btoc_unmap_entries++;
+			} else if (lba == WHIMORY_LBA_BLANK) {
 				w->sftl.btoc_token_ffffffff++;
+				w->sftl.btoc_hole_entries++;
+			} else {
+				w->sftl.btoc_unknown_entries++;
+			}
 			w->sftl.token_hole++;
 			if (vba_ofs + span > WHIMORY_VBAS_PER_SB)
 				break;
@@ -2849,16 +3344,26 @@ static bool whimory_btoc_parse_be_bte(struct whimory *w, const u8 *page,
 			break;
 		if (vba_ofs + span > WHIMORY_DATA_VBAS_PER_SB)
 			break;
-		vba = whimory_pack_vba(w, ce, cau, vblock,
-				       vba_ofs / w->sftl.vbas_per_page,
-				       vba_ofs % w->sftl.vbas_per_page);
-		upd = whimory_l2v_update(w, lba, span, vba);
-		if (upd)
-			break;
-		w->sftl.btoc_l2v_updates++;
+		if (lba == 0) {
+			w->sftl.btoc_skipped_zero++;
+			vba_ofs += span;
+			continue;
+		}
+		for (s = 0; s < span; s++) {
+			unsigned int pg = (vba_ofs + s) / w->sftl.vbas_per_page;
+			int got;
+
+			if (pg == last_pg)
+				continue;
+			last_pg = pg;
+			got = whimory_btoc_confirm_page(w, ce, cau, vblock, pg,
+							0xffffffffu, false);
+			if (got < 0)
+				return hit > 0;
+			if (got > 0)
+				hit += got;
+		}
 		vba_ofs += span;
-		hit++;
-		w->sftl.btoc_recs++;
 	}
 	return hit > 0;
 }
@@ -2868,6 +3373,7 @@ static bool whimory_btoc_parse_bte(struct whimory *w, const u8 *page,
 				   unsigned int cau, unsigned int vblock)
 {
 	unsigned int i, recs, vba_ofs = 0, hit = 0;
+	unsigned int last_pg = ~0u;
 
 	if (len < sizeof(struct whimory_bte) || whimory_page_blank(page, 64))
 		return false;
@@ -2881,57 +3387,174 @@ static bool whimory_btoc_parse_bte(struct whimory *w, const u8 *page,
 			(const struct whimory_bte *)(page + i * sizeof(*bte));
 		u32 lba = le32_to_cpu(bte->lba);
 		u32 span = le32_to_cpu(bte->span);
-		u32 vba;
-		int upd;
+		unsigned int s;
 
 		w->sftl.btoc_entries_seen++;
 		if (!span)
 			break;
 		if (whimory_special_lba(lba)) {
 			if (lba == WHIMORY_LBA_LIST) {
-				vba = whimory_pack_vba(w, ce, cau, vblock,
-						       vba_ofs / w->sftl.vbas_per_page,
-						       vba_ofs % w->sftl.vbas_per_page);
-				if (whimory_sftl_apply_list(w, vba))
-					dev_warn(w->dev,
-						 "list token vba=%u failed\n",
-						 vba);
-				w->sftl.token_list++;
+				u32 vba = whimory_pack_vba(w, ce, cau, vblock,
+						vba_ofs / w->sftl.vbas_per_page,
+						vba_ofs % w->sftl.vbas_per_page);
+				w->sftl.btoc_unmap_entries++;
 				w->sftl.btoc_holelist_ffff0001++;
+				if (btoc_apply_list) {
+					w->sftl.claim_source = 4;
+					if (whimory_sftl_apply_list(w, vba))
+						dev_warn(w->dev,
+							 "list token vba=%u failed\n",
+							 vba);
+					else
+						w->sftl.token_list++;
+					w->sftl.claim_source = 1;
+				}
 			} else if (lba == WHIMORY_LBA_HOLE) {
 				w->sftl.btoc_token_ffff0000++;
-				w->sftl.token_hole++;
+				w->sftl.btoc_hole_entries++;
 			} else if (lba == WHIMORY_LBA_DELETED) {
 				w->sftl.btoc_token_ffffff00++;
-				w->sftl.token_hole++;
+				w->sftl.btoc_unmap_entries++;
 			} else if (lba == WHIMORY_LBA_BLANK) {
 				w->sftl.btoc_token_ffffffff++;
-				w->sftl.token_hole++;
-			} else
-				w->sftl.token_hole++;
+				w->sftl.btoc_hole_entries++;
+			} else {
+				w->sftl.btoc_unknown_entries++;
+			}
+			w->sftl.token_hole++;
 			if (vba_ofs + span > WHIMORY_VBAS_PER_SB)
 				break;
 			vba_ofs += span;
 			continue;
 		}
-		if (span > WHIMORY_DATA_VBAS_PER_SB)
-			break;
-		if (lba >= 0x01000000u)
+		if (span > WHIMORY_DATA_VBAS_PER_SB || lba >= 0x01000000u)
 			break;
 		if (vba_ofs + span > WHIMORY_DATA_VBAS_PER_SB)
 			break;
-		vba = whimory_pack_vba(w, ce, cau, vblock,
-				       vba_ofs / w->sftl.vbas_per_page,
-				       vba_ofs % w->sftl.vbas_per_page);
-		upd = whimory_l2v_update(w, lba, span, vba);
-		if (upd)
-			break;
-		w->sftl.btoc_l2v_updates++;
+		if (lba == 0) {
+			w->sftl.btoc_skipped_zero++;
+			vba_ofs += span;
+			continue;
+		}
+		for (s = 0; s < span; s++) {
+			unsigned int pg = (vba_ofs + s) / w->sftl.vbas_per_page;
+			int got;
+
+			if (pg == last_pg)
+				continue;
+			last_pg = pg;
+			got = whimory_btoc_confirm_page(w, ce, cau, vblock, pg,
+							0xffffffffu, false);
+			if (got < 0)
+				return hit > 0;
+			if (got > 0)
+				hit += got;
+		}
 		vba_ofs += span;
-		hit++;
-		w->sftl.btoc_recs++;
 	}
 	return hit > 0;
+}
+
+/*
+ * Decode a BTOC record stream into a per-VBA LBA table. Records are 16 bytes;
+ * `be` picks the big-endian form (LBA at +8 BE, span in the last byte) over
+ * the little-endian struct whimory_bte. Returns how many VBAs were described.
+ * Special/token LBAs and holes land as WHIMORY_LBA_BLANK.
+ */
+static unsigned int whimory_btoc_decode_map(const u8 *page, unsigned int len,
+					    bool be, u32 *map)
+{
+	unsigned int i, recs = len / 16, vba_ofs = 0;
+
+	for (i = 0; i < recs && vba_ofs < WHIMORY_DATA_VBAS_PER_SB; i++) {
+		const u8 *r = page + i * 16;
+		u32 lba = be ? get_unaligned_be32(r + 8) :
+			       get_unaligned_le32(r + 8);
+		u32 span = be ? r[15] : get_unaligned_le32(r + 12);
+		unsigned int s;
+
+		if (!span || span > WHIMORY_DATA_VBAS_PER_SB)
+			break;
+		if (vba_ofs + span > WHIMORY_DATA_VBAS_PER_SB)
+			break;
+		for (s = 0; s < span; s++)
+			map[vba_ofs + s] = whimory_special_lba(lba) ?
+					   WHIMORY_LBA_BLANK : lba + s;
+		vba_ofs += span;
+	}
+	return vba_ofs;
+}
+
+/*
+ * Sample a few pages of a closed superblock and report how often the BTOC
+ * prediction matches the per-slot metadata. High agreement means the replay
+ * can apply the BTOC directly and drop from 127 reads per SB to one.
+ */
+static void whimory_btoc_verify(struct whimory *w, struct whimory_sb *sb,
+				unsigned int vblock, const u8 *btoc,
+				unsigned int len)
+{
+	static const bool forms[2] = { false, true };
+	u8 meta[S5L8740_NAND_META_SIZE];
+	unsigned int f;
+
+	if (!w->sftl.btoc_map || !w->sftl.data_page)
+		return;
+
+	for (f = 0; f < ARRAY_SIZE(forms); f++) {
+		u32 *map = w->sftl.btoc_map;
+		unsigned int vbas, pages, step, pg, n = 0;
+		unsigned int agree = 0, disagree = 0, nodata = 0;
+		u32 first_hint = 0, first_meta = 0;
+
+		memset(map, 0xff, WHIMORY_DATA_VBAS_PER_SB * sizeof(*map));
+		vbas = whimory_btoc_decode_map(btoc, len, forms[f], map);
+		if (vbas < w->sftl.vbas_per_page)
+			continue;
+		pages = vbas / w->sftl.vbas_per_page;
+		step = pages / (btoc_verify_pages ? btoc_verify_pages : 1);
+		if (!step)
+			step = 1;
+
+		for (pg = 0; pg < pages && n < btoc_verify_pages; pg += step) {
+			unsigned int slot;
+
+			if (whimory_cs_read_page(w, sb->ce, sb->cau, sb->block,
+						 pg, w->sftl.data_page,
+						 S5L8740_NAND_PAGE_SIZE,
+						 meta, sizeof(meta)))
+				break;
+			n++;
+			for (slot = 0; slot < WHIMORY_VBAS_PER_PAGE; slot++) {
+				const u8 *m = meta + slot * WHIMORY_META_SIZE;
+				u32 hint = map[pg * w->sftl.vbas_per_page + slot];
+				u32 mlba;
+
+				if (!whimory_meta_is_data_raw(m) ||
+				    whimory_meta_erased(m, WHIMORY_META_SIZE)) {
+					nodata++;
+					continue;
+				}
+				mlba = get_unaligned_le32(m + 8);
+				if (hint == mlba) {
+					agree++;
+				} else {
+					if (!disagree) {
+						first_hint = hint;
+						first_meta = mlba;
+					}
+					disagree++;
+				}
+			}
+		}
+		dev_info(w->dev,
+			 "BTOC_VERIFY ce=%u cau=%u vblk=%u form=%s vbas=%u "
+			 "pages_probed=%u agree=%u disagree=%u nodata=%u "
+			 "first_hint=%u first_meta=%u\n",
+			 sb->ce, sb->cau, vblock, forms[f] ? "BE" : "LE",
+			 vbas, n, agree, disagree, nodata,
+			 first_hint, first_meta);
+	}
 }
 
 static int whimory_ingest_btoc_page(struct whimory *w, unsigned int ce,
@@ -2959,7 +3582,7 @@ static int whimory_ingest_btoc_page(struct whimory *w, unsigned int ce,
 		verdict = "LE_BTE";
 		hit = 1;
 	}
-	if (w->sftl.btoc_pages_read <= 8)
+	if (ftl_diag && w->sftl.btoc_pages_read <= 8)
 		dev_info(w->dev,
 			 "BTOC_VERDICT ce=%u cau=%u vblock=%u %s first32=%32ph\n",
 			 ce, cau, vblock, verdict, page);
@@ -2974,6 +3597,7 @@ static int whimory_rebuild_open_sb(struct whimory *w, struct whimory_sb *sb)
 	int ret, hits = 0;
 
 	vblock = whimory_vfl_virt(w, sb->cau, sb->block);
+	w->sftl.claim_source = 2;
 	for (pg = 0; pg < WHIMORY_DATA_PAGES_PER_SB; pg++) {
 		ret = whimory_cs_read_page(w, sb->ce, sb->cau, sb->block, pg,
 					   data, S5L8740_NAND_PAGE_SIZE,
@@ -2986,6 +3610,8 @@ static int whimory_rebuild_open_sb(struct whimory *w, struct whimory_sb *sb)
 		for (slot = 0; slot < WHIMORY_VBAS_PER_PAGE; slot++) {
 			const u8 *m = spare + slot * WHIMORY_META_SIZE;
 			u32 lba, vba;
+			struct whimory_range *prev;
+			u64 weave;
 
 			w->sftl.open_slots_seen++;
 			if (m[0] != WHIMORY_META_TYPE_DATA &&
@@ -2997,25 +3623,61 @@ static int whimory_rebuild_open_sb(struct whimory *w, struct whimory_sb *sb)
 				continue;
 			lba = get_unaligned_le32(m + 8);
 			w->sftl.open_slots_valid_meta++;
-			if (whimory_special_lba(lba) || lba >= 0x01000000u)
+			if (whimory_special_lba(lba)) {
+				w->sftl.open_unmap_entries++;
 				continue;
-			if (lba == 0 && w->sftl.open_l2v_updates < 8)
-				dev_info(w->dev,
-					 "OPEN_META_SCAN lba=0 ce=%u cau=%u blk=%u page=%u slot=%u type=%02x flags=%02x first64=%32ph\n",
-					 sb->ce, sb->cau, sb->block, pg, slot,
-					 m[0], m[1], data + slot * WHIMORY_LBA_SIZE);
+			}
+			if (lba >= 0x01000000u) {
+				w->sftl.btoc_unknown_entries++;
+				continue;
+			}
+			if (lba == 0) {
+				w->sftl.open_skipped_zero++;
+				continue;
+			}
 			vba = whimory_pack_vba(w, sb->ce, sb->cau, vblock, pg,
 					       slot);
-			w->sftl.claim_weave = whimory_weave48(m);
+			weave = whimory_weave48(m);
+			prev = whimory_range_find(&w->ranges, lba);
+			if (prev) {
+				if (weave > prev->weave)
+					w->sftl.open_overrides_closed++;
+				else if (weave < prev->weave)
+					w->sftl.open_rejected_stale++;
+				else
+					w->sftl.open_unknown_order++;
+			}
+			w->sftl.claim_weave = weave;
+			if ((l2v_trace_lba && lba == l2v_trace_lba) ||
+			    (audit_lba_winners && whimory_audit_fmss_lba(lba))) {
+				dev_info(w->dev,
+					 "LBA_WINNER fmss_lba=%u candidate vba=%u "
+					 "ce=%u cau=%u vblk=%u pg=%u slot=%u "
+					 "weave=%012llx prev_vba=%u prev_weave=%012llx "
+					 "source=open\n",
+					 lba, vba, sb->ce, sb->cau, vblock, pg,
+					 slot, (unsigned long long)weave,
+					 prev ? prev->vba : ~0u,
+					 prev ? (unsigned long long)prev->weave :
+						0ull);
+			}
 			if (whimory_l2v_update(w, lba, 1, vba)) {
 				w->sftl.claim_weave = 0;
+				w->sftl.claim_source = 0;
 				return -ENOMEM;
 			}
 			w->sftl.claim_weave = 0;
 			w->sftl.open_l2v_updates++;
 			hits++;
 		}
+		if ((pg & 0x0f) == 0) {
+			cond_resched();
+			if (recover_yield_us)
+				usleep_range(recover_yield_us,
+					     recover_yield_us + 500);
+		}
 	}
+	w->sftl.claim_source = 0;
 	return hits;
 }
 
@@ -3036,22 +3698,48 @@ static int whimory_sb_cmp(const void *a, const void *b)
 	return 0;
 }
 
-/*analogue: CXT SB VBAs are not L2V_Update'd. */
+/*
+ * Compact (ce, cau, block) list of the CXT superblocks found by classify.
+ * whimory_vba_is_cxt() is called once per CXT L2V record; scanning all
+ * num_sb entries there was O(num_sb) per record (7840 SBs on N31).
+ */
+static void whimory_cxt_index_build(struct whimory *w, unsigned int nsb)
+{
+	struct whimory_sftl *s = &w->sftl;
+	unsigned int i;
+
+	s->n_cxt_idx = 0;
+	if (!s->sbs)
+		return;
+	for (i = 0; i < nsb && s->n_cxt_idx < ARRAY_SIZE(s->cxt_idx); i++) {
+		struct whimory_sb *sb = &s->sbs[i];
+
+		if (sb->kind != WHIMORY_SB_CXT)
+			continue;
+		s->cxt_idx[s->n_cxt_idx].ce = sb->ce;
+		s->cxt_idx[s->n_cxt_idx].cau = sb->cau;
+		s->cxt_idx[s->n_cxt_idx].block = sb->block;
+		s->n_cxt_idx++;
+	}
+}
+
+/*
+ * VBAs belonging to a CXT superblock hold context records, not user data,
+ * so they must never enter the L2V map.
+ */
 static bool whimory_vba_is_cxt(struct whimory *w, u32 vba)
 {
-	u32 ce, cau, vblock, page, slot, phys, i;
+	u32 ce, cau, vblock, page, slot, phys;
+	unsigned int i;
 
 	if (whimory_unpack_vba(w, vba, &ce, &cau, &vblock, &page, &slot))
 		return false;
 	cau = whimory_vfl_bank(w, cau, vblock);
 	phys = whimory_vfl_phys(w, cau, vblock);
-	if (!w->sftl.sbs)
-		return false;
-	for (i = 0; i < w->sftl.num_sb; i++) {
-		struct whimory_sb *sb = &w->sftl.sbs[i];
+	for (i = 0; i < w->sftl.n_cxt_idx; i++) {
+		struct whimory_cxt_sb_id *c = &w->sftl.cxt_idx[i];
 
-		if (sb->kind == WHIMORY_SB_CXT && sb->ce == ce &&
-		    sb->cau == cau && sb->block == phys)
+		if (c->ce == ce && c->cau == cau && c->block == phys)
 			return true;
 	}
 	return false;
@@ -3149,7 +3837,7 @@ static int whimory_cxt_load_sb(struct whimory *w, u32 sb_idx)
 
 	w->cxt_lba_valid = false;
 	w->cxt_next_lba = 0;
-	/*: VFL_Read in chunks of sftl.gc.zoneSize into ED7C/ED80. */
+	/* Read the superblock in gc_zone_size chunks, as the FTL does. */
 	for (ofs = 0; ofs < s->vbas_per_sb && !done; ofs += zone) {
 		n = min(zone, s->vbas_per_sb - ofs);
 		for (i = 0; i < n; i++) {
@@ -3200,7 +3888,7 @@ static int whimory_cxt_load_sb(struct whimory *w, u32 sb_idx)
 	return 0;
 }
 
-static int whimory_cxt_load(struct whimory *w)
+static int __maybe_unused whimory_cxt_load(struct whimory *w)
 {
 	unsigned int i;
 	int ret, loaded = 0;
@@ -3225,6 +3913,850 @@ static int whimory_cxt_load(struct whimory *w)
 	return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* CXT scanner / dumper (read-only; never touches the map)             */
+/* ------------------------------------------------------------------ */
+
+
+/*
+ * Every superblock classify tagged as CXT, newest weave first.
+ *
+ * whimory_cxt_add_base() only registers a superblock whose page 0 slot 0
+ * carries tag BASE, which on this device is one of the four CXT blocks. The
+ * BASE payload itself names the others ({count, sb, sb, ...}), and the newest
+ * generation need not be the one holding the BASE marker, so the candidate
+ * search has to consider all of them.
+ */
+static unsigned int whimory_cxt_collect_sbs(struct whimory *w,
+					    struct whimory_cxt_base *out,
+					    unsigned int max)
+{
+	struct whimory_sftl *s = &w->sftl;
+	unsigned int i, n = 0;
+
+	if (!s->sbs)
+		return 0;
+	for (i = 0; i < s->num_sb && n < max; i++) {
+		struct whimory_sb *sb = &s->sbs[i];
+		u32 vblock, idx, j;
+
+		if (sb->kind != WHIMORY_SB_CXT)
+			continue;
+		vblock = whimory_vfl_virt(w, sb->cau, sb->block);
+		idx = whimory_sb_index(w, sb->ce, sb->cau, vblock);
+		for (j = 0; j < n; j++)
+			if (out[j].sb == idx)
+				break;
+		if (j < n)
+			continue;
+		out[n].sb = idx;
+		out[n].weave = sb->weave;
+		n++;
+	}
+	/* Insertion sort, newest weave first; n is at most WHIMORY_CXT_MAX_SB. */
+	for (i = 1; i < n; i++) {
+		struct whimory_cxt_base tmp = out[i];
+		int j = (int)i - 1;
+
+		while (j >= 0 && out[j].weave < tmp.weave) {
+			out[j + 1] = out[j];
+			j--;
+		}
+		out[j + 1] = tmp;
+	}
+	return n;
+}
+
+static const char *whimory_cxt_tag_name(u8 tag)
+{
+	switch (tag) {
+	case WHIMORY_CXT_TAG_BASE:
+		return "BASE";
+	case WHIMORY_CXT_TAG_STATS:
+		return "STATS";
+	case WHIMORY_CXT_TAG_SB:
+		return "SB";
+	case WHIMORY_CXT_TAG_L2V:
+		return "TREE";
+	case WHIMORY_CXT_TAG_USERSEQ:
+		return "USERSEQ";
+	case WHIMORY_CXT_TAG_READS:
+		return "READS";
+	case WHIMORY_CXT_TAG_CLEAN:
+		return "CLEAN/END";
+	default:
+		return "?";
+	}
+}
+
+/*
+ * Read one VBA of a CXT superblock. Returns the 4 KiB payload in `data` and
+ * the 16-byte record metadata in `meta`. Page reads are cached across the
+ * four slots of a physical page by the caller.
+ */
+static int whimory_cxt_read_vba(struct whimory *w, u32 sb_idx, u32 ofs,
+				u8 *data, u8 *meta, u8 *spare, u32 *last_key)
+{
+	struct whimory_sftl *s = &w->sftl;
+	u32 ce, cau, vblock, page, slot, pblock, key;
+	u32 vba = s_g_addr_to_vba(w, sb_idx, ofs);
+	int ret;
+
+	ret = whimory_unpack_vba(w, vba, &ce, &cau, &vblock, &page, &slot);
+	if (ret)
+		return ret;
+	cau = whimory_vfl_bank(w, cau, vblock);
+	pblock = whimory_vfl_phys(w, cau, vblock);
+	key = ((ce & 0xf) << 28) | ((cau & 0xf) << 24) |
+	      ((pblock & 0xffff) << 8) | (page & 0xff);
+	if (key != *last_key) {
+		ret = whimory_cs_read_page(w, ce, cau, pblock, page,
+					   s->data_page,
+					   S5L8740_NAND_PAGE_SIZE,
+					   spare, S5L8740_NAND_META_SIZE);
+		if (ret)
+			return ret;
+		*last_key = key;
+	}
+	memcpy(data, s->data_page + slot * WHIMORY_LBA_SIZE, WHIMORY_LBA_SIZE);
+	memcpy(meta, spare + slot * WHIMORY_META_SIZE, WHIMORY_META_SIZE);
+	return 0;
+}
+
+/*
+ * Walk one CXT superblock and report what is actually stored in it: the tag
+ * of every record, the shape of the BASE header (which carries the CXT
+ * superblock list), and the header of each TREE record.
+ */
+static void whimory_cxt_dump_sb(struct whimory *w, u32 sb_idx, u64 weave,
+				unsigned int max_vbas)
+{
+	struct whimory_sftl *s = &w->sftl;
+	u32 counts[8] = {0}, clean = 0, other = 0, end_at = ~0u;
+	u32 ofs, last_key = ~0u, trees = 0, base_seen = 0;
+	u8 *data = s->gc_data;
+	u8 meta[WHIMORY_META_SIZE];
+	u8 spare[S5L8740_NAND_META_SIZE];
+
+	if (!data || !s->data_page) {
+		dev_err(w->dev, "CXT_DUMP sb=%u no scratch\n", sb_idx);
+		return;
+	}
+	if (!max_vbas || max_vbas > s->vbas_per_sb)
+		max_vbas = s->vbas_per_sb;
+
+	dev_info(w->dev, "CXT_DUMP_BEGIN sb=%u weave=%llu vbas=%u\n",
+		 sb_idx, (unsigned long long)weave, max_vbas);
+
+	for (ofs = 0; ofs < max_vbas; ofs++) {
+		u8 type, tag;
+
+		if (whimory_cxt_read_vba(w, sb_idx, ofs, data, meta, spare,
+					 &last_key))
+			break;
+		type = meta[0];
+		tag = meta[1];
+		if (whimory_meta_erased(meta, WHIMORY_META_SIZE)) {
+			clean++;
+			continue;
+		}
+		if (type != WHIMORY_META_TYPE_SFTL_CXT) {
+			other++;
+			continue;
+		}
+		if (tag == WHIMORY_CXT_TAG_CLEAN) {
+			clean++;
+			if (end_at == ~0u)
+				end_at = ofs;
+			break;
+		}
+		if (tag < ARRAY_SIZE(counts))
+			counts[tag]++;
+		else
+			other++;
+
+		/* One compact row per distinct tag, so the record layout of
+		 * a superblock is visible without a full hex dump.
+		 */
+		if (tag < ARRAY_SIZE(counts) && counts[tag] == 1)
+			dev_info(w->dev,
+				 "CXT_REC sb=%u ofs=%u pg=%u slot=%u type=%02x tag=%02x %s\n",
+				 sb_idx, ofs, ofs / s->vbas_per_page,
+				 ofs % s->vbas_per_page, type, tag,
+				 whimory_cxt_tag_name(tag));
+
+		if (tag == WHIMORY_CXT_TAG_BASE && base_seen++ < 2) {
+			dev_info(w->dev,
+				 "CXT_BASE_REC sb=%u ofs=%u meta=%16ph\n",
+				 sb_idx, ofs, meta);
+			dev_info(w->dev,
+				 "CXT_BASE_REC sb=%u ofs=%u first64=%32ph %32ph\n",
+				 sb_idx, ofs, data, data + 32);
+		}
+		if (tag == WHIMORY_CXT_TAG_L2V && trees < 1) {
+			unsigned int b;
+
+			for (b = 0; b < 128; b += 32)
+				dev_info(w->dev,
+					 "CXT_TREE_HEX sb=%u ofs=%u +%03u %32ph\n",
+					 sb_idx, ofs, b, data + b);
+		}
+		if (tag == WHIMORY_CXT_TAG_L2V && trees++ < 3) {
+			dev_info(w->dev,
+				 "CXT_TREE_REC sb=%u ofs=%u hdr_lba=%u "
+				 "hdr_span=0x%08x p0=(%u,%u) p1=(%u,%u) "
+				 "p2=(%u,%u)\n",
+				 sb_idx, ofs,
+				 get_unaligned_le32(data),
+				 get_unaligned_le32(data + 4),
+				 get_unaligned_le32(data + 8),
+				 get_unaligned_le32(data + 12),
+				 get_unaligned_le32(data + 16),
+				 get_unaligned_le32(data + 20),
+				 get_unaligned_le32(data + 24),
+				 get_unaligned_le32(data + 28));
+		}
+	}
+
+	dev_info(w->dev,
+		 "CXT_DUMP_END sb=%u scanned=%u clean=%u other=%u end_at=%d "
+		 "base=%u stats=%u sbrec=%u tree=%u userseq=%u reads=%u\n",
+		 sb_idx, ofs, clean, other, (int)end_at,
+		 counts[WHIMORY_CXT_TAG_BASE], counts[WHIMORY_CXT_TAG_STATS],
+		 counts[WHIMORY_CXT_TAG_SB], counts[WHIMORY_CXT_TAG_L2V],
+		 counts[WHIMORY_CXT_TAG_USERSEQ],
+		 counts[WHIMORY_CXT_TAG_READS]);
+}
+
+/*
+ * Phase 2 entry point: report every CXT base candidate newest-weave first,
+ * then dump what each one contains. Read-only — the L2V map is untouched.
+ */
+int whimory_cxt_dump(unsigned int max_vbas)
+{
+	struct whimory *w = whimory_dev;
+	unsigned int i;
+	struct whimory_cxt_base all[WHIMORY_CXT_MAX_SB];
+	unsigned int n_all;
+	int sess;
+
+	if (!w)
+		return -ENODEV;
+	if (!w->sftl.sbs || !w->sftl.num_sb)
+		return -ENODATA;
+
+	dev_info(w->dev,
+		 "CXT_SCAN bases=%u cxt_sbs=%u classified_sbs=%u "
+		 "cxt_loaded=%d base_weave=%llu\n",
+		 w->n_cxt, w->sftl.cxt_sbs, w->sftl.num_sb, w->sftl.cxt_loaded,
+		 (unsigned long long)w->cxt_base_weave);
+
+	for (i = 0; i < w->n_cxt; i++)
+		dev_info(w->dev, "CXT_CAND i=%u sb=%u weave=%llu\n",
+			 i, w->cxt[i].sb,
+			 (unsigned long long)w->cxt[i].weave);
+
+	n_all = whimory_cxt_collect_sbs(w, all, ARRAY_SIZE(all));
+	for (i = 0; i < n_all; i++)
+		dev_info(w->dev, "CXT_SB i=%u sb=%u weave=%llu\n",
+			 i, all[i].sb, (unsigned long long)all[i].weave);
+
+	if (!w->n_cxt) {
+		dev_warn(w->dev,
+			 "CXT_SCAN no base candidates; classify must reach the "
+			 "high blocks that hold them (scan_blocks=0/1960)\n");
+		return -ENOENT;
+	}
+
+	sess = s5l8740_nand_dma_session_begin();
+	for (i = 0; i < n_all; i++)
+		whimory_cxt_dump_sb(w, all[i].sb, all[i].weave, max_vbas);
+	if (sess == 0)
+		s5l8740_nand_dma_session_end();
+	return 0;
+}
+EXPORT_SYMBOL_GPL(whimory_cxt_dump);
+
+/* ------------------------------------------------------------------ */
+/* Phase 3: CXT TREE -> candidate map, compared against the live map    */
+/* ------------------------------------------------------------------ */
+
+static unsigned int cxt_max_extents = 1048576;
+module_param(cxt_max_extents, uint, 0644);
+MODULE_PARM_DESC(cxt_max_extents,
+		 "Candidate-map extent ceiling for the CXT TREE parser");
+
+/*
+ * CXT VBAs are in the FTL native superblock space, which is not the space
+ * whimory_pack_vba() builds. Apple counts one superblock as the same virtual
+ * block across every (ce, cau) plane, so a superblock holds
+ * pages_per_sb * planes * vbas_per_page VBAs and the plane index sits
+ * between the page and the slot:
+ *
+ *   vba = vblock * (pages_per_sb * planes * 4)
+ *       + page * (planes * 4) + plane * 4 + slot
+ *
+ * whimory_pack_vba() instead gives every (ce, cau, vblock) triple its own
+ * superblock index, so a raw CXT VBA lands on an unrelated page here. Two
+ * consequences: translate before use, and a run of consecutive CXT VBAs is
+ * only contiguous in our space within one 4-slot group, because the next
+ * group belongs to a different plane.
+ */
+static int whimory_cxt_vba_translate(struct whimory *w, u32 cxt_vba, u32 *out)
+{
+	u32 planes = w->geom.num_ce * w->geom.num_cau;
+	u32 per_page, per_sb, vblock, rem, page, plane, slot;
+
+	if (!planes || !w->sftl.vbas_per_page || !w->sftl.pages_per_sb)
+		return -EINVAL;
+	per_page = planes * w->sftl.vbas_per_page;
+	per_sb = w->sftl.pages_per_sb * per_page;
+	vblock = cxt_vba / per_sb;
+	rem = cxt_vba % per_sb;
+	page = rem / per_page;
+	plane = (rem % per_page) / w->sftl.vbas_per_page;
+	slot = rem % w->sftl.vbas_per_page;
+	if (vblock >= w->sftl.user_blocks || page >= w->sftl.pages_per_sb)
+		return -ERANGE;
+	*out = whimory_pack_vba(w, plane / w->geom.num_cau,
+				plane % w->geom.num_cau, vblock, page, slot);
+	return 0;
+}
+
+static void whimory_cxt_ext_reset(struct whimory *w)
+{
+	w->n_cxt_ext = 0;
+	w->cxt_ext_weave = 0;
+	w->cxt_ext_sb = 0;
+}
+
+static int whimory_cxt_ext_add(struct whimory *w, u32 lba, u32 span, u32 vba)
+{
+	struct whimory_cxt_extent *e;
+
+	if (w->n_cxt_ext >= w->max_cxt_ext)
+		return -ENOSPC;
+	e = &w->cxt_ext[w->n_cxt_ext++];
+	e->lba = lba;
+	e->span = span;
+	e->vba = vba;
+	return 0;
+}
+
+/*
+ * A TREE record is {start_lba, CONTIG_SPAN} followed by (vba, span) pairs,
+ * each pair advancing the logical cursor by span. Same shape as
+ * whimory_cxt_load_contig(), but it appends to the candidate map instead of
+ * touching L2V.
+ */
+static int whimory_cxt_parse_tree(struct whimory *w, const u8 *data,
+				  unsigned int len, u32 *next_lba,
+				  bool *lba_valid)
+{
+	u32 lba, span, vba, i, n = len / 8;
+
+	if (len < 16)
+		return 0;
+	lba = get_unaligned_le32(data);
+	span = get_unaligned_le32(data + 4);
+	if (span == 0xffffffffu)
+		return 0;
+	if (span != WHIMORY_CXT_CONTIG_SPAN)
+		return -EINVAL;
+	if (*lba_valid && lba != *next_lba) {
+		dev_warn(w->dev,
+			 "CXT_TREE lba discontinuity want=%u got=%u\n",
+			 *next_lba, lba);
+		return -EINVAL;
+	}
+	*lba_valid = true;
+
+	for (i = 1; i < n; i++) {
+		vba = get_unaligned_le32(data + 8 * i);
+		span = get_unaligned_le32(data + 8 * i + 4);
+		if (vba == 0xffffffffu || !span)
+			break;
+		w->sftl.cxt_records_seen++;
+		if (vba >= WHIMORY_CXT_VBA_HOLE || vba >= w->l2v.invalid_vba) {
+			/* Hole: consumes logical space, maps nothing. */
+			w->sftl.cxt_hole_entries++;
+			lba += span;
+			continue;
+		}
+		while (span) {
+			u32 chunk = w->sftl.vbas_per_page -
+				    (vba % w->sftl.vbas_per_page);
+			u32 tvba;
+			int ret;
+
+			if (chunk > span)
+				chunk = span;
+			if (!whimory_cxt_vba_translate(w, vba, &tvba)) {
+				ret = whimory_cxt_ext_add(w, lba, chunk, tvba);
+				if (ret)
+					return ret;
+			} else {
+				w->sftl.cxt_xlate_fail++;
+			}
+			lba += chunk;
+			vba += chunk;
+			span -= chunk;
+		}
+		continue;
+	}
+	*next_lba = lba;
+	return 0;
+}
+
+/* Walk the records of one CXT superblock and collect every TREE extent. */
+static int whimory_cxt_build_from_sb(struct whimory *w, u32 sb_idx)
+{
+	struct whimory_sftl *s = &w->sftl;
+	u8 *data = s->gc_data;
+	u8 meta[WHIMORY_META_SIZE];
+	u8 spare[S5L8740_NAND_META_SIZE];
+	u32 ofs, last_key = ~0u, next_lba = 0;
+	bool lba_valid = false;
+	int ret;
+
+	if (!data || !s->data_page)
+		return -ENOMEM;
+
+	for (ofs = 0; ofs < s->vbas_per_sb; ofs++) {
+		ret = whimory_cxt_read_vba(w, sb_idx, ofs, data, meta, spare,
+					   &last_key);
+		if (ret)
+			return ret;
+		if (meta[0] != WHIMORY_META_TYPE_SFTL_CXT)
+			continue;
+		if (meta[1] == WHIMORY_CXT_TAG_CLEAN)
+			break;
+		if (meta[1] != WHIMORY_CXT_TAG_L2V)
+			continue;
+		ret = whimory_cxt_parse_tree(w, data, WHIMORY_LBA_SIZE,
+					     &next_lba, &lba_valid);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+/*
+ * Build the candidate map from the newest CXT base that parses cleanly.
+ * Never touches w->ranges.
+ */
+static int whimory_cxt_ext_cmp(const void *a, const void *b)
+{
+	const struct whimory_cxt_extent *x = a, *y = b;
+
+	if (x->lba != y->lba)
+		return x->lba < y->lba ? -1 : 1;
+	return 0;
+}
+
+/*
+ * Build the candidate map from every CXT superblock.
+ *
+ * The TREE is partitioned by logical range across the CXT blocks — on this
+ * device sb 1702 starts at LBA 0 and sb 3662 picks up at 613939 — so taking
+ * the first superblock that parses leaves most of the volume, including the
+ * FAT-critical sectors, unmapped. Merge them all, then sort by LBA so the
+ * lookup can binary search. Never touches w->ranges.
+ */
+static int whimory_cxt_build_candidate(struct whimory *w)
+{
+	struct whimory_cxt_base all[WHIMORY_CXT_MAX_SB];
+	unsigned int i, n_all, ok = 0, overlaps = 0;
+	int ret, sess;
+
+	/*
+	 * Allocated on first use: translation splits every CXT run at 4-slot
+	 * plane boundaries, so the table is roughly one entry per four LBAs
+	 * and is only worth its megabytes when the CXT path is exercised.
+	 */
+	if (!w->cxt_ext) {
+		w->max_cxt_ext = cxt_max_extents;
+		w->cxt_ext = kvmalloc_array(w->max_cxt_ext,
+					    sizeof(*w->cxt_ext), GFP_KERNEL);
+		if (!w->cxt_ext) {
+			w->max_cxt_ext = 0;
+			return -ENOMEM;
+		}
+	}
+	n_all = whimory_cxt_collect_sbs(w, all, ARRAY_SIZE(all));
+	if (!n_all)
+		return -ENOENT;
+
+	whimory_cxt_ext_reset(w);
+	w->sftl.cxt_records_seen = 0;
+	w->sftl.cxt_hole_entries = 0;
+	w->sftl.cxt_xlate_fail = 0;
+
+	sess = s5l8740_nand_dma_session_begin();
+	for (i = 0; i < n_all; i++) {
+		u32 before = w->n_cxt_ext;
+
+		ret = whimory_cxt_build_from_sb(w, all[i].sb);
+		if (ret) {
+			dev_warn(w->dev,
+				 "CXT_CAND_MAP sb=%u parse failed %d\n",
+				 all[i].sb, ret);
+			continue;
+		}
+		if (w->n_cxt_ext == before)
+			continue;
+		ok++;
+		if (all[i].weave > w->cxt_ext_weave) {
+			w->cxt_ext_weave = all[i].weave;
+			w->cxt_ext_sb = all[i].sb;
+		}
+		dev_info(w->dev,
+			 "CXT_CAND_MAP sb=%u weave=%llu extents=+%u total=%u\n",
+			 all[i].sb, (unsigned long long)all[i].weave,
+			 w->n_cxt_ext - before, w->n_cxt_ext);
+	}
+	if (sess == 0)
+		s5l8740_nand_dma_session_end();
+
+	if (!w->n_cxt_ext)
+		return -ENODATA;
+
+	sort(w->cxt_ext, w->n_cxt_ext, sizeof(*w->cxt_ext),
+	     whimory_cxt_ext_cmp, NULL);
+	for (i = 1; i < w->n_cxt_ext; i++)
+		if (w->cxt_ext[i].lba <
+		    w->cxt_ext[i - 1].lba + w->cxt_ext[i - 1].span)
+			overlaps++;
+
+	dev_info(w->dev,
+		 "CXT_MAP sbs_used=%u/%u extents=%u records=%u holes=%u "
+		 "xlate_fail=%u overlaps=%u base_weave=%llu\n",
+		 ok, n_all, w->n_cxt_ext, w->sftl.cxt_records_seen,
+		 w->sftl.cxt_hole_entries, w->sftl.cxt_xlate_fail, overlaps,
+		 (unsigned long long)w->cxt_ext_weave);
+	return 0;
+}
+
+/*
+ * Compare the candidate map against the brute-force interval map, which is
+ * ground truth because it comes from per-slot metadata. Any systematic
+ * decode error shows up as a repeated (vba_cxt - vba_brute) delta.
+ */
+#define WHIMORY_CXT_DELTA_SLOTS	8
+
+static void whimory_cxt_compare(struct whimory *w)
+{
+	s64 delta_val[WHIMORY_CXT_DELTA_SLOTS] = {0};
+	u32 delta_cnt[WHIMORY_CXT_DELTA_SLOTS] = {0};
+	u32 agree = 0, disagree = 0, absent = 0, checked = 0;
+	u32 i, j, shown = 0;
+	u64 covered = 0;
+
+	for (i = 0; i < w->n_cxt_ext; i++) {
+		struct whimory_cxt_extent *e = &w->cxt_ext[i];
+		u32 probes[3], np = 0, k;
+
+		covered += e->span;
+		probes[np++] = e->lba;
+		if (e->span > 2)
+			probes[np++] = e->lba + e->span / 2;
+		if (e->span > 1)
+			probes[np++] = e->lba + e->span - 1;
+
+		for (k = 0; k < np; k++) {
+			u32 lba = probes[k];
+			u32 want = e->vba + (lba - e->lba);
+			struct whimory_range *r;
+			s64 d;
+
+			checked++;
+			r = whimory_range_find(&w->ranges, lba);
+			if (!r) {
+				absent++;
+				continue;
+			}
+			d = (s64)want - (s64)(r->vba + (lba - r->start));
+			if (!d) {
+				agree++;
+				continue;
+			}
+			disagree++;
+			if (shown++ < diag_max_lines) {
+				u32 bv = r->vba + (lba - r->start);
+				u32 per = w->sftl.vbas_per_sb;
+				u32 dper = WHIMORY_DATA_VBAS_PER_SB;
+
+				/*
+				 * Decompose both VBAs in the 512-per-SB space
+				 * we pack into and in the 508-per-SB data-only
+				 * space, so a units mismatch is visible rather
+				 * than inferred.
+				 */
+				dev_info(w->dev,
+					 "CXT_CMP lba=%u cxt_vba=%u brute_vba=%u delta=%lld\n",
+					 lba, want, bv, (long long)d);
+				dev_info(w->dev,
+					 "  cxt   sb512=%u ofs512=%u sb508=%u ofs508=%u\n",
+					 want / per, want % per,
+					 want / dper, want % dper);
+				dev_info(w->dev,
+					 "  brute sb512=%u ofs512=%u sb508=%u ofs508=%u\n",
+					 bv / per, bv % per,
+					 bv / dper, bv % dper);
+			}
+			for (j = 0; j < WHIMORY_CXT_DELTA_SLOTS; j++) {
+				if (delta_cnt[j] && delta_val[j] != d)
+					continue;
+				delta_val[j] = d;
+				delta_cnt[j]++;
+				break;
+			}
+		}
+	}
+
+	dev_info(w->dev,
+		 "CXT_COMPARE extents=%u covered_lbas=%llu checked=%u "
+		 "agree=%u disagree=%u absent_in_brute=%u\n",
+		 w->n_cxt_ext, covered, checked, agree, disagree, absent);
+	for (j = 0; j < WHIMORY_CXT_DELTA_SLOTS; j++) {
+		if (!delta_cnt[j])
+			continue;
+		dev_info(w->dev, "CXT_DELTA %lld x%u\n",
+			 (long long)delta_val[j], delta_cnt[j]);
+	}
+}
+
+/* Resolve an LBA through the candidate map only. */
+static int whimory_cxt_lookup(struct whimory *w, u32 lba, u32 *vba_out)
+{
+	u32 lo = 0, hi = w->n_cxt_ext;
+
+	while (lo < hi) {
+		u32 mid = lo + (hi - lo) / 2;
+		struct whimory_cxt_extent *e = &w->cxt_ext[mid];
+
+		if (lba < e->lba)
+			hi = mid;
+		else if (lba >= e->lba + e->span)
+			lo = mid + 1;
+		else {
+			*vba_out = e->vba + (lba - e->lba);
+			return 0;
+		}
+	}
+	return -ENOENT;
+}
+
+/*
+ * Read the BPB and the FAT-critical sectors through the candidate map and
+ * check that each landed on a page whose metadata claims the LBA we asked
+ * for. This is the gate that decides whether the CXT map is usable.
+ */
+static int whimory_cxt_validate(struct whimory *w, u32 fat_base)
+{
+	static const u32 rel[] = { 0, 1, 2, 6, 7, 8 };
+	struct whimory_meta meta;
+	u8 *buf;
+	unsigned int i;
+	u32 ok = 0, bad = 0, miss = 0;
+	int ret, sess;
+
+	if (!w->n_cxt_ext)
+		return -ENODATA;
+	buf = kmalloc(WHIMORY_LBA_SIZE, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	sess = s5l8740_nand_dma_session_begin();
+	for (i = 0; i < ARRAY_SIZE(rel); i++) {
+		u32 lba = fat_base + rel[i];
+		u32 vba = 0, mlba;
+
+		ret = whimory_cxt_lookup(w, lba, &vba);
+		if (ret) {
+			miss++;
+			dev_info(w->dev, "CXT_VALID lba=%u UNMAPPED\n", lba);
+			continue;
+		}
+		ret = w->vfl_ops->read_vba(w, vba, 1, buf, &meta);
+		if (ret) {
+			bad++;
+			dev_info(w->dev, "CXT_VALID lba=%u vba=%u read %d\n",
+				 lba, vba, ret);
+			continue;
+		}
+		mlba = le32_to_cpu(meta.lba);
+		if (mlba == lba) {
+			ok++;
+		} else {
+			bad++;
+			dev_info(w->dev,
+				 "CXT_VALID lba=%u vba=%u meta_lba=%u MISMATCH\n",
+				 lba, vba, mlba);
+		}
+	}
+	if (sess == 0)
+		s5l8740_nand_dma_session_end();
+	kfree(buf);
+
+	dev_info(w->dev,
+		 "CXT_VALIDATE fat_base=%u ok=%u bad=%u unmapped=%u verdict=%s\n",
+		 fat_base, ok, bad, miss,
+		 (ok == ARRAY_SIZE(rel)) ? "USABLE" : "NOT_USABLE");
+	return (ok == ARRAY_SIZE(rel)) ? 0 : -EBADMSG;
+}
+
+
+/*
+ * Sample extents across the candidate map, read the VBA the CXT claims, and
+ * print what the page metadata actually says. If the decode is merely stale
+ * the page still claims the LBA we asked for; if it is wrong, meta_lba is
+ * unrelated and the (expected, actual) pairs expose the transform.
+ */
+static void whimory_cxt_probe(struct whimory *w, unsigned int nsamples)
+{
+	struct whimory_meta meta;
+	u8 *buf;
+	u32 step, i, ok = 0, stale = 0, wrong = 0, blank = 0, zero = 0;
+	int ret, sess;
+
+	if (!w->n_cxt_ext || !nsamples)
+		return;
+	buf = kmalloc(WHIMORY_LBA_SIZE, GFP_KERNEL);
+	if (!buf)
+		return;
+
+	step = w->n_cxt_ext / nsamples;
+	if (!step)
+		step = 1;
+
+	sess = s5l8740_nand_dma_session_begin();
+	for (i = 0; i < w->n_cxt_ext; i += step) {
+		struct whimory_cxt_extent *e = &w->cxt_ext[i];
+		u32 mlba;
+
+		ret = w->vfl_ops->read_vba(w, e->vba, 1, buf, &meta);
+		if (ret) {
+			wrong++;
+			continue;
+		}
+		mlba = le32_to_cpu(meta.lba);
+		if (mlba == e->lba) {
+			ok++;
+			continue;
+		}
+		if (mlba == 0xffffffffu)
+			blank++;
+		else if (!mlba)
+			zero++;
+		else
+			wrong++;
+		if (stale++ < 12)
+			dev_info(w->dev,
+				 "CXT_PROBE ext=%u lba=%u span=%u vba=%u "
+				 "meta_type=%02x meta_lba=%u diff=%d\n",
+				 i, e->lba, e->span, e->vba, meta.type, mlba,
+				 (int)(mlba - e->lba));
+	}
+	if (sess == 0)
+		s5l8740_nand_dma_session_end();
+	kfree(buf);
+
+	dev_info(w->dev,
+		 "CXT_PROBE_SUM sampled=%u ok=%u wrong=%u blank=%u zero_lba=%u\n",
+		 (w->n_cxt_ext + step - 1) / step, ok, wrong, blank, zero);
+}
+
+/*
+ * Seed the interval map from the CXT snapshot.
+ *
+ * Every extent is claimed at the CXT base weave, so the normal winner rules
+ * apply unchanged: anything the diff replay finds with a newer weave
+ * overrides it, and anything older is rejected as stale.
+ */
+static int whimory_cxt_seed_l2v(struct whimory *w)
+{
+	u32 i, seeded = 0;
+	int ret;
+
+	w->sftl.claim_source = 3;
+	for (i = 0; i < w->n_cxt_ext; i++) {
+		struct whimory_cxt_extent *e = &w->cxt_ext[i];
+
+		w->sftl.claim_weave = w->cxt_ext_weave;
+		ret = whimory_l2v_update(w, e->lba, e->span, e->vba);
+		w->sftl.claim_weave = 0;
+		if (ret) {
+			w->sftl.claim_source = 0;
+			return ret;
+		}
+		seeded += e->span;
+		w->sftl.cxt_l2v_updates++;
+		if ((i & 0x3fff) == 0)
+			cond_resched();
+	}
+	w->sftl.claim_source = 0;
+	dev_info(w->dev,
+		 "CXT_SEED extents=%u lbas=%u ranges=%u base_weave=%llu\n",
+		 w->n_cxt_ext, seeded, w->sftl.range_nodes,
+		 (unsigned long long)w->cxt_ext_weave);
+	return 0;
+}
+
+/*
+ * Fast path: seed from the CXT, then let the caller replay only the
+ * superblocks newer than the checkpoint. Returns 0 when the map is seeded.
+ */
+static int whimory_cxt_fast_load(struct whimory *w)
+{
+	int ret;
+
+	ret = whimory_cxt_build_candidate(w);
+	if (ret) {
+		dev_warn(w->dev,
+			 "CXT fast path unavailable (%d); full replay\n",
+			 ret);
+		return ret;
+	}
+	ret = whimory_cxt_seed_l2v(w);
+	if (ret)
+		return ret;
+	w->cxt_base_weave = w->cxt_ext_weave;
+	w->sftl.cxt_loaded = true;
+	/*
+	 * The interval map now holds everything the extent table did, and the
+	 * table is ~12 MiB on a 55 MiB device. Drop it; the Phase 3 tools
+	 * reallocate it on demand.
+	 */
+	kvfree(w->cxt_ext);
+	w->cxt_ext = NULL;
+	w->max_cxt_ext = 0;
+	w->n_cxt_ext = 0;
+	return 0;
+}
+
+/* Phase 3 entry point: build the candidate map, compare it, validate it. */
+int whimory_cxt_candidate(u32 fat_base)
+{
+	struct whimory *w = whimory_dev;
+	int ret;
+
+	if (!w)
+		return -ENODEV;
+	ret = whimory_cxt_build_candidate(w);
+	if (ret) {
+		dev_warn(w->dev, "CXT candidate build failed %d\n", ret);
+		return ret;
+	}
+	whimory_cxt_compare(w);
+	whimory_cxt_probe(w, 24);
+	if (fat_base)
+		whimory_cxt_validate(w, fat_base);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(whimory_cxt_candidate);
+
+
 static void whimory_note_meta0(struct whimory *w, unsigned int ce,
 			       unsigned int cau, unsigned int block,
 			       unsigned int page, const u8 *data, const u8 *meta)
@@ -3246,7 +4778,7 @@ static void whimory_note_meta0(struct whimory *w, unsigned int ce,
 		    m[0] != WHIMORY_META_TYPE_DATA2)
 			continue;
 		w->sftl.meta0_hits++;
-		if (w->sftl.meta0_hits > 24)
+		if (!ftl_diag || w->sftl.meta0_hits > 24)
 			continue;
 		vblock = whimory_vfl_virt(w, cau, block);
 		vba = whimory_pack_vba(w, ce, cau, vblock, page, slot);
@@ -3278,13 +4810,23 @@ static void whimory_print_recovery_stats(struct whimory *w)
 
 	dev_info(w->dev,
 		 "RECOVERY_STATS:\n"
+		 "  scan_blocks=%u (param) user_blocks=%u\n"
 		 "  fpart_sig=%u vfl_ctx_hits=%u vfl_cxt_loc=%u vfl_bitmap=%u\n"
 		 "  classified_empty=%u classified_closed=%u classified_open=%u classified_cxt=%u classified_unknown=%u\n"
 		 "  cxt_blocks_seen=%u cxt_records_seen=%u cxt_l2v_updates=%u\n"
 		 "  btoc_pages_read=%u btoc_pages_valid=%u btoc_entries_seen=%u btoc_l2v_updates=%u\n"
+		 "  btoc_meta_confirmed=%u btoc_meta_mismatch=%u btoc_skipped_zero=%u\n"
+		 "  btoc_confirm_pages=%u btoc_confirm_capped=%u btoc_confirm_budget_stop=%u\n"
+		 "  btoc_unmap_entries=%u btoc_hole_entries=%u btoc_unknown_entries=%u\n"
 		 "  btoc_token_ffff0000=%u btoc_token_ffffff00=%u btoc_token_ffffffff=%u btoc_holelist_ffff0001=%u\n"
 		 "  open_slots_seen=%u open_slots_valid_meta=%u open_l2v_updates=%u\n"
-		 "  l2v_update_calls=%u l2v_unmap_calls=%u l2v_repack_roots=%u mapped_lbas=%u mapped_roots=%u meta0_hits=%u\n",
+		 "  open_unmap_entries=%u open_skipped_zero=%u open_overrides_closed=%u "
+		 "open_rejected_stale=%u open_unknown_order=%u\n"
+		 "  mapped_lbas=%u mapped_ranges=%u mapped_roots=%u range_budget_stop=%u\n"
+		 "  string_hits itunesdb=%u f00=%u ipod_control=%u music=%u apps=%u mp3=%u m4a=%u\n"
+		 "  l2v_update_calls=%u l2v_unmap_calls=%u stale_mapping_rejected=%u "
+		 "l2v_repack_roots=%u meta0_hits=%u\n",
+		 scan_blocks, s->user_blocks,
 		 w->sig_ok, w->vfl.ctx_hits, w->vfl.cxt_loc_count,
 		 w->vfl.bitmap_loaded,
 		 s->empty_sbs, s->btoc_sbs, s->open_sbs, s->cxt_sbs,
@@ -3292,12 +4834,27 @@ static void whimory_print_recovery_stats(struct whimory *w)
 		 s->cxt_blocks_seen, s->cxt_records_seen, s->cxt_l2v_updates,
 		 s->btoc_pages_read, s->btoc_pages_valid, s->btoc_entries_seen,
 		 s->btoc_l2v_updates,
+		 s->btoc_meta_confirmed, s->btoc_meta_mismatch,
+		 s->btoc_skipped_zero,
+		 s->btoc_confirm_pages, s->btoc_confirm_capped,
+		 s->btoc_confirm_budget_stop,
+		 s->btoc_unmap_entries, s->btoc_hole_entries,
+		 s->btoc_unknown_entries,
 		 s->btoc_token_ffff0000, s->btoc_token_ffffff00,
 		 s->btoc_token_ffffffff, s->btoc_holelist_ffff0001,
 		 s->open_slots_seen, s->open_slots_valid_meta,
 		 s->open_l2v_updates,
-		 s->l2v_update_calls, s->l2v_unmap_calls, s->l2v_repack_roots,
-		 s->mapped_lbas, s->mapped_roots, s->meta0_hits);
+		 s->open_unmap_entries, s->open_skipped_zero,
+		 s->open_overrides_closed, s->open_rejected_stale,
+		 s->open_unknown_order,
+		 s->mapped_lbas, s->range_nodes, s->mapped_roots,
+		 s->range_budget_stop,
+		 s->string_hit_itunesdb, s->string_hit_f00,
+		 s->string_hit_ipod_control, s->string_hit_music,
+		 s->string_hit_apps, s->string_hit_mp3, s->string_hit_m4a,
+		 s->l2v_update_calls, s->l2v_unmap_calls,
+		 s->stale_mapping_rejected,
+		 s->l2v_repack_roots, s->meta0_hits);
 }
 
 static void whimory_scan_closed_meta0(struct whimory *w, unsigned int nsb)
@@ -3335,32 +4892,127 @@ static void whimory_scan_closed_meta0(struct whimory *w, unsigned int nsb)
 	}
 }
 
-static void whimory_dump_vba_page(struct whimory *w, u32 vba)
+/*
+ * Sibling slots on a page need not be contiguous LBAs. Only the selected
+ * map_slot is judged against requested fmss_lba. Sibling dump is VBA_DIAG.
+ */
+static bool whimory_audit_fmss_lba(u32 fmss_lba)
 {
-	u32 ce, cau, vblock, page, slot, pblock;
+	/* Known BPB / critical fmss candidates + FAT-relative later. */
+	switch (fmss_lba) {
+	case 49216u:
+	case 49279u:
+	case 49280u:
+	case 49285u:
+	case 49286u:
+	case 49311u:
+	case 49317u:	/* FAT0 disk 32 @ base 49285 */
+	case 51201u:	/* root @ base 49285 */
+		return true;
+	default:
+		if (fmss_lba >= 49279u && fmss_lba < 49279u + 2048u)
+			return true;
+		return false;
+	}
+}
+
+static bool payload_string_scan;
+module_param(payload_string_scan, bool, 0644);
+MODULE_PARM_DESC(payload_string_scan,
+		 "Scan confirmed pages for iTunesDB/F00/mp3 strings (default N)");
+
+static void whimory_note_payload_strings(struct whimory *w, const u8 *data,
+					 unsigned int len)
+{
+	if (!payload_string_scan || !data || len < 8)
+		return;
+	if (memchr(data, 'i', len) &&
+	    strnstr((const char *)data, "iTunesDB", len))
+		w->sftl.string_hit_itunesdb++;
+	if (strnstr((const char *)data, "F00", len) ||
+	    strnstr((const char *)data, "F01", len) ||
+	    strnstr((const char *)data, "F02", len))
+		w->sftl.string_hit_f00++;
+	if (strnstr((const char *)data, "iPod_Control", len))
+		w->sftl.string_hit_ipod_control++;
+	if (strnstr((const char *)data, "Music", len))
+		w->sftl.string_hit_music++;
+	if (strnstr((const char *)data, "NanoApps", len) ||
+	    strnstr((const char *)data, "Apps", len))
+		w->sftl.string_hit_apps++;
+	if (strnstr((const char *)data, ".mp3", len) ||
+	    strnstr((const char *)data, ".MP3", len) ||
+	    strnstr((const char *)data, "mp3", len))
+		w->sftl.string_hit_mp3++;
+	if (strnstr((const char *)data, ".m4a", len) ||
+	    strnstr((const char *)data, ".M4A", len) ||
+	    strnstr((const char *)data, "m4a", len))
+		w->sftl.string_hit_m4a++;
+}
+
+static void whimory_dump_vba_page(struct whimory *w, u32 vba, u32 fmss_lba)
+{
+	u32 ce, cau, vblock, page, map_slot, pblock, slot;
 	u8 spare[S5L8740_NAND_META_SIZE];
 	u8 *data = w->sftl.data_page;
+	const u8 *sel_m;
+	u32 sel_meta_lba;
+	u64 sel_weave;
+	bool sel_type_ok, sel_lba_ok, bad;
 	int ret;
 
 	if (!data)
 		return;
-	if (whimory_unpack_vba(w, vba, &ce, &cau, &vblock, &page, &slot)) {
-		dev_warn(w->dev, "BAD_VBA unpack failed vba=%u\n", vba);
+	if (whimory_unpack_vba(w, vba, &ce, &cau, &vblock, &page, &map_slot)) {
+		dev_warn(w->dev,
+			 "BAD_VBA unpack failed fmss_lba=%u vba=%u\n",
+			 fmss_lba, vba);
 		return;
 	}
 	cau = whimory_vfl_bank(w, cau, vblock);
 	pblock = whimory_vfl_phys(w, cau, vblock);
-	dev_info(w->dev,
-		 "BAD_VBA vba=%u sb=%u ofs=%u -> ce=%u cau=%u vblock=%u pbn=%u page=%u map_slot=%u\n",
-		 vba, s_g_vba_to_sb(w, vba), s_g_vba_to_ofs(w, vba),
-		 ce, cau, vblock, pblock, page, slot);
 	ret = whimory_cs_read_page(w, ce, cau, pblock, page, data,
 				   S5L8740_NAND_PAGE_SIZE, spare,
 				   sizeof(spare));
 	if (ret) {
-		dev_warn(w->dev, "BAD_VBA page read %d\n", ret);
+		dev_warn(w->dev,
+			 "BAD_VBA page read fmss_lba=%u vba=%u ret=%d\n",
+			 fmss_lba, vba, ret);
 		return;
 	}
+
+	sel_m = spare + map_slot * WHIMORY_META_SIZE;
+	sel_meta_lba = get_unaligned_le32(sel_m + 8);
+	sel_weave = whimory_weave48(sel_m);
+	sel_type_ok = (sel_m[0] == WHIMORY_META_TYPE_DATA ||
+		       sel_m[0] == WHIMORY_META_TYPE_DATA2) &&
+		      !(sel_m[1] & 0x02);
+	sel_lba_ok = (sel_meta_lba == fmss_lba);
+	bad = !sel_type_ok || !sel_lba_ok;
+
+	dev_info(w->dev,
+		 "VBA_DIAG fmss_lba=%u vba=%u sb=%u ofs=%u "
+		 "ppn=ce%u/cau%u/vblk%u/pbn%u/pg%u selected_slot=%u "
+		 "selected_meta_lba=%u selected_weave=%012llx "
+		 "type=%02x flags=%02x verdict=%s\n",
+		 fmss_lba, vba, s_g_vba_to_sb(w, vba), s_g_vba_to_ofs(w, vba),
+		 ce, cau, vblock, pblock, page, map_slot, sel_meta_lba,
+		 (unsigned long long)sel_weave, sel_m[0], sel_m[1],
+		 bad ? "BAD" : "OK");
+
+	if (bad) {
+		const u8 *d = data + map_slot * WHIMORY_LBA_SIZE;
+
+		dev_warn(w->dev,
+			 "BAD_VBA fmss_lba=%u selected_slot=%u type=%02x "
+			 "flags=%02x meta_lba=%u (want %u) first64=%32ph\n",
+			 fmss_lba, map_slot, sel_m[0], sel_m[1], sel_meta_lba,
+			 fmss_lba, d);
+	}
+
+	if (!vba_page_dump)
+		return;
+
 	for (slot = 0; slot < WHIMORY_VBAS_PER_PAGE; slot++) {
 		const u8 *m = spare + slot * WHIMORY_META_SIZE;
 		const u8 *d = data + slot * WHIMORY_LBA_SIZE;
@@ -3368,8 +5020,10 @@ static void whimory_dump_vba_page(struct whimory *w, u32 vba)
 		u16 bps = get_unaligned_le16(d + 11);
 
 		dev_info(w->dev,
-			 "BAD_VBA slot=%u type=%02x flags=%02x meta_lba=%u bps=%u first64=%32ph %32ph meta=%16ph\n",
-			 slot, m[0], m[1], meta_lba, bps, d, d + 32, m);
+			 "VBA_DIAG slot=%u%s type=%02x flags=%02x meta_lba=%u "
+			 "bps=%u first64=%32ph meta=%16ph\n",
+			 slot, slot == map_slot ? "*" : "",
+			 m[0], m[1], meta_lba, bps, d, m);
 	}
 }
 
@@ -3389,10 +5043,24 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 	p127 = s->btoc_page;
 	if (!p127)
 		return -ENOMEM;
-	s->btoc_dumps_left = 5;
+	s->btoc_dumps_left = ftl_diag ? 5 : 0;
+	w->l2v_defer_pack = true;
+	s->btoc_verified = 0;
+	s->diff_replayed_sbs = 0;
+	s->diff_skipped_sbs = 0;
+	s->confirm_start_jiffies = jiffies;
+	s->btoc_confirm_budget_stop = 0;
+	s->string_hit_itunesdb = 0;
+	s->string_hit_f00 = 0;
+	s->string_hit_apps = 0;
+	s->string_hit_mp3 = 0;
+	s->string_hit_m4a = 0;
 
-	dev_info(w->dev, "SFTL classify scan ce=%u cau=%u blocks=%u\n",
-		 w->geom.num_ce, w->geom.num_cau, nscan);
+	dev_info(w->dev,
+		 "SFTL classify scan ce=%u cau=%u blocks=%u "
+		 "btoc_confirm_max=%u recover_budget_ms=%u audit_winners=%d\n",
+		 w->geom.num_ce, w->geom.num_cau, nscan,
+		 btoc_confirm_max, recover_budget_ms, audit_lba_winners);
 
 	for (ce = 0; ce < w->geom.num_ce; ce++) {
 		for (cau = 0; cau < w->geom.num_cau; cau++) {
@@ -3402,10 +5070,15 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 
 				if (nsb >= s->num_sb)
 					goto classify_done;
-				if ((b & 0x7f) == 0 && cau == 0 && ce == 0)
+				if ((b & 0x1f) == 0 && ftl_progress_due(w))
 					dev_info(w->dev,
 						 "SFTL classify ce=%u cau=%u blk=%u/%u nsb=%u\n",
 						 ce, cau, b, nscan, nsb);
+				if (recover_yield_us && (b & 0x3) == 0) {
+					cond_resched();
+					usleep_range(recover_yield_us,
+						     recover_yield_us + 500);
+				}
 				r0 = whimory_cs_read_page(w, ce, cau, b, 0,
 							  w->sftl.data_page,
 							  S5L8740_NAND_PAGE_SIZE,
@@ -3470,7 +5143,18 @@ classify_done:
 		 nsb, s->btoc_sbs, s->open_sbs, s->cxt_sbs, s->empty_sbs,
 		 s->unknown_sbs);
 
-	ret = whimory_cxt_load(w);
+	whimory_cxt_index_build(w, nsb);
+	/*
+	 * The CXT is the FTL own checkpoint: it rebuilds the bulk of the map
+	 * from a handful of pages instead of every open superblock. Replay
+	 * below then adopts only what is newer than its base weave.
+	 */
+	ret = use_cxt ? whimory_cxt_fast_load(w) : -ENOENT;
+	if (ret && use_cxt)
+		dev_info(w->dev,
+			 "CXT seed failed %d; falling back to full replay\n",
+			 ret);
+	ret = 0;
 	if (ret)
 		dev_warn(w->dev, "s_cxt_load %d; continuing with BTOC replay\n",
 			 ret);
@@ -3482,10 +5166,23 @@ classify_done:
 		struct whimory_sb *sb = &s->sbs[i];
 		u32 vblock = whimory_vfl_virt(w, sb->cau, sb->block);
 
+		/*
+		 * Replay is the long pole once scan_blocks is widened. Give RNDIS
+		 * and the watchdog air on every superblock, not just inside
+		 * whimory_rebuild_open_sb().
+		 */
+		cond_resched();
+		if (recover_yield_us && (i & 0x3) == 0)
+			usleep_range(recover_yield_us, recover_yield_us + 500);
+
 		if (sb->kind == WHIMORY_SB_CXT)
 			continue;
-		if (s->cxt_loaded && sb->weave && sb->weave < w->cxt_base_weave)
+		if (use_cxt && s->cxt_loaded && sb->weave &&
+		    sb->weave < w->cxt_base_weave) {
+			s->diff_skipped_sbs++;
 			continue;
+		}
+		s->diff_replayed_sbs++;
 		if (sb->kind == WHIMORY_SB_CLOSED) {
 			int ingested;
 
@@ -3497,6 +5194,11 @@ classify_done:
 			if (ret)
 				continue;
 			s->btoc_pages_read++;
+			if (s->btoc_verified < btoc_verify_sbs) {
+				s->btoc_verified++;
+				whimory_btoc_verify(w, sb, vblock, s->btoc_page,
+						    S5L8740_NAND_PAGE_SIZE);
+			}
 			if (s->btoc_dumps_left &&
 			    (s->btoc_pages_read <= 2 ||
 			     whimory_btoc_looks_be_lpn(s->btoc_page))) {
@@ -3505,12 +5207,24 @@ classify_done:
 				s->btoc_dumps_left--;
 			}
 			s->claim_weave = sb->weave;
+			s->claim_source = 1;
 			ingested = whimory_ingest_btoc_page(w, sb->ce, sb->cau,
 							    vblock, s->btoc_page,
 							    S5L8740_NAND_PAGE_SIZE);
 			s->claim_weave = 0;
+			s->claim_source = 0;
 			if (ingested)
 				s->btoc_pages_valid++;
+			if (ftl_progress_due(w))
+				dev_info(w->dev,
+					 "SFTL replay progress i=%u/%u closed_valid=%u "
+					 "open_updates=%u unmap_calls=%u stale_rej=%u "
+					 "mapped=%u ranges=%u confirm=%u budget_stop=%u\n",
+					 i, nsb, s->btoc_pages_valid,
+					 s->open_l2v_updates, s->l2v_unmap_calls,
+					 s->stale_mapping_rejected, s->mapped_lbas,
+					 s->range_nodes, s->btoc_confirm_pages,
+					 s->range_budget_stop);
 		} else if (sb->kind == WHIMORY_SB_OPEN) {
 			if (max_open_sbs && open_done >= max_open_sbs)
 				continue;
@@ -3519,17 +5233,31 @@ classify_done:
 				open_done++;
 			else if (ret < 0)
 				return ret;
+			if (ftl_progress_due(w))
+				dev_info(w->dev,
+					 "SFTL open progress done=%u/%u i=%u/%u "
+					 "open_updates=%u ranges=%u mapped=%u\n",
+					 open_done, s->open_sbs, i, nsb,
+					 s->open_l2v_updates, s->range_nodes,
+					 s->mapped_lbas);
 		}
 	}
 
+	dev_info(w->dev,
+		 "SFTL diff replay sbs=%u skipped_by_cxt=%u cxt_seeded=%u\n",
+		 s->diff_replayed_sbs, s->diff_skipped_sbs, s->cxt_l2v_updates);
+	w->l2v_defer_pack = false;
 	ret = whimory_l2v_build_from_ranges(w);
-	if (ret && s->range_nodes) {
+	if (ret) {
+		/* The interval map is the lookup authority, so a failed pack
+		 * is survivable as long as it holds something.
+		 */
+		if (!s->range_nodes)
+			return ret;
 		dev_warn(w->dev,
 			 "L2V pack %d; using interval map (%u ranges)\n",
 			 ret, s->range_nodes);
 		ret = 0;
-	} else if (ret) {
-		return ret;
 	} else {
 		s->packed_ok = true;
 	}
@@ -3565,16 +5293,21 @@ static int whimory_sftl_alloc(struct whimory *w)
 	s->meta_page = kvmalloc(WHIMORY_META_SIZE * WHIMORY_VBAS_PER_PAGE *
 				(WHIMORY_DATA_PAGES_PER_SB + 1), GFP_KERNEL);
 	s->cs_page = kvmalloc(sizeof(*s->cs_page), GFP_KERNEL);
+	s->btoc_map = kvmalloc_array(WHIMORY_DATA_VBAS_PER_SB,
+				     sizeof(*s->btoc_map), GFP_KERNEL);
 	s->sbs = kvcalloc(nsb, sizeof(*s->sbs), GFP_KERNEL);
 	if (!s->btoc_page || !s->data_page || !s->meta_page || !s->cs_page ||
-	    !s->sbs)
+	    !s->sbs || !s->btoc_map)
 		return -ENOMEM;
 
 	/*
- *: max_pages_per_btoc =
- * div(page_bytes + 16 * vbas_per_sb - 1, page_bytes) + 1
- * 16×512 BTE bytes fit in a 16KiB NAND page → 1; OSOS adds 1 → 2.
- */
+	 * Pages needed to hold one block table of contents:
+	 *
+	 *   ceil(16 * vbas_per_sb / page_bytes) + 1
+	 *
+	 * 16 bytes per entry x 512 VBAs fits in a single 16 KiB NAND page,
+	 * and the stock firmware reserves one more, giving 2.
+	 */
 	{
 		u32 page_bytes = w->geom.page_size ?
 				 w->geom.page_size : S5L8740_NAND_PAGE_SIZE;
@@ -3596,11 +5329,11 @@ static int whimory_sftl_alloc(struct whimory *w)
 	}
 
 	/*
- *: zoneSize starts at 0x8D0EC98 * vbas_per_page and
- * doubles until >= 16. Minimum from the loop is 16; must be a
- * multiple of vbas_per_page. CXT load reads this
- * many VBAs into gc_data / gc_meta.
- */
+	 * The garbage-collection zone size doubles until it reaches at
+	 * least 16 VBAs and must stay a multiple of vbas_per_page, so 16 is
+	 * both the minimum and what N31 uses. Context load reads this many
+	 * VBAs at a time into gc_data / gc_meta.
+	 */
 	s->gc_zone_size = WHIMORY_GC_ZONE_MIN;
 	if (s->gc_zone_size % s->vbas_per_page)
 		return -EINVAL;
@@ -3611,9 +5344,9 @@ static int whimory_sftl_alloc(struct whimory *w)
 	if (!s->gc_data || !s->gc_meta)
 		return -ENOMEM;
 	/*
- *full-size FTL: num_superblocks * user VBAs per SB.
- * BTOC page is not host LBA space (DATA_VBAS_PER_SB).
- */
+	 *full-size FTL: num_superblocks * user VBAs per SB.
+	 * BTOC page is not host LBA space (DATA_VBAS_PER_SB).
+	 */
 	{
 		u64 cap = (u64)nsb * WHIMORY_DATA_VBAS_PER_SB;
 
@@ -3759,10 +5492,10 @@ static int n31_sftl_open(struct whimory *w)
 	int sess;
 
 	/*
- * OSOS FTL_Open:BTOC (6 slots / 2 open LBA maps),
- *GC zone,block tables,SB
- * state, nodepool ≥ 0x80000,L2V_Init, then s_boot.
- */
+	 * OSOS FTL_Open:BTOC (6 slots / 2 open LBA maps),
+	 *GC zone,block tables,SB
+	 * state, nodepool ≥ 0x80000,L2V_Init, then s_boot.
+	 */
 	ret = whimory_sftl_alloc(w);
 	if (ret)
 		return ret;
@@ -3807,11 +5540,11 @@ static const struct whimory_ftl_ops n31_sftl_ops = {
 static int whimory_select_ops(struct whimory *w)
 {
 	/*
- * OSOS dispatches VFL/FTL by signature major through a table that
- * is not named in the static dump. N31 media is PPN VFL + SFTL;
- * those are the only ops this module implements. Log the majors
- * from the signature (when present) and bind the N31 ops.
- */
+	 * OSOS dispatches VFL/FTL by signature major through a table that
+	 * is not named in the static dump. N31 media is PPN VFL + SFTL;
+	 * those are the only ops this module implements. Log the majors
+	 * from the signature (when present) and bind the N31 ops.
+	 */
 	w->vfl_ops = &n31_vfl_ops;
 	w->ftl = &n31_sftl_ops;
 	if (w->sig_ok) {
@@ -3892,6 +5625,7 @@ static int n31_sftl_read_lba(struct whimory *w, u32 lba, void *buf,
 {
 	struct whimory_meta meta;
 	u32 vba = 0, span = 0;
+	u32 ce, cau, vblock, page, slot;
 	int ret;
 
 	if (!w->l2v_ok)
@@ -3912,18 +5646,30 @@ static int n31_sftl_read_lba(struct whimory *w, u32 lba, void *buf,
 		memset(buf, 0xff, WHIMORY_LBA_SIZE);
 		return 0;
 	}
-	if (lba == 0) {
-		dev_info(w->dev, "L2V lookup LBA0 -> VBA=%u span=%u\n",
-			 vba, span);
-		whimory_dump_vba_page(w, vba);
+	if (ftl_diag && (whimory_audit_fmss_lba(lba) || lba < 16)) {
+		if (!whimory_unpack_vba(w, vba, &ce, &cau, &vblock, &page,
+					&slot))
+			dev_info(w->dev,
+				 "L2V lookup fmss_lba=%u -> vba=%u span=%u "
+				 "ppn=ce%u/cau%u/vblk%u/pg%u/slot%u\n",
+				 lba, vba, span, ce, cau, vblock, page, slot);
+		else
+			dev_info(w->dev,
+				 "L2V lookup fmss_lba=%u -> vba=%u span=%u\n",
+				 lba, vba, span);
+		/* Sibling VBA_DIAG only for BPB candidates (avoid spam). */
+		if (lba == 49279u || lba == 49285u || lba == 49216u ||
+		    lba < 4)
+			whimory_dump_vba_page(w, vba, lba);
 	}
 	ret = w->vfl_ops->read_vba(w, vba, 1, buf, &meta);
 	if (ret)
 		return ret;
 	ret = whimory_validate_meta(w, &meta, lba);
 	if (!ret)
-		dev_dbg(w->dev, "meta OK lba=%u vba=%u type=%02x\n",
-			lba, vba, meta.type);
+		dev_dbg(w->dev,
+			"meta OK fmss_lba=%u vba=%u type=%02x meta_lba=%u\n",
+			lba, vba, meta.type, le32_to_cpu(meta.lba));
 	return ret;
 }
 
@@ -4156,7 +5902,8 @@ static ssize_t whimory_status_show(struct device *dev,
 			  "disk_gate=%s\n"
 			  "mapped_roots=%u mapped_lbas=%u btoc_sbs=%u open_sbs=%u cxt_sbs=%u empty=%u recs=%u cxt_loaded=%d packed=%d\n"
 			  "lba0_vba=%u cap=%llu vbas_per_sb=%u hole=%u list=%u\n"
-			  "spare_applied=%u bitmap=%u frag=%u/%u gc_zone=%u btoc_pages=%u updates=%u gen=%u free=%u list_unmapped=%u\n%s\n",
+			  "spare_applied=%u bitmap=%u frag=%u/%u gc_zone=%u btoc_pages=%u updates=%u gen=%u free=%u list_unmapped=%u\n"
+			  "search_cache hits=%u misses=%u recovery=%s\n%s\n",
 			  w->fil_ok, w->sig_ok, w->vfl_ok, w->ftl_ok,
 			  w->l2v_ok, w->lba0_ok, w->oracle_used,
 			  meta_ok ? "enabled" : "disabled",
@@ -4174,6 +5921,9 @@ static ssize_t whimory_status_show(struct device *dev,
 			  w->sftl.gc_zone_size, w->sftl.max_pages_per_btoc,
 			  w->l2v.updates, w->l2v.gen, w->l2v.free_count,
 			  w->sftl.token_list_applied,
+			  w->sftl.search_cache_hits,
+			  w->sftl.search_cache_misses,
+			  whimory_recovery_state_name(),
 			  w->status);
 }
 static DEVICE_ATTR_RO(whimory_status);
@@ -4199,6 +5949,8 @@ static void whimory_free(struct whimory *w)
 	kvfree(w->sftl.data_page);
 	kvfree(w->sftl.meta_page);
 	kvfree(w->sftl.cs_page);
+	kvfree(w->sftl.btoc_map);
+	kvfree(w->cxt_ext);
 	kvfree(w->sftl.sbs);
 	kvfree(w->sftl.gc_data);
 	kvfree(w->sftl.gc_meta);
@@ -4225,17 +5977,16 @@ static int whimory_open_stack(struct whimory *w)
 
 	/*
 	 * Without CS metadata DMA, classic Whimory open cannot validate
-	 * META via page_read. Recover is available via CS phys reads:
-	 * echo 1 > .../ftl_sftl_recover  (binds csmap disks to L2V).
+	 * META via page_read. Recover is still available via CS phys:
+	 * echo 1 > .../ftl_sftl_recover
 	 */
 	if (!s5l8740_nand_meta_transport_ok()) {
 		whimory_set_status(w,
 				   "CS metadata DMA disabled; "
 				   "use ftl_sftl_recover (CS META path) "
-				   "or meta_dma_read=1");
+				   "or meta_dma_read=1 dma_dry=0");
 		pr_info("s5l8740-ftl: Whimory auto-open deferred "
-			"(meta_dma_read=0); run ftl_sftl_recover for "
-			"CXT→BTOC→L2V on CS META\n");
+			"(meta transport off); run ftl_sftl_recover\n");
 		return -EOPNOTSUPP;
 	}
 
@@ -4381,7 +6132,106 @@ int whimory_l2v_search_phys(u32 lba, u8 *ce, u8 *cau, u16 *blk, u8 *page,
 	return 0;
 }
 
-int whimory_sftl_recover_cs(void)
+static bool whimory_slot_has_needle(const u8 *slot, unsigned int len,
+				    const char *needle)
+{
+	return !!strnstr((const char *)slot, needle, len);
+}
+
+/*
+ * Physical string scanner — ignores L2V. Walks readable CS pages and prints
+ * hits with ce/cau/block/page/slot + meta_lba. Independent of mount.
+ */
+int whimory_phys_string_scan(unsigned int max_blocks)
+{
+	struct whimory *w = whimory_dev;
+	u8 *data;
+	u8 spare[S5L8740_NAND_META_SIZE];
+	unsigned int ce, cau, b, pg, slot, nscan, hits = 0, pages = 0;
+	static const char *const needles[] = {
+		"iTunesDB", "F00", "F01", "F02", "iPod_Control", "Music",
+		"Apps", "NanoApps", ".mp3", ".m4a", "mp3", "m4a",
+	};
+	int sess;
+
+	if (!w || !w->sftl.data_page)
+		return -ENODEV;
+	nscan = max_blocks ? max_blocks :
+		(scan_blocks ? scan_blocks : w->sftl.user_blocks);
+	if (!nscan)
+		nscan = 256;
+	data = w->sftl.data_page;
+	sess = s5l8740_nand_dma_session_begin();
+	dev_info(w->dev,
+		 "PHYS_STRING_SCAN start blocks=%u (L2V ignored)\n", nscan);
+	for (ce = 0; ce < w->geom.num_ce; ce++) {
+		for (cau = 0; cau < w->geom.num_cau; cau++) {
+			for (b = 0; b < nscan; b++) {
+				for (pg = 0; pg < WHIMORY_DATA_PAGES_PER_SB;
+				     pg++) {
+					int ret;
+					unsigned int ni;
+
+					ret = whimory_cs_read_page(w, ce, cau,
+						b, pg, data,
+						S5L8740_NAND_PAGE_SIZE, spare,
+						sizeof(spare));
+					if (ret)
+						break;
+					if (whimory_page_blank(data, 64) &&
+					    whimory_meta_erased(spare, 16))
+						break;
+					pages++;
+					for (slot = 0;
+					     slot < WHIMORY_VBAS_PER_PAGE;
+					     slot++) {
+						const u8 *d = data +
+							slot * WHIMORY_LBA_SIZE;
+						const u8 *m = spare +
+							slot * WHIMORY_META_SIZE;
+						u32 meta_lba =
+							get_unaligned_le32(m + 8);
+
+						for (ni = 0; ni < ARRAY_SIZE(needles);
+						     ni++) {
+							if (!whimory_slot_has_needle(
+								    d,
+								    WHIMORY_LBA_SIZE,
+								    needles[ni]))
+								continue;
+							hits++;
+							if (hits <= 64)
+								dev_info(w->dev,
+									 "PHYS_STRING hit=%s "
+									 "ce=%u cau=%u blk=%u "
+									 "page=%u slot=%u "
+									 "meta_lba=%u type=%02x\n",
+									 needles[ni],
+									 ce, cau, b, pg,
+									 slot, meta_lba,
+									 m[0]);
+							break;
+						}
+					}
+					if ((pages & 0x7f) == 0)
+						cond_resched();
+				}
+				if ((b & 0x7f) == 0)
+					dev_info(w->dev,
+						 "PHYS_STRING_SCAN progress "
+						 "ce=%u cau=%u blk=%u/%u hits=%u\n",
+						 ce, cau, b, nscan, hits);
+			}
+		}
+	}
+	if (sess == 0)
+		s5l8740_nand_dma_session_end();
+	dev_info(w->dev,
+		 "PHYS_STRING_SCAN done pages=%u hits=%u\n", pages, hits);
+	return hits;
+}
+
+static int whimory_sftl_recover_cs_locked(void)
 {
 	struct whimory *w = whimory_dev;
 	int ret, sess;
@@ -4442,11 +6292,25 @@ int whimory_sftl_recover_cs(void)
 		w->sftl.btoc_pages_valid = 0;
 		w->sftl.btoc_entries_seen = 0;
 		w->sftl.btoc_l2v_updates = 0;
+		w->sftl.btoc_meta_mismatch = 0;
+		w->sftl.btoc_meta_confirmed = 0;
+		w->sftl.btoc_skipped_zero = 0;
+		w->sftl.btoc_confirm_pages = 0;
+		w->sftl.btoc_confirm_capped = 0;
+		w->sftl.btoc_confirm_budget_stop = 0;
+		w->sftl.string_hit_itunesdb = 0;
+		w->sftl.string_hit_f00 = 0;
+		w->sftl.string_hit_apps = 0;
+		w->sftl.string_hit_mp3 = 0;
+		w->sftl.string_hit_m4a = 0;
 		w->sftl.open_slots_seen = 0;
 		w->sftl.open_slots_valid_meta = 0;
 		w->sftl.open_l2v_updates = 0;
 		w->sftl.range_nodes = 0;
 		w->sftl.cxt_l2v_updates = 0;
+		w->sftl.range_budget_stop = 0;
+		w->sftl.stale_mapping_rejected = 0;
+		w->sftl.n_cxt_idx = 0;
 
 		sess = s5l8740_nand_dma_session_begin();
 		if (sess && sess != -EBUSY)
@@ -4469,6 +6333,44 @@ int whimory_sftl_recover_cs(void)
 			   w->sftl.range_nodes, w->sftl.btoc_pages_valid,
 			   w->sftl.open_l2v_updates);
 	dev_info(w->dev, "%s\n", w->status);
+	return 0;
+}
+
+/*
+ * One boot should run one recovery. A repeat with the same knobs is a
+ * no-op; a repeat with different knobs rebuilds, but not while the map is
+ * already live behind a registered disk unless asked explicitly.
+ */
+int whimory_sftl_recover_cs(void)
+{
+	struct whimory *w = whimory_dev;
+	int ret;
+
+	if (!w)
+		return -ENODEV;
+	if (recovery_state == RECOVERY_RUNNING)
+		return -EBUSY;
+	if (recovery_state == RECOVERY_VALID) {
+		if (recovery_params_key == whimory_recover_key()) {
+			dev_info(w->dev,
+				 "recover: map already valid (same params); skipping\n");
+			return 0;
+		}
+		if (!recover_force && n31_ftl_cs_disk_registered()) {
+			dev_warn(w->dev,
+				 "recover: disk bound; set recover_force=1 to rebuild\n");
+			return -EBUSY;
+		}
+	}
+
+	recovery_state = RECOVERY_RUNNING;
+	ret = whimory_sftl_recover_cs_locked();
+	if (ret) {
+		recovery_state = RECOVERY_FAILED;
+		return ret;
+	}
+	recovery_state = RECOVERY_VALID;
+	recovery_params_key = whimory_recover_key();
 	return 0;
 }
 
@@ -4527,9 +6429,9 @@ static int __init ftl_init(void)
 			ret, FTL_DISK_NAME, w->fil_ok, w->sig_ok, w->vfl_ok,
 			w->ftl_ok, w->l2v_ok, w->lba0_ok);
 		/*
- * Keep the platform device so sysfs status is visible.
- * The block disk is absent until LBA0 works.
- */
+		 * Keep the platform device so sysfs status is visible.
+		 * The block disk is absent until LBA0 works.
+		 */
 		return 0;
 	}
 	return 0;

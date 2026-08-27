@@ -37,6 +37,8 @@
 #include <linux/sysfs.h>
 #include <linux/workqueue.h>
 
+#include <linux/apple-n31.h>
+
 #define D1830_REG_POWEROFF	13
 #define D1830_POWEROFF_BIT	BIT(0)
 #define D1830_REG_ADC_CFG	48
@@ -50,11 +52,6 @@
 #define D1830_DESIGN_MIN_UV	3300000
 #define D1830_DESIGN_MAX_UV	4200000
 
-int s5l8740_eic_enable_gpio(unsigned int gpio, unsigned int irq_type);
-void s5l8740_n31_report_key(unsigned int code, int pressed);
-int s5l8740_n31_din86(void);
-extern void (*d1830_n31_din_nirq_hook)(void);
-
 /* Provisional Li-ion empty/full for capacity % (OPEN scale) */
 #define D1830_MV_EMPTY		3300
 #define D1830_MV_FULL		4200
@@ -64,12 +61,54 @@ module_param(dump_only, bool, 0644);
 MODULE_PARM_DESC(dump_only,
 		 "Log PMIC rail ops, do not write (docs-internal n31-pmic dummies)");
 
+/*
+ * Chatty WR/RMW/reg dumps are off by default. Enable with verbose=1, or
+ * via dynamic debug (dev_dbg) if the kernel was built with DYNAMIC_DEBUG.
+ */
+static bool verbose;
+module_param(verbose, bool, 0644);
+MODULE_PARM_DESC(verbose, "Verbose n31-pmic I2C/reg logging (default N; also gpio_d1830.verbose=1 on cmdline)");
+
+#define d1830_vinfo(dev, fmt, ...) \
+	do { \
+		if (verbose) \
+			dev_info((dev), fmt, ##__VA_ARGS__); \
+		else \
+			dev_dbg((dev), fmt, ##__VA_ARGS__); \
+	} while (0)
+
 static bool allow_audio_rails = true;
 module_param(allow_audio_rails, bool, 0644);
 MODULE_PARM_DESC(allow_audio_rails,
 		 "Apply sub_23EC LDO trim from d1830_audio_rails() (default on)");
 
-int d1830_audio_rails(void);
+/* Off by default: false Sleep during NAND CS storms was cutting power. */
+static bool sleep_poweroff;
+module_param(sleep_poweroff, bool, 0644);
+MODULE_PARM_DESC(sleep_poweroff,
+		 "Hold Sleep ~500ms → pm_power_off (default N)");
+
+/*
+ * The 100 ms r5-r8 sweep was a bring-up aid, not a product poll: Home /
+ * Sleep / Play arrive on the PMIC nIRQ (GPIO 86 DIN) via
+ * d1830_n31_din_nirq(). Polling it during a NAND CS storm is what
+ * produced the phantom "SLEEP PRESS r7=0x0e" that power-watch turned
+ * into a poweroff mid-recover. Interrupt-driven by default.
+ */
+static unsigned int btn_poll_ms;
+module_param(btn_poll_ms, uint, 0644);
+MODULE_PARM_DESC(btn_poll_ms,
+		 "Fallback button poll period in ms (0=off, interrupt-only)");
+
+/*
+ * A single glitched I2C byte must not reach userspace either: power-watch
+ * turns one KEY_POWER press into reboot(RB_POWER_OFF). Re-read after
+ * btn_confirm_ms and only report the press if Sleep is still low.
+ */
+static unsigned int btn_confirm_ms = 60;
+module_param(btn_confirm_ms, uint, 0644);
+MODULE_PARM_DESC(btn_confirm_ms,
+		 "Re-read delay confirming a Sleep press before KEY_POWER (0=off)");
 
 struct d1830_gpio_map {
 	u8 reg;
@@ -95,6 +134,8 @@ struct d1830_gpio {
 	unsigned long last_adc_jiffies;
 	int psy_ticks;
 	struct delayed_work trace;
+	struct delayed_work confirm;
+	u8 sleep_pending;
 	int trace_r[12];
 	int trace_din;
 	bool trace_inited;
@@ -352,7 +393,7 @@ void d1830_n31_din_nirq(void)
 static irqreturn_t d1830_irq_thread(int irq, void *data)
 {
 	struct d1830_gpio *gpio_dev = data;
-	static unsigned hits;
+	static unsigned int hits;
 
 	hits++;
 	if (hits <= 8 || (hits & 0x3f) == 0) {
@@ -443,7 +484,23 @@ static void d1830_btn_poll_once(struct d1830_gpio *gpio_dev)
 
 	if (!sleep) {
 		if (gpio_dev->last_sleep) {
-			dev_info(&client->dev,
+			/*
+			 * First low sample only arms the press. A real press easily
+			 * outlives btn_confirm_ms; a glitched I2C byte during a NAND
+			 * CS storm does not, and power-watch turns one KEY_POWER into
+			 * reboot(RB_POWER_OFF).
+			 */
+			if (btn_confirm_ms && !gpio_dev->sleep_pending) {
+				gpio_dev->sleep_pending = 1;
+				dev_dbg(&client->dev,
+					"n31-btn SLEEP arm r7=0x%02x (confirm in %ums)\n",
+					r7, btn_confirm_ms);
+				schedule_delayed_work(&gpio_dev->confirm,
+					      msecs_to_jiffies(btn_confirm_ms));
+				return;
+			}
+			gpio_dev->sleep_pending = 0;
+			d1830_vinfo(&client->dev,
 				 "n31-btn SLEEP PRESS r7=0x%02x (bit5 1->0)\n",
 				 r7);
 			s5l8740_n31_report_key(KEY_POWER, 1);
@@ -456,17 +513,23 @@ static void d1830_btn_poll_once(struct d1830_gpio *gpio_dev)
 		 * Short press still emits KEY_POWER for power-watch /
 		 * pm_power_off; hold is the kernel-direct fallback when
 		 * userspace is not watching. One noisy I2C byte must not
-		 * hibernate. */
+		 * hibernate.
+		 */
 		if (gpio_dev->sleep_hold < 5)
 			gpio_dev->sleep_hold++;
 		if (gpio_dev->sleep_hold == 5) {
-			dev_warn(&client->dev,
-				 "n31-btn SLEEP held — poweroff\n");
-			/* Prefer machine pm_power_off (same cut_power). */
-			if (pm_power_off)
-				pm_power_off();
-			else
-				d1830_cut_power(client);
+			if (!sleep_poweroff) {
+				d1830_vinfo(&client->dev,
+					      "n31-btn SLEEP held (poweroff disabled; sleep_poweroff=1 to enable)\n");
+			} else {
+				dev_warn(&client->dev,
+					 "n31-btn SLEEP held — poweroff\n");
+				/* Prefer machine pm_power_off (same cut_power). */
+				if (pm_power_off)
+					pm_power_off();
+				else
+					d1830_cut_power(client);
+			}
 		}
 	} else {
 		if (!gpio_dev->last_sleep) {
@@ -478,6 +541,7 @@ static void d1830_btn_poll_once(struct d1830_gpio *gpio_dev)
 				input_sync(gpio_dev->input);
 			}
 		}
+		gpio_dev->sleep_pending = 0;
 		gpio_dev->sleep_hold = 0;
 	}
 	gpio_dev->last_sleep = sleep;
@@ -496,16 +560,28 @@ static void d1830_btn_poll_once(struct d1830_gpio *gpio_dev)
 static void d1830_trace_work(struct work_struct *work)
 {
 	struct d1830_gpio *gpio_dev = container_of(to_delayed_work(work),
-						   struct d1830_gpio, trace);
+					   struct d1830_gpio, trace);
+	unsigned int period = btn_poll_ms ? btn_poll_ms : 1000;
+	unsigned int psy_every = 10000 / period;
 
-	d1830_btn_poll_once(gpio_dev);
-	if (gpio_dev->psy && ++gpio_dev->psy_ticks >= 100) {
+	if (btn_poll_ms)
+		d1830_btn_poll_once(gpio_dev);
+	if (gpio_dev->psy && ++gpio_dev->psy_ticks >= (psy_every ? psy_every : 1)) {
 		gpio_dev->psy_ticks = 0;
 		power_supply_changed(gpio_dev->psy);
 		if (gpio_dev->usb_psy)
 			power_supply_changed(gpio_dev->usb_psy);
 	}
-	schedule_delayed_work(&gpio_dev->trace, msecs_to_jiffies(100));
+	schedule_delayed_work(&gpio_dev->trace, msecs_to_jiffies(period));
+}
+
+/* Second look at Sleep after btn_confirm_ms; see d1830_btn_poll_once(). */
+static void d1830_confirm_work(struct work_struct *work)
+{
+	struct d1830_gpio *gpio_dev = container_of(to_delayed_work(work),
+					   struct d1830_gpio, confirm);
+
+	d1830_btn_poll_once(gpio_dev);
 }
 
 /*
@@ -771,8 +847,8 @@ static int d1830_write8(struct i2c_client *client, u8 reg, u8 val)
 {
 	int ret;
 
-	dev_info(&client->dev, "n31-pmic: WR %02x <- %02x%s\n",
-		 reg, val, dump_only ? " (suppressed)" : "");
+	d1830_vinfo(&client->dev, "n31-pmic: WR %02x <- %02x%s\n",
+		    reg, val, dump_only ? " (suppressed)" : "");
 	if (dump_only)
 		return 0;
 	ret = i2c_smbus_write_byte_data(client, reg, val);
@@ -790,9 +866,9 @@ static int d1830_rmw(struct i2c_client *client, u8 reg, u8 clear, u8 set)
 	if (v < 0)
 		return v;
 	newv = (u8)((v & ~clear) | set);
-	dev_info(&client->dev,
-		 "n31-pmic: RMW reg=%02x old=%02x clear=%02x set=%02x new=%02x%s\n",
-		 reg, v, clear, set, newv, dump_only ? " (suppressed)" : "");
+	d1830_vinfo(&client->dev,
+		    "n31-pmic: RMW reg=%02x old=%02x clear=%02x set=%02x new=%02x%s\n",
+		    reg, v, clear, set, newv, dump_only ? " (suppressed)" : "");
 	if (dump_only)
 		return 0;
 	return i2c_smbus_write_byte_data(client, reg, newv);
@@ -813,8 +889,8 @@ static void d1830_log_audio_regs(struct i2c_client *client, const char *tag)
 			snprintf(hex, sizeof(hex), "ERR");
 		else
 			snprintf(hex, sizeof(hex), "%02x", v);
-		dev_info(&client->dev, "n31-pmic: %s RD %02x -> %s\n",
-			 tag, regs[i], hex);
+		d1830_vinfo(&client->dev, "n31-pmic: %s RD %02x -> %s\n",
+			    tag, regs[i], hex);
 	}
 }
 
@@ -833,8 +909,8 @@ int d1830_nimbus_rail(bool on)
 	if (before < 0)
 		return before;
 	ret = d1830_rmw(client, 16, BIT(5), on ? BIT(5) : 0);
-	dev_info(&client->dev, "nimbus rail reg16 0x%02x -> bit5=%d ret=%d\n",
-		 before, on, ret);
+	d1830_vinfo(&client->dev, "nimbus rail reg16 0x%02x -> bit5=%d ret=%d\n",
+		    before, on, ret);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(d1830_nimbus_rail);
@@ -857,7 +933,7 @@ static int d1830_sec_trim_seq(struct i2c_client *client, u8 boot_mode)
 	int v20, v21, v35;
 	u8 fill, r16;
 
-	dev_info(&client->dev,
+	d1830_vinfo(&client->dev,
 		 "n31-pmic: sub_23EC-equivalent begin boot_mode=0x%02x\n",
 		 boot_mode);
 
@@ -888,7 +964,7 @@ static int d1830_sec_trim_seq(struct i2c_client *client, u8 boot_mode)
 	d1830_rmw(client, 17, 0, 0x07);
 	d1830_rmw(client, 19, 0, 0x02);
 
-	dev_info(&client->dev, "n31-pmic: sub_23EC-equivalent complete\n");
+	d1830_vinfo(&client->dev, "n31-pmic: sub_23EC-equivalent complete\n");
 	return 0;
 }
 
@@ -904,7 +980,7 @@ int d1830_audio_rails(void)
 	if (!client)
 		return -ENODEV;
 	if (!allow_audio_rails) {
-		dev_info(&client->dev, "n31-pmic: audio rails skipped (allow_audio_rails=0)\n");
+		d1830_vinfo(&client->dev, "n31-pmic: audio rails skipped (allow_audio_rails=0)\n");
 		d1830_log_audio_regs(client, "audio-skip");
 		return 0;
 	}
@@ -940,17 +1016,17 @@ static int d1830_sec_rail_seq(struct i2c_client *client)
 	r02 = i2c_smbus_read_byte_data(client, 2);
 	if (r02 < 0)
 		return r02;
-	dev_info(dev, "n31-pmic: RD 02 -> %02x\n", r02);
+	d1830_vinfo(dev, "n31-pmic: RD 02 -> %02x\n", r02);
 	if (r02 & 0x80) {
 		boot_mode = 0x11;
 		d1830_write8(client, 2, 0x80);
 	}
-	dev_info(dev, "n31-pmic: boot_mode=0x%02x\n", boot_mode);
+	d1830_vinfo(dev, "n31-pmic: boot_mode=0x%02x\n", boot_mode);
 
 	r01 = i2c_smbus_read_byte_data(client, 1);
 	if (r01 < 0)
 		return r01;
-	dev_info(dev, "n31-pmic: RD 01 -> %02x\n", r01);
+	d1830_vinfo(dev, "n31-pmic: RD 01 -> %02x\n", r01);
 
 	if (boot_mode == 0x11) {
 		dev_warn(dev,
@@ -972,7 +1048,7 @@ static int d1830_sec_rail_seq(struct i2c_client *client)
 	d1830_write8(client, 14, 0x20);
 	d1830_rmw(client, 38, 0x01, 0);
 
-	dev_info(dev, "n31-pmic: sub_27F4-equivalent complete (POWEROFF skipped)\n");
+	d1830_vinfo(dev, "n31-pmic: sub_27F4-equivalent complete (POWEROFF skipped)\n");
 	return 0;
 }
 
@@ -1006,7 +1082,7 @@ static int d1830_gpio_probe(struct i2c_client *client)
 	if (of_property_read_bool(dev->of_node, "dlg,apply-sec-rails"))
 		d1830_sec_rail_seq(client);
 	else
-		dev_info(dev, "d1830 gpio-only (rail seq off; CS42 calls d1830_audio_rails)\n");
+		d1830_vinfo(dev, "d1830 gpio-only (rail seq off; CS42 calls d1830_audio_rails)\n");
 
 	d1830_log_audio_regs(client, "probe");
 
@@ -1042,7 +1118,7 @@ static int d1830_gpio_probe(struct i2c_client *client)
 
 	if (!pm_power_off) {
 		pm_power_off = d1830_pm_power_off;
-		dev_info(dev, "registered pm_power_off (SEC reg %u bit0)\n",
+		d1830_vinfo(dev, "registered pm_power_off (SEC reg %u bit0)\n",
 			 D1830_REG_POWEROFF);
 	} else {
 		dev_warn(dev, "pm_power_off already set — sysfs do_poweroff only\n");
@@ -1066,7 +1142,7 @@ static int d1830_gpio_probe(struct i2c_client *client)
 			dev_err(dev, "PMIC nIRQ %d failed: %d\n",
 				client->irq, ret);
 		else
-			dev_info(dev,
+			d1830_vinfo(dev,
 				 "PMIC nIRQ virq=%d hwirq=%lu LEVEL_LOW (OSOS 40641C type=1, EFBB4 DIN=0)\n",
 				 client->irq, d ? d->hwirq : 0);
 	} else {
@@ -1077,7 +1153,7 @@ static int d1830_gpio_probe(struct i2c_client *client)
 	{
 		int v = i2c_smbus_read_byte_data(client, 7);
 
-		dev_info(dev,
+		d1830_vinfo(dev,
 			 "PMIC 7bit=0x%02x wire WR=0x%02x RD=0x%02x reg7 %s (%d)\n",
 			 client->addr, client->addr << 1,
 			 (client->addr << 1) | 1,
@@ -1105,7 +1181,7 @@ static int d1830_gpio_probe(struct i2c_client *client)
 					 PTR_ERR(gpio_dev->psy));
 				gpio_dev->psy = NULL;
 			} else if (!d1830_read_vbat(gpio_dev, &mv)) {
-				dev_info(dev,
+				d1830_vinfo(dev,
 					 "battery psy OSOS ch3 10-bit*6 mV=%d (design %u mAh)\n",
 					 mv, D1830_DESIGN_UAH / 1000);
 			}
@@ -1129,7 +1205,7 @@ static int d1830_gpio_probe(struct i2c_client *client)
 		}
 	}
 
-	dev_info(dev, "Registered %u read-only GPIOs using Dialog D1830 driver\n",
+	d1830_vinfo(dev, "Registered %u read-only GPIOs using Dialog D1830 driver\n",
 		 gpio_dev->num_gpios);
 
 	gpio_dev->input = devm_input_allocate_device(dev);
@@ -1145,13 +1221,16 @@ static int d1830_gpio_probe(struct i2c_client *client)
 			gpio_dev->input = NULL;
 	}
 
-	/* Idle snapshot plus 100ms poll. nIRQ (GPIO 86) still calls
-	 * d1830_n31_din_nirq; poll covers a missed EIC edge so Home /
-	 * Sleep / Play show on n31-btn. Trace prints only on change.
+	/* Idle snapshot only. Home / Sleep / Play arrive on the PMIC nIRQ
+	 * (GPIO 86) via d1830_n31_din_nirq; btn_poll_ms re-enables the old
+	 * 100ms sweep if an EIC edge is ever missed. The slow tick that
+	 * remains is the battery power_supply refresh.
 	 */
 	d1830_btn_poll_once(gpio_dev);
 	INIT_DELAYED_WORK(&gpio_dev->trace, d1830_trace_work);
-	schedule_delayed_work(&gpio_dev->trace, msecs_to_jiffies(100));
+	INIT_DELAYED_WORK(&gpio_dev->confirm, d1830_confirm_work);
+	schedule_delayed_work(&gpio_dev->trace,
+			      msecs_to_jiffies(btn_poll_ms ? btn_poll_ms : 1000));
 	d1830_n31_din_nirq_hook = d1830_n31_din_nirq;
 	return 0;
 }
@@ -1160,8 +1239,10 @@ static void d1830_gpio_remove(struct i2c_client *client)
 {
 	struct d1830_gpio *gpio_dev = i2c_get_clientdata(client);
 
-	if (gpio_dev)
+	if (gpio_dev) {
 		cancel_delayed_work_sync(&gpio_dev->trace);
+		cancel_delayed_work_sync(&gpio_dev->confirm);
+	}
 	device_remove_file(&client->dev, &dev_attr_vbat_raw);
 	device_remove_file(&client->dev, &dev_attr_audio_rails);
 	device_remove_file(&client->dev, &dev_attr_do_poweroff);

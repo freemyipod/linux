@@ -34,6 +34,8 @@
 #include <linux/timer.h>
 #include <linux/workqueue.h>
 
+#include <linux/apple-n31.h>
+
 #define S5L8740_GPIO_BANK_STRIDE	32
 #define S5L8740_GPIO_DIN_OFF		0x04
 #define S5L8740_GPIO_DOUT_OFF		0x08
@@ -43,9 +45,6 @@
 
 #define S5L8740_CMD_OUT_LOW		14
 #define S5L8740_CMD_OUT_HIGH		15
-
-/* From irq-s5l8740-eic.c */
-int s5l8740_eic_enable_gpio(unsigned int gpio, unsigned int irq_type);
 
 /*
  * IpodSec sub_223C / sub_47CC — packed pinmux word:

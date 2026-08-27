@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * S5L8740 FTL CS LBA map and read-only VFAT block front-end (N31).
  *
@@ -169,6 +169,7 @@ struct n31_ftl_cs {
 	unsigned int range_fail;
 	unsigned int range_miss;
 	unsigned int demand_scans;
+	unsigned int read_miss_count;
 
 	bool disk0_ok;
 	bool fat_critical_ok;
@@ -176,6 +177,17 @@ struct n31_ftl_cs {
 	bool block_enable;
 	bool dma_session_held;
 	bool whimory_backed; /* L2V_Search via Whimory recover */
+
+	/* FAT semantic validation (beyond crit sector reads). */
+	u32 fat_sem_root_chain_len;
+	u32 fat_sem_root_entries;
+	u32 fat_sem_music_dirs;
+	u32 fat_sem_fat0_fat1_diff;
+	bool fat_sem_itunesdb;
+	bool fat_sem_apps;
+	bool fat_sem_nanoapps;
+	char fat_sem_log[512];
+	char string_scan_log[384];
 
 	struct n31_ftl_slice ipod;
 	struct n31_ftl_slice ftl_alias;
@@ -186,6 +198,7 @@ struct n31_ftl_cs {
 static int n31_ftl_find_bpb(struct n31_ftl_cs *ftl);
 static int n31_ftl_select_bpb(struct n31_ftl_cs *ftl);
 static int n31_validate_fat_critical(struct n31_ftl_cs *ftl);
+static void n31_fat_semantic_validate(struct n31_ftl_cs *ftl);
 static int n31_ftl_register_disk(struct n31_ftl_cs *ftl);
 static void n31_ftl_unregister_disk(struct n31_ftl_cs *ftl);
 static int n31_ftl_apply_bpb(struct n31_ftl_cs *ftl, u32 fmss_lba,
@@ -193,6 +206,16 @@ static int n31_ftl_apply_bpb(struct n31_ftl_cs *ftl, u32 fmss_lba,
 static bool n31_bpb_looks_valid(const u8 *d, u32 *total_out);
 
 static struct n31_ftl_cs *n31_ftl;
+
+/*
+ * A read miss costs nine L2V probes plus ten console lines. VFAT retries a
+ * failing directory cluster, so an unmapped chain used to bury the log and
+ * slow the mount. Describe the first few, then count silently.
+ */
+static unsigned int read_miss_diag_max = 3;
+module_param(read_miss_diag_max, uint, 0644);
+MODULE_PARM_DESC(read_miss_diag_max,
+		 "Read misses to describe in full before going quiet (0=all)");
 
 static bool ftl_block_enable = true;
 module_param(ftl_block_enable, bool, 0644);
@@ -910,6 +933,9 @@ static int n31_ftl_read_fmss_lba_flags(struct n31_ftl_cs *ftl, u32 fmss_lba,
 
 	/* Whimory L2V is authoritative after CXT→BTOC recover. */
 	if (ftl->whimory_backed && whimory_l2v_ready()) {
+		dev_dbg(ftl->dev,
+			"read disk? via L2V_Search fmss_lba=%u\n",
+			fmss_lba);
 		ret = whimory_read_fmss_lba(fmss_lba, dst);
 		if (!ret)
 			return 0;
@@ -996,6 +1022,9 @@ static int n31_ftl_read_disk_lba_flags(struct n31_ftl_cs *ftl, u32 disk_lba,
 		return -ERANGE;
 
 	fmss_lba = ftl->fat_base_lba + disk_lba;
+	dev_dbg(ftl->dev,
+		"disk_lba=%u -> fmss_lba=%u (fat_base=%u)\n",
+		disk_lba, fmss_lba, ftl->fat_base_lba);
 	return n31_ftl_read_fmss_lba_flags(ftl, fmss_lba, dst, allow_demand);
 }
 
@@ -1202,14 +1231,27 @@ static int n31_ftl_select_bpb(struct n31_ftl_cs *ftl)
 	scnprintf(ftl->bpb_log, sizeof(ftl->bpb_log),
 		  "fat_base_lba=%u valid=%d total=%u candidates=%u "
 		  "oem='%.8s' weave=%012llx ext_flags=0x%04x "
-		  "active_fat=%u mirror=%s selected=%u crit=%u/%u\n",
+		  "active_fat=%u mirror=%s selected=%u crit=%u/%u "
+		  "itunesdb=%d music_dirs=%u fat1_disk_lba=%u\n",
 		  ftl->fat_base_lba, ftl->fat_base_valid, ftl->fat_total_sectors,
 		  ftl->bpb_ncand, ftl->bpb_cand_oem[best],
 		  (unsigned long long)ftl->bpb_cand_weave[best],
 		  ftl->layout.ext_flags, ftl->layout.ext_flags & 0xF,
 		  (ftl->layout.ext_flags & 0x80) ? "off" : "on",
-		  best + 1, ftl->fat_crit_ok_n, ftl->fat_crit_need_n);
+		  best + 1, ftl->fat_crit_ok_n, ftl->fat_crit_need_n,
+		  ftl->fat_sem_itunesdb, ftl->fat_sem_music_dirs,
+		  ftl->layout.fat_start + ftl->layout.fat_size_32);
 	dev_info(ftl->dev, "%s", ftl->bpb_log);
+	for (i = 0; i < ftl->bpb_ncand; i++)
+		dev_info(ftl->dev,
+			 "BPB_CAND #%u fmss_lba=%u weave=%012llx oem='%.8s' "
+			 "total=%u selected=%s reason=%s\n",
+			 i + 1, ftl->bpb_candidates[i],
+			 (unsigned long long)ftl->bpb_cand_weave[i],
+			 ftl->bpb_cand_oem[i], ftl->bpb_cand_total[i],
+			 i == (unsigned int)best ? "yes" : "no",
+			 i == (unsigned int)best ?
+				"newest_valid_high_crit" : "not_selected");
 	return ftl->fat_critical_ok ? 0 : -EAGAIN;
 }
 
@@ -1226,6 +1268,157 @@ static int n31_read_disk_checked(struct n31_ftl_cs *ftl, u32 disk_lba,
 		dev_dbg(ftl->dev, "FAT-critical %s disk_lba=%u OK\n",
 			tag, disk_lba);
 	return ret;
+}
+
+/*
+ * Semantic FAT checks beyond fat_critical N/N sector readability.
+ * Walk root cluster chain, count dir entries, search for known iPod names.
+ * FAT1 starts at reserved + fat_size32 (e.g. 32+942=974), not disk_lba=33.
+ */
+static void n31_fat_semantic_validate(struct n31_ftl_cs *ftl)
+{
+	struct n31_fat_layout *L = &ftl->layout;
+	u8 *buf, *fat0 = NULL, *fat1 = NULL;
+	u32 cluster, chain_len = 0, entries = 0, music_dirs = 0;
+	u32 fat_diff = 0, i, max_chain = 64, max_fat_cmp = 4;
+	bool itunesdb = false, apps = false, nanoapps = false;
+	int ret;
+
+	ftl->fat_sem_root_chain_len = 0;
+	ftl->fat_sem_root_entries = 0;
+	ftl->fat_sem_music_dirs = 0;
+	ftl->fat_sem_fat0_fat1_diff = 0;
+	ftl->fat_sem_itunesdb = false;
+	ftl->fat_sem_apps = false;
+	ftl->fat_sem_nanoapps = false;
+	ftl->fat_sem_log[0] = '\0';
+
+	if (!ftl->fat_base_valid || L->sectors_per_cluster == 0 ||
+	    L->root_cluster < 2)
+		return;
+
+	buf = kmalloc(N31_DATA_SLOT_SIZE, GFP_KERNEL);
+	if (!buf)
+		return;
+
+	/* Compare first few FAT0 vs FAT1 sectors (mirror check). */
+	if (L->num_fats >= 2 && L->fat_size_32) {
+		fat0 = kmalloc(N31_DATA_SLOT_SIZE, GFP_KERNEL);
+		fat1 = kmalloc(N31_DATA_SLOT_SIZE, GFP_KERNEL);
+		if (fat0 && fat1) {
+			u32 n = min(max_fat_cmp, L->fat_size_32);
+
+			for (i = 0; i < n; i++) {
+				u32 d0 = L->fat_start + i;
+				u32 d1 = L->fat_start + L->fat_size_32 + i;
+
+				if (n31_ftl_read_disk_lba(ftl, d0, fat0) ||
+				    n31_ftl_read_disk_lba(ftl, d1, fat1))
+					break;
+				if (memcmp(fat0, fat1, N31_DATA_SLOT_SIZE))
+					fat_diff++;
+			}
+		}
+		kfree(fat0);
+		kfree(fat1);
+	}
+
+	cluster = L->root_cluster;
+	while (cluster >= 2 && cluster < 0x0ffffff8 && chain_len < max_chain) {
+		u32 disk_lba = L->data_start +
+			(cluster - 2) * L->sectors_per_cluster;
+		u32 s;
+
+		for (s = 0; s < L->sectors_per_cluster; s++) {
+			unsigned int off;
+
+			ret = n31_ftl_read_disk_lba(ftl, disk_lba + s, buf);
+			if (ret)
+				goto done;
+			for (off = 0; off + 32 <= N31_DATA_SLOT_SIZE; off += 32) {
+				const u8 *ent = buf + off;
+				char name[13];
+				unsigned int n;
+
+				if (ent[0] == 0x00)
+					goto chain_done;
+				if (ent[0] == 0xe5 || (ent[11] & 0x0f) == 0x0f)
+					continue;
+				entries++;
+				for (n = 0; n < 11; n++)
+					name[n] = ent[n] == ' ' ? '\0' : ent[n];
+				name[11] = '\0';
+				if (strnstr(name, "MUSIC", 11) ||
+				    (ent[11] & 0x10)) {
+					if (strnstr((const char *)ent, "MUSIC", 11) ||
+					    strnstr(name, "F00", 11) ||
+					    strnstr(name, "F01", 11) ||
+					    strnstr(name, "F02", 11))
+						music_dirs++;
+				}
+			}
+			if (strnstr((const char *)buf, "iTunesDB",
+				    N31_DATA_SLOT_SIZE) ||
+			    strnstr((const char *)buf, "ITUNESDB",
+				    N31_DATA_SLOT_SIZE))
+				itunesdb = true;
+			if (strnstr((const char *)buf, "iPod_Control",
+				    N31_DATA_SLOT_SIZE) ||
+			    strnstr((const char *)buf, "IPOD_CON",
+				    N31_DATA_SLOT_SIZE))
+				entries++; /* ensure root hit is counted */
+			if (strnstr((const char *)buf, "NanoApps",
+				    N31_DATA_SLOT_SIZE) ||
+			    strnstr((const char *)buf, "NANOAPPS",
+				    N31_DATA_SLOT_SIZE))
+				nanoapps = true;
+			if (strnstr((const char *)buf, "Apps",
+				    N31_DATA_SLOT_SIZE))
+				apps = true;
+			if (strnstr((const char *)buf, "Music",
+				    N31_DATA_SLOT_SIZE) ||
+			    strnstr((const char *)buf, "MUSIC",
+				    N31_DATA_SLOT_SIZE))
+				music_dirs++;
+			if (strnstr((const char *)buf, "F00",
+				    N31_DATA_SLOT_SIZE) ||
+			    strnstr((const char *)buf, "F01",
+				    N31_DATA_SLOT_SIZE))
+				music_dirs++;
+		}
+
+		/* Next cluster from active FAT (FAT0). */
+		{
+			u32 fat_off = cluster * 4;
+			u32 fat_sec = L->fat_start + (fat_off / N31_DATA_SLOT_SIZE);
+			u32 fat_ent_off = fat_off % N31_DATA_SLOT_SIZE;
+
+			ret = n31_ftl_read_disk_lba(ftl, fat_sec, buf);
+			if (ret)
+				break;
+			cluster = get_unaligned_le32(buf + fat_ent_off) &
+				  0x0fffffffu;
+		}
+		chain_len++;
+	}
+chain_done:
+done:
+	ftl->fat_sem_root_chain_len = chain_len;
+	ftl->fat_sem_root_entries = entries;
+	ftl->fat_sem_music_dirs = music_dirs;
+	ftl->fat_sem_fat0_fat1_diff = fat_diff;
+	ftl->fat_sem_itunesdb = itunesdb;
+	ftl->fat_sem_apps = apps;
+	ftl->fat_sem_nanoapps = nanoapps;
+	scnprintf(ftl->fat_sem_log, sizeof(ftl->fat_sem_log),
+		  "fat_semantic fat_base=%u root_chain_len=%u root_entries=%u "
+		  "music_dirs=%u itunesdb=%d apps=%d nanoapps=%d "
+		  "fat0_fat1_diff=%u fat1_start_disk_lba=%u\n",
+		  ftl->fat_base_lba, chain_len, entries, music_dirs,
+		  itunesdb, apps, nanoapps, fat_diff,
+		  L->fat_start + L->fat_size_32);
+	dev_info(ftl->dev, "%s", ftl->fat_sem_log);
+	kfree(buf);
 }
 
 /*
@@ -1319,10 +1512,12 @@ static int n31_validate_fat_critical(struct n31_ftl_cs *ftl)
 		CRIT(L->data_start + 3, "root3");
 #undef CRIT
 
-	/* Require BPB + FAT0 + root0 at minimum; prefer full set. */
-	ftl->fat_critical_ok = (ok >= 3 && ftl->disk0_ok &&
-				(ftl->whimory_backed ||
-				 n31_map_find(ftl, ftl->fat_base_lba)));
+	/* Whimory-backed maps must nearly pass; 5/9 must not register. */
+	if (ftl->whimory_backed)
+		ftl->fat_critical_ok = (ok >= 8 && ftl->disk0_ok);
+	else
+		ftl->fat_critical_ok = (ok >= 3 && ftl->disk0_ok &&
+					n31_map_find(ftl, ftl->fat_base_lba));
 	ftl->enable_gate_ok = ftl->fat_critical_ok;
 	ftl->fat_crit_ok_n = ok;
 	ftl->fat_crit_need_n = need;
@@ -1331,6 +1526,8 @@ static int n31_validate_fat_critical(struct n31_ftl_cs *ftl)
 		  ok, need, ftl->enable_gate_ok, ftl->fat_base_lba,
 		  ftl->layout_log);
 	dev_info(ftl->dev, "%s", ftl->last_log);
+	if (ftl->fat_critical_ok)
+		n31_fat_semantic_validate(ftl);
 	ret = ftl->fat_critical_ok ? 0 : -EAGAIN;
 out:
 	mutex_unlock(&ftl->lock);
@@ -1504,6 +1701,71 @@ static void n31_firmware_probe(struct n31_ftl_cs *ftl)
 	dev_info(ftl->dev, "%s", ftl->fw_log);
 }
 
+/*
+ * VFAT directory bread failures land here as L2V misses. Print address-space
+ * math + neighbor map presence so we can tell "not scanned yet" from corruption.
+ */
+static void n31_log_read_miss(struct n31_ftl_cs *ftl, struct n31_ftl_slice *sl,
+			      u32 fmss_lba, u32 disk_lba, int ret)
+{
+	struct n31_fat_layout *L = &ftl->layout;
+	u32 cluster = 0;
+	int i;
+	u8 ce = 0, cau = 0, page = 0, slot = 0;
+	u16 blk = 0;
+	u64 weave = 0;
+	int phys_ret;
+
+	ftl->read_miss_count++;
+	if (read_miss_diag_max && ftl->read_miss_count > read_miss_diag_max)
+		return;
+	if (L->valid && L->sectors_per_cluster &&
+	    disk_lba >= L->data_start) {
+		cluster = ((disk_lba - L->data_start) /
+			   L->sectors_per_cluster) + 2;
+	}
+
+	dev_err_ratelimited(ftl->dev,
+		"read miss %s fmss_lba=%u disk_lba=%u ret=%d "
+		"fat_base=%u data_start=%u spc=%u cluster~=%u miss_n=%u\n",
+		sl->gd ? sl->gd->disk_name : "?",
+		fmss_lba, disk_lba, ret,
+		ftl->fat_base_lba, L->data_start, L->sectors_per_cluster,
+		cluster, ftl->read_miss_count);
+
+	for (i = -4; i <= 4; i++) {
+		u32 n = fmss_lba + i;
+		u8 nce = 0, ncau = 0, npg = 0, nslot = 0;
+		u16 nblk = 0;
+		u64 nw = 0;
+		int nr;
+
+		if ((int)fmss_lba + i < 0)
+			continue;
+		nr = whimory_l2v_search_phys(n, &nce, &ncau, &nblk, &npg,
+					     &nslot, &nw);
+		if (!nr)
+			dev_err_ratelimited(ftl->dev,
+				"  neighbor fmss_lba=%u MAPPED ce=%u cau=%u "
+				"blk=%u pg=%u slot=%u weave=%012llx\n",
+				n, nce, ncau, nblk, npg, nslot,
+				(unsigned long long)nw);
+		else if (i == 0)
+			dev_err_ratelimited(ftl->dev,
+				"  neighbor fmss_lba=%u UNMAPPED ret=%d\n",
+				n, nr);
+	}
+
+	phys_ret = whimory_l2v_search_phys(fmss_lba, &ce, &cau, &blk, &page,
+					   &slot, &weave);
+	if (!phys_ret)
+		dev_err_ratelimited(ftl->dev,
+			"  L2V suddenly mapped after miss? ce=%u cau=%u blk=%u "
+			"pg=%u slot=%u\n",
+			ce, cau, blk, page, slot);
+	(void)phys_ret;
+}
+
 static void n31_ftl_submit_bio(struct bio *bio)
 {
 	struct n31_ftl_slice *sl = bio->bi_bdev->bd_disk->private_data;
@@ -1556,10 +1818,7 @@ static void n31_ftl_submit_bio(struct bio *bio)
 			if (!ret)
 				memcpy(dst + done, ftl->bounce, n);
 			else
-				dev_err_ratelimited(ftl->dev,
-					"read miss %s fmss_lba=%u ret=%d\n",
-					sl->gd ? sl->gd->disk_name : "?",
-					fmss_lba, ret);
+				n31_log_read_miss(ftl, sl, fmss_lba, off, ret);
 			mutex_unlock(&ftl->lock);
 			if (ret) {
 				kunmap_local(dst);
@@ -2034,9 +2293,7 @@ static ssize_t ftl_vec_stats_show(struct device *dev,
 	v = &ftl->vec;
 	if (v->ready)
 		cross = n31_vecmap_lookup(v, N31_FAT_BASE_DEFAULT, &p);
-	return sysfs_emit(buf,
-			  "%s"
-			  "cross_49279_ret=%d p=%u\n",
+	return sysfs_emit(buf, "%scross_49279_ret=%d p=%u\n",
 			  ftl->vec_log[0] ? ftl->vec_log : "ready=0\n",
 			  cross, p);
 }
@@ -2147,6 +2404,13 @@ bool n31_ftl_cs_whimory_backed(void)
 {
 	return n31_ftl && n31_ftl->whimory_backed;
 }
+
+/* True once /dev/s5l8740-ipod is live; a rebuild under it is destructive. */
+bool n31_ftl_cs_disk_registered(void)
+{
+	return n31_ftl && n31_ftl->ipod.gd;
+}
+EXPORT_SYMBOL_GPL(n31_ftl_cs_disk_registered);
 
 int n31_ftl_cs_bind_whimory(void)
 {
@@ -2273,10 +2537,57 @@ static ssize_t ftl_sftl_recover_store(struct device *dev,
 	ret = whimory_sftl_recover_cs();
 	if (ret)
 		return ret;
+	/*
+	 * Re-binding a disk that is already registered clears the BPB
+	 * candidates and leaves the gendisk at capacity 0, so a live mount
+	 * starts failing every read. Recovery that was a no-op must not
+	 * disturb the disk it just declined to rebuild.
+	 */
+	if (n31_ftl_cs_disk_registered())
+		return count;
 	ret = n31_ftl_cs_bind_whimory();
 	return ret ? ret : count;
 }
 static DEVICE_ATTR_WO(ftl_sftl_recover);
+
+/* echo <vbas> > ftl_cxt_dump — report CXT bases/tags; never touches L2V */
+static ssize_t ftl_cxt_dump_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	unsigned int v = 0;
+	int ret;
+
+	(void)dev;
+	(void)attr;
+	if (sscanf(buf, "%u", &v) < 1)
+		v = 0;
+	ret = whimory_cxt_dump(v);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(ftl_cxt_dump);
+
+/*
+ * echo [fat_base] > ftl_cxt_candidate — build the CXT TREE map into a
+ * separate candidate array, diff it against the live brute-force map, and
+ * validate the FAT-critical sectors through it. Never mutates L2V.
+ */
+static ssize_t ftl_cxt_candidate_store(struct device *dev,
+				       struct device_attribute *attr,
+				       const char *buf, size_t count)
+{
+	struct n31_ftl_cs *ftl = n31_ftl;
+	unsigned int v = 0;
+	int ret;
+
+	(void)dev;
+	(void)attr;
+	if (sscanf(buf, "%u", &v) < 1 || !v)
+		v = ftl ? ftl->fat_base_lba : 0;
+	ret = whimory_cxt_candidate(v);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(ftl_cxt_candidate);
 
 static ssize_t ftl_finishline_status_show(struct device *dev,
 					  struct device_attribute *attr,
@@ -2309,8 +2620,113 @@ static ssize_t ftl_finishline_status_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(ftl_finishline_status);
 
+static ssize_t ftl_fat_semantic_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct n31_ftl_cs *ftl = n31_ftl;
+
+	if (!ftl)
+		return sysfs_emit(buf, "no ftl\n");
+	return sysfs_emit(buf, "%s",
+			  ftl->fat_sem_log[0] ? ftl->fat_sem_log :
+						"none\n");
+}
+static DEVICE_ATTR_RO(ftl_fat_semantic);
+
+static ssize_t ftl_phys_string_scan_store(struct device *dev,
+					  struct device_attribute *attr,
+					  const char *buf, size_t count)
+{
+	unsigned int blocks = 0;
+	int hits;
+
+	if (kstrtouint(buf, 0, &blocks))
+		blocks = 0;
+	hits = whimory_phys_string_scan(blocks);
+	if (n31_ftl)
+		scnprintf(n31_ftl->string_scan_log,
+			  sizeof(n31_ftl->string_scan_log),
+			  "phys_string_scan blocks=%u hits=%d\n", blocks, hits);
+	return hits < 0 ? hits : count;
+}
+static DEVICE_ATTR_WO(ftl_phys_string_scan);
+
+static ssize_t ftl_logical_string_scan_store(struct device *dev,
+					     struct device_attribute *attr,
+					     const char *buf, size_t count)
+{
+	struct n31_ftl_cs *ftl = n31_ftl;
+	u8 *sec;
+	u32 i, nsectors = 4096, hits = 0;
+	int ret, sess;
+	static const char *const needles[] = {
+		"iTunesDB", "F00", "F01", "F02", "iPod_Control", "Music",
+		"Apps", "NanoApps", ".mp3", ".m4a",
+	};
+
+	if (!ftl || !ftl->fat_base_valid)
+		return -ENODEV;
+	if (kstrtouint(buf, 0, &nsectors))
+		nsectors = 4096;
+	if (nsectors > ftl->fat_total_sectors)
+		nsectors = ftl->fat_total_sectors;
+	sec = kmalloc(N31_DATA_SLOT_SIZE, GFP_KERNEL);
+	if (!sec)
+		return -ENOMEM;
+	sess = s5l8740_nand_dma_session_begin();
+	dev_info(ftl->dev,
+		 "LOGICAL_STRING_SCAN start disk_lbas=0..%u via L2V\n",
+		 nsectors);
+	for (i = 0; i < nsectors; i++) {
+		unsigned int ni;
+
+		ret = n31_ftl_read_disk_lba(ftl, i, sec);
+		if (ret)
+			continue;
+		for (ni = 0; ni < ARRAY_SIZE(needles); ni++) {
+			if (!strnstr((const char *)sec, needles[ni],
+				     N31_DATA_SLOT_SIZE))
+				continue;
+			hits++;
+			if (hits <= 64)
+				dev_info(ftl->dev,
+					 "LOGICAL_STRING hit=%s disk_lba=%u "
+					 "fmss_lba=%u\n",
+					 needles[ni], i,
+					 ftl->fat_base_lba + i);
+			break;
+		}
+		if ((i & 0xff) == 0)
+			cond_resched();
+	}
+	if (sess == 0)
+		s5l8740_nand_dma_session_end();
+	scnprintf(ftl->string_scan_log, sizeof(ftl->string_scan_log),
+		  "logical_string_scan disk_lbas=%u hits=%u\n", nsectors, hits);
+	dev_info(ftl->dev, "%s", ftl->string_scan_log);
+	kfree(sec);
+	return count;
+}
+static DEVICE_ATTR_WO(ftl_logical_string_scan);
+
+static ssize_t ftl_string_scan_log_show(struct device *dev,
+					struct device_attribute *attr,
+					char *buf)
+{
+	struct n31_ftl_cs *ftl = n31_ftl;
+
+	if (!ftl)
+		return sysfs_emit(buf, "no ftl\n");
+	return sysfs_emit(buf, "%s",
+			  ftl->string_scan_log[0] ? ftl->string_scan_log :
+						    "none\n");
+}
+static DEVICE_ATTR_RO(ftl_string_scan_log);
+
 static struct attribute *n31_ftl_finish_attrs[] = {
 	&dev_attr_ftl_sftl_recover.attr,
+	&dev_attr_ftl_cxt_dump.attr,
+	&dev_attr_ftl_cxt_candidate.attr,
 	&dev_attr_ftl_map_build.attr,
 	&dev_attr_ftl_scan_block_window.attr,
 	&dev_attr_ftl_map_stats.attr,
@@ -2322,6 +2738,10 @@ static struct attribute *n31_ftl_finish_attrs[] = {
 	&dev_attr_ftl_fat_base_lba.attr,
 	&dev_attr_ftl_bpb.attr,
 	&dev_attr_ftl_layout.attr,
+	&dev_attr_ftl_fat_semantic.attr,
+	&dev_attr_ftl_phys_string_scan.attr,
+	&dev_attr_ftl_logical_string_scan.attr,
+	&dev_attr_ftl_string_scan_log.attr,
 	&dev_attr_ftl_read_fmss_lba.attr,
 	&dev_attr_ftl_read_disk_lba.attr,
 	&dev_attr_ftl_read_disk_range.attr,

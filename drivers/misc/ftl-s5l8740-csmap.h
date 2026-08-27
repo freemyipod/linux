@@ -34,10 +34,13 @@ int n31_ftl_read_disk_lba(struct n31_ftl_cs *ftl, u32 disk_lba, void *dst);
  * (no full hash import — avoids multi-million node RAM).
  */
 int n31_ftl_cs_bind_whimory(void);
+bool n31_ftl_cs_disk_registered(void);
 bool n31_ftl_cs_whimory_backed(void);
 
 /* Implemented in ftl-s5l8740-core.c (same module). */
 int whimory_sftl_recover_cs(void);
+int whimory_cxt_dump(unsigned int max_vbas);
+int whimory_cxt_candidate(u32 fat_base);
 bool whimory_l2v_ready(void);
 int whimory_read_fmss_lba(u32 lba, void *buf);
 int whimory_range_walk(int (*fn)(u32 start, u32 len, u32 vba, u64 weave,
@@ -45,5 +48,8 @@ int whimory_range_walk(int (*fn)(u32 start, u32 len, u32 vba, u64 weave,
 		       void *ctx);
 int whimory_l2v_search_phys(u32 lba, u8 *ce, u8 *cau, u16 *blk, u8 *page,
 			    u8 *slot, u64 *weave);
+
+/* Physical NAND string scan (ignores L2V). Returns hit count. */
+int whimory_phys_string_scan(unsigned int max_blocks);
 
 #endif /* FTL_S5L8740_CSMAP_H */

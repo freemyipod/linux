@@ -59,8 +59,10 @@ struct whimory_fpart {
 #define WHIMORY_PAGES_PER_SB		128
 #define WHIMORY_DATA_PAGES_PER_SB	127
 #define WHIMORY_BTOC_PAGE		127
-/* s_g_vbas_per_sb includes the BTOC page: addr_to_vba(sb, vfl+76-1)
- * is the last VBA of page 127 (sub_56B77C). */
+/*
+ * VBAs per superblock includes the block table of contents page: the last
+ * VBA a superblock can address falls on page 127.
+ */
 #define WHIMORY_VBAS_PER_SB		(WHIMORY_PAGES_PER_SB * \
 					 WHIMORY_VBAS_PER_PAGE)
 #define WHIMORY_DATA_VBAS_PER_SB	(WHIMORY_DATA_PAGES_PER_SB * \
@@ -82,10 +84,16 @@ struct whimory_fpart {
 #define WHIMORY_CXT_MAX_SB		32
 #define WHIMORY_CXT_TAG_BASE		1
 #define WHIMORY_CXT_TAG_STATS		2
+#define WHIMORY_CXT_TAG_SB		3
 #define WHIMORY_CXT_TAG_L2V		4
+#define WHIMORY_CXT_TAG_USERSEQ		5
+#define WHIMORY_CXT_TAG_READS		6
+/* 0xff is both "nothing written here" and the record-stream terminator. */
 #define WHIMORY_CXT_TAG_END		255
 #define WHIMORY_CXT_TAG_CLEAN		0xff
 #define WHIMORY_CXT_CONTIG_SPAN		0xfffffff0u
+/* TREE hole sentinel: consumes logical space, maps nothing. */
+#define WHIMORY_CXT_VBA_HOLE		0x7fffffu
 #define WHIMORY_FIL_META_BYTES		16	/* FIL GetInfo(105); sub_12ED9C */
 
 /* BTOC / META tokens (sub_5688C4). Occupy VBA stream, not user L2V. */
@@ -213,6 +221,13 @@ struct whimory_sb {
 	u64 weave;
 };
 
+/* Compact CXT superblock identity; see whimory_cxt_index_build(). */
+struct whimory_cxt_sb_id {
+	u16 ce;
+	u16 cau;
+	u16 block;
+};
+
 struct whimory_sftl {
 	u32 vba_factor_a;
 	u32 vba_factor_b;
@@ -244,11 +259,16 @@ struct whimory_sftl {
 	u8 *gc_data;
 	u8 *gc_meta;
 	u32 *btoc_lba[WHIMORY_BTOC_OPEN];
+	u32 *btoc_map;		/* per-VBA LBA decoded from one BTOC page */
 	bool cxt_loaded;
 	bool packed_ok;
 	u32 cxt_blocks_seen;
 	u32 cxt_records_seen;
 	u32 cxt_l2v_updates;
+	u32 cxt_hole_entries;
+	u32 cxt_xlate_fail;
+	u32 diff_replayed_sbs;
+	u32 diff_skipped_sbs;
 	u32 btoc_pages_read;
 	u32 btoc_pages_valid;
 	u32 btoc_entries_seen;
@@ -257,6 +277,29 @@ struct whimory_sftl {
 	u32 btoc_token_ffffff00;
 	u32 btoc_token_ffffffff;
 	u32 btoc_holelist_ffff0001;
+	/* Classified BTOC/open entry counters (recovery observability). */
+	u32 btoc_unmap_entries;	/* LIST tokens applied or attempted */
+	u32 btoc_hole_entries;	/* HOLE / erased physical spans */
+	u32 btoc_unknown_entries;
+	u32 open_unmap_entries;
+	u32 open_skipped_zero;
+	u32 open_overrides_closed;
+	u32 open_rejected_stale;
+	u32 open_unknown_order;
+	u32 stale_mapping_rejected;
+	u32 btoc_meta_mismatch;
+	u32 btoc_meta_confirmed;
+	u32 btoc_skipped_zero;
+	u32 btoc_confirm_pages;
+	u32 btoc_confirm_capped;
+	u32 btoc_confirm_budget_stop;
+	u32 string_hit_itunesdb;
+	u32 string_hit_f00;
+	u32 string_hit_apps;
+	u32 string_hit_mp3;
+	u32 string_hit_m4a;
+	u32 string_hit_ipod_control;
+	u32 string_hit_music;
 	u32 open_slots_seen;
 	u32 open_slots_valid_meta;
 	u32 open_l2v_updates;
@@ -267,11 +310,33 @@ struct whimory_sftl {
 	u32 btoc_dumps_left;
 	u32 unknown_sbs;
 	u64 claim_weave;
+	/* 0=none, 1=BTOC/closed, 2=open, 3=CXT, 4=LIST-unmap */
+	u8 claim_source;
+	unsigned long confirm_start_jiffies;
+	/* Recover-time replay accounting (widen staging / OOM guard). */
+	u32 range_budget_stop;
+	u32 btoc_verified;
+	u32 map_gen;		/* bumped on every map mutation */
+	u32 search_cache_hits;
+	u32 search_cache_misses;
+	struct whimory_cxt_sb_id cxt_idx[WHIMORY_CXT_MAX_SB];
+	unsigned int n_cxt_idx;
 };
 
 struct whimory_cxt_base {
 	u32 sb;
 	u64 weave;
+};
+
+/*
+ * One contiguous (lba, span) -> vba mapping decoded from a CXT TREE record.
+ * Phase 3 keeps these in a candidate map, separate from the live interval
+ * map, so the CXT decode can be validated without disturbing a working disk.
+ */
+struct whimory_cxt_extent {
+	u32 lba;
+	u32 span;
+	u32 vba;
 };
 
 struct whimory_fpart_ops {
@@ -321,6 +386,11 @@ struct whimory {
 	struct platform_device *pdev;
 	u32 lba0_vba;
 	u64 cxt_base_weave;
+	struct whimory_cxt_extent *cxt_ext;	/* candidate map (Phase 3) */
+	u32 n_cxt_ext;
+	u32 max_cxt_ext;
+	u64 cxt_ext_weave;			/* base weave it came from */
+	u32 cxt_ext_sb;
 	struct whimory_cxt_base cxt[WHIMORY_CXT_MAX_SB];
 	u32 n_cxt;
 	u32 cxt_next_lba;
@@ -332,6 +402,14 @@ struct whimory {
 	bool l2v_ok;
 	bool lba0_ok;
 	bool oracle_used;
+	bool l2v_defer_pack;	/* pack once after replay, not per update */
+	unsigned long progress_jiffies;	/* rate-limits recover progress */
+	/* L2V_Search sequential hint; see whimory_l2v_search(). */
+	u32 search_start;
+	u32 search_len;
+	u32 search_vba;
+	u32 search_gen;
+	bool search_valid;
 	char status[512];
 };
 

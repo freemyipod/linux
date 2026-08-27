@@ -25,6 +25,8 @@
 #include <sound/pcm_params.h>
 #include <sound/soc.h>
 
+#include <linux/apple-n31.h>
+
 #include "n31-audio-rates.h"
 
 #define S5L8740_I2S_RATES	(SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000)
@@ -704,8 +706,6 @@ static void s5l8740_i2s_tx_kick(struct s5l8740_i2s *i2s, bool dma)
 			 readl(i2s->base + I2SCLKCON));
 }
 
-int s5l_pl080_peri_snapshot(unsigned int peri, u32 *src, u32 *dst, u32 *en);
-
 static void s5l8740_i2s_dma_watch(struct work_struct *work)
 {
 	struct s5l8740_i2s *i2s = container_of(work, struct s5l8740_i2s,
@@ -1068,10 +1068,6 @@ static ssize_t pad_scan_show(struct device *dev, struct device_attribute *attr,
 	return n;
 }
 static DEVICE_ATTR_RO(pad_scan);
-
-struct dma_chan *s5l_pl080_request_slave(struct device *consumer,
-					 unsigned int idx);
-struct dma_chan *s5l_pl080_lookup_peri(unsigned int peri);
 
 static struct dma_chan *s5l8740_i2s_tx_get(struct s5l8740_i2s *i2s)
 {

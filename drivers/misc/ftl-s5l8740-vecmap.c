@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Dual vector LBA maps for S5L8740 FTL.
  *
@@ -104,7 +104,8 @@ static int n31_compress_axis(u32 *base_out, s8 *delta_out, u32 count,
 	s32 *scratch;
 	unsigned int g;
 
-	scratch = kmalloc(N31_VEC_GROUP_SIZE * sizeof(*scratch), GFP_KERNEL);
+	scratch = kmalloc_array(N31_VEC_GROUP_SIZE, sizeof(*scratch),
+				GFP_KERNEL);
 	if (!scratch)
 		return -ENOMEM;
 

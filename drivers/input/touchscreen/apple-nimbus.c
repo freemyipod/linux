@@ -81,6 +81,8 @@
 #include <linux/types.h>
 #include <linux/unaligned.h>
 
+#include <linux/apple-n31.h>
+
 #define NIMBUS_MAGIC		0xEA
 #define NIMBUS_PING_TYPE	490
 #define NIMBUS_BOOTLOAD_WORD	6593		/* 0x19C1 */
@@ -168,9 +170,14 @@ MODULE_PARM_DESC(prepend_z2_hdr, "0=none (N31 default) 1=5A5A+BE len+CRC32 2=c3f
 static int chunk_spi;
 module_param(chunk_spi, int, 0644);
 MODULE_PARM_DESC(chunk_spi, "1=spi_sync chunk xfers (apple_z2-style atomic CS)");
-static int quiet;
+/* Default quiet: bring-up spam off; set quiet=0 or verbose=1 for detail. */
+static int quiet = 1;
 module_param(quiet, int, 0644);
-MODULE_PARM_DESC(quiet, "1=minimal logs (auto after GO fail)");
+MODULE_PARM_DESC(quiet, "1=minimal logs (default); 0=verbose bring-up (or apple_nimbus.verbose=1)");
+
+static bool verbose;
+module_param(verbose, bool, 0644);
+MODULE_PARM_DESC(verbose, "Verbose Nimbus logs (overrides quiet; default N)");
 static int skip_download;
 module_param(skip_download, int, 0644);
 MODULE_PARM_DESC(skip_download, "1=bootload+ping only, no FW chunks");
@@ -230,16 +237,21 @@ static unsigned int exec_word1 = 0x00000100;
 module_param(exec_word1, uint, 0644);
 MODULE_PARM_DESC(exec_word1, "2D54C EXEC word1 (OSOS 0x00000100)");
 
-/* nand-s5l8740.ko exports (optional link). */
-bool nand_ftl_present(void);
-int nand_ftl_read_sector(u64 logical_sector, void *buf);
 
-static bool nimbus_verbose = true;
+static bool nimbus_verbose;
+
+#define nimbus_dev_vinfo(dev, fmt, ...) \
+	do { \
+		if (nimbus_verbose) \
+			dev_info((dev), fmt, ##__VA_ARGS__); \
+		else \
+			dev_dbg((dev), fmt, ##__VA_ARGS__); \
+	} while (0)
 
 #define nimbus_vinfo(n, fmt, ...) \
 	do { \
-		if (nimbus_verbose && !(n)->parked) \
-			dev_info(&(n)->spi->dev, fmt, ##__VA_ARGS__); \
+		if (!(n)->parked) \
+			nimbus_dev_vinfo(&(n)->spi->dev, fmt, ##__VA_ARGS__); \
 	} while (0)
 
 struct nimbus {
@@ -275,10 +287,7 @@ struct nimbus {
 	unsigned int recycle_count;
 };
 
-/* From irq-s5l8740-eic.c */
-int s5l8740_eic_enable_gpio(unsigned int gpio, unsigned int irq_type);
 /* From gpio-d1830.c — OSOS 20766 / 6644(4) / reg16 bit5 */
-int d1830_nimbus_rail(bool on);
 
 static u16 nimbus_sum16(const u8 *buf, int len)
 {
@@ -364,7 +373,7 @@ static void nimbus_power_down(struct nimbus *n)
 	nimbus_spi2_pinmux(n, false);
 	d1830_nimbus_rail(false);
 	nimbus_gpiocmd_mode(n, NIMBUS_GPIO_EN, 1, 0);
-	dev_info(&n->spi->dev, "1A878 power-cut (RST hold, rail off, EN mode 1)\n");
+	nimbus_vinfo(n, "1A878 power-cut (RST hold, rail off, EN mode 1)\n");
 }
 
 /*
@@ -392,7 +401,7 @@ static void nimbus_spi2_11b70(struct nimbus *n)
 	       n->spi2 + SPI2_CTRL);
 	writel(SPI2_CTRL_ENABLE, n->spi2 + SPI2_CTRL);
 	setup = readl(n->spi2 + SPI2_SETUP);
-	dev_info(&n->spi->dev, "11B70 SPI2 SETUP=0x%x CLKDIV=%u\n",
+	nimbus_vinfo(n, "11B70 SPI2 SETUP=0x%x CLKDIV=%u\n",
 		 setup, readl(n->spi2 + SPI2_CLKDIV));
 }
 
@@ -593,7 +602,7 @@ static int nimbus_probe_26494(struct nimbus *n, const char *tag)
 	ret = nimbus_xfer(n, tx, rx, NIMBUS_FRAME_LEN);
 	w0 = (u16)((rx[0] << 8) | rx[1]);
 	w1 = (u16)((rx[2] << 8) | rx[3]);
-	dev_info(&n->spi->dev,
+	nimbus_vinfo(n,
 		 "26494 %s ret=%d words 0x%04x 0x%04x known=%d rx %02x %02x %02x %02x %02x %02x %02x %02x\n",
 		 tag, ret, w0, w1, nimbus_opcode_known(w0) && nimbus_opcode_known(w1),
 		 rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7]);
@@ -645,7 +654,7 @@ static void nimbus_fwfile_classify(struct nimbus *n, const u8 *data, size_t size
 	u32 le0c = (h8740 && size >= 0x10) ? get_unaligned_le32(data + 0xc) : 0;
 	u8 rev = (h8740 && size >= 5) ? data[4] : 0;
 
-	dev_info(&n->spi->dev,
+	nimbus_vinfo(n,
 		 "FWFILE size=%zu first16=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x has_8740=%d rev=%u le32(+0xc)=0x%x arm@0=%d arm@0x400=%d Z2FW=%d\n",
 		 size,
 		 size > 0 ? data[0] : 0, size > 1 ? data[1] : 0,
@@ -669,14 +678,14 @@ static void __maybe_unused nimbus_log_calcand(struct nimbus *n, const char *name
 	u32 s;
 
 	if (size < off + NIMBUS_FW_HDR_LEN) {
-		dev_info(&n->spi->dev, "CALCAND %s off=%u OOB (file=%zu)\n",
+		nimbus_vinfo(n, "CALCAND %s off=%u OOB (file=%zu)\n",
 			 name, off, size);
 		return;
 	}
 	memcpy(tmp, data + off, NIMBUS_FW_HDR_LEN);
 	nimbus_bswap32_words(tmp, NIMBUS_FW_HDR_LEN);
 	s = nimbus_sum32(tmp, NIMBUS_FW_HDR_LEN);
-	dev_info(&n->spi->dev,
+	nimbus_vinfo(n,
 		 "CALCAND %s off=%u sum32=0x%08x first16=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x (post-bswap)\n",
 		 name, off, s,
 		 tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5], tmp[6],
@@ -709,7 +718,7 @@ static void nimbus_fw_audit(struct nimbus *n, const u8 *body, size_t body_len,
 		return;
 	crc = nimbus_crc32_payload(body, body_len);
 	pad = body_len & 3u;
-	dev_info(&n->spi->dev,
+	nimbus_vinfo(n,
 		 "FW audit %s %zuB arm=%d crc32=0x%08x pad=%zu\n",
 		 tag, body_len, nimbus_looks_like_arm(body, body_len), crc, pad);
 	if (body_len >= 16) {
@@ -719,7 +728,7 @@ static void nimbus_fw_audit(struct nimbus *n, const u8 *body, size_t body_len,
 		u32 c_le = get_unaligned_le32(body + 8);
 
 		if (m == NIMBUS_Z2_MAGIC_5A5A || m == NIMBUS_Z2_MAGIC_C3F5)
-			dev_info(&n->spi->dev,
+			nimbus_vinfo(n,
 				 "  z2-dl hdr magic=0x%08x len_le=%u len_be=%u crc=0x%08x\n",
 				 m, ln_le, ln_be, c_le);
 	}
@@ -756,7 +765,7 @@ static u8 *nimbus_maybe_prepend_z2_hdr(struct nimbus *n, const u8 *body,
 		memset(buf + *out_len, 0, 4 - (*out_len & 3));
 		*out_len = round_up(*out_len, 4);
 	}
-	dev_info(&n->spi->dev,
+	nimbus_vinfo(n,
 		 "prepended Z2 dl hdr magic=0x%08x total=%zu\n", magic, *out_len);
 	return buf;
 }
@@ -823,7 +832,7 @@ static int nimbus_hbpp_wake_ee(struct nimbus *n, const char *tag)
 
 	tx[14] = 0xee;
 	ret = nimbus_burst16(n, tx, rx);
-	dev_info(&n->spi->dev,
+	nimbus_vinfo(n,
 		 "HBPP 0xEE wake %s ret=%d rx %02x %02x %02x %02x %02x %02x\n",
 		 tag, ret, rx[0], rx[1], rx[2], rx[3], rx[4], rx[5]);
 	return ret;
@@ -880,7 +889,7 @@ static void nimbus_fw_readback(struct nimbus *n, const char *tag)
 	buf = kmalloc(0x1000, GFP_KERNEL);
 	if (!buf)
 		return;
-	dev_info(&n->spi->dev, "NIMBUS FW_READBACK %s:\n", tag);
+	nimbus_vinfo(n, "NIMBUS FW_READBACK %s:\n", tag);
 	for (i = 0; i < ARRAY_SIZE(addrs); i++) {
 		u32 crc100, crc1000;
 
@@ -892,7 +901,7 @@ static void nimbus_fw_readback(struct nimbus *n, const char *tag)
 		}
 		crc100 = nimbus_crc32_payload(buf, 0x100);
 		crc1000 = nimbus_crc32_payload(buf, 0x1000);
-		dev_info(&n->spi->dev,
+		nimbus_vinfo(n,
 			 "  addr=%08x first32=%32ph crc100=0x%08x crc1000=0x%08x\n",
 			 addrs[i], buf, crc100, crc1000);
 	}
@@ -915,7 +924,7 @@ static void nimbus_cal_readback(struct nimbus *n, const u8 *upload)
 	}
 	crc_chip = nimbus_crc32_payload(buf, NIMBUS_FW_HDR_LEN);
 	crc_host = nimbus_crc32_payload(upload, NIMBUS_FW_HDR_LEN);
-	dev_info(&n->spi->dev,
+	nimbus_vinfo(n,
 		 "NIMBUS CAL_READBACK @%08x first64=%32ph %32ph crc200=0x%08x host_crc=0x%08x match=%d\n",
 		 NIMBUS_CAL_DEST, buf, buf + 32, crc_chip, crc_host,
 		 crc_chip == crc_host && !memcmp(buf, upload, NIMBUS_FW_HDR_LEN));
@@ -938,7 +947,7 @@ static int nimbus_bootload_cmd(struct nimbus *n)
 	}
 	memset(rx, 0, sizeof(rx));
 	ret = nimbus_xfer(n, tx, rx, NIMBUS_FRAME_LEN);
-	dev_info(&n->spi->dev,
+	nimbus_vinfo(n,
 		 "bootload 6593 ret=%d rx %02x %02x %02x %02x %02x %02x %02x %02x\n",
 		 ret, rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7]);
 	return ret;
@@ -1016,14 +1025,14 @@ static int nimbus_prepare_cal_from_isys(struct nimbus *n, const u8 *isys,
 
 	raw = n->isys + NIMBUS_FW_HDR_OFF;
 	memcpy(n->cal_upload, raw, NIMBUS_FW_HDR_LEN);
-	dev_info(&n->spi->dev,
+	nimbus_vinfo(n,
 		 "cal +350 raw head %02x %02x %02x %02x%s\n",
 		 raw[0], raw[1], raw[2], raw[3],
 		 nimbus_cal_looks_ni(raw) ? " (NI family — good)" :
 		 " (not NI — suspect vs 4S/IOReg cal)");
 	nimbus_bswap32_words(n->cal_upload, NIMBUS_FW_HDR_LEN);
 	sum = nimbus_sum32(n->cal_upload, NIMBUS_FW_HDR_LEN);
-	dev_info(&n->spi->dev,
+	nimbus_vinfo(n,
 		 "Nimbus IsyS cal prepared: off=%u len=0x%x sum32=0x%08x upload_first32=%32ph\n",
 		 NIMBUS_FW_HDR_OFF, NIMBUS_FW_HDR_LEN, sum, n->cal_upload);
 	if (!sum) {
@@ -1062,7 +1071,7 @@ static int nimbus_load_isys_from_a34(struct nimbus *n)
 	ptr = readl(desc_io + 4);
 	iounmap(desc_io);
 
-	dev_info(&n->spi->dev,
+	nimbus_vinfo(n,
 		 "A34 IsyS descriptor: magic=0x%08x ptr=0x%08x\n",
 		 magic, ptr);
 
@@ -1090,7 +1099,7 @@ static int nimbus_load_isys_from_a34(struct nimbus *n)
 	memcpy_fromio(tmp, src_io, NIMBUS_ISYS_LEN);
 	iounmap(src_io);
 
-	dev_info(&n->spi->dev,
+	nimbus_vinfo(n,
 		 "A34 IsyS read: ptr=0x%08x len=0x%x first32=%32ph calraw_first16=%16ph\n",
 		 ptr, NIMBUS_ISYS_LEN, tmp, tmp + NIMBUS_FW_HDR_OFF);
 
@@ -1128,7 +1137,7 @@ static int nimbus_load_isys_from_dt(struct nimbus *n)
 	if (ret)
 		goto out;
 
-	dev_info(&n->spi->dev, "DT IsyS: addr=0x%08x size=0x%x\n", addr, size);
+	nimbus_vinfo(n, "DT IsyS: addr=0x%08x size=0x%x\n", addr, size);
 
 	if (!addr || size != NIMBUS_ISYS_LEN) {
 		ret = -EINVAL;
@@ -1148,7 +1157,7 @@ static int nimbus_load_isys_from_dt(struct nimbus *n)
 		goto out;
 	}
 
-	dev_info(&n->spi->dev,
+	nimbus_vinfo(n,
 		 "DT IsyS read: addr=0x%08x len=0x%x first32=%32ph calraw_first16=%16ph\n",
 		 addr, size, tmp, tmp + NIMBUS_FW_HDR_OFF);
 
@@ -1171,7 +1180,7 @@ static int nimbus_acquire_isys_cal(struct nimbus *n)
 	if (!ret)
 		return 0;
 
-	dev_info(&n->spi->dev, "DT IsyS unavailable: %d; trying A34 live\n",
+	nimbus_vinfo(n, "DT IsyS unavailable: %d; trying A34 live\n",
 		 ret);
 
 	ret = nimbus_load_isys_from_a34(n);
@@ -1254,7 +1263,7 @@ static u8 *nimbus_try_gpfw_from_ftl(struct device *dev, size_t *out_len)
 					     NIMBUS_FTL_SECTOR_SIZE);
 			}
 			if (got >= 0x410) {
-				dev_info(dev,
+				nimbus_dev_vinfo(dev,
 					 "gpfw/8740 from FTL lba=%llu off=%u need=%zu got=%zu rev=%u\n",
 					 lba, off, need, got, buf[7]);
 				*out_len = got;
@@ -1300,10 +1309,10 @@ static int nimbus_acquire_fw(struct device *dev, const u8 **data,
 
 static void nimbus_release_fw(const struct firmware *fw, u8 *kbuf)
 {
-	if (kbuf)
-		kfree(kbuf);
-	else if (fw)
+	/* Exactly one of the decoded copy and the firmware blob is live. */
+	if (!kbuf && fw)
 		release_firmware(fw);
+	kfree(kbuf);
 }
 
 /*
@@ -1403,10 +1412,10 @@ static void nimbus_log_upload_prefix(struct nimbus *n, const char *tag,
 				     unsigned int len, const u8 *tx,
 				     unsigned int xfer_len, u16 ack, int ack_ret)
 {
-	dev_info(&n->spi->dev,
+	nimbus_vinfo(n,
 		 "NIMBUS %s chunk=%u dest=%08x len=%04x xfer=%u ACK=0x%04x ret=%d\n",
 		 tag, chunk_idx, dest, len, xfer_len, ack, ack_ret);
-	dev_info(&n->spi->dev,
+	nimbus_vinfo(n,
 		 "  tx[0:16] = %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
 		 tx[0], tx[1], tx[2], tx[3], tx[4], tx[5], tx[6], tx[7],
 		 tx[8], tx[9], tx[10], tx[11],
@@ -1425,21 +1434,21 @@ static void nimbus_dump_hbpp_tx(struct nimbus *n, const char *tag,
 	nimbus_log_upload_prefix(n, tag, chunk_idx, dest, chunk_len,
 				 tx, xfer_len, ack, ack_ret);
 	if (raw && chunk_len >= 64)
-		dev_info(&n->spi->dev, "  raw first64=%32ph %32ph\n",
+		nimbus_vinfo(n, "  raw first64=%32ph %32ph\n",
 			 raw, raw + 32);
 	else if (raw)
-		dev_info(&n->spi->dev, "  raw first%u=%*ph\n",
+		nimbus_vinfo(n, "  raw first%u=%*ph\n",
 			 chunk_len, chunk_len, raw);
 	if (xfer_len >= 96)
-		dev_info(&n->spi->dev,
+		nimbus_vinfo(n,
 			 "  tx first96=%32ph %32ph %32ph\n",
 			 tx, tx + 32, tx + 64);
 	else if (xfer_len > 16)
-		dev_info(&n->spi->dev, "  tx first%u=%*ph\n",
+		nimbus_vinfo(n, "  tx first%u=%*ph\n",
 			 xfer_len, xfer_len, tx);
 	if (xfer_len >= 32) {
 		last_off = xfer_len - 32;
-		dev_info(&n->spi->dev, "  tx last32=%32ph\n", tx + last_off);
+		nimbus_vinfo(n, "  tx last32=%32ph\n", tx + last_off);
 	}
 }
 
@@ -1497,7 +1506,7 @@ static int nimbus_send_chunk_ex(struct nimbus *n, const u8 *data,
 		}
 		if (n->blob16 && try == 0) {
 			n->blob16 = false;
-			dev_info(&n->spi->dev,
+			nimbus_vinfo(n,
 				 "16-bit DATA no 4BC1 — falling back to 8-bit PIO\n");
 		}
 	}
@@ -1614,12 +1623,12 @@ static int nimbus_post_download(struct nimbus *n)
 		u32 rb = 0;
 
 		ret = nimbus_cmd_34ad0(n, pokes[i].a1, pokes[i].a2, pokes[i].a3);
-		dev_info(&n->spi->dev, "34AD0[%d] %d\n", i, ret);
+		nimbus_vinfo(n, "34AD0[%d] %d\n", i, ret);
 		if (ret)
 			return ret;
 		/* 4AD1 = write ACK only; verify with RDREG while still in HBPP. */
 		if (nimbus_rdreg(n, pokes[i].a1, &rb) == 0)
-			dev_info(&n->spi->dev,
+			nimbus_vinfo(n,
 				 "34AD0[%d] RDREG 0x%08x -> 0x%08x (wrote %u)\n",
 				 i, pokes[i].a1, rb, pokes[i].a2);
 	}
@@ -1631,7 +1640,7 @@ static int nimbus_post_download(struct nimbus *n)
 	msleep(65);
 	/* 2D5B0: 3D5706 success only — does not require 0x4BC1 */
 	if (nimbus_status_poll(n, &st) == 0) {
-		dev_info(&n->spi->dev, "post-poke status 0x%04x\n", st);
+		nimbus_vinfo(n, "post-poke status 0x%04x\n", st);
 		n->requestcal_done = true;
 		return 0;
 	}
@@ -1657,7 +1666,7 @@ static int nimbus_cmd_2d54c_raw(struct nimbus *n, u32 word0, u32 word1)
 		if (go_spi_setup > 0) {
 			saved_setup = readl(n->spi2 + SPI2_SETUP);
 			writel((u32)go_spi_setup, n->spi2 + SPI2_SETUP);
-			dev_info(&n->spi->dev, "2D54C GO SETUP 0x%x (was 0x%x)\n",
+			nimbus_vinfo(n, "2D54C GO SETUP 0x%x (was 0x%x)\n",
 				 go_spi_setup, saved_setup);
 		}
 	}
@@ -1669,7 +1678,7 @@ static int nimbus_cmd_2d54c_raw(struct nimbus *n, u32 word0, u32 word1)
 		ret = nimbus_burst(n, tx, rx, 12);
 	if (saved_setup)
 		writel(saved_setup, n->spi2 + SPI2_SETUP);
-	dev_info(&n->spi->dev,
+	nimbus_vinfo(n,
 		 "2D54C %08x %08x ret=%d xfer=%d rx %02x %02x %02x %02x %02x %02x\n",
 		 word0, word1, ret, go_xfer, rx[0], rx[1], rx[2], rx[3],
 		 rx[4], rx[5]);
@@ -1698,7 +1707,7 @@ static void nimbus_pre_exec_verify(struct nimbus *n)
 		u32 v = 0;
 
 		if (nimbus_rdreg(n, addrs[i], &v) == 0)
-			dev_info(&n->spi->dev, "pre-EXEC RDREG 0x%08x=0x%08x\n",
+			nimbus_vinfo(n, "pre-EXEC RDREG 0x%08x=0x%08x\n",
 				 addrs[i], v);
 	}
 }
@@ -1732,7 +1741,7 @@ static int nimbus_probe_z2_eb(struct nimbus *n)
 	tx[1] = 0x01;
 	put_unaligned_le16(0xeb + 1, tx + 14);
 	ret = nimbus_burst16(n, tx, rx);
-	dev_info(&n->spi->dev,
+	nimbus_vinfo(n,
 		 "z2-EB ret=%d rx %02x %02x %02x %02x %02x %02x %02x %02x\n",
 		 ret, rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7]);
 	return (ret == 0 && rx[0] == 0xe1) ? 0 : -EIO;
@@ -1751,7 +1760,7 @@ static int nimbus_probe_ea16(struct nimbus *n)
 	csum = nimbus_sum16(tx, 14);
 	put_unaligned_le16(csum, tx + 14);
 	ret = nimbus_burst16(n, tx, rx);
-	dev_info(&n->spi->dev,
+	nimbus_vinfo(n,
 		 "EA16 ret=%d rx %02x %02x %02x %02x %02x %02x %02x %02x\n",
 		 ret, rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7]);
 	return (ret == 0 && rx[0] == NIMBUS_MAGIC) ? 0 : -EIO;
@@ -1777,7 +1786,7 @@ static int nimbus_probe_ping16(struct nimbus *n)
 	spi_message_init(&m);
 	spi_message_add_tail(&t, &m);
 	ret = spi_sync(n->spi, &m);
-	dev_info(&n->spi->dev,
+	nimbus_vinfo(n,
 		 "ping16 ret=%d rx %02x %02x %02x %02x %02x %02x %02x %02x csum=%d\n",
 		 ret, rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7],
 		 nimbus_sum16(rx, 14) == get_unaligned_le16(rx + 14));
@@ -1959,14 +1968,14 @@ static int nimbus_send_preconstructed_hbpp(struct nimbus *n, const u8 *data,
 		if (ret)
 			continue;
 		if (nimbus_wait_ack(n, NIMBUS_ACK_CHUNK, 8) == 0) {
-			dev_info(&n->spi->dev,
+			nimbus_vinfo(n,
 				 "preconstructed HBPP %zuB ACK 0x4BC1 try=%d\n",
 				 len, try);
 			return 0;
 		}
 		if (n->blob16 && try == 0) {
 			n->blob16 = false;
-			dev_info(&n->spi->dev,
+			nimbus_vinfo(n,
 				 "preconstructed HBPP: fall back to 8-bit\n");
 		}
 	}
@@ -2035,7 +2044,7 @@ static int nimbus_download_fw(struct nimbus *n, const u8 *data, size_t size,
 		 * disk-shaped image — send the whole 8740+ARM at dest 0.
 		 */
 		if (rev != 3) {
-			dev_info(&n->spi->dev,
+			nimbus_vinfo(n,
 				 "204E0 ARM-at-0 %zuB dest 0 (rev=%u hdr+0x0c=0x%x file=%zu)\n",
 				 body_len, rev, get_unaligned_le32(data + 0x0c),
 				 size);
@@ -2046,7 +2055,7 @@ static int nimbus_download_fw(struct nimbus *n, const u8 *data, size_t size,
 							      round_up(min_t(size_t, body_len, size - 0x400) & ~15u, 16),
 							      false) == 0 &&
 				    nimbus_looks_like_arm(try, min_t(size_t, 16, body_len))) {
-					dev_info(&n->spi->dev, "force_gid 422FFA ARM ok\n");
+					nimbus_vinfo(n, "force_gid 422FFA ARM ok\n");
 					body = try;
 					body_len = min_t(size_t, body_len, size - 0x400);
 					dec = try;
@@ -2056,7 +2065,7 @@ static int nimbus_download_fw(struct nimbus *n, const u8 *data, size_t size,
 			}
 			goto send;
 		}
-		dev_info(&n->spi->dev,
+		nimbus_vinfo(n,
 			 "204E0 ARM-at-0 %zu bytes rev=%u (hdr+0x0c=0x%x file=%zu)\n",
 			 body_len, rev, get_unaligned_le32(data + 0x0c), size);
 
@@ -2070,14 +2079,14 @@ static int nimbus_download_fw(struct nimbus *n, const u8 *data, size_t size,
 			if (nimbus_gid_crypt(&n->spi->dev, probe, 16, true) == 0 &&
 			    !memcmp(probe, data + 0x40, 16)) {
 				verified = true;
-				dev_info(&n->spi->dev, "26CCC GID verify OK\n");
+				nimbus_vinfo(n, "26CCC GID verify OK\n");
 			} else {
 				memcpy(probe, data, 16);
 				if (nimbus_422ffa_mmio(&n->spi->dev, probe, 16,
 						       true) == 0 &&
 				    !memcmp(probe, data + 0x40, 16)) {
 					verified = true;
-					dev_info(&n->spi->dev,
+					nimbus_vinfo(n,
 						 "26CCC 422FFA verify OK\n");
 				} else {
 					dev_warn(&n->spi->dev,
@@ -2101,12 +2110,12 @@ static int nimbus_download_fw(struct nimbus *n, const u8 *data, size_t size,
 				ret = nimbus_gid_crypt(&n->spi->dev, dec,
 						       body_len, false);
 			}
-			dev_info(&n->spi->dev,
+			nimbus_vinfo(n,
 				 "204E0 GID decrypt ret=%d arm=%d head %02x %02x %02x %02x ver=%d\n",
 				 ret, nimbus_looks_like_arm(dec, body_len),
 				 dec[0], dec[1], dec[2], dec[3], verified);
 			if (!ret && body_len > 0xd210)
-				dev_info(&n->spi->dev,
+				nimbus_vinfo(n,
 					 "ARM +0x54 %02x%02x%02x%02x +0x100 %02x%02x%02x%02x +0x1000 %02x%02x%02x%02x +0xD208 %02x%02x%02x%02x +0x20=%08x\n",
 					 dec[0x54], dec[0x55], dec[0x56], dec[0x57],
 					 dec[0x100], dec[0x101], dec[0x102], dec[0x103],
@@ -2126,7 +2135,7 @@ static int nimbus_download_fw(struct nimbus *n, const u8 *data, size_t size,
 		dev_warn(&n->spi->dev, "FW empty (%zu) — skip download\n", size);
 		return -EINVAL;
 	} else {
-		dev_info(&n->spi->dev, "Grape FW download %zu bytes (no 8740)\n",
+		nimbus_vinfo(n, "Grape FW download %zu bytes (no 8740)\n",
 			 size);
 	}
 
@@ -2136,15 +2145,15 @@ send:
 	 * send once and run post-download. Do not re-packetize ARM.
 	 */
 	if (nimbus_looks_like_hbpp_data(body, body_len)) {
-		dev_info(&n->spi->dev,
+		nimbus_vinfo(n,
 			 "preconstructed HBPP DATA %zuB — direct SPI (no ARM wrap)\n",
 			 body_len);
 		ret = nimbus_send_preconstructed_hbpp(n, body, body_len);
 		if (!ret) {
-				ret = nimbus_post_download(n);
-				if (!ret)
-					ret = nimbus_cmd_2d54c(n);
-			}
+			ret = nimbus_post_download(n);
+			if (!ret)
+				ret = nimbus_cmd_2d54c(n);
+		}
 		kfree(dec);
 		return ret;
 	}
@@ -2159,7 +2168,7 @@ send:
 		int try, cal;
 
 		if (official < body_len) {
-			dev_info(&n->spi->dev,
+			nimbus_vinfo(n,
 				 "cap ARM %zu -> %zu (204E0 +0x0c; strip S/C fill)\n",
 				 body_len, official);
 			body_len = official;
@@ -2179,7 +2188,7 @@ send:
 			memset(pad_buf + dl_len, 0, round_up(dl_len, 4) - dl_len);
 			dl_len = round_up(dl_len, 4);
 			dl_body = pad_buf;
-			dev_info(&n->spi->dev, "FW padded to %zu (4-byte align)\n",
+			nimbus_vinfo(n, "FW padded to %zu (4-byte align)\n",
 				 dl_len);
 		}
 		nimbus_fw_audit(n, dl_body, dl_len, "2D640");
@@ -2207,17 +2216,17 @@ send:
 			return cal;
 		}
 
-		dev_info(&n->spi->dev,
+		nimbus_vinfo(n,
 			 "2D640 ARM dest_base=0x%08x EXEC=0x%08x cal=0x%08x\n",
 			 fw_dest, exec_addr, NIMBUS_CAL_DEST);
 		if (fw_dest == 0)
-			dev_info(&n->spi->dev,
+			nimbus_vinfo(n,
 				 "expect FW prefix: 18 e1 30 01 07 fc 00 00 00 00 01 03 (len=0x1ff0)\n");
 		else
 			dev_warn(&n->spi->dev,
 				 "fw_dest override 0x%08x — OSOS uses 0 (A/B only)\n",
 				 fw_dest);
-		dev_info(&n->spi->dev,
+		nimbus_vinfo(n,
 			 "expect CAL prefix: 18 e1 30 01 00 80 02 00 00 40 00 c2\n");
 
 		/* 20E94: 273A0 up to 3 times, no 1A878 between. */
@@ -2240,7 +2249,7 @@ send:
 				continue;
 			}
 			n->cal_uploaded = true;
-			dev_info(&n->spi->dev,
+			nimbus_vinfo(n,
 				 "2D7A4 512B cal @0x%08x ACK (transport only)\n",
 				 NIMBUS_CAL_DEST);
 			nimbus_cal_readback(n, win);
@@ -2252,7 +2261,7 @@ send:
 			}
 			ret = nimbus_cmd_2d54c(n);
 			if (!ret) {
-				dev_info(&n->spi->dev,
+				nimbus_vinfo(n,
 					 "2D54C EXEC sent (try %d) — await runtime ping\n",
 					 try);
 				break;
@@ -2446,7 +2455,7 @@ static void nimbus_dump_pad(struct nimbus *n, unsigned int gpio, const char *nam
 	pcon = readl(b);
 	din = readl(b + 0x04);
 	dir = readl(b + 0x14);
-	dev_info(&n->spi->dev,
+	nimbus_vinfo(n,
 		 "pad %s gpio%u pcon=%x din=%u dir=%u dout=%u punb=%u punc=%u\n",
 		 name, gpio, (pcon >> (4 * pin)) & 0xf,
 		 !!(din & BIT(pin)), !!(dir & BIT(pin)),
@@ -2467,7 +2476,7 @@ static void nimbus_gpio_por_reset(struct nimbus *n)
 	msleep(reset_release_ms);
 	nimbus_gpiocmd_mode(n, NIMBUS_GPIO_RST, 1, 0);
 	msleep(5);
-	dev_info(&n->spi->dev, "extra POR RST %dms low / %dms high\n",
+	nimbus_vinfo(n, "extra POR RST %dms low / %dms high\n",
 		 reset_hold_ms, reset_release_ms);
 }
 
@@ -2525,7 +2534,7 @@ static void nimbus_irq_enable(struct nimbus *n)
 	nimbus_gpiocmd_mode(n, NIMBUS_GPIO_IRQ, 0, 0);
 	/* RetailOS: level, active-low → VIC EXT1 */
 	if (s5l8740_eic_enable_gpio(NIMBUS_GPIO_IRQ, IRQ_TYPE_LEVEL_LOW) == 0)
-		dev_info(&n->spi->dev, "EIC enabled GPIO%d level-low\n",
+		nimbus_vinfo(n, "EIC enabled GPIO%d level-low\n",
 			 NIMBUS_GPIO_IRQ);
 }
 
@@ -2544,7 +2553,7 @@ static int nimbus_1a5ac_and_download(struct nimbus *n, const u8 *data,
 	msleep(15); /* 1A5AC: after 20848, before 2075A(0) */
 	nimbus_gpio_release_reset(n);
 	if (skip_download) {
-		dev_info(&n->spi->dev, "skip_download — no 2D640\n");
+		nimbus_vinfo(n, "skip_download — no 2D640\n");
 		return 0;
 	}
 	/* 20E94: 26494 then 273A0; settle already done in release (30ms). */
@@ -2590,7 +2599,7 @@ static void nimbus_recycle(struct nimbus *n)
 		return;
 	}
 	n->recycle_count++;
-	dev_info(&n->spi->dev,
+	nimbus_vinfo(n,
 		 "1703E8 10 ping fails — 13A20 recycle %u/%u\n",
 		 n->recycle_count, NIMBUS_RECYCLE_MAX);
 	nimbus_power_down(n);
@@ -2609,7 +2618,7 @@ static void nimbus_recycle(struct nimbus *n)
 	msleep(2);
 	if (!nimbus_ping(n, &st)) {
 		n->spi_ok = true;
-		dev_info(&n->spi->dev, "recycle ping ok, status=0x%04x\n", st);
+		nimbus_vinfo(n, "recycle ping ok, status=0x%04x\n", st);
 	} else if (n->recycle_count >= NIMBUS_RECYCLE_MAX) {
 		nimbus_park(n, "still bootloader after GO");
 	}
@@ -2631,7 +2640,7 @@ static void nimbus_service(struct nimbus *n)
 	}
 	n->ping_fails++;
 	if (nimbus_verbose && (n->ping_fails <= 3 || n->ping_fails == 10))
-		dev_info(&n->spi->dev,
+		nimbus_vinfo(n,
 			 "188FFC ping still fail (%u) attn=%d\n",
 			 n->ping_fails,
 			 n->attn ? gpiod_get_value_cansleep(n->attn) : -1);
@@ -2690,7 +2699,7 @@ static int nimbus_poll_thread(void *data)
 	}
 	if (!n->fw_loaded && !n->fw_tried) {
 		n->fw_tried = true;
-		dev_info(&n->spi->dev,
+		nimbus_vinfo(n,
 			 "no apple/grape-nimbus.bin — bootload+ping only\n");
 	}
 
@@ -2783,7 +2792,7 @@ static int nimbus_probe(struct spi_device *spi)
 		return -ENOMEM;
 	n->spi = spi;
 	n->blob16 = false;
-	nimbus_verbose = !quiet;
+	nimbus_verbose = verbose || !quiet;
 	mutex_init(&n->lock);
 	spi_set_drvdata(spi, n);
 
@@ -2861,7 +2870,7 @@ static int nimbus_probe(struct spi_device *spi)
 					n->spi_ok = true;
 					n->runtime_ready = true;
 					n->fw_loaded = true;
-					dev_info(&spi->dev,
+					nimbus_dev_vinfo(&spi->dev,
 						 "runtime ping ok status=0x%04x (ready)\n",
 						 ping_st);
 				} else {
@@ -2871,7 +2880,7 @@ static int nimbus_probe(struct spi_device *spi)
 					nimbus_peek(n, "post-go-fail");
 					/* Diagnostics only after runtime fail. */
 					if (nimbus_status_poll(n, &st) == 0)
-						dev_info(&spi->dev,
+						nimbus_dev_vinfo(&spi->dev,
 							 "post-fail HBPP status 0x%04x\n",
 							 st);
 					err = 0; /* keep 1A878 retries going */
@@ -2884,7 +2893,7 @@ static int nimbus_probe(struct spi_device *spi)
 		}
 	}
 	nimbus_release_fw(fw, kbuf);
-	dev_info(&spi->dev,
+	nimbus_dev_vinfo(&spi->dev,
 		 "nimbus state uploaded=%d cal=%d reqcal=%d exec=%d runtime=%d spi_ok=%d\n",
 		 n->fw_uploaded, n->cal_uploaded, n->requestcal_done,
 		 n->exec_sent, n->runtime_ready, n->spi_ok);
@@ -2905,7 +2914,7 @@ static int nimbus_probe(struct spi_device *spi)
 				n->irq = -1;
 			} else {
 				n->use_irq = true;
-				dev_info(&spi->dev,
+				nimbus_dev_vinfo(&spi->dev,
 					 "IRQ-driven (VIC irq %d + EIC GPIO%d)\n",
 					 n->irq, NIMBUS_GPIO_IRQ);
 			}

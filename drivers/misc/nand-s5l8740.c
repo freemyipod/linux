@@ -383,6 +383,28 @@ module_param(reset_every, uint, 0644);
 MODULE_PARM_DESC(reset_every, "nand_reset after this many page_read calls (0=off)");
 
 /* 50D960 uses 3; full PPN page is 16 x 1K data (+64 spare not in this PIO). */
+/*
+ * The CS/command-list path bumps pages_since_reset but historically never
+ * acted on it — only the PIO page_read paths reset. A recover is thousands
+ * of back-to-back live C00 kicks with no controller reset in between, and
+ * the glass reboots partway through a wide scan. Reset every N CS reads.
+ */
+/* Total live CS kicks since insmod; heartbeat + post-mortem marker. */
+static unsigned int cs_reads_total;
+/* Off by default: console writes lengthen recover measurably. */
+static bool cs_heartbeat;
+module_param(cs_heartbeat, bool, 0644);
+MODULE_PARM_DESC(cs_heartbeat, "Log CS read progress every 1024 pages");
+module_param(cs_reads_total, uint, 0444);
+
+/* Where CS read wall time actually goes; reported by the heartbeat. */
+static u64 cs_ns_kick, cs_ns_copy;
+
+static unsigned int cs_reset_every;
+module_param(cs_reset_every, uint, 0644);
+MODULE_PARM_DESC(cs_reset_every,
+		 "fmss_nand_reset after this many CS phys reads (0=off)");
+
 static unsigned int page_chunks = 16;
 module_param(page_chunks, uint, 0644);
 MODULE_PARM_DESC(page_chunks, "1K PIO chunks per page_read (16=full 16KiB data)");
@@ -425,7 +447,8 @@ MODULE_PARM_DESC(dma_nsect, "DMA span (# logical LBAs) per CS read (default 1)")
 static bool meta_dma_read;
 module_param(meta_dma_read, bool, 0644);
 MODULE_PARM_DESC(meta_dma_read,
-		 "Use command-list data+meta read for metadata callers (default N — CS kick wedges)");
+		 "Allow page_read META via CS span4 (default N). "
+		 "ftl_sftl_recover uses dma_session live CS without this.");
 
 /*
  * PIO page path uses the legacy reset/reinit sequence.
@@ -472,7 +495,9 @@ static unsigned int dma_kick = 0xfff5;
 module_param(dma_kick, uint, 0644);
 MODULE_PARM_DESC(dma_kick, "FMSEQ (C00) kick value (OSOS D39EC = 0xFFF5)");
 
-/* Default Y: program descriptors without C00 kick until glass preflight passes. */
+/* Default dry/disarmed: permanent live C00 kick reboots (glass 2026-08-27).
+ * ftl_sftl_recover / cs_phys use dma_session_begin to arm live CS temporarily.
+ */
 static bool dma_dry = true;
 module_param(dma_dry, bool, 0644);
 MODULE_PARM_DESC(dma_dry,
@@ -480,11 +505,12 @@ MODULE_PARM_DESC(dma_dry,
 
 static bool dma_armed;
 module_param(dma_armed, bool, 0644);
-MODULE_PARM_DESC(dma_armed, "Allow one hazardous CS DMA kick");
+MODULE_PARM_DESC(dma_armed, "Allow CS DMA kick (default N — session arms for recover)");
 
 static bool dma_one_shot = true;
 module_param(dma_one_shot, bool, 0644);
-MODULE_PARM_DESC(dma_one_shot, "Disarm CS DMA after one kick");
+MODULE_PARM_DESC(dma_one_shot,
+		 "Clear dma_armed after each CS kick (default Y outside sessions)");
 
 /* Canary path: one page, no FTL/lba_map ingest. */
 static bool dma_skip_ingest;
@@ -918,8 +944,8 @@ static int fmss_page_read(struct nand_s5l8740 *f, unsigned int ce, u32 addr)
 				writel(0x1e2, f->base + FMCTRL1);
 			} else {
 				/* OSOS 50D960 parity: FMLEN=52 FMCE=16 +0x24=0 CTRL1=34
- * — do not touch +0x18 or +0x28 here.
- */
+				 * — do not touch +0x18 or +0x28 here.
+				 */
 				writel(52, f->base + FMLEN);
 				writel(parity_fmce, f->base + FMCE);
 				writel(0, f->base + FMUNK24);
@@ -931,11 +957,11 @@ static int fmss_page_read(struct nand_s5l8740 *f, unsigned int ce, u32 addr)
 				goto fail_ctrl0;
 			}
 			/*
- * Live: after FMCE=16 FMLEN=52, D622C can read bytes
- * (head often 02 …) — parity lands on the DATA FIFO.
- * Never drain it when ecc_before_drain=1 (OSOS leaves
- * it for 4EB458). Optional strip only when ECC off.
- */
+			 * Live: after FMCE=16 FMLEN=52, D622C can read bytes
+			 * (head often 02 …) — parity lands on the DATA FIFO.
+			 * Never drain it when ecc_before_drain=1 (OSOS leaves
+			 * it for 4EB458). Optional strip only when ECC off.
+			 */
 			if (xfer_style == 0 && !ecc_before_drain) {
 				u8 dig[64];
 
@@ -944,9 +970,9 @@ static int fmss_page_read(struct nand_s5l8740 *f, unsigned int ce, u32 addr)
 					memcpy(f->last_parity[i], dig, 53);
 					f->last_parity_len[i] = 53;
 					/*
- * Host-visible spare is the first 16 of
- * the 53-byte beat, once per 4K slot.
- */
+					 * Host-visible spare is the first 16 of
+					 * the 53-byte beat, once per 4K slot.
+					 */
 					if ((i & 3) == 0) {
 						unsigned int slot = (unsigned int)i / 4u;
 						unsigned int pick = 0;
@@ -992,11 +1018,11 @@ static int fmss_page_read(struct nand_s5l8740 *f, unsigned int ce, u32 addr)
 			ecc_ret = fmss_ecc_chunk(f, 0);
 			if (ecc_ret == 1) {
 				/*
- * Chunk is erased/clean — leave zeros and
- * keep going. Aborting the whole page on
- * chunk0 made FPart/VFL miss SLC specials
- * (glass: 4096 tail reads, tag30=0).
- */
+				 * Chunk is erased/clean — leave zeros and
+				 * keep going. Aborting the whole page on
+				 * chunk0 made FPart/VFL miss SLC specials
+				 * (glass: 4096 tail reads, tag30=0).
+				 */
 				f->last_clean_chunks++;
 				continue;
 			}
@@ -1016,10 +1042,10 @@ static int fmss_page_read(struct nand_s5l8740 *f, unsigned int ce, u32 addr)
 	}
 
 	/*
- * Trailing fmss_data_in(64) after 16×1K is an empty FIFO (zeros) and
- * must not be treated as META (that polluted lba_map with type 0x00).
- * Extra style-1 FMLEN=15 beats after this path desynced the next page.
- */
+	 * Trailing fmss_data_in(64) after 16×1K is an empty FIFO (zeros) and
+	 * must not be treated as META (that polluted lba_map with type 0x00).
+	 * Extra style-1 FMLEN=15 beats after this path desynced the next page.
+	 */
 
 	fmss_cmd(f, 0x77);
 	writel(0, f->base + FMCTRL0);
@@ -1060,9 +1086,9 @@ static int fmss_page_read_with_meta(struct nand_s5l8740 *f, unsigned int ce,
 	if (ret || !meta_pass)
 		return ret;
 	/*
- * Erased PPN page: all 16 chunks ECC-clean. Spare is 0xFF; a second
- * 50D960 only burns the controller (tail+brute are mostly empty).
- */
+	 * Erased PPN page: all 16 chunks ECC-clean. Spare is 0xFF; a second
+	 * 50D960 only burns the controller (tail+brute are mostly empty).
+	 */
 	if (f->last_clean_chunks &&
 	    f->last_clean_chunks >= (page_chunks ? page_chunks : 16)) {
 		memset(f->last_spare, 0xff, sizeof(f->last_spare));
@@ -1144,9 +1170,9 @@ static bool fmss_cs_preflight(struct nand_s5l8740 *f)
 	}
 
 	/*
- * Conservative idle gate. Adjust allowed states only after glass logs.
- * Avoid kick if status already advertises completion/error/busy noise.
- */
+	 * Conservative idle gate. Adjust allowed states only after glass logs.
+	 * Avoid kick if status already advertises completion/error/busy noise.
+	 */
 	if (c0c & 0x0d)
 		return false;
 
@@ -1190,10 +1216,10 @@ static irqreturn_t fmss_cs_irq(int irq, void *data)
 	f->last_dma_c0c = st;
 
 	/*
- * Level-style VIC source: clear peripheral before parent EOI, or it
- * can retrigger/stick. Snapshot first — waiter must not require C0C
- * to remain asserted after W1C.
- */
+	 * Level-style VIC source: clear peripheral before parent EOI, or it
+	 * can retrigger/stick. Snapshot first — waiter must not require C0C
+	 * to remain asserted after W1C.
+	 */
 	if (st & 0x0d) {
 		writel(st & 0x0d, f->base + FMSEQIRQ);
 		readl(f->base + FMSEQIRQ);
@@ -1290,18 +1316,18 @@ static int fmss_dma_page_read(struct nand_s5l8740 *f, unsigned int ce, u32 addr)
 	ce_bit = 1u << (16 + ce);
 
 	/*
- * 4EDDDC one-page descriptor list:
- * desc0: CE-select dword0=1<<(ce+16), later |0x80000000 if last for CE
- * dword2/3 = packed physical address (v40: low in [2])
- * desc1: transfer dword0=(1<<(ce+16))|1, [1]=span, [2]=meta, [3]=data
- * term: 0x00010002
- */
+	 * 4EDDDC one-page descriptor list:
+	 * desc0: CE-select dword0=1<<(ce+16), later |0x80000000 if last for CE
+	 * dword2/3 = packed physical address (v40: low in [2])
+	 * desc1: transfer dword0=(1<<(ce+16))|1, [1]=span, [2]=meta, [3]=data
+	 * term: 0x00010002
+	 */
 	/*
- * 4EDDDC address qword from 5172A0 (READ, v40 / multi-LBA page):
- * lo = (rec * span) | ((rec * slot) << 16) // length | column<<16
- * hi = encoded_ppn (5173CA, mode 0)
- * desc[2]=lo, desc[3]=hi when dma_d14>=7 (v40).
- */
+	 * 4EDDDC address qword from 5172A0 (READ, v40 / multi-LBA page):
+	 * lo = (rec * span) | ((rec * slot) << 16) // length | column<<16
+	 * hi = encoded_ppn (5173CA, mode 0)
+	 * desc[2]=lo, desc[3]=hi when dma_d14>=7 (v40).
+	 */
 	cl[0] = ce_bit;
 	cl[1] = 0;
 	{
@@ -1365,9 +1391,9 @@ static int fmss_dma_page_read(struct nand_s5l8740 *f, unsigned int ce, u32 addr)
 	}
 
 	/*
- * Clear/idle before programming D-regs / C04 (USB/PL080 pattern:
- * clear status, prove idle, program pointers, kick last).
- */
+	 * Clear/idle before programming D-regs / C04 (USB/PL080 pattern:
+	 * clear status, prove idle, program pointers, kick last).
+	 */
 	if (!fmss_cs_preflight(f)) {
 		ret = -EBUSY;
 		goto dma_done;
@@ -1381,9 +1407,9 @@ static int fmss_dma_page_read(struct nand_s5l8740 *f, unsigned int ce, u32 addr)
 	writel(dma_d14, f->base + FMGEN5);		/* D14 = addr_cycles-1 */
 	writel((u32)f->seq_dma, f->base + FMSEQBASE);	/* C04 = seq program */
 	/*
- * Do NOT poke +0x81C here — that is 4EB458 ECC, not in 4EDDDC/D39EC.
- * A spurious 81C write before CS previously correlated with SoC wedges.
- */
+	 * Do NOT poke +0x81C here — that is 4EB458 ECC, not in 4EDDDC/D39EC.
+	 * A spurious 81C write before CS previously correlated with SoC wedges.
+	 */
 	/* D39EC: C00 = 0xFFF5. Do NOT use 0x80000 (reset) here. */
 	reinit_completion(&f->cs_irq);
 	fmss_info("dma kick ce=%u addr=%08x seq=%08x cmdl=%08x data=%08x meta=%08x st=%08x d14=%u kick=%04x dry=%d armed=%d\n",
@@ -1405,10 +1431,12 @@ static int fmss_dma_page_read(struct nand_s5l8740 *f, unsigned int ce, u32 addr)
 		dma_armed = false;
 
 	/*
- * Device-visible descriptor/data/status buffers before CS fetch.
- * Coherent allocs do not need explicit cache flushes; ordering does.
- */
+	 * Publish the descriptor, data and status buffers before the
+	 * sequencer fetches them. Coherent allocations need no explicit
+	 * cache maintenance, but they do need ordering.
+	 */
 	dma_wmb();
+	/* Pair the DMA-visible write above with a full barrier. */
 	wmb();
 
 	/* Flush posted MMIO programming before the sequencer kick. */
@@ -1422,9 +1450,9 @@ static int fmss_dma_page_read(struct nand_s5l8740 *f, unsigned int ce, u32 addr)
 	readl(f->base + FMSEQ); /* posted write flush */
 
 	/*
- * Prefer IRQ completion snapshot (ISR already W1C'd C0C). Fall back
- * to short poll only when no IRQ or completion never arrived.
- */
+	 * Prefer IRQ completion snapshot (ISR already W1C'd C0C). Fall back
+	 * to short poll only when no IRQ or completion never arrived.
+	 */
 	if (f->irq > 0) {
 		if (wait_for_completion_timeout(&f->cs_irq,
 						msecs_to_jiffies(200))) {
@@ -1437,9 +1465,9 @@ static int fmss_dma_page_read(struct nand_s5l8740 *f, unsigned int ce, u32 addr)
 	}
 
 	/*
- * Avoid require C0C to still be live — ISR clears it for VIC EOI.
- * Trust the saved snapshot from ISR or poll.
- */
+	 * Avoid require C0C to still be live — ISR clears it for VIC EOI.
+	 * Trust the saved snapshot from ISR or poll.
+	 */
 	if (!ret && f->last_dma_c0c &&
 	    ((f->last_dma_c0c & 0x0d) != 1))
 		ret = -EIO;
@@ -1523,8 +1551,10 @@ dma_done:
 }
 
 /*
- *: PPN parameter page, 512 bytes via 41AE38.
- * cmd 0x92, addr 0, cmd 0x97, 0x77/0x7D, 41DA70, cmd 0x7A, 512 PIO.
+ * Read the 512-byte PPN parameter page.
+ *
+ * Command sequence: 0x92, address 0, 0x97, then 0x77/0x7D to select the
+ * page, then 0x7A and 512 bytes of PIO.
  */
 static int fmss_param_read(struct nand_s5l8740 *f, unsigned int ce)
 {
@@ -1574,8 +1604,8 @@ out_idle:
 }
 
 /*
- *: controller reset only (no NAND array write).
- * Followed by per-CE cmd 0xFF as in 130060(a3=1).
+ * Reset the FMSS controller only; this touches no NAND array state.
+ * Each CE is then issued command 0xFF, matching the stock reset path.
  */
 static int fmss_ctrl_reset(struct nand_s5l8740 *f)
 {
@@ -2301,9 +2331,9 @@ static ssize_t cs_phys_read_store(struct device *dev,
 	if (nf < 4)
 		return -EINVAL;
 	/*
- * Legacy: "ce cau blk pg slc [lba]" — if 5th token is 0/1 treat as
- * SLC and take optional 6th as fmss_lba.
- */
+	 * Legacy: "ce cau blk pg slc [lba]" — if 5th token is 0/1 treat as
+	 * SLC and take optional 6th as fmss_lba.
+	 */
 	if (nf == 5 && want_lba <= 1) {
 		unsigned int slc_ignored = want_lba;
 		u32 lba6 = 0xffffffffu;
@@ -2455,9 +2485,9 @@ static void fmss_lba_claim_note_page(struct nand_s5l8740 *f, unsigned int ce,
 
 		meta = f->last_spare + s * 16;
 		/*
- * Diagnostic: any type whose LE LBA matches a target.
- * Production mapping still prefers type 0x01.
- */
+		 * Diagnostic: any type whose LE LBA matches a target.
+		 * Production mapping still prefers type 0x01.
+		 */
 		lba_le = fmss_ppn_meta_lba(meta);
 		lba_be = get_unaligned_be32(meta + 8);
 		if (meta[0] == 0x01 && lba_le < 4096u)
@@ -2615,24 +2645,27 @@ static int fmss_lba_parse_targets(const char *s, unsigned int *start,
 {
 	unsigned int n = 0, a = 0, b = 256;
 	const char *p = s;
-	char *end;
+	char *list, *cursor, *tok;
+	size_t len = 0;
 
 	lba_claim_ntargets = 0;
-	while (*p && *p != ' ' && *p != '\t' && *p != '\n') {
-		unsigned long v = simple_strtoul(p, &end, 0);
+	while (p[len] && p[len] != ' ' && p[len] != '\t' && p[len] != '\n')
+		len++;
+	list = kstrndup(p, len, GFP_KERNEL);
+	if (!list)
+		return -ENOMEM;
+	cursor = list;
+	while ((tok = strsep(&cursor, ",")) != NULL) {
+		unsigned int v;
 
-		if (end == p)
+		if (n >= FMSS_LBA_TARGETS_MAX || kstrtouint(tok, 0, &v)) {
+			kfree(list);
 			return -EINVAL;
-		if (n >= FMSS_LBA_TARGETS_MAX)
-			return -EINVAL;
-		lba_claim_targets[n++] = (unsigned int)v;
-		p = end;
-		if (*p == ',') {
-			p++;
-			continue;
 		}
-		break;
+		lba_claim_targets[n++] = v;
 	}
+	kfree(list);
+	p += len;
 	if (!n)
 		return -EINVAL;
 	while (*p == ' ' || *p == '\t')
@@ -3416,10 +3449,10 @@ static void fmss_l2v_ingest_btoc(struct nand_s5l8740 *f, unsigned int ce,
 			continue;
 		if (lpn == 0) {
 			/*
- * Avoid fmss_boot_carve_try here — nested full-page
- * reads during the BTOC walk wedge FMSS. Discover
- * handles BTOC[0]==0 after the walk.
- */
+			 * Avoid fmss_boot_carve_try here — nested full-page
+			 * reads during the BTOC walk wedge FMSS. Discover
+			 * handles BTOC[0]==0 after the walk.
+			 */
 			continue;
 		}
 		fmss_l2v_set_ex(lpn, ce, cau, block, p, true, L2V_SRC_BTOC, 0);
@@ -4423,10 +4456,10 @@ static int fmss_boot_carve_discover(struct nand_s5l8740 *f, unsigned int start,
 				l1 = use_le ? fmss_btoc_entry_le(f->last_page, 1)
 					    : fmss_btoc_entry_be(f->last_page, 1);
 				/*
- * LPN0 candidate: BTOC[0]==0 (even if [1] is junk —
- * live ce1/cau1/blk63). Avoid scan every random
- * zero dword in non-ingestible pages (wedges NAND).
- */
+				 * LPN0 candidate: BTOC[0]==0 (even if [1] is junk —
+				 * live ce1/cau1/blk63). Avoid scan every random
+				 * zero dword in non-ingestible pages (wedges NAND).
+				 */
 				if (l0 == 0) {
 					page_chunks = 16;
 					if (fmss_boot_try_btoc_page(f, ce, cau, b,
@@ -4460,9 +4493,9 @@ static int fmss_boot_carve_discover(struct nand_s5l8740 *f, unsigned int start,
 	}
 
 	/*
- * Aligned BPB: page0 of each block, then all pages of open SBs
- * (page0 programmed && page127 not closed BTOC/BTE). Never mid-page OEM.
- */
+	 * Aligned BPB: page0 of each block, then all pages of open SBs
+	 * (page0 programmed && page127 not closed BTOC/BTE). Never mid-page OEM.
+	 */
 	page_chunks = 16;
 	{
 		unsigned int boot_scan = nblocks ? nblocks : 256;
@@ -4769,10 +4802,10 @@ static int fmss_l2v_build(struct nand_s5l8740 *f, unsigned int max_lpn,
 								     max_lpn);
 					else if (fmss_page_looks_bte(f->last_page)) {
 						/*
- * Pass 2: BTE needs the full
- * 16 KiB page; walk used 1-chunk
- * probe — re-read full page.
- */
+						 * Pass 2: BTE needs the full
+						 * 16 KiB page; walk used 1-chunk
+						 * probe — re-read full page.
+						 */
 						unsigned int saved2 = page_chunks;
 
 						page_chunks = 16;
@@ -4788,9 +4821,9 @@ static int fmss_l2v_build(struct nand_s5l8740 *f, unsigned int max_lpn,
 				}
 
 				/*
- * Classic block-map heuristic only when BTOC is
- * blank — capped probes to avoid wedging.
- */
+				 * Classic block-map heuristic only when BTOC is
+				 * blank — capped probes to avoid wedging.
+				 */
 				if (!btoc_ok && bmap_probes < 32) {
 					page_chunks = 16;
 					fmss_l2v_try_block_map_page(f, ce, cau,
@@ -5307,10 +5340,10 @@ static ssize_t ftl_grep_store(struct device *dev, struct device_attribute *attr,
 					f->pages_since_reset = 0;
 				}
 				/*
- * Avoid require BTOC page 127 — Apple FAT clusters
- * live in data pages even when BTOC looks blank.
- * (Root cause: old code skipped whole superblocks.)
- */
+				 * Avoid require BTOC page 127 — Apple FAT clusters
+				 * live in data pages even when BTOC looks blank.
+				 * (Root cause: old code skipped whole superblocks.)
+				 */
 				for (p = 0; p < FMSS_BTOC_PAGE; p++) {
 					unsigned int off = 0, show, flags;
 					u32 lpn = ~0u;
@@ -6346,15 +6379,15 @@ int nand_ftl_read_sector(u64 logical_sector, void *buf)
 	unsigned int lpn, sec, ce, cau, block, page, pblock, off, saved;
 	u32 addr, packed;
 	int ret;
-	int (*hook)(u64, void *);
+	int (*hook)(u64 lba, void *buf);
 
 	if (!buf)
 		return -ENODEV;
 
 	/*
- * Whimory registers the real LBA reader after FTL_Open. Call it
- * without the FMSS mutex — the FIL page_read wrapper takes that lock.
- */
+	 * Whimory registers the real LBA reader after FTL_Open. Call it
+	 * without the FMSS mutex — the FIL page_read wrapper takes that lock.
+	 */
 	hook = READ_ONCE(nand_ftl_read_hook);
 	if (hook)
 		return hook(logical_sector, buf);
@@ -6458,10 +6491,10 @@ int s5l8740_nand_meta_transport_ok(void)
 	struct nand_s5l8740 *f = nand_dev;
 
 	/*
- * Disk registration still requires meta_dma_read=1.
- * Early CS phys helpers use s5l8740_nand_cs_phys_read() instead —
- * glass-proven span4/rec4112, but FTL must not auto-open yet.
- */
+	 * Disk registration still requires meta_dma_read=1.
+	 * Early CS phys helpers use s5l8740_nand_cs_phys_read() instead —
+	 * glass-proven span4/rec4112, but FTL must not auto-open yet.
+	 */
 	return f && f->dma_ok && meta_dma_read;
 }
 EXPORT_SYMBOL_GPL(s5l8740_nand_meta_transport_ok);
@@ -6542,15 +6575,15 @@ int s5l8740_nand_query_geometry(struct s5l8740_nand_geom *g)
 	mutex_unlock(&f->lock);
 
 	/*
- * FIL GetInfo (vtable +80,:
- * 101 — NAND present / signature +0x34 geometry (WhimoryBoot.c:169,260)
- * 0 → "No NAND device found". Compared to sig[+0x34].
- * Value stored at format is blocks_per_cau → 0x8D102CC
- * is the first geometry word copied from the param page).
- * 104 — BUF_Init data bytes first arg) = physical page size
- * 105 — BUF_Init meta bytes second arg) = 16 
- * 135 — stored at 0x8D0CE2C and unused after GetInfo
- */
+	 * FIL GetInfo (vtable +80,:
+	 * 101 — NAND present / signature +0x34 geometry (WhimoryBoot.c:169,260)
+	 * 0 → "No NAND device found". Compared to sig[+0x34].
+	 * Value stored at format is blocks_per_cau → 0x8D102CC
+	 * is the first geometry word copied from the param page).
+	 * 104 — BUF_Init data bytes first arg) = physical page size
+	 * 105 — BUF_Init meta bytes second arg) = 16
+	 * 135 — stored at 0x8D0CE2C and unused after GetInfo
+	 */
 	g->dev_id = g->blocks_per_cau;
 	g->geom_104 = g->page_size;
 	g->geom_105 = 16;
@@ -6711,6 +6744,7 @@ int s5l8740_nand_cs_phys_read(u8 ce, u8 cau, u16 block, u8 page,
 	u32 addr;
 	bool saved_armed;
 	int ret;
+	u64 t0, t1, t2;
 	unsigned int s;
 
 	if (!f || !out)
@@ -6729,11 +6763,15 @@ int s5l8740_nand_cs_phys_read(u8 ce, u8 cau, u16 block, u8 page,
 	addr = fmss_ppn_addr(cau, block, page, 0);
 
 	mutex_lock(&f->lock);
+	if (cs_reset_every && f->pages_since_reset >= cs_reset_every)
+		fmss_nand_reset(f);
 	saved_armed = dma_armed;
 	/* One-shot friendly: re-arm for this kick; disarm after if one_shot. */
 	dma_armed = true;
 	dma_skip_ingest = true;
+	t0 = ktime_get_ns();
 	ret = fmss_dma_page_read_records(f, ce, addr, 0, 4);
+	t1 = ktime_get_ns();
 	dma_skip_ingest = false;
 	if (!dma_one_shot)
 		dma_armed = saved_armed;
@@ -6771,6 +6809,21 @@ int s5l8740_nand_cs_phys_read(u8 ce, u8 cau, u16 block, u8 page,
 			s5l8740_nand_meta_decode(out->meta_raw[s], &out->meta[s]);
 		}
 	}
+
+	/* Where the wall time goes; also the last line the host sees over
+	 * /proc/kmsg if the glass dies mid-recover.
+	 */
+	t2 = ktime_get_ns();
+	cs_ns_kick += t1 - t0;
+	cs_ns_copy += t2 - t1;
+	cs_reads_total++;
+	if (cs_heartbeat && (cs_reads_total & 0x3ff) == 0)
+		pr_info("s5l8740-nand: cs_phys_read n=%u since_reset=%u "
+			"kick_us=%llu copy_us=%llu NANDSTAT=%08x\n",
+			cs_reads_total, f->pages_since_reset,
+			div_u64(cs_ns_kick, 1000 * cs_reads_total),
+			div_u64(cs_ns_copy, 1000 * cs_reads_total),
+			readl(f->base + NANDSTAT));
 	mutex_unlock(&f->lock);
 	return ret;
 }
@@ -6842,9 +6895,9 @@ int s5l8740_nand_page_read(unsigned int ce, unsigned int cau,
 
 	if (meta && meta_len) {
 		/*
- * Real metadata: always full-page CS span4/rec4112, then
- * software-slice. Never invent PIO spare as Whimory meta.
- */
+		 * Real metadata: always full-page CS span4/rec4112, then
+		 * software-slice. Never invent PIO spare as Whimory meta.
+		 */
 		if (!meta_dma_read || !f->dma_ok) {
 			ret = -EOPNOTSUPP;
 			goto out_restore;
