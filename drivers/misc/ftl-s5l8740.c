@@ -73,20 +73,20 @@ module_param(sig_scan_blocks, uint, 0644);
 MODULE_PARM_DESC(sig_scan_blocks,
 		 "FPart assignment scan: tail blocks (0 = vfl_tail)");
 
-static unsigned int fpart_assign_pages = 16;
+static unsigned int fpart_assign_pages = 1;
 module_param(fpart_assign_pages, uint, 0644);
 MODULE_PARM_DESC(fpart_assign_pages,
-		 "Pages per tail block to scan for META 0x30 assignment (default 16)");
+		 "Pages per tail block to scan for META 0x30 assignment (default 1 = page0)");
 
 static bool sig_brute_scan;
 module_param(sig_brute_scan, bool, 0644);
 MODULE_PARM_DESC(sig_brute_scan,
 		 "META 0x30 page0 brute (default N — PIO spare is not Sogeti)");
 
-static bool payload_magic_scan = true;
+static bool payload_magic_scan;
 module_param(payload_magic_scan, bool, 0644);
 MODULE_PARM_DESC(payload_magic_scan,
-		 "Data-only xrmw/wrmx hunt; skip META locate and sigless classify (default Y)");
+		 "Debug-only data xrmw/wrmx hunt (default N — FPart uses META 0x30)");
 
 /* Kept so existing insmod lines do not fail. Recovery always runs at probe. */
 static bool ftl_auto_map __maybe_unused;
@@ -125,6 +125,41 @@ static bool whimory_page_blank(const u8 *p, unsigned int n)
 		all_00 |= p[i];
 	}
 	return all_ff == 0xff || all_00 == 0;
+}
+
+static bool whimory_meta_erased(const u8 *m, unsigned int n)
+{
+	unsigned int i;
+
+	for (i = 0; i < n; i++) {
+		if (m[i] != 0xff)
+			return false;
+	}
+	return true;
+}
+
+static bool whimory_meta_is_user_data(const struct whimory_meta *m)
+{
+	return m->type == WHIMORY_META_TYPE_DATA ||
+	       m->type == WHIMORY_META_TYPE_DATA2;
+}
+
+static bool whimory_meta_is_cxt_base(const u8 *m, u32 vba_ofs)
+{
+	return m[0] == WHIMORY_META_TYPE_SFTL_CXT &&
+	       m[1] == WHIMORY_CXT_TAG_BASE &&
+	       vba_ofs == 0;
+}
+
+static bool whimory_meta_is_btoc(const u8 *m)
+{
+	return m[0] == WHIMORY_META_TYPE_BTOC;
+}
+
+static bool whimory_meta_is_data_raw(const u8 *m)
+{
+	return m[0] == WHIMORY_META_TYPE_DATA ||
+	       m[0] == WHIMORY_META_TYPE_DATA2;
 }
 
 static bool whimory_special_lba(u32 lba)
@@ -345,6 +380,7 @@ static int whimory_range_split(struct whimory *w, struct whimory_range *r,
 	right->start = at;
 	right->len = r->len - left_len;
 	right->vba = r->vba + left_len;
+	right->weave = r->weave;
 	r->len = left_len;
 	whimory_range_link(&w->ranges, right);
 	w->sftl.range_nodes++;
@@ -372,6 +408,7 @@ static int whimory_range_insert_new(struct whimory *w, u32 start, u32 len,
 	n->start = start;
 	n->len = len;
 	n->vba = vba;
+	n->weave = w->sftl.claim_weave;
 	whimory_range_link(&w->ranges, n);
 	w->sftl.range_nodes++;
 	return 0;
@@ -389,7 +426,8 @@ static void whimory_range_coalesce_at(struct whimory *w, u32 start)
 	if (p) {
 		prev = rb_entry(p, struct whimory_range, rb);
 		if (prev->start + prev->len == r->start &&
-		    prev->vba + prev->len == r->vba) {
+		    prev->vba + prev->len == r->vba &&
+		    prev->weave == r->weave) {
 			prev->len += r->len;
 			whimory_range_erase(w, r);
 			r = prev;
@@ -399,7 +437,8 @@ static void whimory_range_coalesce_at(struct whimory *w, u32 start)
 	if (q) {
 		next = rb_entry(q, struct whimory_range, rb);
 		if (r->start + r->len == next->start &&
-		    r->vba + r->len == next->vba) {
+		    r->vba + r->len == next->vba &&
+		    r->weave == next->weave) {
 			r->len += next->len;
 			whimory_range_erase(w, next);
 		}
@@ -415,6 +454,25 @@ static int whimory_range_update(struct whimory *w, u32 lba, u32 span, u32 vba)
 
 	if (!span || whimory_special_lba(lba))
 		return 0;
+
+	{
+		u32 end = lba + span;
+		struct rb_node *node = rb_first(&w->ranges);
+
+		while (node) {
+			struct whimory_range *r = rb_entry(node,
+							  struct whimory_range,
+							  rb);
+			u32 r_end = r->start + r->len;
+
+			if (r->start >= end)
+				break;
+			if (r_end > lba && r->start < end &&
+			    r->weave > w->sftl.claim_weave)
+				return 0;
+			node = rb_next(node);
+		}
+	}
 
 	hit = whimory_range_find(&w->ranges, lba);
 	if (hit) {
@@ -1417,6 +1475,7 @@ static bool fpart_type_class1(u16 type_word)
 }
 
 static bool fpart_meta_special(const u8 *meta, u8 want_chunk, u16 *type_out);
+static bool fpart_meta_is_assign(const u8 *meta, u16 *type_out);
 static bool fpart_has_xrmw(const u8 *page);
 
 /*
@@ -1445,7 +1504,10 @@ static int fpart_fil_read_page(struct whimory *w, u16 bank, u32 block,
 		if (ret)
 			continue;
 		last = 0;
-		if (fpart_meta_special(meta, 0, NULL) || fpart_has_xrmw(data))
+		if (fpart_meta_special(meta, 0, NULL) ||
+		    fpart_meta_is_assign(meta, NULL))
+			return 0;
+		if (payload_magic_scan && fpart_has_xrmw(data))
 			return 0;
 	}
 	return last;
@@ -1468,6 +1530,33 @@ static bool fpart_meta_special(const u8 *meta, u8 want_chunk, u16 *type_out)
 		if (type_out)
 			*type_out = get_unaligned_le16(m + 2);
 		return true;
+	}
+	return false;
+}
+
+/*
+ * Scanner: META tag 0x30 and class 1. Chunk-0 assignment pages use m[1]==0
+ * with class in type_word[15:8]. Do not treat payload magic as a hit.
+ */
+static bool fpart_meta_is_assign(const u8 *meta, u16 *type_out)
+{
+	unsigned int slot;
+
+	if (!meta)
+		return false;
+	for (slot = 0; slot < 4; slot++) {
+		const u8 *m = meta + slot * WHIMORY_META_SIZE;
+		u16 tw;
+
+		if (m[0] != FPART_SPECIAL_TAG)
+			continue;
+		tw = get_unaligned_le16(m + 2);
+		if ((m[1] & FPART_SPECIAL_CLASS_MASK) == FPART_SPECIAL_CLASS ||
+		    (m[1] == 0 && fpart_type_class1(tw))) {
+			if (type_out)
+				*type_out = tw;
+			return true;
+		}
 	}
 	return false;
 }
@@ -1707,19 +1796,18 @@ static int fpart_scan_region(struct whimory *w, u16 type,
 						w->fpart_ctx.slot_logs++;
 					}
 				}
-				special = fpart_meta_special(meta, 0, &type_word);
+				special = fpart_meta_is_assign(meta, &type_word);
+				if (!special)
+					special = fpart_meta_special(meta, 0,
+								     &type_word);
 				magic = fpart_has_xrmw(page);
 				if (fpart_has_wrmx(page))
 					wrmx++;
-				if (!special && !magic)
-					continue;
-				if (special)
-					tag30++;
-				if (magic) {
+				if (magic)
 					xrmw++;
-					if (!special)
-						type_word = WHIMORY_SIG_TYPE;
-				}
+				if (!special)
+					continue;
+				tag30++;
 				fpart_bank_to_ce_cau(w, bank, &ce, &cau);
 				dev_info(w->dev,
 					 "FPART_ASSIGN_SCAN bank=%u ce=%u cau=%u block=%u page=%u slot=%d type_word=0x%04x blank=%d m0=%16ph m1=%16ph m2=%16ph m3=%16ph data00=%32ph data80=%32ph\n",
@@ -2198,18 +2286,8 @@ static int whimory_read_signature(struct whimory *w)
 	ret = w->fpart->init(w);
 	if (ret)
 		return ret;
-	if (payload_magic_scan) {
+	if (payload_magic_scan)
 		whimory_payload_magic_scan(w);
-		if (w->sig_ok)
-			return 0;
-		dev_warn(w->dev,
-			 "PAYLOAD_SCAN: no usable xrmw. PIO META locate skipped; sigless classify off.\n");
-		if (!allow_sigless_debug) {
-			dev_err(w->dev,
-				"sig=0 true_meta=unproven: stopping (no VFL/FTL/L2V)\n");
-			return -ENOENT;
-		}
-	}
 	ret = w->fpart->read_signature(w, w->sig.raw, WHIMORY_SIG_SIZE);
 	if (ret) {
 		dev_warn(w->dev,
@@ -2851,6 +2929,8 @@ static int whimory_rebuild_open_sb(struct whimory *w, struct whimory_sb *sb)
 				continue;
 			if (m[1] & 0x02)
 				continue;
+			if (whimory_meta_erased(m, WHIMORY_META_SIZE))
+				continue;
 			lba = get_unaligned_le32(m + 8);
 			w->sftl.open_slots_valid_meta++;
 			if (whimory_special_lba(lba) || lba >= 0x01000000u)
@@ -2862,8 +2942,12 @@ static int whimory_rebuild_open_sb(struct whimory *w, struct whimory_sb *sb)
 					 m[0], m[1], data + slot * WHIMORY_LBA_SIZE);
 			vba = whimory_pack_vba(w, sb->ce, sb->cau, vblock, pg,
 					       slot);
-			if (whimory_l2v_update(w, lba, 1, vba))
+			w->sftl.claim_weave = whimory_weave48(m);
+			if (whimory_l2v_update(w, lba, 1, vba)) {
+				w->sftl.claim_weave = 0;
 				return -ENOMEM;
+			}
+			w->sftl.claim_weave = 0;
 			w->sftl.open_l2v_updates++;
 			hits++;
 		}
@@ -3063,7 +3147,9 @@ static int whimory_cxt_load(struct whimory *w)
 
 		dev_info(w->dev, "s_cxt_load base sb=%u weave=%llu\n",
 			 sb, w->cxt[i].weave);
+		w->sftl.claim_weave = w->cxt[i].weave;
 		ret = whimory_cxt_load_sb(w, sb);
+		w->sftl.claim_weave = 0;
 		if (ret) {
 			dev_warn(w->dev, "cxt sb=%u failed %d\n", sb, ret);
 			continue;
@@ -3130,7 +3216,7 @@ static void whimory_print_recovery_stats(struct whimory *w)
 	dev_info(w->dev,
 		 "RECOVERY_STATS:\n"
 		 "  fpart_sig=%u vfl_ctx_hits=%u vfl_cxt_loc=%u vfl_bitmap=%u\n"
-		 "  classified_empty=%u classified_closed=%u classified_open=%u classified_cxt=%u\n"
+		 "  classified_empty=%u classified_closed=%u classified_open=%u classified_cxt=%u classified_unknown=%u\n"
 		 "  cxt_blocks_seen=%u cxt_records_seen=%u cxt_l2v_updates=%u\n"
 		 "  btoc_pages_read=%u btoc_pages_valid=%u btoc_entries_seen=%u btoc_l2v_updates=%u\n"
 		 "  btoc_token_ffff0000=%u btoc_token_ffffff00=%u btoc_token_ffffffff=%u btoc_holelist_ffff0001=%u\n"
@@ -3139,6 +3225,7 @@ static void whimory_print_recovery_stats(struct whimory *w)
 		 w->sig_ok, w->vfl.ctx_hits, w->vfl.cxt_loc_count,
 		 w->vfl.bitmap_loaded,
 		 s->empty_sbs, s->btoc_sbs, s->open_sbs, s->cxt_sbs,
+		 s->unknown_sbs,
 		 s->cxt_blocks_seen, s->cxt_records_seen, s->cxt_l2v_updates,
 		 s->btoc_pages_read, s->btoc_pages_valid, s->btoc_entries_seen,
 		 s->btoc_l2v_updates,
@@ -3273,9 +3360,9 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 				if (r0 && r127)
 					continue;
 				if ((!r0 && whimory_page_blank(w->sftl.data_page, 64) &&
-				     whimory_page_blank(meta0, 16)) &&
+				     whimory_meta_erased(meta0, 16)) &&
 				    (r127 || (whimory_page_blank(p127, 64) &&
-					      whimory_page_blank(meta127, 16)))) {
+					      whimory_meta_erased(meta127, 16)))) {
 					s->empty_sbs++;
 					continue;
 				}
@@ -3284,30 +3371,31 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 				sb->cau = cau;
 				sb->block = b;
 				sb->weave = 0;
-				if (!r0 && (meta0[0] == WHIMORY_META_TYPE_DATA ||
-					    meta0[0] == WHIMORY_META_TYPE_DATA2 ||
+				if (!r0 && (whimory_meta_is_data_raw(meta0) ||
 					    meta0[0] == WHIMORY_META_TYPE_SFTL_CXT))
 					sb->weave = whimory_weave48(meta0);
-				if ((!r0 && meta0[0] == WHIMORY_META_TYPE_SFTL_CXT) ||
-				    (!r127 && meta127[0] == WHIMORY_META_TYPE_SFTL_CXT)) {
+				if (!r0 && whimory_meta_is_cxt_base(meta0, 0)) {
 					u32 vblock = whimory_vfl_virt(w, cau, b);
 					u32 sb_idx = whimory_sb_index(w, ce, cau,
 								      vblock);
 
 					sb->kind = WHIMORY_SB_CXT;
 					s->cxt_sbs++;
-					if ((!r0 && meta0[1] == 1) ||
-					    (!r127 && meta127[1] == 1))
-						whimory_cxt_add_base(w, sb_idx,
-								     sb->weave);
-				} else if (!r127 &&
-					   (meta127[0] == WHIMORY_META_TYPE_BTOC ||
-					    !whimory_page_blank(p127, 64))) {
+					whimory_cxt_add_base(w, sb_idx, sb->weave);
+				} else if (!r0 &&
+					   meta0[0] == WHIMORY_META_TYPE_SFTL_CXT) {
+					sb->kind = WHIMORY_SB_CXT;
+					s->cxt_sbs++;
+				} else if (!r127 && whimory_meta_is_btoc(meta127)) {
 					sb->kind = WHIMORY_SB_CLOSED;
 					s->btoc_sbs++;
-				} else {
+				} else if ((!r0 && whimory_meta_is_data_raw(meta0)) ||
+					   (!r127 && whimory_meta_is_data_raw(meta127))) {
 					sb->kind = WHIMORY_SB_OPEN;
 					s->open_sbs++;
+				} else {
+					s->unknown_sbs++;
+					continue;
 				}
 				nsb++;
 			}
@@ -3316,8 +3404,9 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 classify_done:
 	sort(s->sbs, nsb, sizeof(s->sbs[0]), whimory_sb_cmp, NULL);
 	dev_info(w->dev,
-		 "SFTL classified nsb=%u closed=%u open=%u cxt=%u empty=%u\n",
-		 nsb, s->btoc_sbs, s->open_sbs, s->cxt_sbs, s->empty_sbs);
+		 "SFTL classified nsb=%u closed=%u open=%u cxt=%u empty=%u unknown=%u\n",
+		 nsb, s->btoc_sbs, s->open_sbs, s->cxt_sbs, s->empty_sbs,
+		 s->unknown_sbs);
 
 	ret = whimory_cxt_load(w);
 	if (ret)
@@ -3353,9 +3442,11 @@ classify_done:
 						       s->btoc_page, meta127);
 				s->btoc_dumps_left--;
 			}
+			s->claim_weave = sb->weave;
 			ingested = whimory_ingest_btoc_page(w, sb->ce, sb->cau,
 							    vblock, s->btoc_page,
 							    S5L8740_FMSS_PAGE_SIZE);
+			s->claim_weave = 0;
 			if (ingested)
 				s->btoc_pages_valid++;
 		} else if (sb->kind == WHIMORY_SB_OPEN) {
@@ -3700,18 +3791,27 @@ static int whimory_validate_meta(struct whimory *w,
 {
 	u32 meta_lba = le32_to_cpu(m->lba);
 
+	if (!whimory_meta_is_user_data(m)) {
+		dev_err(w->dev,
+			"sftl non-data meta want=0x%x type=%02x flags=%02x lba=0x%x\n",
+			expected_lba, m->type, m->flags, meta_lba);
+		return -EIO;
+	}
+
 	if (meta_lba != expected_lba) {
 		dev_err(w->dev,
 			"sftl lba mismatch want=0x%x meta=0x%x type=%02x flags=%02x\n",
 			expected_lba, meta_lba, m->type, m->flags);
 		return -EIO;
 	}
+
 	if (m->flags & 0x02) {
 		dev_err(w->dev,
 			"sftl uECC flag lba=0x%x type=%02x flags=%02x\n",
 			expected_lba, m->type, m->flags);
 		return -EIO;
 	}
+
 	return 0;
 }
 

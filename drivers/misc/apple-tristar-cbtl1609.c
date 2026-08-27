@@ -2,29 +2,149 @@
 /*
  * Apple Lightning Tristar mux — NXP CBTL1609A1 (iPod nano 7G / N31)
  *
- * Public “0x34 write / 0x35 read” is 8-bit; Linux 7-bit address is 0x1a.
- * THS7383 Dx/ACCx pin tables are public (nyansatan); CBTL1609 I2C indices
- * that program them are still OPEN in public docs. RetailOS RE shows
- * **zero** Dx/mux register writes — dump is flat until accessory attaches.
- * Only apple,init-sequence from DT may write. UDC soft reconnect is done
- * from initramfs via sysfs udc soft_connect.
+ * Transport (proven): I2C0 7-bit 0x1a. Public 0x34 write / 0x35 read is
+ * the 8-bit form of that address (nyansatan).
+ *
+ * Routing is IDBUS inside the chip, not Linux Dx register writes.
+ * RetailOS N31 RE observed zero Dx/mux I2C writes. The 0x75 accessory
+ * ID byte programs ACCx/Dx per the THS7383 tables (nyansatan; first-gen
+ * CBTL1608 is documented as backwards compatible with those tables).
+ * CBTL1609 is the nano7 first-gen part — same IDBUS decode, no invented
+ * I2C mux map.
+ *
+ * N31 analog 3.5 mm jack is CS42 + MikeyBus UART2 (accessoryMgr type 1,
+ * sub_35A4). It is not a Tristar Dx path. Lightning analog EarPods use
+ * ID 04 F1 00 00 00 00 (nyansatan) — a different connector. CS42 still
+ * refreshes Tristar on prepare so we log whether Lightning is USB,
+ * analog, idle, or I2C-echo; we do not mute the jack because USB is
+ * routed.
+ *
+ * OSOS software lane (sub_11C8C): TriStarID/VBUS/CONDET tasks wait on
+ * event source 13 and branch on raw bits 0x01/0x04/0x08/0x10/0x20.
+ * Those bits are not mapped to I2C registers (TODO RE). Linux keeps
+ * osos_event=0 and reports hardware observations separately. Do not
+ * treat dump-not-flat as OSOS bit 0x04.
+ *
+ * Register 0x11 is CBTL1610 "configuration status" (Lina/nyansatan).
+ * First-gen may NAK it or the bus may echo 0x35 — the read result is
+ * reported, never invented.
+ *
+ * accessoryMgr type 2 is TODO RE — logged, not stub-handled.
  */
-#include <linux/module.h>
-#include <linux/i2c.h>
-#include <linux/of.h>
+#include <linux/debugfs.h>
 #include <linux/delay.h>
+#include <linux/device.h>
+#include <linux/i2c.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/of.h>
+#include <linux/seq_file.h>
+#include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/sysfs.h>
+#include <linux/workqueue.h>
 
 #define TRISTAR_DUMP_LEN	0x40
+#define TRISTAR_LOG_LEN		64
+
+/* OSOS sub_11C8C masks — names only. Not produced from I2C until RE maps them. */
+#define N31_TS_EVENT_01		BIT(0)
+#define N31_TS_EVENT_04		BIT(2)
+#define N31_TS_EVENT_08		BIT(3)
+#define N31_TS_EVENT_10		BIT(4)
+#define N31_TS_EVENT_20		BIT(5)
+
+/* nyansatan 0x75 first byte: ACCx[7:6] Dx[5:4] DATA[3:0] */
+#define TS_ID_ACCX(id0)		(((id0) >> 6) & 3)
+#define TS_ID_DX(id0)		(((id0) >> 4) & 3)
+
+struct tristar_id_sig {
+	u8 bytes[6];
+	const char *name;
+};
+
+/* nyansatan Lightning ID table (HOSTID=1). */
+static const struct tristar_id_sig tristar_known_ids[] = {
+	{ { 0x10, 0x0c, 0x00, 0x00, 0x00, 0x00 }, "usb-cable" },
+	{ { 0x04, 0xf1, 0x00, 0x00, 0x00, 0x00 }, "lightning-analog" },
+	{ { 0x0b, 0xf0, 0x00, 0x00, 0x00, 0x00 }, "haywire-hdmi" },
+	{ { 0x20, 0x00, 0x00, 0x00, 0x00, 0x00 }, "dcsd-or-uart-charge" },
+	{ { 0x20, 0x02, 0x00, 0x00, 0x00, 0x00 }, "kong-swd-idle" },
+	{ { 0xa0, 0x00, 0x00, 0x00, 0x00, 0x00 }, "kong-swd-astris" },
+	{ { 0x20, 0x0e, 0x00, 0x00, 0x00, 0x00 }, "kanzi-swd-idle" },
+	{ { 0xa0, 0x0c, 0x00, 0x00, 0x00, 0x00 }, "kanzi-swd-astris" },
+	{ { 0x20, 0x00, 0x10, 0x00, 0x00, 0x00 }, "uart-charge" },
+};
 
 struct apple_tristar {
 	struct i2c_client *client;
+	struct mutex lock;
+	struct delayed_work poll;
+	struct dentry *debug_root;
 	u8 last_dump[TRISTAR_DUMP_LEN];
 	u8 read_reg;
 	u8 read_val;
 	bool dump_ok;
 	bool dump_flat;
+	bool i2c_echo;
+	int reg11_ret;
+	u8 reg11;
+	bool id_valid;
+	u8 id75[6];
+	unsigned int id_off;
+	const char *id_name;
+	u8 accx;
+	u8 dx;
+	/* OSOS v36 — stays 0. Not synthesized from I2C. */
+	u8 osos_event;
+	u8 prev_osos_event;
+	bool cf9_latch;
+	u8 cfa_state;
+	u32 seen_mask;
+	u32 polls;
+	u32 deltas;
+	u32 writes;
+	u32 i2c_fail_streak;
+	bool poll_disabled;
+	char log[TRISTAR_LOG_LEN][112];
+	unsigned int log_head;
+	unsigned int log_count;
 };
+
+static struct apple_tristar *tristar_singleton;
+static DEFINE_MUTEX(tristar_singleton_lock);
+
+int apple_tristar_refresh(void);
+int apple_tristar_connected(void);
+int apple_tristar_usb_routed(void);
+int apple_tristar_lightning_analog(void);
+int apple_tristar_vbus(void);
+int apple_tristar_config_reg11(u8 *val);
+void apple_tristar_log_audio_path(struct device *audio_dev);
+
+static bool read_only = true;
+module_param(read_only, bool, 0644);
+MODULE_PARM_DESC(read_only,
+		 "Refuse I2C writes (default 1). IDBUS routing does not need them.");
+
+static bool unsafe_acks;
+module_param(unsafe_acks, bool, 0600);
+MODULE_PARM_DESC(unsafe_acks,
+		 "Unused: OSOS event ack path not recovered. Default 0.");
+
+static bool unsafe_writes;
+module_param(unsafe_writes, bool, 0600);
+MODULE_PARM_DESC(unsafe_writes,
+		 "Allow poke / DT init-sequence writes. Default 0.");
+
+/*
+ * Glass: I2C0 often -110 / echo 0x35. Polling reg0 every 250ms floods dmesg
+ * and burns the bus. Default off; enable only when I2C0 ACKs for real.
+ */
+static int poll_ms;
+module_param(poll_ms, int, 0644);
+MODULE_PARM_DESC(poll_ms,
+		 "Status poll interval ms (0=off). Default 0 — I2C0 often times out.");
 
 static int tristar_read_reg(struct apple_tristar *ts, u8 reg, u8 *val)
 {
@@ -38,7 +158,14 @@ static int tristar_read_reg(struct apple_tristar *ts, u8 reg, u8 *val)
 
 static int tristar_write_reg(struct apple_tristar *ts, u8 reg, u8 val)
 {
-	return i2c_smbus_write_byte_data(ts->client, reg, val);
+	int ret;
+
+	if (read_only && !unsafe_writes)
+		return -EPERM;
+	ret = i2c_smbus_write_byte_data(ts->client, reg, val);
+	if (!ret)
+		ts->writes++;
+	return ret;
 }
 
 static bool tristar_dump_is_flat(const u8 *dump, size_t len)
@@ -52,33 +179,441 @@ static bool tristar_dump_is_flat(const u8 *dump, size_t len)
 	return true;
 }
 
-static int tristar_dump(struct apple_tristar *ts)
+static u8 tristar_read_addr_echo(struct apple_tristar *ts)
+{
+	return (u8)((ts->client->addr << 1) | 1);
+}
+
+static const char *tristar_dx_usb_id0(u8 dx)
+{
+	switch (dx) {
+	case 0:
+		return "hiz";
+	case 1:
+		return "usb0-on-dp1dn1";
+	case 2:
+		return "usb0-on-dp1dn1+uart-on-dp2dn2";
+	default:
+		return "hiz";
+	}
+}
+
+static const char *tristar_dx_usb_id1(u8 dx)
+{
+	switch (dx) {
+	case 0:
+		return "hiz";
+	case 1:
+		return "usb0-on-dp2dn2";
+	case 2:
+		return "usb0-on-dp1dn1+uart-on-dp2dn2";
+	default:
+		return "hiz";
+	}
+}
+
+static const char *tristar_accx_name(u8 accx)
+{
+	switch (accx) {
+	case 0:
+		return "hiz-idbus";
+	case 1:
+		return "uart1";
+	case 2:
+		return "jtag-swd";
+	default:
+		return "host-reset";
+	}
+}
+
+static bool tristar_usb_dp_from_dx(u8 dx)
+{
+	return dx == 1 || dx == 2;
+}
+
+static bool tristar_is_lightning_analog(struct apple_tristar *ts)
+{
+	return ts->id_valid && ts->id_name &&
+	       !strcmp(ts->id_name, "lightning-analog");
+}
+
+static const char *tristar_id_label(struct apple_tristar *ts)
+{
+	if (ts->i2c_echo)
+		return "i2c-echo";
+	if (ts->id_name)
+		return ts->id_name;
+	if (!ts->dump_ok)
+		return "unread";
+	if (ts->dump_flat)
+		return "idle";
+	return "unknown";
+}
+
+static void tristar_log_line(struct apple_tristar *ts, const char *why)
+{
+	unsigned int i = ts->log_head;
+
+	snprintf(ts->log[i], sizeof(ts->log[i]),
+		 "%s osos=0x%02x (unmapped) flat=%d echo=%d id=%s accx=%u dx=%u r11=%s%02x",
+		 why, ts->osos_event, ts->dump_flat, ts->i2c_echo,
+		 tristar_id_label(ts), ts->accx, ts->dx,
+		 ts->reg11_ret ? "ERR" : "",
+		 ts->reg11_ret ? 0 : ts->reg11);
+	ts->log_head = (i + 1) % TRISTAR_LOG_LEN;
+	if (ts->log_count < TRISTAR_LOG_LEN)
+		ts->log_count++;
+}
+
+static void tristar_clear_id(struct apple_tristar *ts)
+{
+	ts->id_valid = false;
+	ts->id_name = NULL;
+	ts->id_off = 0;
+	memset(ts->id75, 0, sizeof(ts->id75));
+	ts->accx = 0;
+	ts->dx = 0;
+}
+
+static void tristar_find_id(struct apple_tristar *ts)
+{
+	unsigned int s, off;
+	const struct tristar_id_sig *sig;
+
+	tristar_clear_id(ts);
+
+	if (!ts->dump_ok || ts->dump_flat || ts->i2c_echo)
+		return;
+
+	for (s = 0; s < ARRAY_SIZE(tristar_known_ids); s++) {
+		sig = &tristar_known_ids[s];
+		for (off = 0; off + 6 <= TRISTAR_DUMP_LEN; off++) {
+			if (memcmp(ts->last_dump + off, sig->bytes, 6))
+				continue;
+			memcpy(ts->id75, sig->bytes, 6);
+			ts->id_name = sig->name;
+			ts->id_valid = true;
+			ts->id_off = off;
+			ts->accx = TS_ID_ACCX(sig->bytes[0]);
+			ts->dx = TS_ID_DX(sig->bytes[0]);
+			dev_info(&ts->client->dev,
+				 "tristar: IDBUS id %s @dump+0x%x accx=%u(%s) dx=%u id0=%s id1=%s\n",
+				 sig->name, off, ts->accx,
+				 tristar_accx_name(ts->accx), ts->dx,
+				 tristar_dx_usb_id0(ts->dx),
+				 tristar_dx_usb_id1(ts->dx));
+			return;
+		}
+	}
+}
+
+static int tristar_refresh_locked(struct apple_tristar *ts, const char *why)
 {
 	int i, ret;
 	u8 v;
+	u8 prior[TRISTAR_DUMP_LEN];
+	unsigned int n = 0;
+	u8 echo = tristar_read_addr_echo(ts);
+	bool echo_now;
+	const char *prev_id;
+
+	memcpy(prior, ts->last_dump, sizeof(prior));
+	prev_id = tristar_id_label(ts);
 
 	for (i = 0; i < TRISTAR_DUMP_LEN; i++) {
-		ret = tristar_read_reg(ts, i, &v);
+		ret = tristar_read_reg(ts, (u8)i, &v);
 		if (ret) {
-			dev_warn(&ts->client->dev,
-				 "read 0x%02x failed: %d\n", i, ret);
 			ts->dump_ok = false;
+			ts->i2c_echo = false;
+			tristar_clear_id(ts);
+			ts->reg11_ret = ret;
+			ts->i2c_fail_streak++;
+			/*
+			 * One line per outage, not one per poll. I2C0 -110 is
+			 * common until the mux/bus is actually live. Kill poll
+			 * immediately so a leftover poll_ms=250 never storms.
+			 */
+			ts->poll_disabled = true;
+			if (ts->i2c_fail_streak == 1)
+				dev_warn(&ts->client->dev,
+					 "tristar: I2C read 0x%02x failed %d (poll off until bus recovers)\n",
+					 i, ret);
 			return ret;
 		}
+		ts->i2c_fail_streak = 0;
 		ts->last_dump[i] = v;
+		/*
+		 * I2C0 often echoes the 8-bit read address (0x35). Four
+		 * identical echo bytes means the dump is not chip SRAM —
+		 * stop before a 64-register storm.
+		 */
+		if (i == 3 && ts->last_dump[0] == echo &&
+		    ts->last_dump[1] == echo &&
+		    ts->last_dump[2] == echo &&
+		    ts->last_dump[3] == echo) {
+			memset(ts->last_dump, echo, TRISTAR_DUMP_LEN);
+			break;
+		}
 	}
-
 	ts->dump_ok = true;
+	echo_now = tristar_dump_is_flat(ts->last_dump, TRISTAR_DUMP_LEN) &&
+		   ts->last_dump[0] == echo;
+	ts->i2c_echo = echo_now;
 	ts->dump_flat = tristar_dump_is_flat(ts->last_dump, TRISTAR_DUMP_LEN);
 
-	dev_dbg(&ts->client->dev,
-		 "CBTL1609 dump[0..0x3f] on %s:\n",
-		 ts->client->adapter->name);
-	dev_dbg(&ts->client->dev, "  %*ph\n", 16, ts->last_dump);
-	dev_dbg(&ts->client->dev, "  %*ph\n", 16, ts->last_dump + 16);
-	dev_dbg(&ts->client->dev, "  %*ph\n", 16, ts->last_dump + 32);
-	dev_dbg(&ts->client->dev, "  %*ph\n", 16, ts->last_dump + 48);
+	if (echo_now) {
+		ts->reg11_ret = -ENOTSUPP;
+		ts->reg11 = echo;
+		tristar_clear_id(ts);
+	} else {
+		ts->reg11 = ts->last_dump[0x11];
+		ts->reg11_ret = 0;
+		tristar_find_id(ts);
+	}
+
+	ts->polls++;
+	for (i = 0; i < TRISTAR_DUMP_LEN; i++) {
+		if (prior[i] != ts->last_dump[i])
+			n++;
+	}
+	ts->deltas += n;
+
+	if (n || strcmp(prev_id, tristar_id_label(ts))) {
+		dev_info(&ts->client->dev,
+			 "tristar: %s osos=0x00 (unmapped) flat=%d echo=%d deltas=%u id=%s r11=%d/%02x CONDET=%s VBUS=ENOTSUPP accmgr_type2=TODO\n",
+			 why, ts->dump_flat, ts->i2c_echo, n,
+			 tristar_id_label(ts), ts->reg11_ret,
+			 ts->reg11_ret ? 0 : ts->reg11,
+			 (!ts->dump_ok || ts->i2c_echo) ? "unknown" :
+			 (ts->dump_flat ? "idle" : "not-flat"));
+		if (!ts->dump_flat && !ts->i2c_echo && !ts->id_valid)
+			dev_info(&ts->client->dev,
+				 "tristar: unknown non-flat dump[0..15] %*ph\n",
+				 16, ts->last_dump);
+		tristar_log_line(ts, why);
+	}
 	return 0;
+}
+
+static int tristar_poll_cheap_locked(struct apple_tristar *ts)
+{
+	u8 v, echo = tristar_read_addr_echo(ts);
+	int ret;
+
+	if (ts->poll_disabled)
+		return -ENOTSUPP;
+
+	ret = tristar_read_reg(ts, 0x00, &v);
+	if (ret) {
+		ts->i2c_fail_streak++;
+		ts->dump_ok = false;
+		ts->poll_disabled = true;
+		if (ts->i2c_fail_streak == 1)
+			dev_warn(&ts->client->dev,
+				 "tristar: poll read 0x00 failed %d — disabling poll\n",
+				 ret);
+		/* Do not call full 64-reg refresh on NACK — that is the storm. */
+		return ret;
+	}
+	ts->i2c_fail_streak = 0;
+	if (ts->i2c_echo && v == echo) {
+		ts->polls++;
+		return 0;
+	}
+	if (ts->dump_ok && ts->dump_flat && !ts->i2c_echo && v == ts->last_dump[0]) {
+		ts->polls++;
+		return 0;
+	}
+	return tristar_refresh_locked(ts, "poll");
+}
+
+static int tristar_refresh(struct apple_tristar *ts, const char *why)
+{
+	int ret;
+
+	mutex_lock(&ts->lock);
+	ret = tristar_refresh_locked(ts, why);
+	mutex_unlock(&ts->lock);
+	return ret;
+}
+
+int apple_tristar_refresh(void)
+{
+	struct apple_tristar *ts;
+	int ret;
+
+	mutex_lock(&tristar_singleton_lock);
+	ts = tristar_singleton;
+	if (!ts) {
+		mutex_unlock(&tristar_singleton_lock);
+		return -ENODEV;
+	}
+	ret = tristar_refresh(ts, "export");
+	mutex_unlock(&tristar_singleton_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_tristar_refresh);
+
+int apple_tristar_connected(void)
+{
+	struct apple_tristar *ts;
+	int ret;
+
+	mutex_lock(&tristar_singleton_lock);
+	ts = tristar_singleton;
+	if (!ts) {
+		mutex_unlock(&tristar_singleton_lock);
+		return -ENODEV;
+	}
+	mutex_lock(&ts->lock);
+	if (!ts->dump_ok)
+		ret = -EIO;
+	else if (ts->i2c_echo)
+		ret = -ENOTSUPP;
+	else
+		ret = ts->dump_flat ? 0 : 1;
+	mutex_unlock(&ts->lock);
+	mutex_unlock(&tristar_singleton_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_tristar_connected);
+
+int apple_tristar_usb_routed(void)
+{
+	struct apple_tristar *ts;
+	int ret;
+
+	mutex_lock(&tristar_singleton_lock);
+	ts = tristar_singleton;
+	if (!ts) {
+		mutex_unlock(&tristar_singleton_lock);
+		return -ENODEV;
+	}
+	mutex_lock(&ts->lock);
+	if (!ts->dump_ok)
+		ret = -EIO;
+	else if (ts->i2c_echo)
+		ret = -ENOTSUPP;
+	else if (!ts->id_valid)
+		ret = 0;
+	else
+		ret = tristar_usb_dp_from_dx(ts->dx) ? 1 : 0;
+	mutex_unlock(&ts->lock);
+	mutex_unlock(&tristar_singleton_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_tristar_usb_routed);
+
+int apple_tristar_lightning_analog(void)
+{
+	struct apple_tristar *ts;
+	int ret;
+
+	mutex_lock(&tristar_singleton_lock);
+	ts = tristar_singleton;
+	if (!ts) {
+		mutex_unlock(&tristar_singleton_lock);
+		return -ENODEV;
+	}
+	mutex_lock(&ts->lock);
+	if (!ts->dump_ok)
+		ret = -EIO;
+	else if (ts->i2c_echo)
+		ret = -ENOTSUPP;
+	else
+		ret = tristar_is_lightning_analog(ts) ? 1 : 0;
+	mutex_unlock(&ts->lock);
+	mutex_unlock(&tristar_singleton_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_tristar_lightning_analog);
+
+int apple_tristar_vbus(void)
+{
+	mutex_lock(&tristar_singleton_lock);
+	if (!tristar_singleton) {
+		mutex_unlock(&tristar_singleton_lock);
+		return -ENODEV;
+	}
+	mutex_unlock(&tristar_singleton_lock);
+	/* TriStarVBUSProcessTask exists; I2C register is TODO RE. */
+	return -ENOTSUPP;
+}
+EXPORT_SYMBOL_GPL(apple_tristar_vbus);
+
+int apple_tristar_config_reg11(u8 *val)
+{
+	struct apple_tristar *ts;
+	int ret;
+
+	if (!val)
+		return -EINVAL;
+	mutex_lock(&tristar_singleton_lock);
+	ts = tristar_singleton;
+	if (!ts) {
+		mutex_unlock(&tristar_singleton_lock);
+		return -ENODEV;
+	}
+	mutex_lock(&ts->lock);
+	if (!ts->dump_ok)
+		ret = -EIO;
+	else if (ts->i2c_echo)
+		ret = -ENOTSUPP;
+	else if (ts->reg11_ret)
+		ret = ts->reg11_ret;
+	else {
+		*val = ts->reg11;
+		ret = 0;
+	}
+	mutex_unlock(&ts->lock);
+	mutex_unlock(&tristar_singleton_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_tristar_config_reg11);
+
+void apple_tristar_log_audio_path(struct device *audio_dev)
+{
+	struct apple_tristar *ts;
+
+	if (!audio_dev)
+		return;
+
+	mutex_lock(&tristar_singleton_lock);
+	ts = tristar_singleton;
+	if (!ts) {
+		mutex_unlock(&tristar_singleton_lock);
+		dev_info(audio_dev,
+			 "tristar unbound — 3.5mm is Mikey/CS42, not Lightning Dx\n");
+		return;
+	}
+	mutex_lock(&ts->lock);
+	tristar_refresh_locked(ts, "audio-path");
+	dev_info(audio_dev,
+		 "tristar audio-path: lightning=%s flat=%d echo=%d usb_dx=%u accx=%u analog_lightning=%d — 3.5mm jack is CS42+Mikey not Dx; USB route does not mute jack\n",
+		 tristar_id_label(ts), ts->dump_flat, ts->i2c_echo, ts->dx,
+		 ts->accx, tristar_is_lightning_analog(ts));
+	if (tristar_is_lightning_analog(ts))
+		dev_warn(audio_dev,
+			 "Lightning analog ID 04 F1 present — that is EarPods-on-Lightning, not the onboard 3.5mm CS42 jack\n");
+	mutex_unlock(&ts->lock);
+	mutex_unlock(&tristar_singleton_lock);
+}
+EXPORT_SYMBOL_GPL(apple_tristar_log_audio_path);
+
+static void tristar_poll_work(struct work_struct *work)
+{
+	struct apple_tristar *ts = container_of(to_delayed_work(work),
+						struct apple_tristar, poll);
+
+	mutex_lock(&ts->lock);
+	tristar_poll_cheap_locked(ts);
+	if (ts->poll_disabled) {
+		mutex_unlock(&ts->lock);
+		return;
+	}
+	mutex_unlock(&ts->lock);
+	if (poll_ms > 0)
+		schedule_delayed_work(&ts->poll, msecs_to_jiffies(poll_ms));
 }
 
 static int tristar_apply_init_sequence(struct apple_tristar *ts)
@@ -94,6 +629,11 @@ static int tristar_apply_init_sequence(struct apple_tristar *ts)
 	n = of_property_count_u32_elems(np, "apple,init-sequence");
 	if (n <= 0)
 		return 0;
+	if (!unsafe_writes && read_only) {
+		dev_warn(dev,
+			 "tristar: apple,init-sequence present but read_only=1 unsafe_writes=0 — not applied\n");
+		return 0;
+	}
 	if (n % 2) {
 		dev_err(dev, "apple,init-sequence must be reg,val pairs\n");
 		return -EINVAL;
@@ -108,23 +648,10 @@ static int tristar_apply_init_sequence(struct apple_tristar *ts)
 				reg, val, ret);
 			return ret;
 		}
-		dev_dbg(dev, "init 0x%02x <= 0x%02x\n", reg, val);
+		dev_info(dev, "init 0x%02x <= 0x%02x\n", reg, val);
 		udelay(100);
 	}
 	return 0;
-}
-
-/*
- * Mode heuristic from dump only — no invented mux map.
- * Flat dump → unknown; non-flat → "active" (register diversity seen).
- */
-static const char *tristar_mode_name(struct apple_tristar *ts)
-{
-	if (!ts->dump_ok)
-		return "unknown";
-	if (ts->dump_flat)
-		return "unknown";
-	return "active";
 }
 
 static ssize_t dump_show(struct device *dev, struct device_attribute *attr,
@@ -133,12 +660,14 @@ static ssize_t dump_show(struct device *dev, struct device_attribute *attr,
 	struct apple_tristar *ts = i2c_get_clientdata(to_i2c_client(dev));
 	int i, n = 0;
 
-	if (tristar_dump(ts))
+	if (tristar_refresh(ts, "sysfs-dump"))
 		return -EIO;
+	mutex_lock(&ts->lock);
 	for (i = 0; i < TRISTAR_DUMP_LEN; i++)
 		n += scnprintf(buf + n, PAGE_SIZE - n, "%02x%s",
 			       ts->last_dump[i],
 			       (i + 1) % 16 ? " " : "\n");
+	mutex_unlock(&ts->lock);
 	return n;
 }
 static DEVICE_ATTR_RO(dump);
@@ -154,7 +683,9 @@ static ssize_t poke_store(struct device *dev, struct device_attribute *attr,
 		return -EINVAL;
 	if (reg > 0xff || val > 0xff)
 		return -EINVAL;
-	ret = tristar_write_reg(ts, reg, val);
+	if (!unsafe_writes)
+		return -EPERM;
+	ret = tristar_write_reg(ts, (u8)reg, (u8)val);
 	if (ret)
 		return ret;
 	dev_info(dev, "poke 0x%02x <= 0x%02x\n", reg, val);
@@ -166,12 +697,65 @@ static ssize_t mode_show(struct device *dev, struct device_attribute *attr,
 			 char *buf)
 {
 	struct apple_tristar *ts = i2c_get_clientdata(to_i2c_client(dev));
+	const char *name;
 
-	if (tristar_dump(ts))
-		return sysfs_emit(buf, "unknown\n");
-	return sysfs_emit(buf, "%s\n", tristar_mode_name(ts));
+	if (tristar_refresh(ts, "sysfs-mode"))
+		return sysfs_emit(buf, "unread\n");
+	mutex_lock(&ts->lock);
+	name = tristar_id_label(ts);
+	mutex_unlock(&ts->lock);
+	return sysfs_emit(buf, "%s\n", name);
 }
 static DEVICE_ATTR_RO(mode);
+
+static ssize_t route_show(struct device *dev, struct device_attribute *attr,
+			  char *buf)
+{
+	struct apple_tristar *ts = i2c_get_clientdata(to_i2c_client(dev));
+	int n;
+
+	if (tristar_refresh(ts, "sysfs-route"))
+		return -EIO;
+	mutex_lock(&ts->lock);
+	n = sysfs_emit(buf,
+		       "id=%s valid=%d accx=%u (%s) dx=%u id0=%s id1=%s usb=%d lightning_analog=%d echo=%d jack_3v5=cs42+mikey vbus=ENOTSUPP osos_event=0x00\n",
+		       tristar_id_label(ts), ts->id_valid, ts->accx,
+		       tristar_accx_name(ts->accx), ts->dx,
+		       tristar_dx_usb_id0(ts->dx), tristar_dx_usb_id1(ts->dx),
+		       ts->id_valid && tristar_usb_dp_from_dx(ts->dx),
+		       tristar_is_lightning_analog(ts), ts->i2c_echo);
+	mutex_unlock(&ts->lock);
+	return n;
+}
+static DEVICE_ATTR_RO(route);
+
+static ssize_t audio_path_show(struct device *dev, struct device_attribute *attr,
+			       char *buf)
+{
+	struct apple_tristar *ts = i2c_get_clientdata(to_i2c_client(dev));
+	int n;
+
+	if (tristar_refresh(ts, "sysfs-audio-path"))
+		return -EIO;
+	mutex_lock(&ts->lock);
+	if (tristar_is_lightning_analog(ts))
+		n = sysfs_emit(buf,
+			       "selected=lightning-analog (04 F1) — not onboard 3.5mm\n");
+	else
+		n = sysfs_emit(buf,
+			       "selected=onboard-3.5mm cs42+mikey lightning=%s\n",
+			       tristar_id_label(ts));
+	mutex_unlock(&ts->lock);
+	return n;
+}
+static DEVICE_ATTR_RO(audio_path);
+
+static ssize_t vbus_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	return sysfs_emit(buf, "ENOTSUPP (TriStarVBUSProcessTask I2C map TODO RE)\n");
+}
+static DEVICE_ATTR_RO(vbus);
 
 static ssize_t read_store(struct device *dev, struct device_attribute *attr,
 			  const char *buf, size_t count)
@@ -214,12 +798,22 @@ static ssize_t verify_show(struct device *dev, struct device_attribute *attr,
 			   char *buf)
 {
 	struct apple_tristar *ts = i2c_get_clientdata(to_i2c_client(dev));
+	int n;
 
-	if (tristar_dump(ts))
+	if (tristar_refresh(ts, "sysfs-verify"))
 		return sysfs_emit(buf, "FAIL read\n");
-	if (ts->dump_flat)
-		return sysfs_emit(buf, "FAIL flat 0x%02x\n", ts->last_dump[0]);
-	return sysfs_emit(buf, "STATUS_OK non-flat\n");
+	mutex_lock(&ts->lock);
+	if (ts->i2c_echo)
+		n = sysfs_emit(buf,
+			       "I2C_ECHO 0x%02x (8-bit read addr; chip SRAM not visible)\n",
+			       ts->last_dump[0]);
+	else if (ts->dump_flat)
+		n = sysfs_emit(buf, "IDLE flat 0x%02x (no Lightning IDBUS accessory)\n",
+			       ts->last_dump[0]);
+	else
+		n = sysfs_emit(buf, "STATUS_OK id=%s\n", tristar_id_label(ts));
+	mutex_unlock(&ts->lock);
+	return n;
 }
 static DEVICE_ATTR_RO(verify);
 
@@ -227,33 +821,26 @@ static ssize_t poll_store(struct device *dev, struct device_attribute *attr,
 			  const char *buf, size_t count)
 {
 	struct apple_tristar *ts = i2c_get_clientdata(to_i2c_client(dev));
-	u8 prior[TRISTAR_DUMP_LEN];
-	unsigned int i, deltas = 0;
 	int ret;
 
-	memcpy(prior, ts->last_dump, sizeof(prior));
-	ret = tristar_dump(ts);
-	if (ret)
-		return ret;
-
-	for (i = 0; i < TRISTAR_DUMP_LEN; i++) {
-		if (prior[i] != ts->last_dump[i])
-			deltas++;
-	}
-
-	dev_info(dev, "Tristar poll: flat=%d deltas=%u mode=%s (mux map OPEN)\n",
-		 ts->dump_flat, deltas, tristar_mode_name(ts));
-	return count;
+	if (buf[0] != '1' && buf[0] != 'y' && buf[0] != 'Y')
+		return -EINVAL;
+	ret = tristar_refresh(ts, "sysfs-poll");
+	return ret ? ret : count;
 }
 
 static ssize_t poll_show(struct device *dev, struct device_attribute *attr,
 			 char *buf)
 {
 	struct apple_tristar *ts = i2c_get_clientdata(to_i2c_client(dev));
+	int n;
 
-	return sysfs_emit(buf,
-			  "flat=%d last_ok=%d — echo 1 > poll to re-dump\n",
-			  ts->dump_flat, ts->dump_ok);
+	mutex_lock(&ts->lock);
+	n = sysfs_emit(buf, "flat=%d echo=%d last_ok=%d polls=%u id=%s\n",
+		       ts->dump_flat, ts->i2c_echo, ts->dump_ok, ts->polls,
+		       tristar_id_label(ts));
+	mutex_unlock(&ts->lock);
+	return n;
 }
 static DEVICE_ATTR_RW(poll);
 
@@ -261,6 +848,9 @@ static struct attribute *tristar_attrs[] = {
 	&dev_attr_dump.attr,
 	&dev_attr_poke.attr,
 	&dev_attr_mode.attr,
+	&dev_attr_route.attr,
+	&dev_attr_audio_path.attr,
+	&dev_attr_vbus.attr,
 	&dev_attr_read.attr,
 	&dev_attr_value.attr,
 	&dev_attr_verify.attr,
@@ -268,6 +858,127 @@ static struct attribute *tristar_attrs[] = {
 	NULL,
 };
 ATTRIBUTE_GROUPS(tristar);
+
+static int tristar_dbg_anchors_show(struct seq_file *m, void *p)
+{
+	seq_puts(m,
+		 "OSOS central loop: sub_11C8C\n"
+		 "OSOS tasks: TriStarIDProcessTask, TriStarVBUSProcessTask, TriStarCONDETProcessTask\n"
+		 "OSOS accessory manager: accessoryMgr.cpp:716 type1=MikeyBus UART2, type2=TODO RE\n"
+		 "OSOS MikeyBus: CMikeyBusUartReadTask, CMikeyBusUartResistorTask, mikeyTask.cpp:169\n"
+		 "I2C: 7-bit 0x1a (8-bit WR 0x34 / RD 0x35)\n"
+		 "Routing: IDBUS 0x74/0x75 inside CBTL1609 — Linux does not write Dx\n"
+		 "0x75 ACCx/Dx tables: THS7383 datasheet via nyansatan\n"
+		 "reg 0x11: CBTL1610 config status (Lina); may NAK or echo on CBTL1609\n"
+		 "OSOS v36 bits 0x01/0x04/0x08/0x10/0x20: logged as unmapped, not synthesized\n"
+		 "3.5mm analog: CS42 + apple-mikeybus, not Tristar Dx\n"
+		 "Lightning analog EarPods: ID 04 F1 00 00 00 00\n"
+		 "Bootloader PMIC sub_3F40/3F60 is not Tristar\n"
+		 "Candidate index pmic-tristar-ida-out.txt is not a write recipe\n");
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(tristar_dbg_anchors);
+
+static int tristar_dbg_status_show(struct seq_file *m, void *p)
+{
+	struct apple_tristar *ts = m->private;
+
+	mutex_lock(&ts->lock);
+	seq_printf(m,
+		   "osos_event=0x%02x\nprev_osos_event=0x%02x\nseen_mask=0x%02x\n"
+		   "osos_masks=0x%02x,0x%02x,0x%02x,0x%02x,0x%02x (I2C producer TODO RE)\n"
+		   "cf9_latch=%d\ncfa_state=%u\n"
+		   "dump_ok=%d dump_flat=%d i2c_echo=%d\nreg11_ret=%d reg11=0x%02x\n"
+		   "id=%s usb_routed=%d lightning_analog=%d\n"
+		   "read_only=%d unsafe_writes=%d unsafe_acks=%d poll_ms=%d\n"
+		   "polls=%u writes=%u\n",
+		   ts->osos_event, ts->prev_osos_event, ts->seen_mask & 0xff,
+		   (unsigned int)N31_TS_EVENT_01, (unsigned int)N31_TS_EVENT_04,
+		   (unsigned int)N31_TS_EVENT_08, (unsigned int)N31_TS_EVENT_10,
+		   (unsigned int)N31_TS_EVENT_20,
+		   ts->cf9_latch, ts->cfa_state,
+		   ts->dump_ok, ts->dump_flat, ts->i2c_echo, ts->reg11_ret,
+		   ts->reg11, tristar_id_label(ts),
+		   ts->id_valid && tristar_usb_dp_from_dx(ts->dx),
+		   tristar_is_lightning_analog(ts),
+		   read_only, unsafe_writes, unsafe_acks, poll_ms, ts->polls,
+		   ts->writes);
+	mutex_unlock(&ts->lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(tristar_dbg_status);
+
+static int tristar_dbg_log_show(struct seq_file *m, void *p)
+{
+	struct apple_tristar *ts = m->private;
+	unsigned int i, n, idx;
+
+	mutex_lock(&ts->lock);
+	n = ts->log_count;
+	idx = (ts->log_head + TRISTAR_LOG_LEN - n) % TRISTAR_LOG_LEN;
+	for (i = 0; i < n; i++) {
+		seq_printf(m, "%s\n", ts->log[idx]);
+		idx = (idx + 1) % TRISTAR_LOG_LEN;
+	}
+	mutex_unlock(&ts->lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(tristar_dbg_log);
+
+static int tristar_dbg_counters_show(struct seq_file *m, void *p)
+{
+	struct apple_tristar *ts = m->private;
+
+	mutex_lock(&ts->lock);
+	seq_printf(m, "polls=%u\ndeltas=%u\nwrites=%u\nacks=0\n",
+		   ts->polls, ts->deltas, ts->writes);
+	mutex_unlock(&ts->lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(tristar_dbg_counters);
+
+static int tristar_dbg_mode_show(struct seq_file *m, void *p)
+{
+	struct apple_tristar *ts = m->private;
+
+	mutex_lock(&ts->lock);
+	seq_printf(m,
+		   "read_only=%d\nunsafe_writes=%d\nunsafe_acks=%d\n"
+		   "i2c_echo=%d\nid=%s\n",
+		   read_only, unsafe_writes, unsafe_acks, ts->i2c_echo,
+		   tristar_id_label(ts));
+	mutex_unlock(&ts->lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(tristar_dbg_mode);
+
+static int tristar_dbg_unsafe_show(struct seq_file *m, void *p)
+{
+	seq_printf(m, "%d\n", unsafe_writes);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(tristar_dbg_unsafe);
+
+static void tristar_debugfs_init(struct apple_tristar *ts)
+{
+	ts->debug_root = debugfs_create_dir("n31_tristar", NULL);
+	if (IS_ERR_OR_NULL(ts->debug_root)) {
+		ts->debug_root = NULL;
+		return;
+	}
+	debugfs_create_file("source_anchors", 0444, ts->debug_root, ts,
+			    &tristar_dbg_anchors_fops);
+	debugfs_create_file("raw_status", 0444, ts->debug_root, ts,
+			    &tristar_dbg_status_fops);
+	debugfs_create_file("event_log", 0444, ts->debug_root, ts,
+			    &tristar_dbg_log_fops);
+	debugfs_create_file("counters", 0444, ts->debug_root, ts,
+			    &tristar_dbg_counters_fops);
+	debugfs_create_file("mode", 0444, ts->debug_root, ts,
+			    &tristar_dbg_mode_fops);
+	debugfs_create_file("unsafe_writes_enabled", 0444, ts->debug_root, ts,
+			    &tristar_dbg_unsafe_fops);
+}
 
 static int apple_tristar_probe(struct i2c_client *client)
 {
@@ -280,14 +991,21 @@ static int apple_tristar_probe(struct i2c_client *client)
 	if (!ts)
 		return -ENOMEM;
 	ts->client = client;
+	mutex_init(&ts->lock);
+	INIT_DELAYED_WORK(&ts->poll, tristar_poll_work);
 	i2c_set_clientdata(client, ts);
 
-	/*
-	 * I2C RX still returns the address byte (DS=0x31/0xe1). Do not
-	 * require a read ACK at probe — that either fails the bind or
-	 * storms IIC0. U-Boot DFU already routed Lightning USB. Only
-	 * apple,init-sequence may write; RetailOS has no Dx mux map.
-	 */
+	dev_info(dev,
+		 "N31 Tristar: OSOS sub_11C8C ID/VBUS/CONDET; I2C 7-bit 0x%02x on %s\n",
+		 client->addr, client->adapter->name);
+	dev_info(dev,
+		 "N31 Tristar: IDBUS routes USB/UART/SWD; read_only=%d unsafe_writes=%d poll_ms=%d\n",
+		 read_only, unsafe_writes, poll_ms);
+	dev_info(dev,
+		 "N31 Tristar: 3.5mm analog is CS42+MikeyBus — not a Dx write; type2 accessoryMgr TODO RE\n");
+	dev_info(dev,
+		 "N31 Tristar: OSOS v36 bits 0x01/0x04/0x08/0x10/0x20 unmapped; VBUS I2C map ENOTSUPP\n");
+
 	if (of_property_read_bool(dev->of_node, "apple,require-ack")) {
 		ret = tristar_read_reg(ts, 0x00, &id0);
 		if (ret) {
@@ -296,35 +1014,60 @@ static int apple_tristar_probe(struct i2c_client *client)
 				client->addr, client->adapter->name, ret);
 			return -ENODEV;
 		}
-		dev_info(dev,
-			 "Lightning Tristar ACK @7bit=0x%02x on %s reg0=0x%02x\n",
-			 client->addr, client->adapter->name, id0);
-	} else {
-		dev_info(dev,
-			 "Tristar bound @7bit=0x%02x on %s (skip ACK)\n",
-			 client->addr, client->adapter->name);
+		dev_info(dev, "Lightning Tristar ACK @7bit=0x%02x reg0=0x%02x\n",
+			 client->addr, id0);
 	}
 
-	/* Full 64-byte dump deferred to sysfs (poll/dump) — avoid boot I2C storm */
-
-	/* DT-only init — never invent mux register writes in driver */
 	tristar_apply_init_sequence(ts);
+	tristar_debugfs_init(ts);
 
 	ret = sysfs_create_groups(&dev->kobj, tristar_groups);
 	if (ret)
 		dev_warn(dev, "sysfs groups failed: %d\n", ret);
 
+	mutex_lock(&tristar_singleton_lock);
+	tristar_singleton = ts;
+	mutex_unlock(&tristar_singleton_lock);
+
+	/*
+	 * Probe with a single cheap ACK. Full 64-reg refresh only if the
+	 * chip answers — otherwise one warn and stay quiet (I2C0 often
+	 * NACKs until Lightning/mux is up).
+	 */
+	ret = tristar_read_reg(ts, 0x00, &id0);
+	if (ret) {
+		ts->dump_ok = false;
+		ts->poll_disabled = true;
+		ts->i2c_fail_streak = 1;
+		dev_warn(dev,
+			 "tristar: probe ACK failed %d — leaving unbound quiet (poll off)\n",
+			 ret);
+	} else {
+		tristar_refresh(ts, "probe");
+		if (poll_ms > 0 && !ts->poll_disabled)
+			schedule_delayed_work(&ts->poll,
+					      msecs_to_jiffies(poll_ms));
+	}
 	return 0;
 }
 
 static void apple_tristar_remove(struct i2c_client *client)
 {
+	struct apple_tristar *ts = i2c_get_clientdata(client);
+
+	cancel_delayed_work_sync(&ts->poll);
+	mutex_lock(&tristar_singleton_lock);
+	if (tristar_singleton == ts)
+		tristar_singleton = NULL;
+	mutex_unlock(&tristar_singleton_lock);
+	debugfs_remove_recursive(ts->debug_root);
 	sysfs_remove_groups(&client->dev.kobj, tristar_groups);
 }
 
 static const struct of_device_id apple_tristar_of_match[] = {
 	{ .compatible = "apple,tristar-cbtl1609" },
 	{ .compatible = "nxp,cbtl1609a1" },
+	{ .compatible = "apple,n31-tristar" },
 	{ },
 };
 MODULE_DEVICE_TABLE(of, apple_tristar_of_match);

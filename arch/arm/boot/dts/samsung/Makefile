@@ -50,7 +50,8 @@ dtb-$(CONFIG_ARCH_S3C64XX) += \
 dtb-$(CONFIG_ARCH_S5L87XX) += \
 	s5l8702-n46.dtb \
 	s5l8723-n20.dtb \
-	s5l8740-n31.dtb
+	s5l8740-n31.dtb \
+	s5l8740-n31-nodrm.dtb
 dtb-$(CONFIG_ARCH_S5PV210) += \
 	s5pv210-aquila.dtb \
 	s5pv210-fascinate4g.dtb \

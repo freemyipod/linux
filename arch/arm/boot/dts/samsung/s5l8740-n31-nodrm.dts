@@ -1,0 +1,465 @@
+// SPDX-License-Identifier: GPL-2.0+
+/*
+ * Apple S5L8740 SoC
+ * Board name: N31
+ * Product name: iPod nano (7th generation)
+ */
+/dts-v1/;
+
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/clock/samsung,s5l8702-clock.h>
+
+/ {
+    #address-cells = <1>;
+    #size-cells = <1>;
+    model = "Apple iPod nano (7th generation)";
+    compatible = "apple,n31", "samsung,s5l8740";
+
+    aliases {
+        serial0 = &uart3;
+        console = &uart3;
+    };
+
+    chosen {
+        /* quiet: suppress non-critical boot spam; nimbus uses explicit prints */
+		bootargs = "panic=-1 loglevel=8 nohlt";
+        stdout-path = "serial0";
+    };
+
+    nclk: external_clock {
+        compatible = "fixed-clock";
+        #clock-cells = <0>;
+        clock-frequency = <24000000>;
+        clock-output-names = "nclk";
+    };
+
+    // pclk: clock-ref {
+    //     compatible = "fixed-clock";
+    //     #clock-cells = <0>;
+    //     clock-frequency = <6000000>;
+    //     clock-output-names = "pclk";
+    // };
+
+    cpus {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        cpu@0 {
+            device_type = "cpu";
+            reg = <0>;
+            compatible = "arm,cortex-a5";
+        };
+    };
+
+    memory@8000000 {
+        device_type = "memory";
+        reg = <0x08000000 0x04000000>;
+    };
+
+    soc {
+        compatible = "simple-bus";
+        #address-cells = <1>;
+        #size-cells = <1>;
+        ranges;
+
+        vic0: interrupt-controller@38e00000 {
+            compatible = "arm,pl192-vic";
+            interrupt-controller;
+            reg = <0x38e00000 0x1000>;
+            #interrupt-cells = <1>;
+        };
+
+        vic1: interrupt-controller@38e01000 {
+            compatible = "arm,pl192-vic";
+            interrupt-controller;
+            reg = <0x38e01000 0x1000>;
+            #interrupt-cells = <1>;
+        };
+
+        clkctrl: clock-controller@3c500000 {
+            compatible = "samsung,s5l8740-clock", "samsung,s5l8702-clock";
+            reg = <0x3c500000 0x100>;
+            #clock-cells = <1>;
+            /* boot-minimal: WTF already ungated clocks — skip SEC mass reprogram */
+            apple,skip-clkcon-ensure;
+            apple,skip-clkcon-bringup;
+            status = "okay";
+        };
+        eic: interrupt-controller@39700000 {
+            compatible = "apple,s5l8740-eic", "samsung,s5l8740-eic";
+            reg = <0x39700000 0x1000>;
+            interrupt-controller;
+            #interrupt-cells = <2>;
+            /*
+             * Chain ONLY VIC EXT1 (group1 / GPIOs 32-63): Vol 40/41, Nimbus 38.
+             * Chaining all EXT0-6 hung boot previously.
+             */
+            interrupt-parent = <&vic0>;
+            interrupts = <1>; /* EXT1 */
+            /* boot-minimal v2: no EIC chain (IRQ storm risk without Nimbus) */
+            status = "disabled";
+        };
+
+        timer: timer@3c700000 {
+            compatible = "samsung,s5l8720-timer";
+            reg = <0x3c700000 0x20000>;
+            interrupt-parent = <&vic0>;
+            interrupts = <7>;
+        };
+
+        /* Probe lcdif early — before SPI/Nimbus (boot-minimal bisect) */
+        lcdif: lcdif@38300000 {
+            compatible = "samsung,s5l8740-lcdif";
+            reg = <0x38300000 0x10000>;
+            status = "disabled";
+        };
+
+        backlight: backlight@3e000000 {
+            compatible = "apple,s5l8740-backlight", "samsung,s5l8740-backlight";
+            reg = <0x3e000000 0x100>;
+            default-brightness = <62>;
+            status = "disabled";
+        };
+
+        /* if this one is not first, pointers get overwritten
+           in the driver and it fails to initialize */
+        uart3: serial@3dd00000 {
+            compatible = "apple,s5l-uart";
+            reg = <0x3dd00000 0x3c>;
+            clocks = <&nclk>, <&nclk>;
+            clock-names = "uart", "clk_uart_baud0";
+            reg-io-width = <4>;
+            interrupt-parent = <&vic0>;
+            interrupts = <27>;
+            status = "okay";
+        };
+
+        uart0: serial@3cc00000 {
+            compatible = "apple,s5l-uart";
+            reg = <0x3cc00000 0x3c>;
+            clocks = <&nclk>, <&nclk>;
+            clock-names = "uart", "clk_uart_baud0";
+            reg-io-width = <4>;
+            interrupt-parent = <&vic0>;
+            interrupts = <24>;
+            status = "okay";
+        };
+
+        uart1: serial@3db00000 {
+            compatible = "apple,s5l-uart";
+            reg = <0x3db00000 0x3c>;
+            clocks = <&nclk>, <&nclk>;
+            clock-names = "uart", "clk_uart_baud0";
+            reg-io-width = <4>;
+            interrupt-parent = <&vic0>;
+            interrupts = <25>;
+            status = "okay";
+
+            /* BCM2078KUBG on UART1 @115200 — Vincent CodePatches → BCM2076B1.hcd */
+            bluetooth {
+                compatible = "brcm,bcm2078", "brcm,bcm4329-bt";
+                max-speed = <115200>;
+                shutdown-gpios = <&gpio 97 GPIO_ACTIVE_LOW>;
+                device-wakeup-gpios = <&gpio 98 GPIO_ACTIVE_HIGH>;
+                host-wakeup-gpios = <&gpio 119 GPIO_ACTIVE_HIGH>;
+                firmware-name = "brcm/BCM2076B1.hcd";
+                /* Boot-safe: defer BCM until init up — see bcm2078-bt.c */
+                status = "disabled";
+            };
+        };
+
+        uart2: serial@3dc00000 {
+            compatible = "apple,s5l-uart";
+            reg = <0x3dc00000 0x3c>;
+            clocks = <&nclk>, <&nclk>;
+            clock-names = "uart", "clk_uart_baud0";
+            reg-io-width = <4>;
+            interrupt-parent = <&vic0>;
+            interrupts = <26>;
+            status = "okay";
+        };
+
+        usbphy: usbphy@3c400000 {
+            /* N31 uses s5l87xx PHY sequence (NOT Nano3 8702 ramp) */
+            compatible = "apple,s5l8740-otgphy", "apple,s5l87xx-otgphy";
+            reg = <0x3c400000 0x100>;
+            status = "disabled";
+            #phy-cells = <0>;
+        };
+
+        usbotg_hs: usb@38400000 {
+            compatible = "apple,s5l8740-usb", "apple,s5l87xx-usb";
+            reg = <0x38400000 0x40000>;
+            interrupt-parent = <&vic0>;
+            interrupts = <19>;
+            phys = <&usbphy>;
+            phy-names = "usb2-phy";
+            clocks = <&clkctrl CLK_USBOTG>, <&clkctrl CLK_USBPHY>, <&nclk>;
+            clock-names = "otg", "phy", "ref";
+            /* rx=256 + np-tx=256 leaves room for periodic TX FIFOs (536+256 overflowed) */
+            g-rx-fifo-size = <256>;
+            g-np-tx-fifo-size = <256>;
+            status = "disabled";
+            dr_mode = "peripheral";
+        };
+
+
+        spi2: spi@3d200000 {
+            /* N31 Nimbus on SPI2 — CLK_SPI2 (+ alt/secondary) + pinmux in driver */
+            compatible = "apple,s5l8702-spi", "samsung,s5l8740-spi", "samsung,s5l8702-spi";
+            reg = <0x3d200000 0x100>;
+            clocks = <&clkctrl CLK_SPI2>, <&clkctrl CLK_SPI2_2>, <&clkctrl CLK_SPI2_ALT>;
+            clock-names = "spi", "spi-2", "spi-alt";
+            /* SPI DMA peri IDs OPEN in N31 RE — Nimbus uses proven PIO path */
+            #address-cells = <1>;
+            #size-cells = <0>;
+            status = "disabled";
+            nimbus: touchscreen@0 {
+                compatible = "apple,nimbus";
+                reg = <0>;
+                spi-max-frequency = <1000000>;
+                enable-gpios = <&gpio 14 GPIO_ACTIVE_HIGH>;
+                reset-gpios = <&gpio 39 GPIO_ACTIVE_LOW>;
+                attn-gpios = <&gpio 38 GPIO_ACTIVE_LOW>;
+                /* GPIO38 → EIC group1 → VIC EXT1 */
+                interrupts-extended = <&eic 38 IRQ_TYPE_LEVEL_LOW>;
+                status = "disabled";
+            };
+        };
+
+        /*
+         * SPI0 @0x3C300000: panel in IpodSec, CS42 in RetailOS.
+         * Keep disabled so LCD SPI ownership is undisturbed; enable only
+         * after panel/CS42 mux is sequenced.
+         */
+        /* SPI0: CS42 control. Panel pixels are LCDIF@383 — not this bus. */
+        spi0: spi@3c300000 {
+            compatible = "apple,s5l8702-spi", "samsung,s5l8740-spi", "samsung,s5l8702-spi";
+            reg = <0x3c300000 0x100>;
+            clocks = <&clkctrl CLK_SPI0>, <&clkctrl CLK_SPI0_2>;
+            clock-names = "spi", "spi-2";
+            #address-cells = <1>;
+            #size-cells = <0>;
+            status = "disabled";
+            cs42l81: codec@0 {
+                compatible = "cirrus,cs42l81", "apple,338s1146";
+                reg = <0>;
+                spi-max-frequency = <1000000>;
+                status = "okay";
+            };
+        };
+
+        i2s0: i2s@3ca00000 {
+            compatible = "apple,s5l8740-i2s", "samsung,s5l8740-i2s";
+            reg = <0x3ca00000 0x1000>;
+            clocks = <&clkctrl CLK_I2S0>, <&clkctrl CLK_CG16_9>;
+            clock-names = "i2s", "cg16";
+            dmas = <&dmac 12 0>, <&dmac 13 0>;
+            dma-names = "tx", "rx";
+            #sound-dai-cells = <0>;
+            status = "disabled";
+        };
+
+        i2s2: i2s@3d400000 {
+            compatible = "apple,s5l8740-iis2";
+            reg = <0x3d400000 0x1000>;
+            clocks = <&clkctrl CLK_I2S2>, <&clkctrl CLK_CG16_11>;
+            clock-names = "i2s", "cg16";
+            dmas = <&dmac 16 0>, <&dmac 17 0>;
+            dma-names = "tx", "rx";
+            status = "disabled";
+        };
+
+        nano7_audio: audio {
+            compatible = "apple,n31-audio";
+            apple,cpu = <&i2s0>;
+            status = "disabled";
+        };
+
+        wdt: watchdog@3c800000 {
+            compatible = "apple,s5l8740-syscon", "syscon", "simple-mfd";
+            reg = <0x3c800000 0x8>;
+
+            reboot: syscon-reboot@3c800000 {
+                compatible = "syscon-reboot";
+                offset = <0x0>;
+                value = <0x100000>;
+            };
+        };
+
+        /*
+         * Full S5L8740 banked GPIO (was: 2-line bcm6345 hack at 0x3cf000a4).
+         * Keep label gpio5 disabled so old phandles fail closed if any remain.
+         */
+        gpio5: gpio-hack@3cf000a4 {
+            compatible = "brcm,bcm6345-gpio";
+            reg-names = "dat";
+            reg = <0x3cf000a4 0x4>;
+            #gpio-cells = <2>;
+            gpio-controller;
+            ngpios = <2>;
+            status = "disabled";
+        };
+
+        gpio: gpio@3cf00000 {
+            compatible = "apple,s5l8740-gpio", "samsung,s5l8740-gpio";
+            reg = <0x3cf00000 0x400>;
+            clocks = <&clkctrl CLK_GPIO>;
+            clock-names = "gpio";
+            apple,eic = <&eic>;
+            /* boot-minimal: skip SEC sub_223C mass pinmux (WTF handoff) */
+            apple,skip-sec-pinmux;
+            #gpio-cells = <2>;
+            gpio-controller;
+            ngpios = <128>; /* BT host-wake GPIO 119 */
+            status = "disabled";
+        };
+
+        i2c0: i2c@3c600000 {
+            compatible = "samsung,s5l8702-i2c";
+            samsung,write-busy-poll;
+            #address-cells = <1>;
+            #size-cells = <0>;
+            reg = <0x3c600000 0x100>;
+            clocks = <&clkctrl CLK_I2C0>, <&clkctrl CLK_I2C0_2>;
+            clock-names = "i2c", "i2c-2";
+            clock-frequency = <100000>;
+            interrupt-parent = <&vic0>;
+            interrupts = <21>;
+            status = "disabled";
+
+            /*
+             * Tristar CBTL1609A1 — public "0x34 write / 0x35 read" is 8-bit;
+             * Linux DT 7-bit address is 0x1a.
+             * RetailOS RE: zero Dx/mux register writes observed — dump stays
+             * flat until accessory; only apple,init-sequence may write.
+             */
+            tristar: lightning-mux@1a {
+                compatible = "apple,tristar-cbtl1609", "nxp,cbtl1609a1",
+                             "apple,n31-tristar";
+                reg = <0x1a>;
+                /* Parent i2c0 is disabled in this DTB; child cannot probe. */
+                status = "okay";
+            };
+        };
+
+        i2c1: i2c@3c900000 {
+            compatible = "samsung,s5l8702-i2c";
+            samsung,write-busy-poll;
+            #address-cells = <1>;
+            #size-cells = <0>;
+            reg = <0x3c900000 0x100>;
+            clocks = <&clkctrl CLK_I2C1>, <&clkctrl CLK_I2C1_2>;
+            clock-names = "i2c", "i2c-2";
+            clock-frequency = <100000>; /* UPDATE ME */
+            interrupt-parent = <&vic0>;
+            interrupts = <22>;
+            status = "disabled";
+
+            /* ST lis3lv02d binding; mount-matrix optional (skip until board orient known) */
+            lis3dc: lis331dlh@18 {
+                compatible = "st,lis3lv02d";
+                reg = <0x18>;
+                /* Identity until board orientation proven on HW */
+                mount-matrix = "1", "0", "0",
+                               "0", "1", "0",
+                               "0", "0", "1";
+                status = "okay";
+            };
+
+            /* Duplicate of i2c0 tristar@1a — keep disabled; primary is i2c0 only */
+            tristar_i2c1: lightning-mux@1a {
+                compatible = "apple,tristar-cbtl1609", "nxp,cbtl1609a1";
+                reg = <0x1a>;
+                status = "disabled";
+            };
+            /* Also try literal 7-bit 0x34 in case public notes meant that */
+            /* 0x34 is 8-bit write addr form — NOT a Linux 7-bit address */
+            tristar_i2c1_34: lightning-mux@34 {
+                compatible = "apple,tristar-cbtl1609", "nxp,cbtl1609a1";
+                reg = <0x34>;
+                status = "disabled";
+            };
+
+            d1830: pmic@73 {
+                compatible = "dlg,d1830-gpio";
+                reg = <0x73>;
+                gpio-controller;
+                #gpio-cells = <2>;
+                /* N31: no Home/Play. Sleep/Wake is PMIC — map TBD. */
+                dlg,gpio-map = <0x07 5>; /* SEC sub_27F4: Sleep/Wake status bit5 */
+            };
+        };
+
+        sha1: sha1@38000000 {
+            compatible = "samsung,s5l8702-sha1";
+            reg = <0x38000000 0x100>;
+            clocks = <&clkctrl CLK_SHA1>;
+            clock-names = "sha1";
+            status = "disabled";
+        };
+
+        /*
+         * PL080 DMAC0/1 — OSOS pairs 0x38200000 + 0x38700000.
+         * NOT 0x384 (DWC OTG). Peri IDs: N31 RE IIS0 12/13, IIS2 16/17.
+         */
+        dmac: dma-controller@38200000 {
+            compatible = "apple,s5l8740-pl080", "arm,pl080";
+            reg = <0x38200000 0x1000>, <0x38700000 0x1000>;
+            clocks = <&clkctrl CLK_DMAC0>, <&clkctrl CLK_DMAC1>;
+            clock-names = "dmac0", "dmac1";
+            interrupt-parent = <&vic0>;
+            interrupts = <16>, <17>;
+            #dma-cells = <2>;
+            status = "disabled";
+        };
+
+        aes: aes@38c00000 {
+            compatible = "samsung,s5l8702-aes";
+            reg = <0x38c00000 0x100>;
+            clocks = <&clkctrl CLK_AES>;
+            clock-names = "aes";
+            status = "disabled";
+        };
+
+        prng: prng@3c100000 {
+            compatible = "samsung,s5l8702-prng";
+            reg = <0x3c100000 0x100>;
+            clocks = <&clkctrl CLK_PRNG>;
+            clock-names = "prng";
+            status = "disabled";
+        };
+    };
+    gpio-keys {
+        compatible = "gpio-keys";
+        status = "disabled";
+
+        button-power {
+            label = "Sleep/Wake";
+            gpios = <&d1830 0 GPIO_ACTIVE_LOW>;
+            linux,code = <KEY_POWER>;
+            debounce-interval = <50>;
+            wakeup-source;
+            status = "okay";
+        };
+
+        /* Active-low CONFIRMED; Vol+ = GPIO40 provisional (swap with 41 if inverted) */
+        button-volup {
+            label = "Volume Up";
+            gpios = <&gpio 40 GPIO_ACTIVE_LOW>;
+            linux,code = <KEY_VOLUMEUP>;
+            debounce-interval = <30>;
+            status = "okay";
+        };
+
+        button-voldown {
+            label = "Volume Down";
+            gpios = <&gpio 41 GPIO_ACTIVE_LOW>;
+            linux,code = <KEY_VOLUMEDOWN>;
+            debounce-interval = <30>;
+            status = "okay";
+        };
+    };
+};

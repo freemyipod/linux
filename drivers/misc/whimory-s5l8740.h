@@ -77,10 +77,14 @@ struct whimory_fpart {
 #define WHIMORY_SB_OPEN			2
 #define WHIMORY_SB_CXT			7	/* s_cxt_diff.c type 7 */
 
+#define WHIMORY_SB_UNKNOWN		3
+
 #define WHIMORY_CXT_MAX_SB		32
+#define WHIMORY_CXT_TAG_BASE		1
 #define WHIMORY_CXT_TAG_STATS		2
 #define WHIMORY_CXT_TAG_L2V		4
 #define WHIMORY_CXT_TAG_END		255
+#define WHIMORY_CXT_TAG_CLEAN		0xff
 #define WHIMORY_CXT_CONTIG_SPAN		0xfffffff0u
 #define WHIMORY_FIL_META_BYTES		16	/* FIL GetInfo(105); sub_12ED9C */
 
@@ -180,6 +184,7 @@ struct whimory_range {
 	u32 start;
 	u32 len;
 	u32 vba;
+	u64 weave;
 };
 
 struct whimory_vfl {
@@ -259,6 +264,8 @@ struct whimory_sftl {
 	u32 l2v_repack_roots;
 	u32 meta0_hits;
 	u32 btoc_dumps_left;
+	u32 unknown_sbs;
+	u64 claim_weave;
 };
 
 struct whimory_cxt_base {

@@ -1523,6 +1523,24 @@ static int cs42_codec_prepare(struct cs42l81 *c, unsigned int rate)
 			return -ENODEV;
 	}
 
+	{
+		int (*rails)(void);
+
+		rails = (int (*)(void))__symbol_get("d1830_audio_rails");
+		if (rails) {
+			int rr = rails();
+
+			__symbol_put("d1830_audio_rails");
+			if (rr)
+				dev_warn(&c->spi->dev,
+					 "d1830_audio_rails ret=%d (continuing)\n",
+					 rr);
+		} else {
+			dev_warn(&c->spi->dev,
+				 "d1830 unbound — sibling LDOs 21-23 not trimmed\n");
+		}
+	}
+
 	mikey_jack = (int (*)(void))__symbol_get("apple_mikeybus_jack_present");
 	if (mikey_jack) {
 		jack = mikey_jack();
@@ -1536,6 +1554,20 @@ static int cs42_codec_prepare(struct cs42l81 *c, unsigned int rate)
 			 "MikeyBus open circuit — force_headset=1 to override\n");
 	else
 		dev_info(&c->spi->dev, "MikeyBus jack present\n");
+
+	{
+		void (*ts_path)(struct device *);
+
+		ts_path = (void (*)(struct device *))
+			__symbol_get("apple_tristar_log_audio_path");
+		if (ts_path) {
+			ts_path(&c->spi->dev);
+			__symbol_put("apple_tristar_log_audio_path");
+		} else {
+			dev_info(&c->spi->dev,
+				 "tristar unbound — 3.5mm path is CS42+Mikey, not Lightning Dx\n");
+		}
+	}
 
 	ret = cs42l81_state_3_headset_detect(c);
 	if (ret)

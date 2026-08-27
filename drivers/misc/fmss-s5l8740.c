@@ -22,6 +22,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/irq.h>
+#include <linux/math.h>
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -418,10 +419,25 @@ static unsigned int dma_d14 = 7;
 module_param(dma_d14, uint, 0644);
 MODULE_PARM_DESC(dma_d14, "FMSS D14 address-cycles-1 for DMA (default 7 = PPN v40)");
 
-/* One 4096-byte host sector first (oracle G1); raise to 4 for full 16K page. */
+/* One 4096-byte host sector first (oracle G1); FTL callers override via span. */
 static unsigned int dma_nsect = 1;
 module_param(dma_nsect, uint, 0644);
 MODULE_PARM_DESC(dma_nsect, "DMA span (# logical LBAs) per CS read (default 1)");
+
+/*
+ * Decomp wants command-list META. Live CS kick (C00=0xFFF5) still wedges
+ * the SoC on glass — keep default off until that path is safe. Callers that
+ * ask for meta with this off get -EOPNOTSUPP (never PIO fake spare).
+ */
+static bool meta_dma_read;
+module_param(meta_dma_read, bool, 0644);
+MODULE_PARM_DESC(meta_dma_read,
+		 "Use command-list data+meta read for metadata callers (default N — CS kick wedges)");
+
+static bool meta_dma_reset_before = true;
+module_param(meta_dma_reset_before, bool, 0644);
+MODULE_PARM_DESC(meta_dma_reset_before,
+		 "Reset NAND controller before command-list metadata read");
 
 /*
  * PPN physical page = N × (4096 DATA + 16 META) records (N=2 or 4).
@@ -5955,6 +5971,36 @@ u32 s5l8740_fmss_fil_get_info(u32 selector)
 }
 EXPORT_SYMBOL_GPL(s5l8740_fmss_fil_get_info);
 
+static int fmss_dma_page_read_records(struct fmss_n31 *f,
+				      unsigned int ce, u32 addr,
+				      unsigned int slot,
+				      unsigned int span)
+{
+	unsigned int saved_slot = dma_slot;
+	unsigned int saved_nsect = dma_nsect;
+	unsigned int saved_rec = dma_rec;
+	int ret;
+
+	if (slot > 3)
+		return -EINVAL;
+	if (!span || span > 4 || slot + span > 4)
+		return -EINVAL;
+
+	dma_slot = slot;
+	dma_nsect = span;
+	dma_rec = FMSS_PPN_REC; /* 4096 data + 16 meta */
+
+	if (meta_dma_reset_before)
+		fmss_nand_reset(f);
+
+	ret = fmss_dma_page_read(f, ce, addr);
+
+	dma_rec = saved_rec;
+	dma_nsect = saved_nsect;
+	dma_slot = saved_slot;
+	return ret;
+}
+
 int s5l8740_fmss_page_read(unsigned int ce, unsigned int cau,
 			   unsigned int block, unsigned int page,
 			   unsigned int slc, unsigned int chunks,
@@ -5963,6 +6009,7 @@ int s5l8740_fmss_page_read(unsigned int ce, unsigned int cau,
 {
 	struct fmss_n31 *f = fmss_dev;
 	unsigned int saved;
+	unsigned int span;
 	u32 addr;
 	int ret;
 
@@ -5974,39 +6021,69 @@ int s5l8740_fmss_page_read(unsigned int ce, unsigned int cau,
 	if (!chunks || chunks > FMSS_MAX_CHUNKS)
 		chunks = FMSS_MAX_CHUNKS;
 
+	/*
+	 * PIO chunks are 1024-byte units.
+	 * Metadata records are 4096-byte units.
+	 */
+	span = DIV_ROUND_UP(chunks, 4);
+	if (!span)
+		span = 1;
+	if (span > 4)
+		span = 4;
+
 	mutex_lock(&f->lock);
+
 	if (reset_every && f->pages_since_reset >= reset_every) {
 		fmss_nand_reset(f);
 		f->pages_since_reset = 0;
 	}
+
 	saved = page_chunks;
 	page_chunks = chunks;
 	addr = fmss_ppn_addr(cau, block, page, slc);
-	/*
-	 * PIO last_spare is not proven Sogeti/Whimory META (glass 2026-08-27:
-	 * 53-byte beat is FIFO garbage). Only take the second pass when the
-	 * caller actually asked for a meta buffer.
-	 */
-	if (meta && meta_len)
-		ret = fmss_page_read_with_meta(f, ce, addr);
-	else
+
+	if (meta && meta_len) {
+		/*
+		 * Real metadata path. Do not fall back to PIO metadata,
+		 * because fake metadata poisons FPart/VFL/FTL/L2V.
+		 */
+		if (!meta_dma_read || !f->dma_ok) {
+			ret = -EOPNOTSUPP;
+			goto out_restore;
+		}
+
+		ret = fmss_dma_page_read_records(f, ce, addr, 0, span);
+	} else {
 		ret = fmss_page_read(f, ce, addr);
+	}
+
 	f->pages_since_reset++;
-	page_chunks = saved;
+
 	if (!ret) {
 		if (data && data_len) {
-			if (data_len > f->last_page_len)
-				data_len = f->last_page_len;
+			size_t have = f->last_page_len;
+
+			if (have > span * FMSS_SECTOR_LEN)
+				have = span * FMSS_SECTOR_LEN;
+			if (data_len > have)
+				data_len = have;
 			memcpy(data, f->last_page, data_len);
 		}
+
 		if (meta && meta_len) {
+			size_t have = span * 16;
+
 			memset(meta, 0xff, meta_len);
-			if (f->last_spare_len)
-				memcpy(meta, f->last_spare,
-				       min_t(size_t, meta_len,
-					     f->last_spare_len));
+			if (have > f->last_spare_len)
+				have = f->last_spare_len;
+			if (have > meta_len)
+				have = meta_len;
+			memcpy(meta, f->last_spare, have);
 		}
 	}
+
+out_restore:
+	page_chunks = saved;
 	mutex_unlock(&f->lock);
 	return ret;
 }

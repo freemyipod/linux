@@ -14,6 +14,11 @@
  * 158C82(3/5) writes bitfields in 87/88 — not the ADC. Keep poweroff
  * unchanged. Do not enable dlg,apply-sec-rails from here.
  *
+ * Analog HP needs SEC sub_23EC sibling LDOs (regs 21–23 bit4) plus
+ * reg16 bit4. Default probe stays gpio-only. CS42 calls
+ * d1830_audio_rails() on prepare. Never replay hibernate cookie
+ * writes (regs 1/2/73/96) unless boot_mode bit7 is actually set.
+ *
  * Copyright (C) 2026 Vencislav Atanasov <user890104@freemyipod.org>
  */
 #include <linux/delay.h>
@@ -53,6 +58,18 @@ extern void (*d1830_n31_din_nirq_hook)(void);
 /* Provisional Li-ion empty/full for capacity % (OPEN scale) */
 #define D1830_MV_EMPTY		3300
 #define D1830_MV_FULL		4200
+
+static bool dump_only;
+module_param(dump_only, bool, 0644);
+MODULE_PARM_DESC(dump_only,
+		 "Log PMIC rail ops, do not write (docs-internal n31-pmic dummies)");
+
+static bool allow_audio_rails = true;
+module_param(allow_audio_rails, bool, 0644);
+MODULE_PARM_DESC(allow_audio_rails,
+		 "Apply sub_23EC LDO trim from d1830_audio_rails() (default on)");
+
+int d1830_audio_rails(void);
 
 struct d1830_gpio_map {
 	u8 reg;
@@ -206,6 +223,19 @@ static ssize_t do_poweroff_store(struct device *dev,
 	return count;
 }
 static DEVICE_ATTR_WO(do_poweroff);
+
+static ssize_t audio_rails_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	int ret;
+
+	if (buf[0] != '1' && buf[0] != 'y' && buf[0] != 'Y')
+		return -EINVAL;
+	ret = d1830_audio_rails();
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(audio_rails);
 
 /*
  * Chain from RE (do not invert without new ARM):
@@ -737,13 +767,55 @@ static enum power_supply_property d1830_usb_props[] = {
 	POWER_SUPPLY_PROP_SCOPE,
 };
 
+static int d1830_write8(struct i2c_client *client, u8 reg, u8 val)
+{
+	int ret;
+
+	dev_info(&client->dev, "n31-pmic: WR %02x <- %02x%s\n",
+		 reg, val, dump_only ? " (suppressed)" : "");
+	if (dump_only)
+		return 0;
+	ret = i2c_smbus_write_byte_data(client, reg, val);
+	if (ret)
+		dev_err(&client->dev, "n31-pmic: WR %02x failed ret=%d\n",
+			reg, ret);
+	return ret;
+}
+
 static int d1830_rmw(struct i2c_client *client, u8 reg, u8 clear, u8 set)
 {
 	int v = i2c_smbus_read_byte_data(client, reg);
+	u8 newv;
 
 	if (v < 0)
 		return v;
-	return i2c_smbus_write_byte_data(client, reg, (u8)((v & ~clear) | set));
+	newv = (u8)((v & ~clear) | set);
+	dev_info(&client->dev,
+		 "n31-pmic: RMW reg=%02x old=%02x clear=%02x set=%02x new=%02x%s\n",
+		 reg, v, clear, set, newv, dump_only ? " (suppressed)" : "");
+	if (dump_only)
+		return 0;
+	return i2c_smbus_write_byte_data(client, reg, newv);
+}
+
+static void d1830_log_audio_regs(struct i2c_client *client, const char *tag)
+{
+	static const u8 regs[] = {
+		1, 2, 3, 5, 13, 14, 16, 17, 19, 20, 21, 22, 23, 26, 35,
+		36, 37, 38, 41, 42, 43, 48, 89, 96, 110, 111
+	};
+	char hex[8];
+	int i, v;
+
+	for (i = 0; i < ARRAY_SIZE(regs); i++) {
+		v = i2c_smbus_read_byte_data(client, regs[i]);
+		if (v < 0)
+			snprintf(hex, sizeof(hex), "ERR");
+		else
+			snprintf(hex, sizeof(hex), "%02x", v);
+		dev_info(&client->dev, "n31-pmic: %s RD %02x -> %s\n",
+			 tag, regs[i], hex);
+	}
 }
 
 /*
@@ -768,80 +840,139 @@ int d1830_nimbus_rail(bool on)
 EXPORT_SYMBOL_GPL(d1830_nimbus_rail);
 
 /*
- * IpodSec PMIC rail / charge bring-up:
- *   sub_23EC — regs 20–23,26,16,17,19,35 (charge/rail-ish)
- *   sub_27F4 — IIC1 init already done by i2c driver; apply safe RMW sequence
- *              (skip hibernate Stpr cookie / fatal halt paths).
+ * SEC sub_23EC trim — sibling LDOs used by analog HP.
+ *
+ * Bootloader writes computed 5-bit values from tables at 0x22004B70 /
+ * 0x22004B80 (not recovered). Live Linux (gpio-only): r20=0x1a already
+ * has bit4; r21=0x0a (no bit4); r22=r23=0x00. Match the group by
+ * setting bit4 on 20–23 and forcing 21/22/23 to the same value, then
+ * the documented r16/r17/r19 RMWs. Skip r26=0xB2 (charge). Never
+ * touch POWEROFF (reg 13).
+ *
+ * Cold-boot sub_23EC also sets r16 bit5 (same bit Nimbus uses). Keep
+ * that — OSOS 7484 will still toggle it for BT.
+ */
+static int d1830_sec_trim_seq(struct i2c_client *client, u8 boot_mode)
+{
+	int v20, v21, v35;
+	u8 fill, r16;
+
+	dev_info(&client->dev,
+		 "n31-pmic: sub_23EC-equivalent begin boot_mode=0x%02x\n",
+		 boot_mode);
+
+	v35 = i2c_smbus_read_byte_data(client, 35);
+	if (v35 >= 0)
+		d1830_write8(client, 35, (u8)(v35 & 0xFC));
+
+	v20 = i2c_smbus_read_byte_data(client, 20);
+	v21 = i2c_smbus_read_byte_data(client, 21);
+	if (v20 < 0 || v21 < 0)
+		return v20 < 0 ? v20 : v21;
+
+	/* Keep r20 extras (live 0x1a). 21–23 share one 5-bit field + bit4. */
+	d1830_write8(client, 20, (u8)(v20 | 0x10));
+	fill = (u8)((v21 & 0x1f) | 0x10);
+	d1830_write8(client, 21, fill);
+	d1830_write8(client, 22, fill);
+	d1830_write8(client, 23, fill);
+
+	v21 = i2c_smbus_read_byte_data(client, 16);
+	if (v21 < 0)
+		return v21;
+	r16 = (u8)((v21 & 0x2f) | 0x10);
+	if (!boot_mode)
+		r16 |= 0x20;
+	d1830_write8(client, 16, r16);
+
+	d1830_rmw(client, 17, 0, 0x07);
+	d1830_rmw(client, 19, 0, 0x02);
+
+	dev_info(&client->dev, "n31-pmic: sub_23EC-equivalent complete\n");
+	return 0;
+}
+
+/*
+ * sub_23EC analog-adjacent trim only. Called from CS42 prepare.
+ * Does not run hibernate cookie / POWEROFF / charger 0xB2.
+ */
+int d1830_audio_rails(void)
+{
+	struct i2c_client *client = d1830_poweroff_client;
+	int r02, ret;
+
+	if (!client)
+		return -ENODEV;
+	if (!allow_audio_rails) {
+		dev_info(&client->dev, "n31-pmic: audio rails skipped (allow_audio_rails=0)\n");
+		d1830_log_audio_regs(client, "audio-skip");
+		return 0;
+	}
+
+	d1830_log_audio_regs(client, "audio-before");
+	r02 = i2c_smbus_read_byte_data(client, 2);
+	if (r02 < 0)
+		return r02;
+	ret = d1830_sec_trim_seq(client, (r02 & 0x80) ? 0x11 : 0x00);
+	/* sub_27F4 analog-adjacent: r14 fixed 0x20. Not POWEROFF. */
+	if (!ret)
+		d1830_write8(client, 14, 0x20);
+	d1830_log_audio_regs(client, "audio-after");
+	return ret;
+}
+EXPORT_SYMBOL_GPL(d1830_audio_rails);
+
+/*
+ * IpodSec PMIC rail / charge bring-up. Opt-in via dlg,apply-sec-rails.
+ *
+ * The old Linux seq always wrote the hibernate-to-standby cluster
+ * (reg2=0x80, reg73=0, reg1=0, cookie@96) and historically POWEROFF.
+ * Bootloader only does that when reg2 bit7 is set. Match the dummies
+ * doc: detect boot_mode, skip reset/hibernate unless that branch,
+ * never write reg 13 here.
  */
 static int d1830_sec_rail_seq(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
-	int ret, v;
-	u8 b;
+	int r02, r01;
+	u8 boot_mode = 0;
 
-	/* --- sub_23EC (rail/charge) --- */
-	/* Reg20 ← (delay-derived) & 0x1F: use 0x10 as safe mid rail enable-ish */
-	ret = i2c_smbus_write_byte_data(client, 20, 0x10);
-	if (ret)
-		dev_warn(dev, "rail reg20: %d\n", ret);
+	r02 = i2c_smbus_read_byte_data(client, 2);
+	if (r02 < 0)
+		return r02;
+	dev_info(dev, "n31-pmic: RD 02 -> %02x\n", r02);
+	if (r02 & 0x80) {
+		boot_mode = 0x11;
+		d1830_write8(client, 2, 0x80);
+	}
+	dev_info(dev, "n31-pmic: boot_mode=0x%02x\n", boot_mode);
 
-	v = i2c_smbus_read_byte_data(client, 35);
-	if (v >= 0) {
-		b = (u8)(v & 0xFC);
-		ret = i2c_smbus_write_byte_data(client, 35, b);
-		if (ret)
-			dev_warn(dev, "rail reg35: %d\n", ret);
+	r01 = i2c_smbus_read_byte_data(client, 1);
+	if (r01 < 0)
+		return r01;
+	dev_info(dev, "n31-pmic: RD 01 -> %02x\n", r01);
+
+	if (boot_mode == 0x11) {
+		dev_warn(dev,
+			 "n31-pmic: hibernate-to-standby path detected, reset suppressed (reg01=%02x)\n",
+			 r01);
+		/* Do not write reg 0x49/0x60/0x01/0x0d or call sub_1130. */
 	}
 
-	/* Regs 21–23 same pattern as 20 in SEC loop — use 0x10 */
-	i2c_smbus_write_byte_data(client, 21, 0x10);
-	i2c_smbus_write_byte_data(client, 22, 0x10);
-	i2c_smbus_write_byte_data(client, 23, 0x10);
+	d1830_sec_trim_seq(client, boot_mode);
 
-	/* Reg26 ← 0xB2 (-78) twice in SEC */
-	i2c_smbus_write_byte_data(client, 26, 0xB2);
-	i2c_smbus_write_byte_data(client, 26, 0xB2);
+	/* sub_27F4 post-trim, non-fatal. NEVER POWEROFF (reg 13). */
+	d1830_rmw(client, 48, 0, 0x40);
+	d1830_rmw(client, 89, 0x1C, 0);
+	d1830_write8(client, 60, 0x01);
+	if (boot_mode != 0x11)
+		d1830_rmw(client, 41, 0x13, 0x10);
+	d1830_rmw(client, 42, 0x3F, 0x14);
+	d1830_rmw(client, 43, 0x0F, 0x01);
+	d1830_write8(client, 14, 0x20);
+	d1830_rmw(client, 38, 0x01, 0);
 
-	v = i2c_smbus_read_byte_data(client, 16);
-	if (v >= 0) {
-		b = (u8)((v & 0x2F) | 0x10);
-		/* optional |0x20 path when a1 set — keep base */
-		i2c_smbus_write_byte_data(client, 16, b);
-	}
-
-	v = i2c_smbus_read_byte_data(client, 17);
-	if (v >= 0)
-		i2c_smbus_write_byte_data(client, 17, (u8)(v | 0x07));
-
-	v = i2c_smbus_read_byte_data(client, 19);
-	if (v >= 0)
-		i2c_smbus_write_byte_data(client, 19, (u8)(v | 0x02));
-
-	/* --- sub_27F4 safe subset (non-fatal) --- */
-	i2c_smbus_write_byte_data(client, 2, 0x80);
-	i2c_smbus_write_byte_data(client, 73, 0x00);
-	i2c_smbus_write_byte_data(client, 1, 0x00);
-	/* clear 4-byte cookie @96 without hibernate SPI (SEC writes 4 bytes) */
-	if (i2c_check_functionality(client->adapter, I2C_FUNC_SMBUS_WRITE_I2C_BLOCK)) {
-		u8 z[4] = { 0, 0, 0, 0 };
-
-		i2c_smbus_write_i2c_block_data(client, 96, 4, z);
-	} else {
-		i2c_smbus_write_byte_data(client, 96, 0);
-	}
-	/* NEVER write reg 13 here — bit0 is D1830_POWEROFF_BIT (cuts Vbat). */
-	d1830_rmw(client, 48, 0, 0x40);		/* |= 0x40 */
-	d1830_rmw(client, 89, 0x1C, 0);		/* &= 0xE3 */
-	i2c_smbus_write_byte_data(client, 60, 0x01);
-	d1830_rmw(client, 41, 0x13, 0x10);	/* (x & 0xEC) | 0x10 */
-	d1830_rmw(client, 42, 0x3F, 0x14);	/* (x & 0xC0) | 0x14 */
-	d1830_rmw(client, 43, 0x0F, 0x01);	/* (x & 0xF0) | 0x01 */
-	i2c_smbus_write_byte_data(client, 14, 0x20);
-	/* 36/37 depend on ADC helper — leave unread defaults */
-	d1830_rmw(client, 38, 0x01, 0);		/* clear bit0 */
-	/* do not RMW reg 13 — poweroff register */
-
-	dev_info(dev, "SEC PMIC rail seq applied (sub_23EC + sub_27F4 safe)\n");
+	dev_info(dev, "n31-pmic: sub_27F4-equivalent complete (POWEROFF skipped)\n");
 	return 0;
 }
 
@@ -867,30 +998,17 @@ static int d1830_gpio_probe(struct i2c_client *client)
 	if (ret)
 		return ret;
 
+	d1830_poweroff_client = client;
+
 	/* Opt-in only. Default probe is GPIO + VBAT reads — no rail writes.
 	 * The old default seq wrote reg 13 = 0x01 (POWEROFF bit) at boot.
 	 */
 	if (of_property_read_bool(dev->of_node, "dlg,apply-sec-rails"))
 		d1830_sec_rail_seq(client);
 	else
-		dev_info(dev, "d1830 gpio-only (rail seq off; set dlg,apply-sec-rails to enable)\n");
+		dev_info(dev, "d1830 gpio-only (rail seq off; CS42 calls d1830_audio_rails)\n");
 
-	{
-		static const u8 dump_regs[] = {
-			1, 2, 3, 5, 13, 14, 16, 17, 19, 20, 21, 22, 23,
-			26, 35, 36, 37, 41, 48, 49, 50, 96, 110, 111
-		};
-		int i, v;
-
-		dev_dbg(dev, "PMIC identity dump @0x%02x:\n", client->addr);
-		for (i = 0; i < ARRAY_SIZE(dump_regs); i++) {
-			v = i2c_smbus_read_byte_data(client, dump_regs[i]);
-			if (v < 0)
-				dev_dbg(dev, "  reg 0x%02u: ERR %d\n", dump_regs[i], v);
-			else
-				dev_dbg(dev, "  reg 0x%02u = 0x%02x\n", dump_regs[i], v);
-		}
-	}
+	d1830_log_audio_regs(client, "probe");
 
 	gpio_dev->gpio_chip.label = dev_name(dev);
 	gpio_dev->gpio_chip.parent = dev;
@@ -914,11 +1032,14 @@ static int d1830_gpio_probe(struct i2c_client *client)
 	if (ret)
 		dev_warn(dev, "sysfs do_poweroff unavailable: %d\n", ret);
 
+	ret = device_create_file(dev, &dev_attr_audio_rails);
+	if (ret)
+		dev_warn(dev, "sysfs audio_rails unavailable: %d\n", ret);
+
 	ret = device_create_file(dev, &dev_attr_vbat_raw);
 	if (ret)
 		dev_warn(dev, "sysfs vbat_raw unavailable: %d\n", ret);
 
-	d1830_poweroff_client = client;
 	if (!pm_power_off) {
 		pm_power_off = d1830_pm_power_off;
 		dev_info(dev, "registered pm_power_off (SEC reg %u bit0)\n",
@@ -1042,6 +1163,7 @@ static void d1830_gpio_remove(struct i2c_client *client)
 	if (gpio_dev)
 		cancel_delayed_work_sync(&gpio_dev->trace);
 	device_remove_file(&client->dev, &dev_attr_vbat_raw);
+	device_remove_file(&client->dev, &dev_attr_audio_rails);
 	device_remove_file(&client->dev, &dev_attr_do_poweroff);
 	if (pm_power_off == d1830_pm_power_off)
 		pm_power_off = NULL;

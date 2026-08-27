@@ -291,7 +291,8 @@
              * skips I2C ACK (reads still return the address byte).
              */
             tristar: lightning-mux@1a {
-                compatible = "apple,tristar-cbtl1609", "nxp,cbtl1609a1";
+                compatible = "apple,tristar-cbtl1609", "nxp,cbtl1609a1",
+                             "apple,n31-tristar";
                 reg = <0x1a>;
                 status = "okay";
             };
