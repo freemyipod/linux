@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * N31 ASoC machine — IIS0 CPU DAI + CS42L81 SPI codec + PL080 PCM.
+ * N31 ASoC machine — IIS0+CS42 playback + IIS2 FM capture (local only).
  *
- * CS42 path has no snd_soc_dapm_route table — analog routing is explicit
- * register writes in cs42l81_audio_on(). dai_fmt = I2S NB_NF CBS_CFS
+ * Playback: IIS0 CPU DAI + CS42L81 SPI codec (peri 10 TX).
+ * Capture:  IIS2 CPU DAI + snd-soc-dummy (peri 13 RX). Userspace loops
+ * arecord/tinycap → aplay/tinyplay. No FM→BT / A2DP path.
+ *
+ * CS42 path has no snd_soc_dapm_route table — analog routing uses explicit
+ * register writes: cs42_codec_prepare() + cs42_retailos_play_start/stop().
  * (SoC master, codec slave, 16-bit S16_LE).
  */
 #include <linux/module.h>
@@ -16,12 +20,25 @@ SND_SOC_DAILINK_DEFS(playback,
 	DAILINK_COMP_ARRAY(COMP_CODEC(NULL, "cs42l81-hifi")),
 	DAILINK_COMP_ARRAY(COMP_PLATFORM("snd-soc-dummy")));
 
+SND_SOC_DAILINK_DEFS(fm_capture,
+	DAILINK_COMP_ARRAY(COMP_CPU("bcm2078-pcm")),
+	DAILINK_COMP_ARRAY(COMP_CODEC("snd-soc-dummy", "snd-soc-dummy-dai")),
+	DAILINK_COMP_ARRAY(COMP_PLATFORM("snd-soc-dummy")));
+
 static struct snd_soc_dai_link nano7_dais[] = {
 	{
 		.name = "CS42L81",
 		.stream_name = "Playback",
 		SND_SOC_DAILINK_REG(playback),
 		.playback_only = 1,
+		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
+			   SND_SOC_DAIFMT_CBS_CFS,
+	},
+	{
+		.name = "BCM2078-PCM",
+		.stream_name = "BCM2078 PCM Capture",
+		SND_SOC_DAILINK_REG(fm_capture),
+		.capture_only = 1,
 		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
 			   SND_SOC_DAIFMT_CBS_CFS,
 	},
@@ -37,7 +54,7 @@ static struct snd_soc_card nano7_card = {
 static int nano7_audio_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	struct device_node *cpu_np, *codec_np;
+	struct device_node *cpu_np, *codec_np, *fm_np;
 	int ret;
 
 	cpu_np = of_parse_phandle(dev->of_node, "apple,cpu", 0);
@@ -63,18 +80,34 @@ static int nano7_audio_probe(struct platform_device *pdev)
 	nano7_dais[0].codecs->name = NULL;
 	nano7_dais[0].codecs->dai_name = "cs42l81-hifi";
 
+	fm_np = of_parse_phandle(dev->of_node, "apple,fm-cpu", 0);
+	if (!fm_np)
+		fm_np = of_find_compatible_node(NULL, NULL, "apple,s5l8740-iis2");
+	if (fm_np) {
+		nano7_dais[1].cpus->of_node = fm_np;
+		nano7_dais[1].cpus->dai_name = NULL;
+		nano7_dais[1].platforms->of_node = fm_np;
+		nano7_dais[1].platforms->name = NULL;
+		nano7_card.num_links = 2;
+	} else {
+		dev_warn(dev, "no IIS2 fm-cpu — playback-only card\n");
+		nano7_card.num_links = 1;
+	}
+
 	nano7_card.dev = dev;
 	ret = devm_snd_soc_register_card(dev, &nano7_card);
 	if (ret) {
 		of_node_put(cpu_np);
 		of_node_put(codec_np);
+		of_node_put(fm_np);
 		if (ret == -EPROBE_DEFER)
 			return ret;
 		dev_err(dev, "snd_soc_register_card failed: %d\n", ret);
 		return ret;
 	}
 
-	dev_info(dev, "nano7g-audio: IIS0 + CS42L81 DAI (no dummy codec)\n");
+	dev_info(dev, "nano7g-audio: IIS0+CS42 play%s (no FM→BT)\n",
+		 nano7_card.num_links > 1 ? " + BCM2078 PCM capture (IIS2 RX)" : "");
 	return 0;
 }
 
@@ -95,5 +128,5 @@ static struct platform_driver nano7_audio_driver = {
 module_platform_driver(nano7_audio_driver);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("iPod nano 7G ASoC machine");
-MODULE_SOFTDEP("pre: cs42l81_spi s5l8740_i2s");
+MODULE_DESCRIPTION("iPod nano 7G ASoC machine (play + FM capture)");
+MODULE_SOFTDEP("pre: cs42l81_spi s5l8740_i2s s5l8740_iis2");

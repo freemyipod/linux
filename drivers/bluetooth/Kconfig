@@ -520,7 +520,11 @@ config BT_INTEL_PCIE
 endmenu
 
 config BT_BCM2078_N31
-	tristate "Broadcom BCM2078 power companion (N31)"
+	tristate "Broadcom BCM2078 GPIO/FM companion (N31)"
 	depends on BT && OF && HAS_IOMEM
+	depends on VIDEO_DEV
 	help
-	  Power/GPIO + Vincent patchram HCD companion for BCM2078 on N31.
+	  Thin N31 helper: RetailOS GPIO mode-2, FM 0xFC15 via hci0, and
+	  V4L2 /dev/radio0. Sysfs fm_* is debug. UART1 HCI is hci_bcm.
+	  No FM->A2DP path — local IIS2 capture + IIS0 play only.
+

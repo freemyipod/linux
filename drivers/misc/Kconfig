@@ -666,6 +666,14 @@ config FTL_S5L8740
 	  Higher-level FTL helper layered on FMSS_S5L8740 for N31
 	  restore / LBA mapping experiments.
 
+config APPLE_MIKEYBUS
+	tristate "Apple MikeyBus headset jack (N31 UART2)"
+	depends on SERIAL_DEV_BUS
+	help
+	  MikeyBus on UART2 (GPIO 66/67): headset model ID (open circuit /
+	  A18/B18/…) and remote button RX. Not Tristar; not CS42 amp.
+	  Baud/protocol OPEN until accessory snap. force_plugged for glass.
+
 config APPLE_TRISTAR_CBTL1609
 	tristate "Apple Lightning Tristar (CBTL1609A1) mux"
 	depends on I2C
@@ -675,8 +683,8 @@ config APPLE_TRISTAR_CBTL1609
 	  (CONFIG_USB host is off, so drivers/usb/misc is invisible).
 
 config S5L8740_IIS2_MMIO
-	tristate "S5L8740 IIS2 FM MMIO hook (N31)"
-	depends on HAS_IOMEM
+	tristate "S5L8740 IIS2 FM MMIO hook (obsolete)"
+	depends on HAS_IOMEM && BROKEN
 	help
-	  IIS2 @0x3D400000 FM digital RX hook — MMIO regs sysfs only.
-	  Capture PCM register model still OPEN per N31 RE.
+	  Obsolete. Use CONFIG_SND_SOC_APPLE_S5L8740_IIS2 instead.
+

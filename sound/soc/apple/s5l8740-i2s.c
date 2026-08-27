@@ -11,17 +11,21 @@
 #include <linux/dma-mapping.h>
 #include <linux/export.h>
 #include <linux/io.h>
+#include <linux/jiffies.h>
 #include <linux/kthread.h>
 #include <linux/mutex.h>
 #include <linux/module.h>
 #include <linux/sched.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/workqueue.h>
 #include <linux/sysfs.h>
 #include <sound/dmaengine_pcm.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
 #include <sound/soc.h>
+
+#include "n31-audio-rates.h"
 
 #define S5L8740_I2S_RATES	(SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000)
 #define S5L8740_I2S_FORMATS	(SNDRV_PCM_FMTBIT_S16_LE)
@@ -33,8 +37,17 @@
 #define I2SRXCOM	0x34
 #define I2SSTATUS	0x3c
 #define I2SCLKDIV	0x40	/* OSOS 4F716: *(base+64). Not Rockbox +0x24. */
+/* RetailOS music IIS0+0x44 readback 0x00010007 (oracle 2026-08-25). */
+#define I2SREG44	0x44
+/*
+ * OSOS sub_C095E(port, ch): STATUS W1C — TX sticky is bit15 (1<<15).
+ * Linux never cleared this; silent dumps always show 0x8xxx.
+ */
+#define I2SSTATUS_TX_W1C	0x8000u
 #define MCLK_ASSUME_HZ	12000000u
-/* BCB60 a3!=0 a5!=24: 1048728|50331649 = 0x100098|0x03000001. Not 0x03100219. */
+/* BCB60 a3!=0 a5!=24: 1048728|50331649 = 0x100098|0x03000001. Not 0x03100219.
+ * NEVER leave Rockbox 0x0B100019 in txcon — glass SRC sticks at +0x1a and
+ * FIFO never drains (status 0x82a4). */
 #define I2STXCON_N31_16	0x03100099u
 #define I2SRXCON_N31	0x1000u
 /* OSOS enable ORs 0x100218 (bit20). Live: that bit holds STATUS at
@@ -42,31 +55,55 @@
  * Override via txcon= for bring-up; default stays OSOS. */
 static uint txcon = I2STXCON_N31_16;
 module_param(txcon, uint, 0644);
-MODULE_PARM_DESC(txcon, "I2STXCON (default 0x03100099 BCB60 16-bit)");
+MODULE_PARM_DESC(txcon, "I2STXCON (default 0x03100099; NOT Rockbox 0x0B100019)");
 /*
- * D34C0 → 4F716(port, div). 48 kHz is 250, or 125 if 892A02C==6000.
- * 0 = 12 MHz / rate (250 @ 48 kHz).
+ * D34C0 → 4F716(port, div). Table in n31-audio-rates.h.
+ * 0 = 12 MHz / rate (272 @ 44.1 kHz RetailOS music).
  */
 static uint clkdiv;
 module_param(clkdiv, uint, 0644);
-MODULE_PARM_DESC(clkdiv, "I2SCLKDIV override; 0 = 12000000/rate");
+MODULE_PARM_DESC(clkdiv, "I2SCLKDIV override; 0 = OSOS table / 12000000/rate");
+/*
+ * Default IIS program rate for clk_run / dma_tone when no ALSA hw_params.
+ * 0 = RetailOS 44100. ALSA playback uses the PCM rate, not this.
+ */
+static uint default_rate;
+module_param(default_rate, uint, 0644);
+MODULE_PARM_DESC(default_rate, "clk_run/dma_tone rate; 0 = 44100 OSOS default");
 /*
  * dma_tone FIFO beat width. Rockbox s5l8702 PCM is 16-bit (WIDTH_16).
  * Default 2 = 16-bit stereo interleaved (Rockbox/OSOS BCB60 16-bit).
- * 4 = packed LR 32-bit beats for pio_tone CPU path.
  */
 static int tone_width = 2;
 module_param(tone_width, int, 0644);
 MODULE_PARM_DESC(tone_width, "dma_tone dst width bytes 2 or 4 (default 2)");
 /*
- * OSOS B6620(port,0) does TXCOM |= 6 after PL080 is armed (peri 12).
- * That is a DMA kick. CPU PIO has no DMA: Rockbox-family bit 3 must be
- * set or the serializer never leaves STATUS 0x24. Default 0xC = PIO.
+ * dma_tone / pio_tone sample rate. 0 = default_rate / OSOS 44100.
+ */
+static uint tone_rate;
+module_param(tone_rate, uint, 0644);
+MODULE_PARM_DESC(tone_rate, "dma_tone/pio_tone rate; 0 = OSOS 44100");
+
+/* Keep TX/codec up this long after START even if ALSA xruns. */
+static uint sustain_ms = 5000;
+module_param(sustain_ms, uint, 0644);
+MODULE_PARM_DESC(sustain_ms, "ignore ALSA STOP for this many ms after START (default 5000)");
+
+static uint fifo_prefill = 16;
+module_param(fifo_prefill, uint, 0644);
+MODULE_PARM_DESC(fifo_prefill, "stereo words to push into TX FIFO before TXCOM kick");
+/*
+ * OSOS B6620(port,0) does TXCOM |= 6 after PL080 is armed (peri 10).
+ * RE body: sub_B6620 only ORs 0x6 — not 0xC. Hybrid 0xE was Linux invention.
  */
 #define I2STXCOM_DMA	0x6
 #define I2STXCOM_PIO	0xc
 #define I2STXCOM_STOP	0x0
 #define CLKCON_PHYS	0x3c500000ul
+/* RetailOS oracle dwords at CLKCON+0x30 (music vs idle/A2DP). */
+#define CLKCON_AUDIO_OFF	0x30
+#define CLKCON_AUDIO_PLAY	0x32190u
+#define CLKCON_AUDIO_IDLE	0x1c20u
 #define GPIO_PHYS	0x3cf00000ul
 #define GPIOCMD_PHYS	0x3cf001e0ul
 
@@ -117,17 +154,54 @@ static u32 s5l8740_scale_lr(u32 sample)
 
 static int use_pio;
 module_param(use_pio, int, 0644);
-MODULE_PARM_DESC(use_pio, "1 = CPU FIFO PCM; 0 = OSOS PL080 M2P peri 12 (default)");
+MODULE_PARM_DESC(use_pio, "1 = CPU FIFO PCM; 0 = PL080 M2P peri 10 from DT (default)");
 
 static int txcom_pio = I2STXCOM_PIO;
 module_param(txcom_pio, int, 0644);
 MODULE_PARM_DESC(txcom_pio, "TXCOM when use_pio=1 (default 0xC; OSOS DMA is 0x6)");
+
+/*
+ * TXCOM kick mode (checkpoint-003 / handoff P0.3):
+ *   0 = retail: TXCOM |= 0x6 after DMA armed
+ *   1 = pio:    TXCOM = txcom_pio (0xC)
+ *   2 = hybrid: bit3 then |0x6 (glass experimental default)
+ */
+/*
+ * RetailOS music-playing SCSI oracle 2026-08-25: TXCOM readback = 0x6.
+ * sub_B6620 does |= 6 only. Hybrid 0xE was a Linux false lead.
+ */
+static int txcom_mode;
+module_param(txcom_mode, int, 0644);
+MODULE_PARM_DESC(txcom_mode, "0=retail |=6 (default), 1=pio 0xC, 2=hybrid |C|6");
+
+/*
+ * txcom_exact: when >=0, tx_kick writes this value exactly (no OR). -1=use mode.
+ * Isolation tests: 0x6 / 0xC / 0xE from TXCOM=0 baseline.
+ */
+static int txcom_exact = -1;
+module_param(txcom_exact, int, 0644);
+MODULE_PARM_DESC(txcom_exact, "Exact TXCOM write when >=0; -1=txcom_mode (default)");
+
+/* RetailOS local music CLKDIV=0x110 (272) ≈ 12 MHz / 44100. */
 
 /* BCB60 sets DIR. Live pad_oe=0: GPIO 7/20 stop, GPIO 6 still
  * toggles — BCLK/LRCK are SoC-driven, not codec-master. */
 static int pad_oe = 1;
 module_param(pad_oe, int, 0644);
 MODULE_PARM_DESC(pad_oe, "1 = OSOS DIR out (default); 0 = mode 3, DIR in");
+
+/*
+ * Pad bring-up variants (exhaust RE before RetailOS GPIO oracle):
+ *   0 = local 43D38C(7,3)(20,3) only [BCB60 — CONFIRMED OSOS body]
+ *   1 = +43D38C(6,3) — NO OSOS 43D38C call site for GPIO6; debug only
+ *   2 = gpio-s5l8740 s5l8740_iis0_pads_enable(3) — SEC pinmux + GPIOCMD
+ *   3 = gpio driver mode 2 (BCB60 teardown)
+ *   4 = SEC pinmux 6/7/20 + local mode3 on all three
+ *   5 = mode2 + SEC pinmux refresh (func2 only, no mode3)
+ */
+static int pad_mode;
+module_param(pad_mode, int, 0644);
+MODULE_PARM_DESC(pad_mode, "0=7/20 local; 1=+gpio6; 2=gpio drv; 3=mode2; 4=SEC+6/7/20; 5=SEC func2 only");
 
 struct s5l8740_i2s {
 	void __iomem *base;
@@ -139,6 +213,7 @@ struct s5l8740_i2s {
 	int num_clks;
 	bool has_dma;
 	struct dma_chan *tx_chan;	/* cached — avoid dma:tx symlink churn */
+	u8 tx_chan_borrowed;		/* 1 = lookup_peri, do not dma_release */
 	struct mutex dma_lock;
 	struct snd_dmaengine_dai_dma_data play_dma;
 	struct snd_pcm_substream *ss;
@@ -146,15 +221,36 @@ struct s5l8740_i2s {
 	bool pio_run;
 	unsigned int pio_hw_ptr;
 	unsigned int rate;
+	struct delayed_work dma_watch;
+	unsigned long play_jiffies;
+	u32 last_dma_src;
+	u8 watch_ticks;
 };
 
 /*
  * SEC sub_2034 leftovers. OSOS 983430 never programs clock 9;
  * it does program clocks 6/20 into +0x1C after SEC. If U-Boot
  * zeroed the pair, IIS has no parent. Do not write +00/+04/+44.
+ *
+ * RetailOS music-playing oracle (checkpoint-010): +0x1C = 0xD0052003.
+ * Leaving the SEC bring-up value 0x10122003 yields IIS STATUS 0x82A0
+ * and a silent jack even with TXCOM=6 / CS42 unmuted. Always force
+ * the stock music parent when force_stock_audio_parent=1 (default).
  */
-#define SEC_CLKCON_18	0x20012001u
-#define SEC_CLKCON_1C	0x10122003u
+#define SEC_CLKCON_18		0x20012001u
+#define SEC_CLKCON_1C		0x10122003u
+/* artifacts/retailos-mmio/music-playing/CLKCON.bin — checkpoint-010 */
+#define STOCK_CLKCON_08		0xa009200au
+#define STOCK_CLKCON_0C		0x80000001u
+#define STOCK_CLKCON_10		0x00008000u
+#define STOCK_CLKCON_14		0x80002200u
+#define STOCK_CLKCON_18		0x20012001u
+#define STOCK_CLKCON_1C		0xD0052003u
+
+static bool force_stock_audio_parent = true;
+module_param(force_stock_audio_parent, bool, 0644);
+MODULE_PARM_DESC(force_stock_audio_parent,
+		 "1=force CLKCON+0x08..0x1C to RetailOS music-playing snapshot");
 
 /* sub_41CBD8(9,1): CLKCON+0x0C bit 15 clear = IIS0 CG16 on. */
 static void s5l8740_i2s_ungate(struct s5l8740_i2s *i2s)
@@ -165,36 +261,178 @@ static void s5l8740_i2s_ungate(struct s5l8740_i2s *i2s)
 		return;
 	r18 = readl(i2s->clkcon + 0x18);
 	r1c = readl(i2s->clkcon + 0x1c);
-	if (!r18)
-		writel(SEC_CLKCON_18, i2s->clkcon + 0x18);
-	if (!r1c)
-		writel(SEC_CLKCON_1C, i2s->clkcon + 0x1c);
-	v = readl(i2s->clkcon + 0x0c);
-	if (v & 0x8000u)
-		writel(v & ~0x8000u, i2s->clkcon + 0x0c);
+	if (force_stock_audio_parent) {
+		/*
+		 * +0x1C alone left STATUS at 0x82A0. Push the rest of the
+		 * music-playing parent snapshot (checkpoint-010 §5.B).
+		 */
+		writel(STOCK_CLKCON_08, i2s->clkcon + 0x08);
+		writel(STOCK_CLKCON_0C, i2s->clkcon + 0x0c);
+		writel(STOCK_CLKCON_10, i2s->clkcon + 0x10);
+		writel(STOCK_CLKCON_14, i2s->clkcon + 0x14);
+		writel(STOCK_CLKCON_18, i2s->clkcon + 0x18);
+		writel(STOCK_CLKCON_1C, i2s->clkcon + 0x1c);
+	} else {
+		if (!r18)
+			writel(SEC_CLKCON_18, i2s->clkcon + 0x18);
+		if (!r1c)
+			writel(SEC_CLKCON_1C, i2s->clkcon + 0x1c);
+		v = readl(i2s->clkcon + 0x0c);
+		if (v & 0x8000u)
+			writel(v & ~0x8000u, i2s->clkcon + 0x0c);
+	}
 }
 
-/* sub_43D38C(7,3) and (20,3) — IIS0 pads only (do not touch 0x0A061010 / GPIO86). */
-static void s5l8740_i2s_pads(struct s5l8740_i2s *i2s)
+/* RetailOS absolute dword — better than sticky play when idle. */
+static void s5l8740_i2s_clkcon_audio(struct s5l8740_i2s *i2s, u32 val)
 {
-	static const u8 gpios[] = { 7, 20 };
-	unsigned int i;
+	if (!i2s || !i2s->clkcon)
+		return;
+	writel(val, i2s->clkcon + CLKCON_AUDIO_OFF);
+}
+
+/*
+ * STOP teardown (beats RetailOS sticky TX): TXCOM stop → terminate DMA →
+ * clear I2SCLKCON → CLKCON+0x30 idle dword.
+ */
+static void s5l8740_i2s_hw_stop(struct s5l8740_i2s *i2s,
+				struct snd_pcm_substream *substream)
+{
+	struct dma_chan *chan = NULL;
+
+	if (!i2s || !i2s->base)
+		return;
+
+	writel(I2STXCOM_STOP, i2s->base + I2STXCOM);
+
+	if (substream && i2s->has_dma && !use_pio)
+		chan = snd_dmaengine_pcm_get_chan(substream);
+	if (!chan)
+		chan = i2s->tx_chan;
+	if (chan)
+		dmaengine_terminate_sync(chan);
+
+	writel(0, i2s->base + I2SCLKCON);
+	s5l8740_i2s_clkcon_audio(i2s, CLKCON_AUDIO_IDLE);
+}
+
+/* Packed pinmux word — same as gpio-s5l8740 sub_223C / sub_47CC. */
+static void s5l8740_i2s_pinmux_word(struct s5l8740_i2s *i2s, u32 word)
+{
+	unsigned int bank = (word >> 24) & 0xff;
+	unsigned int pin = (word >> 16) & 0xff;
+	void __iomem *base;
+	u32 v;
+
+	if (!i2s->gpio)
+		return;
+	base = i2s->gpio + 32u * bank;
+	v = readl(base + 0x00);
+	writel(((word & 0xfu) << (4u * pin)) | (v & ~(15u << (4u * pin))),
+	       base + 0x00);
+	v = readl(base + 0x14);
+	writel((((word >> 12) & 1u) << pin) | (v & ~BIT(pin)), base + 0x14);
+	v = readl(base + 0x0c);
+	writel((((word >> 4) & 1u) << pin) | (v & ~BIT(pin)), base + 0x0c);
+	v = readl(base + 0x10);
+	writel((((word >> 8) & 1u) << pin) | (v & ~BIT(pin)), base + 0x10);
+}
+
+static void s5l8740_i2s_gpiocmd(struct s5l8740_i2s *i2s, unsigned int gpio, u8 cmd)
+{
+	unsigned int bank = gpio >> 3;
+	unsigned int pin = gpio & 7;
+	void __iomem *b;
+	u32 dir;
 
 	if (!i2s->gpio || !i2s->gpiocmd)
 		return;
-	for (i = 0; i < ARRAY_SIZE(gpios); i++) {
-		unsigned int gpio = gpios[i];
-		unsigned int bank = gpio >> 3;
-		unsigned int pin = gpio & 7;
-		void __iomem *b = i2s->gpio + 32 * bank;
-		u32 dir = readl(b + 0x14);
+	b = i2s->gpio + 32 * bank;
+	dir = readl(b + 0x14);
+	writel(dir | BIT(pin), b + 0x14);
+	writel((bank << 16) | (pin << 8) | cmd, i2s->gpiocmd);
+}
 
-		if (pad_oe)
-			writel(dir | BIT(pin), b + 0x14);
-		else
-			writel(dir & ~BIT(pin), b + 0x14);
-		writel((bank << 16) | (pin << 8) | 3, i2s->gpiocmd);
+static void s5l8740_i2s_log_iis_gpio(struct s5l8740_i2s *i2s, const char *tag)
+{
+	void (*logpads)(const char *);
+
+	logpads = (void (*)(const char *))__symbol_get("s5l8740_gpio_log_iis0_pads");
+	if (logpads) {
+		logpads(tag);
+		__symbol_put("s5l8740_gpio_log_iis0_pads");
+	} else if (i2s->dev) {
+		dev_info(i2s->dev, "%s pads (no gpio export)\n", tag);
 	}
+}
+
+/* sub_43D38C(7,3) and (20,3) — IIS0 pads. Optional (6,3) in pad_mode 1/4. */
+static void s5l8740_i2s_pads(struct s5l8740_i2s *i2s)
+{
+	static const u8 sec_words[] = { 6, 7, 20 };
+	unsigned int i;
+
+	if (pad_mode == 2) {
+		void (*en)(unsigned int);
+
+		en = (void (*)(unsigned int))__symbol_get("s5l8740_iis0_pads_enable");
+		if (en) {
+			en(3);
+			__symbol_put("s5l8740_iis0_pads_enable");
+		}
+		s5l8740_i2s_log_iis_gpio(i2s, "pads-mode2-gpio");
+		return;
+	}
+
+	if (pad_mode == 3) {
+		void (*en)(unsigned int);
+
+		en = (void (*)(unsigned int))__symbol_get("s5l8740_iis0_pads_enable");
+		if (en) {
+			en(2);
+			__symbol_put("s5l8740_iis0_pads_enable");
+		}
+		s5l8740_i2s_log_iis_gpio(i2s, "pads-mode3-off");
+		return;
+	}
+
+	if (pad_mode >= 4) {
+		s5l8740_i2s_pinmux_word(i2s, 0x00061002u);
+		s5l8740_i2s_pinmux_word(i2s, 0x00071002u);
+		s5l8740_i2s_pinmux_word(i2s, 0x02041002u);
+	}
+
+	if (pad_mode == 5) {
+		s5l8740_i2s_log_iis_gpio(i2s, "pads-mode5-sec-only");
+		return;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(sec_words); i++) {
+		unsigned int g = sec_words[i];
+
+		if (g == 6 && pad_mode != 1 && pad_mode != 4)
+			continue;
+		if (pad_oe || g == 7 || g == 20)
+			s5l8740_i2s_gpiocmd(i2s, g, 3);
+	}
+
+	/*
+	 * RetailOS music/idle gpio.bin bank0 PCON = 0x32112224
+	 * (pins4/5 = func1). Linux often left 0x32222224 — force stock.
+	 */
+	if (i2s->gpio) {
+		u32 p0 = readl(i2s->gpio);
+
+		if (p0 != 0x32112224u) {
+			writel(0x32112224u, i2s->gpio);
+			if (i2s->dev)
+				dev_info(i2s->dev,
+					 "PCON0 %08x -> 32112224 (RetailOS music)\n",
+					 p0);
+		}
+	}
+
+	s5l8740_i2s_log_iis_gpio(i2s, "pads-applied");
 }
 
 static void s5l8740_i2s_c09ac_start(struct s5l8740_i2s *i2s);
@@ -217,7 +455,41 @@ static int s5l8740_i2s_codec_prepare(void)
 	return ret;
 }
 
-static int s5l8740_i2s_asp_lock(void)
+static int s5l8740_i2s_codec_play_start(void)
+{
+	int (*start)(void) = __symbol_get("cs42l81_play_start");
+	int ret = 0;
+
+	if (start) {
+		ret = start();
+		__symbol_put("cs42l81_play_start");
+	}
+	return ret;
+}
+
+static void s5l8740_i2s_codec_play_stop(void)
+{
+	void (*stop)(void) = __symbol_get("cs42l81_play_stop");
+
+	if (stop) {
+		stop();
+		__symbol_put("cs42l81_play_stop");
+	}
+}
+
+static int s5l8740_i2s_audio_path_mode(void)
+{
+	int (*mode)(void) = __symbol_get("cs42l81_get_audio_path_mode");
+	int m = 1;
+
+	if (mode) {
+		m = mode();
+		__symbol_put("cs42l81_get_audio_path_mode");
+	}
+	return m;
+}
+
+static int __maybe_unused s5l8740_i2s_asp_lock(void)
 {
 	int (*asp)(void) = __symbol_get("cs42l81_post_iis_start");
 	int ret = -ENOENT;
@@ -230,64 +502,147 @@ static int s5l8740_i2s_asp_lock(void)
 	return ret;
 }
 
-static void s5l8740_i2s_fifo_write(struct s5l8740_i2s *i2s, s16 s)
+static int __maybe_unused s5l8740_i2s_asp_hold_light(void)
 {
-	unsigned int n;
-	u32 status;
+	int (*hold)(void) = __symbol_get("cs42l81_asp_hold_light");
+	int ret = -ENOENT;
 
-	for (n = 0; n < fifo_wait_loops; n++) {
-		status = readl(i2s->base + I2SSTATUS);
-		if (!(status & 0x20))
-			break;
-		cpu_relax();
+	if (hold) {
+		ret = hold();
+		__symbol_put("cs42l81_asp_hold_light");
 	}
-	writel((u32)(u16)s | ((u32)(u16)s << 16), i2s->base + I2STXFIFO);
+	return ret;
 }
 
-static int s5l8740_i2s_play_start(struct s5l8740_i2s *i2s, bool dma)
+static void s5l8740_i2s_log_clocks(struct s5l8740_i2s *i2s, const char *tag)
 {
-	int ret;
+	u32 c0c = 0, c18 = 0, c1c = 0;
+	u32 clkcon = 0, txcon = 0, txcom = 0, rxcon = 0, rxcom = 0;
+	u32 status = 0, clkdiv = 0;
 
-	ret = s5l8740_i2s_codec_prepare();
-	if (ret && i2s->dev)
-		dev_warn(i2s->dev, "codec prepare: %d\n", ret);
-	s5l8740_i2s_program(i2s, 48000);
-	s5l8740_i2s_tx_kick(i2s, dma);
-	ret = s5l8740_i2s_asp_lock();
-	if (i2s->dev)
-		dev_info(i2s->dev, "play_start dma=%d asp=%d status=0x%x txcom=0x%x\n",
-			 dma, ret, readl(i2s->base + I2SSTATUS),
-			 readl(i2s->base + I2STXCOM));
-	return ret;
+	if (!i2s || !i2s->dev)
+		return;
+	if (i2s->clkcon) {
+		c0c = readl(i2s->clkcon + 0x0c);
+		c18 = readl(i2s->clkcon + 0x18);
+		c1c = readl(i2s->clkcon + 0x1c);
+	}
+	if (i2s->base) {
+		clkcon = readl(i2s->base + I2SCLKCON);
+		txcon = readl(i2s->base + I2STXCON);
+		txcom = readl(i2s->base + I2STXCOM);
+		rxcon = readl(i2s->base + I2SRXCON);
+		rxcom = readl(i2s->base + I2SRXCOM);
+		status = readl(i2s->base + I2SSTATUS);
+		clkdiv = readl(i2s->base + I2SCLKDIV);
+	}
+	dev_info(i2s->dev,
+		 "%s CLKCON+0C=%08x +18=%08x +1C=%08x IIS0 +00=%08x +04=%08x +08=%08x +30=%08x +34=%08x +3C=%08x +40=%08x\n",
+		 tag, c0c, c18, c1c, clkcon, txcon, txcom, rxcon, rxcom, status,
+		 clkdiv);
+}
+
+static void s5l8740_i2s_pre_codec(void)
+{
+	void (*pre)(void);
+
+	pre = (void (*)(void))__symbol_get("cs42l81_pre_iis_start");
+	if (pre) {
+		pre();
+		__symbol_put("cs42l81_pre_iis_start");
+	}
+}
+
+static void s5l8740_i2s_schedule_asp(void)
+{
+	void (*sched)(void);
+
+	sched = (void (*)(void))__symbol_get("cs42l81_schedule_post_iis");
+	if (sched) {
+		sched();
+		__symbol_put("cs42l81_schedule_post_iis");
+	}
+}
+
+static void s5l8740_i2s_cancel_asp(void)
+{
+	void (*cancel)(void);
+
+	cancel = (void (*)(void))__symbol_get("cs42l81_cancel_post_iis");
+	if (cancel) {
+		cancel();
+		__symbol_put("cs42l81_cancel_post_iis");
+	}
+}
+static void s5l8740_i2s_log_txcon(struct device *dev, u32 v, const char *tag)
+{
+	dev_info(dev,
+		 "%s txcon=0x%08x %s%s%s%s%s\n",
+		 tag, v,
+		 v == 0x0B100019u ? "ROCKBOX-POISON " : "",
+		 (v & 0x03000001u) ? "BCB60-low " : "",
+		 (v & 0x00100098u) ? "16bit " : "",
+		 v == 0x03100219u ? "extclk " : "",
+		 v == 0x03100099u ? "intclk " : "");
 }
 
 /*
  * 345D70 is JUMPOUT 0x22000350 = bootloader sub_350 (SCTLR C-bit).
  * Play 414FAE only starts — it does not C09AC-stop first.
+ * RetailOS music: I2SCLKCON = 0x1 (not 0x2 stop-ack).
  */
 static void s5l8740_i2s_c09ac_start(struct s5l8740_i2s *i2s)
 {
 	writel(1, i2s->base + I2SCLKCON);
 }
 
+/* OSOS sub_C095E(port, 0): clear TX sticky STATUS bit15 (W1C). */
+static void s5l8740_i2s_status_w1c_tx(struct s5l8740_i2s *i2s)
+{
+	u32 before, after;
+
+	if (!i2s || !i2s->base)
+		return;
+	before = readl(i2s->base + I2SSTATUS);
+	writel(I2SSTATUS_TX_W1C, i2s->base + I2SSTATUS);
+	after = readl(i2s->base + I2SSTATUS);
+	if (i2s->dev && (before & I2SSTATUS_TX_W1C))
+		dev_info(i2s->dev, "STATUS W1C tx sticky %08x->%08x\n",
+			 before, after);
+}
+
 /* 26DDDE: 41CBD8(9,1), 5705DC RX, 414FAE (C09AC + BCB60), D34C0 CLKDIV. */
 static void s5l8740_i2s_program(struct s5l8740_i2s *i2s, unsigned int rate)
 {
-	u32 div = clkdiv ? clkdiv : MCLK_ASSUME_HZ / (rate ? rate : 48000);
+	const struct n31_rate_cfg *r = n31_find_rate(rate);
+	u32 div;
 	u32 rxcom;
 
+	if (clkdiv)
+		div = clkdiv;
+	else if (r)
+		div = r->clkdiv;
+	else
+		div = MCLK_ASSUME_HZ / n31_pick_rate(rate);
 	if (div < 1)
 		div = 1;
 	s5l8740_i2s_ungate(i2s);
+	s5l8740_i2s_clkcon_audio(i2s, CLKCON_AUDIO_PLAY);
 	s5l8740_i2s_c09ac_start(i2s);
 	s5l8740_i2s_pads(i2s);
+	/* sub_BCB60 a3!=0 a5=16 → TXCON; +0x30 = 0x1000 */
 	writel(txcon, i2s->base + I2STXCON);
+	if (i2s->dev)
+		s5l8740_i2s_log_txcon(i2s->dev, txcon, "program");
 	writel(I2SRXCON_N31, i2s->base + I2SRXCON);
 	rxcom = readl(i2s->base + I2SRXCOM);
 	writel(rxcom & ~4u, i2s->base + I2SRXCOM);
 	writel(div, i2s->base + I2SCLKDIV);
-	/* C095E/BB9F8 is not on the 26DDDE play path. Bit15 looks W1C. */
-	i2s->rate = rate ? rate : 48000;
+	/* RetailOS music IIS0+0x44 = 0x00010007 (IIS2 already programs this). */
+	writel(0x00010007u, i2s->base + I2SREG44);
+	/* Setup only — TXCOM stays 0 until .trigger START (OSOS B6620). */
+	writel(I2STXCOM_STOP, i2s->base + I2STXCOM);
+	i2s->rate = n31_pick_rate(rate);
 }
 
 /*
@@ -296,18 +651,92 @@ static void s5l8740_i2s_program(struct s5l8740_i2s *i2s, unsigned int rate)
  */
 static void s5l8740_i2s_tx_kick(struct s5l8740_i2s *i2s, bool dma)
 {
-	u32 txcom;
+	u32 txcom, before, after;
 
 	if (!i2s || !i2s->base)
 		return;
-	if (dma) {
-		txcom = readl(i2s->base + I2STXCOM);
-		writel(txcom | I2STXCOM_PIO, i2s->base + I2STXCOM);
-		writel(txcom | I2STXCOM_PIO | I2STXCOM_DMA,
-		       i2s->base + I2STXCOM);
+	s5l8740_i2s_pre_codec();
+	{
+		unsigned int n = fifo_prefill, i;
+		unsigned int rate = i2s->rate ? i2s->rate : N31_RATE_DEFAULT;
+		s16 s;
+
+		if (n > 64)
+			n = 64;
+		for (i = 0; i < n; i++) {
+			s = s5l8740_scale_s16(n31_tone_s16(i, rate));
+			writel(((u32)(u16)s << 16) | (u16)s,
+			       i2s->base + I2STXFIFO);
+		}
+	}
+	before = readl(i2s->base + I2STXCOM);
+	if (txcom_exact >= 0) {
+		writel((u32)txcom_exact, i2s->base + I2STXCOM);
+	} else if (dma) {
+		switch (txcom_mode) {
+		case 0: /* retail: OSOS B6620 TXCOM = 0x6 after DMA armed */
+			writel(I2STXCOM_DMA, i2s->base + I2STXCOM);
+			break;
+		case 1: /* pio-only kick (debug) */
+			writel(txcom_pio, i2s->base + I2STXCOM);
+			break;
+		default: /* hybrid: glass bit3 + DMA */
+			txcom = before;
+			writel(txcom | I2STXCOM_PIO, i2s->base + I2STXCOM);
+			writel(txcom | I2STXCOM_PIO | I2STXCOM_DMA,
+			       i2s->base + I2STXCOM);
+			break;
+		}
 	} else {
 		writel(txcom_pio, i2s->base + I2STXCOM);
 	}
+	after = readl(i2s->base + I2STXCOM);
+	/* RetailOS music never leaves TX sticky 0x8000 set — clear after kick. */
+	s5l8740_i2s_status_w1c_tx(i2s);
+	/* Keep C09AC start bit; 0x2 is stop-ack class (sub_C09AC wait). */
+	if ((readl(i2s->base + I2SCLKCON) & 1u) == 0)
+		writel(1, i2s->base + I2SCLKCON);
+	if (i2s->dev)
+		dev_info_ratelimited(i2s->dev,
+			 "tx_kick dma=%d mode=%d txcom %08x->%08x status=%08x clkcon=%08x\n",
+			 dma, txcom_mode, before, after,
+			 readl(i2s->base + I2SSTATUS),
+			 readl(i2s->base + I2SCLKCON));
+}
+
+int s5l_pl080_peri_snapshot(unsigned int peri, u32 *src, u32 *dst, u32 *en);
+
+static void s5l8740_i2s_dma_watch(struct work_struct *work)
+{
+	struct s5l8740_i2s *i2s = container_of(work, struct s5l8740_i2s,
+					       dma_watch.work);
+	u32 src = 0, dst = 0, en = 0, st, txcom;
+	int ret;
+
+	if (!i2s || !i2s->base)
+		return;
+	ret = s5l_pl080_peri_snapshot(10, &src, &dst, &en);
+	st = readl(i2s->base + I2SSTATUS);
+	txcom = readl(i2s->base + I2STXCOM);
+	{
+		const char *tag;
+
+		if (ret)
+			tag = "NOPERI";
+		else if (i2s->watch_ticks == 0)
+			tag = "BASE";
+		else if (src != i2s->last_dma_src)
+			tag = "WALK";
+		else
+			tag = "STUCK";
+		dev_info(i2s->dev,
+			 "dma_watch t=%ums src=%08x %s dst=%08x en=%x status=%08x txcom=%08x\n",
+			 i2s->watch_ticks * 100, src, tag, dst, en, st, txcom);
+	}
+	i2s->last_dma_src = src;
+	i2s->watch_ticks++;
+	if (i2s->watch_ticks < 50)
+		schedule_delayed_work(&i2s->dma_watch, msecs_to_jiffies(100));
 }
 
 static int s5l8740_i2s_hw_params(struct snd_pcm_substream *substream,
@@ -316,15 +745,24 @@ static int s5l8740_i2s_hw_params(struct snd_pcm_substream *substream,
 {
 	struct s5l8740_i2s *i2s = dev_get_drvdata(dai->dev);
 	unsigned int rate = params_rate(params);
+	const struct n31_rate_cfg *r = n31_find_rate(rate);
 	u32 div;
+	int ret;
 
 	if (!i2s || !i2s->base)
 		return -ENODEV;
+	if (!r && !clkdiv)
+		return -EINVAL;
+	ret = s5l8740_i2s_codec_prepare();
+	if (ret && i2s->dev)
+		dev_warn(i2s->dev, "codec prepare in hw_params: %d\n", ret);
 	s5l8740_i2s_program(i2s, rate);
-	div = MCLK_ASSUME_HZ / (i2s->rate ? i2s->rate : 48000);
-	dev_info(dai->dev, "IIS hw_params rate=%u clkdiv=%u dma=%d pio=%d txcom=0x%x\n",
-		 rate, div, i2s->has_dma, use_pio,
-		 use_pio ? txcom_pio : I2STXCOM_DMA);
+	div = clkdiv ? clkdiv : (r ? r->clkdiv : 0);
+	s5l8740_i2s_log_clocks(i2s, "hw_params");
+	dev_info(dai->dev,
+		 "IIS hw_params rate=%u code=%u clkdiv=%u dma=%d pio=%d txcom=%08x\n",
+		 rate, r ? r->cs42_rate_code : 0, div, i2s->has_dma, use_pio,
+		 readl(i2s->base + I2STXCOM));
 	return 0;
 }
 
@@ -332,6 +770,7 @@ static int s5l8740_i2s_trigger(struct snd_pcm_substream *substream, int cmd,
 			       struct snd_soc_dai *dai)
 {
 	struct s5l8740_i2s *i2s = dev_get_drvdata(dai->dev);
+	int path_mode;
 
 	if (!i2s || !i2s->base)
 		return -ENODEV;
@@ -339,14 +778,41 @@ static int s5l8740_i2s_trigger(struct snd_pcm_substream *substream, int cmd,
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		path_mode = s5l8740_i2s_audio_path_mode();
+		if (path_mode == 1)
+			s5l8740_i2s_codec_play_start();
 		s5l8740_i2s_tx_kick(i2s, !use_pio);
+		if (path_mode == 2)
+			s5l8740_i2s_codec_play_start();
+		s5l8740_i2s_log_clocks(i2s, "trigger_start");
+		s5l8740_i2s_schedule_asp();
 		i2s->pio_run = use_pio;
+		i2s->play_jiffies = jiffies;
+		i2s->watch_ticks = 0;
+		i2s->last_dma_src = 0;
+		mod_delayed_work(system_wq, &i2s->dma_watch, msecs_to_jiffies(100));
+		dev_info(dai->dev,
+			 "DAI trigger START path_mode=%d txcom=%08x sustain=%ums\n",
+			 path_mode, readl(i2s->base + I2STXCOM), sustain_ms);
 		return 0;
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		if (sustain_ms &&
+		    time_before(jiffies,
+				i2s->play_jiffies +
+				msecs_to_jiffies(sustain_ms))) {
+			dev_info_ratelimited(dai->dev,
+					     "DAI trigger STOP ignored (%ums sustain)\n",
+					     sustain_ms);
+			return 0;
+		}
 		i2s->pio_run = false;
-		writel(I2STXCOM_STOP, i2s->base + I2STXCOM);
+		cancel_delayed_work(&i2s->dma_watch);
+		s5l8740_i2s_cancel_asp();
+		s5l8740_i2s_codec_play_stop();
+		s5l8740_i2s_hw_stop(i2s, substream);
+		dev_info_ratelimited(dai->dev, "DAI trigger STOP txcom=0\n");
 		return 0;
 	default:
 		return -EINVAL;
@@ -420,7 +886,7 @@ static int s5l8740_pio_thread(void *data)
 		 * (~10 ms) and a 3s tone hung for a minute. Burst ~4 ms of
 		 * realtime writes, then cond_resched so RNDIS still runs.
 		 */
-		rate = i2s->rate ? i2s->rate : 48000;
+		rate = i2s->rate ? i2s->rate : N31_RATE_DEFAULT;
 		burst = rate / 250; /* ~4 ms */
 		if (burst < 16)
 			burst = 16;
@@ -515,7 +981,7 @@ static ssize_t regs_show(struct device *dev, struct device_attribute *attr,
 	struct s5l8740_i2s *i2s = dev_get_drvdata(dev);
 	static const u32 offs[] = {
 		I2SCLKCON, I2STXCON, I2STXCOM, I2STXFIFO,
-		I2SRXCON, I2SRXCOM, I2SSTATUS, I2SCLKDIV,
+		I2SRXCON, I2SRXCOM, I2SSTATUS, I2SCLKDIV, I2SREG44,
 	};
 	int i, n = 0;
 
@@ -527,7 +993,7 @@ static ssize_t regs_show(struct device *dev, struct device_attribute *attr,
 	if (i2s->clkcon) {
 		static const u32 clk_offs[] = {
 			0x00, 0x08, 0x0c, 0x10, 0x14, 0x18, 0x1c,
-			0x44, 0x48, 0x4c, 0x58, 0x68, 0x6c,
+			0x30, 0x44, 0x48, 0x4c, 0x58, 0x68, 0x6c,
 		};
 		int c;
 
@@ -569,215 +1035,6 @@ static ssize_t volume_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RW(volume);
 
-/* 1 kHz sine @ 48 kHz, 48 samples/period, peak 32767. No FP in the loop. */
-static const s16 sine_1khz_48k[48] = {
-	0, 4277, 8481, 12540, 16384, 19948, 23170, 25997,
-	28378, 30274, 31651, 32487, 32767, 32487, 31651, 30274,
-	28378, 25997, 23170, 19948, 16384, 12540, 8481, 4277,
-	0, -4277, -8481, -12540, -16384, -19948, -23170, -25997,
-	-28378, -30274, -31651, -32487, -32767, -32487, -31651, -30274,
-	-28378, -25997, -23170, -19948, -16384, -12540, -8481, -4277,
-};
-
-/* CPU-paced FIFO write. TXCOM 6 = OSOS B6620 TX start. */
-static ssize_t pio_tone_store(struct device *dev, struct device_attribute *attr,
-			      const char *buf, size_t count)
-{
-	struct s5l8740_i2s *i2s = dev_get_drvdata(dev);
-	unsigned int frames, i;
-	s16 s;
-
-	if (!i2s || !i2s->base)
-		return -ENODEV;
-	if (buf[0] != '1' && buf[0] != 'y' && buf[0] != 'Y')
-		return -EINVAL;
-
-	s5l8740_i2s_play_start(i2s, false);
-
-	frames = 48000 * 2; /* ~2 s */
-	for (i = 0; i < frames; i++) {
-		s = s5l8740_scale_s16(sine_1khz_48k[i % 48]);
-		s5l8740_i2s_fifo_write(i2s, s);
-		udelay(20);
-	}
-	writel(I2STXCOM_STOP, i2s->base + I2STXCOM);
-	dev_info(dev, "pio_tone 2s done status=0x%08x\n",
-		 readl(i2s->base + I2SSTATUS));
-	return count;
-}
-static DEVICE_ATTR_WO(pio_tone);
-
-struct dma_chan *s5l_pl080_request_slave(struct device *consumer,
-					 unsigned int idx);
-
-static struct dma_chan *s5l8740_i2s_tx_get(struct s5l8740_i2s *i2s,
-					   struct device *dev)
-{
-	if (i2s->tx_chan)
-		return i2s->tx_chan;
-	i2s->tx_chan = s5l_pl080_request_slave(dev, 0);
-	return i2s->tx_chan;
-}
-
-static void s5l8740_i2s_tx_put(struct s5l8740_i2s *i2s)
-{
-	if (!i2s || !i2s->tx_chan)
-		return;
-	dma_release_channel(i2s->tx_chan);
-	i2s->tx_chan = NULL;
-}
-
-/* One-shot OSOS path: PL080 M2P -> +0x10, then TXCOM=0xE. */
-static ssize_t dma_tone_store(struct device *dev, struct device_attribute *attr,
-			      const char *buf, size_t count)
-{
-	struct s5l8740_i2s *i2s = dev_get_drvdata(dev);
-	struct dma_chan *chan;
-	struct dma_async_tx_descriptor *desc;
-	struct dma_slave_config cfg = { };
-	dma_cookie_t cookie;
-	dma_addr_t dma;
-	s16 *tone;
-	size_t bytes = 48000 * 2 * 2 * 2; /* 2 s stereo S16 */
-	unsigned int i;
-	s16 s;
-	int ret;
-
-	if (!i2s || !i2s->base)
-		return -ENODEV;
-	if (buf[0] != '1' && buf[0] != 'y' && buf[0] != 'Y')
-		return -EINVAL;
-
-	mutex_lock(&i2s->dma_lock);
-	chan = s5l8740_i2s_tx_get(i2s, dev);
-	if (IS_ERR(chan)) {
-		ret = PTR_ERR(chan);
-		dev_err(dev, "dma_tone request tx: %d\n", ret);
-		mutex_unlock(&i2s->dma_lock);
-		return ret;
-	}
-
-	tone = dma_alloc_coherent(dev, bytes, &dma, GFP_KERNEL);
-	if (!tone) {
-		ret = -ENOMEM;
-		goto out_unlock;
-	}
-	for (i = 0; i < bytes / 4; i++) {
-		s = s5l8740_scale_s16(sine_1khz_48k[i % 48]);
-		tone[i * 2] = s;
-		tone[i * 2 + 1] = s;
-	}
-	dma_sync_single_for_device(dev, dma, bytes, DMA_TO_DEVICE);
-
-	cfg.direction = DMA_MEM_TO_DEV;
-	cfg.dst_addr = i2s->play_dma.addr;
-	if (tone_width == 2)
-		cfg.dst_addr_width = DMA_SLAVE_BUSWIDTH_2_BYTES;
-	else
-		cfg.dst_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
-	cfg.dst_maxburst = 1;
-	ret = dmaengine_slave_config(chan, &cfg);
-	if (ret) {
-		dev_err(dev, "dma_tone slave_config: %d\n", ret);
-		goto out_chan;
-	}
-
-	s5l8740_i2s_codec_prepare();
-	s5l8740_i2s_program(i2s, 48000);
-	desc = dmaengine_prep_slave_single(chan, dma, bytes, DMA_MEM_TO_DEV,
-					   DMA_PREP_INTERRUPT);
-	if (!desc) {
-		dev_err(dev, "dma_tone prep_slave_single failed\n");
-		ret = -EIO;
-		goto out_chan;
-	}
-	cookie = dmaengine_submit(desc);
-	if (dma_submit_error(cookie)) {
-		ret = cookie;
-		goto out_chan;
-	}
-	dma_async_issue_pending(chan);
-	s5l8740_i2s_tx_kick(i2s, true);
-	{
-		int asp = s5l8740_i2s_asp_lock();
-
-		dev_info(dev, "dma_tone asp_lock=%d\n", asp);
-	}
-	{
-		void __iomem *pl = ioremap(0x38200000ul, 0x200);
-		unsigned int t, i;
-
-		if (i2s->gpio) {
-			u32 xor[8] = { }, last[8] = { }, pcon[8] = { };
-			unsigned int b;
-
-			for (b = 0; b < 8; b++) {
-				pcon[b] = readl(i2s->gpio + 32 * b);
-				last[b] = readl(i2s->gpio + 32 * b + 4);
-			}
-			for (i = 0; i < 20000; i++) {
-				for (b = 0; b < 8; b++) {
-					u32 d = readl(i2s->gpio + 32 * b + 4);
-
-					xor[b] |= d ^ last[b];
-					last[b] = d;
-				}
-			}
-			dev_info(dev,
-				 "dma_tone pads xor %02x %02x %02x %02x %02x %02x %02x %02x\n",
-				 xor[0], xor[1], xor[2], xor[3],
-				 xor[4], xor[5], xor[6], xor[7]);
-			dev_info(dev,
-				 "dma_tone pcon %08x %08x %08x %08x\n",
-				 pcon[0], pcon[1], pcon[2], pcon[3]);
-		}
-
-		if (pl) {
-			for (t = 0; t < 3; t++) {
-				u32 en = readl(pl + 0x1c);
-				u32 st = readl(i2s->base + I2SSTATUS);
-				int ch;
-
-				dev_info(dev,
-					 "dma_tone t=%ums status=0x%x txcom=0x%x en=0x%x rawtc=0x%x\n",
-					 t * 100, st,
-					 readl(i2s->base + I2STXCOM), en,
-					 readl(pl + 0x14));
-				for (ch = 0; ch < 8; ch++) {
-					u32 dst = readl(pl + 0x104 + ch * 0x20);
-					u32 src = readl(pl + 0x100 + ch * 0x20);
-					u32 cfg = readl(pl + 0x110 + ch * 0x20);
-					u32 c2 = readl(pl + 0x114 + ch * 0x20);
-
-					if (!(en & BIT(ch)) && dst != 0x3ca00010)
-						continue;
-					dev_info(dev,
-						 "  ch%u src=0x%x dst=0x%x cfg=0x%x c2=0x%x\n",
-						 ch, src, dst, cfg, c2);
-				}
-				if (t == 0)
-					msleep(100);
-				else if (t == 1)
-					msleep(1900);
-			}
-			iounmap(pl);
-		}
-	}
-	dev_info(dev, "dma_tone 1kHz 2s status=0x%x txcom=0x%x\n",
-		 readl(i2s->base + I2SSTATUS),
-		 readl(i2s->base + I2STXCOM));
-	dmaengine_terminate_sync(chan);
-	writel(I2STXCOM_STOP, i2s->base + I2STXCOM);
-	ret = 0;
-out_chan:
-	dma_free_coherent(dev, bytes, tone, dma);
-out_unlock:
-	mutex_unlock(&i2s->dma_lock);
-	return ret ? ret : count;
-}
-static DEVICE_ATTR_WO(dma_tone);
-
-/* Sample GPIO DIN xor across banks 0-7. Use after clk_run or at idle. */
 static ssize_t pad_scan_show(struct device *dev, struct device_attribute *attr,
 			     char *buf)
 {
@@ -812,6 +1069,172 @@ static ssize_t pad_scan_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(pad_scan);
 
+struct dma_chan *s5l_pl080_request_slave(struct device *consumer,
+					 unsigned int idx);
+struct dma_chan *s5l_pl080_lookup_peri(unsigned int peri);
+
+static struct dma_chan *s5l8740_i2s_tx_get(struct s5l8740_i2s *i2s)
+{
+	struct dma_chan *chan;
+
+	if (i2s->tx_chan)
+		return i2s->tx_chan;
+	chan = s5l_pl080_lookup_peri(10);
+	if (chan) {
+		i2s->tx_chan = chan;
+		i2s->tx_chan_borrowed = 1;
+		return chan;
+	}
+	chan = s5l_pl080_request_slave(i2s->dev, 0);
+	if (IS_ERR_OR_NULL(chan))
+		return chan;
+	i2s->tx_chan = chan;
+	i2s->tx_chan_borrowed = 0;
+	return chan;
+}
+
+static void s5l8740_i2s_tx_put(struct s5l8740_i2s *i2s)
+{
+	if (!i2s || !i2s->tx_chan)
+		return;
+	if (!i2s->tx_chan_borrowed)
+		dma_release_channel(i2s->tx_chan);
+	i2s->tx_chan = NULL;
+	i2s->tx_chan_borrowed = 0;
+}
+
+static unsigned int s5l8740_i2s_tone_rate(void)
+{
+	if (tone_rate)
+		return n31_pick_rate(tone_rate);
+	return n31_pick_rate(default_rate);
+}
+
+static ssize_t pio_tone_store(struct device *dev, struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct s5l8740_i2s *i2s = dev_get_drvdata(dev);
+	unsigned int rate, frames, i;
+	s16 s;
+
+	if (!i2s || !i2s->base)
+		return -ENODEV;
+	if (buf[0] != '1' && buf[0] != 'y' && buf[0] != 'Y')
+		return -EINVAL;
+
+	rate = s5l8740_i2s_tone_rate();
+	s5l8740_i2s_codec_prepare();
+	s5l8740_i2s_program(i2s, rate);
+	s5l8740_i2s_codec_play_start();
+	s5l8740_i2s_tx_kick(i2s, false);
+
+	frames = rate * 2;
+	for (i = 0; i < frames; i++) {
+		s = s5l8740_scale_s16(n31_tone_s16(i, rate));
+		writel(((u32)(u16)s << 16) | (u16)s, i2s->base + I2STXFIFO);
+		udelay(1000000 / rate);
+	}
+	s5l8740_i2s_codec_play_stop();
+	s5l8740_i2s_hw_stop(i2s, NULL);
+	dev_info(dev, "pio_tone 2s rate=%u status=0x%08x\n",
+		 rate, readl(i2s->base + I2SSTATUS));
+	return count;
+}
+static DEVICE_ATTR_WO(pio_tone);
+
+static ssize_t dma_tone_store(struct device *dev, struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct s5l8740_i2s *i2s = dev_get_drvdata(dev);
+	struct dma_chan *chan;
+	struct dma_async_tx_descriptor *desc;
+	struct dma_slave_config cfg = { };
+	dma_cookie_t cookie;
+	dma_addr_t dma;
+	s16 *tone;
+	unsigned int rate, frames, i;
+	size_t bytes;
+	s16 s;
+	int ret;
+
+	if (!i2s || !i2s->base)
+		return -ENODEV;
+	if (buf[0] != '1' && buf[0] != 'y' && buf[0] != 'Y')
+		return -EINVAL;
+
+	rate = s5l8740_i2s_tone_rate();
+	frames = n31_tone_period_frames(rate);
+	bytes = frames * 2 * sizeof(s16);
+
+	mutex_lock(&i2s->dma_lock);
+	chan = s5l8740_i2s_tx_get(i2s);
+	if (IS_ERR_OR_NULL(chan)) {
+		ret = chan ? PTR_ERR(chan) : -ENODEV;
+		dev_err(dev, "dma_tone request tx: %d\n", ret);
+		mutex_unlock(&i2s->dma_lock);
+		return ret;
+	}
+
+	tone = dma_alloc_coherent(dev, bytes, &dma, GFP_KERNEL);
+	if (!tone) {
+		ret = -ENOMEM;
+		goto out_unlock;
+	}
+	for (i = 0; i < frames; i++) {
+		s = s5l8740_scale_s16(n31_tone_s16(i, rate));
+		tone[i * 2] = s;
+		tone[i * 2 + 1] = s;
+	}
+	dma_sync_single_for_device(dev, dma, bytes, DMA_TO_DEVICE);
+
+	cfg.direction = DMA_MEM_TO_DEV;
+	cfg.dst_addr = i2s->play_dma.addr;
+	cfg.dst_addr_width = (tone_width == 2) ?
+		DMA_SLAVE_BUSWIDTH_2_BYTES : DMA_SLAVE_BUSWIDTH_4_BYTES;
+	cfg.dst_maxburst = 1;
+	ret = dmaengine_slave_config(chan, &cfg);
+	if (ret) {
+		dev_err(dev, "dma_tone slave_config: %d\n", ret);
+		goto out_buf;
+	}
+
+	s5l8740_i2s_codec_prepare();
+	s5l8740_i2s_program(i2s, rate);
+	desc = dmaengine_prep_dma_cyclic(chan, dma, bytes, bytes,
+					 DMA_MEM_TO_DEV, DMA_PREP_INTERRUPT);
+	if (!desc) {
+		dev_err(dev, "dma_tone prep_dma_cyclic failed\n");
+		ret = -ENOMEM;
+		goto out_buf;
+	}
+	cookie = dmaengine_submit(desc);
+	if (dma_submit_error(cookie)) {
+		ret = cookie;
+		goto out_buf;
+	}
+	dma_async_issue_pending(chan);
+	s5l8740_i2s_codec_play_start();
+	s5l8740_i2s_tx_kick(i2s, true);
+	s5l8740_i2s_schedule_asp();
+	dev_info(dev, "dma_tone 1kHz rate=%u frames=%u bytes=%zu cyclic 2s\n",
+		 rate, frames, bytes);
+	msleep(2000);
+	s5l8740_i2s_cancel_asp();
+	s5l8740_i2s_codec_play_stop();
+	dmaengine_terminate_sync(chan);
+	s5l8740_i2s_hw_stop(i2s, NULL);
+	dev_info(dev, "dma_tone done status=0x%x txcom=0x%x\n",
+		 readl(i2s->base + I2SSTATUS),
+		 readl(i2s->base + I2STXCOM));
+	ret = 0;
+out_buf:
+	dma_free_coherent(dev, bytes, tone, dma);
+out_unlock:
+	mutex_unlock(&i2s->dma_lock);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(dma_tone);
+
 /* Program IIS and leave TXCOM running so BCLK/LRCK (and MCLK if any) stay up. */
 static ssize_t clk_run_store(struct device *dev, struct device_attribute *attr,
 			     const char *buf, size_t count)
@@ -824,7 +1247,7 @@ static ssize_t clk_run_store(struct device *dev, struct device_attribute *attr,
 	if (kstrtouint(buf, 0, &v))
 		return -EINVAL;
 	if (v) {
-		s5l8740_i2s_program(i2s, 48000);
+		s5l8740_i2s_program(i2s, n31_pick_rate(default_rate));
 		s5l8740_i2s_tx_kick(i2s, false);
 	} else {
 		writel(I2STXCOM_STOP, i2s->base + I2STXCOM);
@@ -868,12 +1291,13 @@ static int s5l8740_i2s_probe(struct platform_device *pdev)
 	if (res) {
 		i2s->play_dma.addr = res->start + I2STXFIFO;
 		i2s->play_dma.addr_width = DMA_SLAVE_BUSWIDTH_2_BYTES;
-		i2s->play_dma.maxburst = 1;
+		i2s->play_dma.maxburst = 4;
 	}
 
 	platform_set_drvdata(pdev, i2s);
 	dev_set_drvdata(dev, i2s);
 	mutex_init(&i2s->dma_lock);
+	INIT_DELAYED_WORK(&i2s->dma_watch, s5l8740_i2s_dma_watch);
 
 	if (!use_pio && of_property_present(dev->of_node, "dmas")) {
 		ret = devm_snd_dmaengine_pcm_register(dev, NULL, 0);
@@ -936,6 +1360,7 @@ static void s5l8740_i2s_remove(struct platform_device *pdev)
 		i2s->kthread = NULL;
 	}
 	s5l8740_i2s_tx_put(i2s);
+	cancel_delayed_work_sync(&i2s->dma_watch);
 	if (i2s && i2s->num_clks)
 		clk_bulk_disable_unprepare(i2s->num_clks, i2s->clks);
 }

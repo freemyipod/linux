@@ -7,16 +7,22 @@
  * DT #dma-cells = <2>: <peri_id ccr_flags>
  * Quirks (PL080 + I²S on S5L8740/N31):
  *   Burst: M2P dest=1 beat (fixed IIS FIFO @+0x10); src≈4 beats (half FIFO).
- *   Peri: glass IIS0 TX/RX = 10/11 (Rockbox 0xA); OSOS table 12/13 never TCs.
+ *   Peri: RetailOS oracle 2026-08-25 — IIS0 TX **10** (→0x3CA00010), IIS2 RX **13**
+ *         (←0x3D400038); BT A2DP uses UART1 only (no PL080). Glass: peri 12 stuck;
+ *         Rockbox IIS0 TX=0xA. See artifacts/retailos-mmio/README.md.
  *   Cache: PL080 not coherent — dma_sync in start(); no CTL_PROT_CACHE on slave.
- *   LLI: dma_alloc_coherent, 16-byte aligned chain; misaligned LLI hangs engine.
+ *   LLI: OSOS B424C uses **5×u32 / 20-byte** nodes (src,dst,lli,ctl,count).
+ *        Count lives in LLI[4] and is programmed to CONTROL2 @+0x114.
  *   terminate_all: CFG disable + bounded ENBLD poll — never spin on BUSY (amba-pl08x).
  *   SG: multi-element builds LLI chain; contiguous buffers preferred (CMA).
  *   AHB: M2P src=mem on AHB2 (ahb_s=1), dst=FIFO on AHB1 (ahb_d=0).
  *   FIFO: S3C64xx-style ~64 deep — src burst 8 (m2p_src_burst=2), dst=1.
- *   PL080S: CONTROL2 @+0x114 holds count (OSOS B424C), not CTL low bits.
- *   Cache: ARM1176 32-byte lines — LLI/buffer 32-byte aligned; sync in start().
+ *   PL080S/S5L: CTL @+0x10c, CFG @+0x110, CONTROL2 count @+0x114 (OSOS B424C).
+ *        Not the mainline Samsung map (CONTROL2@+0x10 / CFG@+0x14).
+ *   Cache: ARM1176 32-byte lines — buffer 32-byte aligned; sync in start().
  */
+#include <linux/preempt.h>
+#include <linux/bitmap.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/dmaengine.h>
@@ -79,20 +85,30 @@
 #define CTL_PROT_CACHE		BIT(30)
 
 /* Glass: peri 12 Active+c2 stuck. peri 10 SRC walks. Rockbox IIS0 TX=0xA. */
-static int force_peri = 10;
+static int force_peri = -1;
 module_param(force_peri, int, 0644);
 MODULE_PARM_DESC(force_peri, "override DT DMA peri id (-1 = use DT)");
 static int force_mem;
 module_param(force_mem, int, 0644);
 MODULE_PARM_DESC(force_mem, "1 = M2M flow + soft req, dest still FIFO");
-static int force_flow = -1;
+/*
+ * RetailOS music CFG = 0x28a81 (Active RO bit17 set mid-play → base 0x8a81):
+ *   DstPeri=10, FlowCntrl=1 (M2P DMA), ITC=1, IE=0.
+ * Earlier misread of Active as Flow=5; keep Flow=1 per PL080-DECODE.md.
+ */
+static int force_flow = 1;
 module_param(force_flow, int, 0644);
-MODULE_PARM_DESC(force_flow, "PL080 FlowCntrl -1=auto M2P, 0=M2M+soft, 1=M2P, 5=M2P-peri");
+MODULE_PARM_DESC(force_flow, "PL080 FlowCntrl -1=auto M2P, 0=M2M+soft, 1=M2P (RetailOS), 5=M2P-peri");
 /* DDI0196 CxControl bits 24/25: 0=AHB1, 1=AHB2. Kitra memcpy uses AHB1. */
-/* M2P: AHB2→memory, AHB1→APB FIFO (Samsung PL080S topology). */
-static int ahb_s = 1;
+/*
+ * RetailOS music-playing CTL = 0x84249000:
+ *   Prot=0, SI=1, width=16, SB=1, DB=1, AHB_S=0, AHB_D=0, TC_IRQ=1.
+ * Prior Linux defaults (ahb_s=1, SB=8, DB=1, Prot=PRIV|BUFF) yielded
+ * CTL 0xb5242000 and STATUS stuck in 0x2A0 class vs retail 0x320.
+ */
+static int ahb_s;
 module_param(ahb_s, int, 0644);
-MODULE_PARM_DESC(ahb_s, "source AHB master (0=AHB1/periph-side, 1=AHB2/mem)");
+MODULE_PARM_DESC(ahb_s, "source AHB master (0=AHB1 RetailOS music, 1=AHB2)");
 static int ahb_d;
 module_param(ahb_d, int, 0644);
 MODULE_PARM_DESC(ahb_d, "dest AHB master (0=AHB1/periph, 1=AHB2/mem)");
@@ -100,27 +116,38 @@ MODULE_PARM_DESC(ahb_d, "dest AHB master (0=AHB1/periph, 1=AHB2/mem)");
 static int xfer_width = 1;
 module_param(xfer_width, int, 0644);
 MODULE_PARM_DESC(xfer_width, "PL080 src/dst width 0=8 1=16 2=32");
-/* M2P: dest burst 1; src 8 beats (~half 64-entry IIS FIFO). */
-static int m2p_src_burst = 2; /* enc: 2=8 beats */
+/* RetailOS music SBSIZE/DBSIZE enc = 1 (4-beat? enc1) — CTL 0x84249000. */
+static int m2p_src_burst = 1;
 module_param(m2p_src_burst, int, 0644);
-MODULE_PARM_DESC(m2p_src_burst, "M2P SBSIZE enc (default 2=8 beats)");
-static int m2p_dst_burst; /* 0=1 beat — do not burst into IIS TX FIFO */
+MODULE_PARM_DESC(m2p_src_burst, "M2P SBSIZE enc (default 1 = RetailOS music)");
+static int m2p_dst_burst = 1;
 module_param(m2p_dst_burst, int, 0644);
-MODULE_PARM_DESC(m2p_dst_burst, "M2P DBSIZE enc (default 0=1 beat)");
-static int force_eng = -1;
+MODULE_PARM_DESC(m2p_dst_burst, "M2P DBSIZE enc (default 1 = RetailOS music)");
+/* 1=match RetailOS Prot=0 on slave; 0=PRIV|BUFF (old Linux). */
+static int retail_prot = 1;
+module_param(retail_prot, int, 0644);
+MODULE_PARM_DESC(retail_prot, "1=Prot=0 on M2P/P2M (RetailOS music CTL)");
+static int force_eng = 0;
 module_param(force_eng, int, 0644);
-MODULE_PARM_DESC(force_eng, "PL080 engine 0/1 for xlate (-1 = either)");
+MODULE_PARM_DESC(force_eng, "PL080 engine 0/1 for xlate (-1 = either; default 0 = PL080_0)");
+/* Prefer physical channel (RetailOS music uses ch2). -1 = first free. */
+static int force_ch = 2;
+module_param(force_ch, int, 0644);
+MODULE_PARM_DESC(force_ch, "prefer PL080 channel id 0..7 (-1=any; default 2=RetailOS)");
 
+/* OSOS B424C descriptor stride is 20 bytes; keep pool 32-byte aligned. */
 #define PL080_LLI_ALIGN		32
 #define PL080_TERM_POLL_US	10
 #define PL080_TERM_POLL_MAX	10
+#define PL080S_XFER_COUNT_MASK	0x1fffffffu
 
 struct pl080_lli {
 	__le32 src;
 	__le32 dst;
 	__le32 lli;
 	__le32 ctrl;
-} __aligned(PL080_LLI_ALIGN);
+	__le32 ctrl2; /* transfer count → CONTROL2 (OSOS v27) */
+};
 
 static size_t s5l_pl080_lli_size(unsigned int nlli)
 {
@@ -132,21 +159,8 @@ static dma_addr_t s5l_pl080_lli_pa(dma_addr_t base, unsigned int idx)
 	return base + idx * sizeof(struct pl080_lli);
 }
 
-static struct pl080_lli *s5l_pl080_lli_alloc(struct device *dev,
-					     unsigned int nlli,
-					     dma_addr_t *phys)
-{
-	size_t bytes = s5l_pl080_lli_size(nlli);
-	struct pl080_lli *lli;
+#define PL080_LLI_POOL_NODES	64
 
-	lli = dma_alloc_coherent(dev, bytes, phys, GFP_NOWAIT);
-	if (!lli)
-		return NULL;
-	if (*phys & (PL080_LLI_ALIGN - 1))
-		dev_warn(dev, "LLI phys misaligned pa=%pad (need %u)\n",
-			 &*phys, PL080_LLI_ALIGN);
-	return lli;
-}
 struct s5l_pl080_chan {
 	struct virt_dma_chan	vc;
 	struct s5l_pl080	*host;
@@ -165,16 +179,23 @@ struct s5l_pl080_desc {
 	struct pl080_lli	*lli;
 	dma_addr_t		lli_phys;
 	unsigned int		nlli;
+	unsigned int		lli_off;
+	bool			lli_from_pool;
 	u32			cfg;
 	bool			cyclic;
 	dma_addr_t		buf_addr;
 	size_t			buf_len;
+	size_t			period_len;
+	unsigned int		periods;
+	unsigned int		periods_done;
 };
 
 struct s5l_pl080;
 
 struct dma_chan *s5l_pl080_request_slave(struct device *consumer,
 					 unsigned int idx);
+struct dma_chan *s5l_pl080_lookup_peri(unsigned int peri);
+int s5l_pl080_peri_snapshot(unsigned int peri, u32 *src, u32 *dst, u32 *en);
 
 struct s5l_pl080 {
 	struct device		*dev;
@@ -185,8 +206,81 @@ struct s5l_pl080 {
 	spinlock_t		lock;
 	void			*dummy_cpu;
 	dma_addr_t		dummy_dma;
+	struct pl080_lli	*lli_pool;
+	dma_addr_t		lli_pool_phys;
+	DECLARE_BITMAP(lli_busy, PL080_LLI_POOL_NODES);
 	struct task_struct	*pump;
 };
+
+static struct pl080_lli *s5l_pl080_lli_alloc(struct s5l_pl080 *pl,
+					     unsigned int nlli,
+					     dma_addr_t *phys,
+					     unsigned int *off,
+					     bool *from_pool)
+{
+	unsigned long flags;
+	unsigned int i, j;
+	struct pl080_lli *lli;
+
+	if (!pl || !nlli || !phys || !off || !from_pool)
+		return NULL;
+
+	if (pl->lli_pool && nlli <= PL080_LLI_POOL_NODES) {
+		spin_lock_irqsave(&pl->lock, flags);
+		for (i = 0; i + nlli <= PL080_LLI_POOL_NODES; i++) {
+			for (j = 0; j < nlli; j++) {
+				if (test_bit(i + j, pl->lli_busy))
+					break;
+			}
+			if (j != nlli)
+				continue;
+			for (j = 0; j < nlli; j++)
+				set_bit(i + j, pl->lli_busy);
+			*phys = pl->lli_pool_phys +
+				i * sizeof(struct pl080_lli);
+			*off = i;
+			*from_pool = true;
+			spin_unlock_irqrestore(&pl->lock, flags);
+			return pl->lli_pool + i;
+		}
+		spin_unlock_irqrestore(&pl->lock, flags);
+	}
+
+	lli = dma_alloc_coherent(pl->dev, s5l_pl080_lli_size(nlli), phys,
+				 GFP_NOWAIT);
+	if (!lli) {
+		dev_warn_ratelimited(pl->dev,
+				     "LLI alloc nlli=%u ENOMEM\n", nlli);
+		return NULL;
+	}
+	*off = 0;
+	*from_pool = false;
+	return lli;
+}
+
+static void s5l_pl080_lli_release(struct s5l_pl080 *pl, struct s5l_pl080_desc *d)
+{
+	unsigned long flags;
+	unsigned int j;
+
+	if (!pl || !d || !d->lli)
+		return;
+	if (d->lli_from_pool) {
+		spin_lock_irqsave(&pl->lock, flags);
+		for (j = 0; j < d->nlli && d->lli_off + j < PL080_LLI_POOL_NODES;
+		     j++)
+			clear_bit(d->lli_off + j, pl->lli_busy);
+		spin_unlock_irqrestore(&pl->lock, flags);
+	} else if (!irqs_disabled() && !in_atomic()) {
+		dma_free_coherent(pl->dev, s5l_pl080_lli_size(d->nlli),
+				  d->lli, d->lli_phys);
+	} else {
+		dev_warn_ratelimited(pl->dev,
+				     "LLI leak nlli=%u (atomic free)\n",
+				     d->nlli);
+	}
+	d->lli = NULL;
+}
 
 static int s5l_pl080_need_soft(void)
 {
@@ -260,6 +354,11 @@ static unsigned int s5l_pl080_unit(void)
 	return 1u << w;
 }
 
+/*
+ * CTL template only — transfer count is NOT in CTL[11:0] on this SoC.
+ * OSOS B424C / RetailOS music CTL (e.g. 0x84249000) keep size bits clear;
+ * count is written to CONTROL2 and LLI ctrl2.
+ */
 static u32 s5l_pl080_build_ctl(struct s5l_pl080_chan *ch, u32 words,
 			      bool src_inc, bool dst_inc, bool irq)
 {
@@ -267,19 +366,20 @@ static u32 s5l_pl080_build_ctl(struct s5l_pl080_chan *ch, u32 words,
 	unsigned int sb, db;
 	u32 ctl;
 
+	(void)words;
 	if (w > 2)
 		w = 1;
 	if (ch && (ch->dir == DMA_MEM_TO_DEV || ch->dir == DMA_DEV_TO_MEM)) {
 		sb = ch->src_burst;
 		db = ch->dst_burst;
-		ctl = CTL_PROT_PRIV | CTL_PROT_BUFF;
+		ctl = retail_prot ? 0 : (CTL_PROT_PRIV | CTL_PROT_BUFF);
 	} else {
 		/* M2M selftest / memcpy: Rockbox pcm-s5l8702 8/4 */
 		sb = 2;
 		db = 1;
 		ctl = CTL_PROT_PRIV | CTL_PROT_BUFF | CTL_PROT_CACHE;
 	}
-	ctl |= words | (w << CTL_WIDTH_SHIFT) | (w << (CTL_WIDTH_SHIFT + 3)) |
+	ctl |= (w << CTL_WIDTH_SHIFT) | (w << (CTL_WIDTH_SHIFT + 3)) |
 	      (sb << CTL_SBSIZE_SHIFT) | (db << CTL_DBSIZE_SHIFT);
 	if (ahb_s)
 		ctl |= BIT(24);
@@ -345,11 +445,11 @@ static void s5l_pl080_start(struct s5l_pl080_chan *ch, struct s5l_pl080_desc *d)
 	s5l_pl080_chan_disable(ch);
 	writel(le32_to_cpu(first->src), b + PL080_Cx_SRC(id));
 	writel(le32_to_cpu(first->dst), b + PL080_Cx_DST(id));
-	/* Next LLI, not the first (already loaded into SRC/DST/CTL). */
+	/* Next LLI, not the first (already loaded into SRC/DST/CTL/C2). */
 	writel(le32_to_cpu(first->lli), b + PL080_Cx_LLI(id));
 	writel(le32_to_cpu(first->ctrl), b + PL080_Cx_CTL(id));
-	/* B424C: CONTROL2 = transfer count (v27 & 0x1FFFFFFF), not CTL. */
-	writel(le32_to_cpu(first->ctrl) & 0x1fffffffu,
+	/* B424C: *v25 = v27 & 0x1FFFFFFF — count only, never the CTL word. */
+	writel(le32_to_cpu(first->ctrl2) & PL080S_XFER_COUNT_MASK,
 	       b + PL080S_Cx_CONTROL2(id));
 	writel(d->cfg | CFG_ENABLE, b + PL080_Cx_CFG(id));
 	/* M2M / force_flow 0|4: software request. M2P peri waits for IIS DRQ. */
@@ -359,11 +459,11 @@ static void s5l_pl080_start(struct s5l_pl080_chan *ch, struct s5l_pl080_desc *d)
 			writel(BIT(id), b + PL080_SOFT_SREQ);
 	}
 	ch->running = d;
-	dev_info(ch->host->dev,
-		 "ch%u start peri=%u cfg=0x%x nlli=%u src=0x%x dst=0x%x ctl=0x%x\n",
+	dev_dbg(ch->host->dev,
+		"ch%u start peri=%u cfg=0x%x nlli=%u src=0x%x dst=0x%x ctl=0x%x c2=0x%x\n",
 		 ch->id, ch->peri, (u32)(d->cfg | CFG_ENABLE), d->nlli,
 		 le32_to_cpu(first->src), le32_to_cpu(first->dst),
-		 le32_to_cpu(first->ctrl));
+		 le32_to_cpu(first->ctrl), le32_to_cpu(first->ctrl2));
 }
 
 static void s5l_pl080_issue(struct dma_chan *c)
@@ -399,16 +499,23 @@ static enum dma_status s5l_pl080_tx_status(struct dma_chan *c,
 	spin_lock_irqsave(&ch->vc.lock, flags);
 	d = ch->running;
 	if (d && d->buf_len) {
-		u8 id = ch->id % PL080_CH_COUNT;
+		if (d->cyclic && d->period_len) {
+			size_t pos = (size_t)d->periods_done * d->period_len;
 
-		cur = readl(ch->base + ((ch->dir == DMA_DEV_TO_MEM) ?
-					PL080_Cx_DST(id) : PL080_Cx_SRC(id)));
-		start = lower_32_bits(d->buf_addr);
-		end = start + d->buf_len;
-		if (cur >= start && cur < end)
-			state->residue = end - cur;
-		else
-			state->residue = d->buf_len;
+			pos %= d->buf_len;
+			state->residue = d->buf_len - pos;
+		} else {
+			u8 id = ch->id % PL080_CH_COUNT;
+
+			cur = readl(ch->base + ((ch->dir == DMA_DEV_TO_MEM) ?
+						PL080_Cx_DST(id) : PL080_Cx_SRC(id)));
+			start = lower_32_bits(d->buf_addr);
+			end = start + d->buf_len;
+			if (cur >= start && cur < end)
+				state->residue = end - cur;
+			else
+				state->residue = d->buf_len;
+		}
 	}
 	spin_unlock_irqrestore(&ch->vc.lock, flags);
 	return st;
@@ -429,9 +536,7 @@ static void s5l_pl080_desc_free(struct virt_dma_desc *vd)
 	struct s5l_pl080_desc *d = to_s5l_desc(vd);
 	struct s5l_pl080_chan *ch = to_s5l_chan(vd->tx.chan);
 
-	if (d->lli && !irqs_disabled() && !in_atomic())
-		dma_free_coherent(ch->host->dev, s5l_pl080_lli_size(d->nlli),
-				  d->lli, d->lli_phys);
+	s5l_pl080_lli_release(ch->host, d);
 	kfree(d);
 }
 
@@ -466,7 +571,8 @@ s5l_pl080_prep_slave_sg(struct dma_chan *c, struct scatterlist *sgl,
 	if (!d)
 		return NULL;
 
-	lli = s5l_pl080_lli_alloc(ch->host->dev, nlli, &lli_phys);
+	lli = s5l_pl080_lli_alloc(ch->host, nlli, &lli_phys, &d->lli_off,
+				  &d->lli_from_pool);
 	if (!lli) {
 		kfree(d);
 		return NULL;
@@ -475,7 +581,10 @@ s5l_pl080_prep_slave_sg(struct dma_chan *c, struct scatterlist *sgl,
 	cfg = 0;
 	dev_addr = ch->fifo_addr;
 	if (force_flow >= 0) {
-		cfg |= ((force_flow & 7) << CFG_FLOW_SHIFT) | CFG_IE | CFG_ITC;
+		/* Retail music Flow=1 → CFG 0x8a81 (ITC only; Active RO adds 0x20000). */
+		cfg |= ((force_flow & 7) << CFG_FLOW_SHIFT) | CFG_ITC;
+		if (force_flow != 1 && force_flow != 5)
+			cfg |= CFG_IE;
 		if (dir == DMA_MEM_TO_DEV)
 			cfg |= (ch->peri & 0x1f) << CFG_DST_PERI_SHIFT;
 		else
@@ -528,6 +637,8 @@ s5l_pl080_prep_slave_sg(struct dma_chan *c, struct scatterlist *sgl,
 					dir == DMA_MEM_TO_DEV,
 					dir == DMA_DEV_TO_MEM,
 					idx == nlli - 1));
+				lli[idx].ctrl2 = cpu_to_le32(words &
+							     PL080S_XFER_COUNT_MASK);
 
 				if (idx < nlli - 1)
 					lli[idx].lli = cpu_to_le32(
@@ -583,7 +694,8 @@ s5l_pl080_prep_dma_cyclic(struct dma_chan *c, dma_addr_t buf_addr,
 	if (!d)
 		return NULL;
 
-	lli = s5l_pl080_lli_alloc(ch->host->dev, nlli, &lli_phys);
+	lli = s5l_pl080_lli_alloc(ch->host, nlli, &lli_phys, &d->lli_off,
+				  &d->lli_from_pool);
 	if (!lli) {
 		kfree(d);
 		return NULL;
@@ -592,7 +704,10 @@ s5l_pl080_prep_dma_cyclic(struct dma_chan *c, dma_addr_t buf_addr,
 	cfg = 0;
 	dev_addr = ch->fifo_addr;
 	if (force_flow >= 0) {
-		cfg |= ((force_flow & 7) << CFG_FLOW_SHIFT) | CFG_IE | CFG_ITC;
+		/* Retail music Flow=1 → CFG 0x8a81 (ITC only; Active RO adds 0x20000). */
+		cfg |= ((force_flow & 7) << CFG_FLOW_SHIFT) | CFG_ITC;
+		if (force_flow != 1 && force_flow != 5)
+			cfg |= CFG_IE;
 		if (dir == DMA_MEM_TO_DEV)
 			cfg |= (ch->peri & 0x1f) << CFG_DST_PERI_SHIFT;
 		else
@@ -645,6 +760,8 @@ s5l_pl080_prep_dma_cyclic(struct dma_chan *c, dma_addr_t buf_addr,
 				dir == DMA_MEM_TO_DEV,
 				dir == DMA_DEV_TO_MEM,
 				period_last));
+			lli[idx].ctrl2 = cpu_to_le32(words &
+						     PL080S_XFER_COUNT_MASK);
 
 			if (idx + 1 < nlli)
 				lli[idx].lli = cpu_to_le32(lower_32_bits(
@@ -668,6 +785,9 @@ s5l_pl080_prep_dma_cyclic(struct dma_chan *c, dma_addr_t buf_addr,
 	d->cyclic = true;
 	d->buf_addr = buf_addr;
 	d->buf_len = buf_len;
+	d->period_len = period_len;
+	d->periods = periods;
+	d->periods_done = 0;
 	dev_info(ch->host->dev,
 		 "cyclic ok peri=%u nlli=%u periods=%u period=%zu fifo=0x%x\n",
 		 ch->peri, nlli, periods, period_len,
@@ -682,12 +802,19 @@ static int s5l_pl080_config(struct dma_chan *c,
 
 	if (cfg->direction == DMA_MEM_TO_DEV) {
 		ch->fifo_addr = cfg->dst_addr;
-		ch->src_burst = cfg->src_maxburst ?
-			s5l_pl080_burst_enc(cfg->src_maxburst) :
-			clamp(m2p_src_burst, 0, 7);
-		ch->dst_burst = cfg->dst_maxburst ?
-			s5l_pl080_burst_enc(cfg->dst_maxburst) :
-			clamp(m2p_dst_burst, 0, 7);
+		/*
+		 * ALSA/dma_tone often pass maxburst=1. burst_enc(1)=0, but
+		 * RetailOS music CTL 0x84249000 needs SB/DB enc=1. Prefer
+		 * module params (oracle) over a 1-beat slave hint.
+		 */
+		if (cfg->src_maxburst > 1)
+			ch->src_burst = s5l_pl080_burst_enc(cfg->src_maxburst);
+		else
+			ch->src_burst = clamp(m2p_src_burst, 0, 7);
+		if (cfg->dst_maxburst > 1)
+			ch->dst_burst = s5l_pl080_burst_enc(cfg->dst_maxburst);
+		else
+			ch->dst_burst = clamp(m2p_dst_burst, 0, 7);
 	} else {
 		ch->fifo_addr = cfg->src_addr;
 		ch->src_burst = cfg->src_maxburst ?
@@ -706,8 +833,8 @@ static int s5l_pl080_terminate(struct dma_chan *c)
 	unsigned long flags;
 	struct virt_dma_desc *vd;
 
-	dev_info(ch->host->dev,
-		 "term ch%u en=0x%x src=0x%x dst=0x%x lli=0x%x ctl=0x%x cfg=0x%x rawtc=0x%x rawerr=0x%x\n",
+	dev_dbg(ch->host->dev,
+		"term ch%u en=0x%x src=0x%x dst=0x%x lli=0x%x ctl=0x%x cfg=0x%x rawtc=0x%x rawerr=0x%x\n",
 		 ch->id, readl(ch->base + PL080_ENBLD_CHNS),
 		 readl(ch->base + PL080_Cx_SRC(id)),
 		 readl(ch->base + PL080_Cx_DST(id)),
@@ -746,9 +873,8 @@ static irqreturn_t s5l_pl080_irq(int irq, void *data)
 		tc = readl(b + PL080_INT_TC_STATUS);
 		err = readl(b + PL080_INT_ERR_STATUS);
 		if (tc || err)
-			dev_info_ratelimited(pl->dev,
-					     "irq eng%u tc=0x%x err=0x%x\n",
-					     eng, tc, err);
+			dev_dbg(pl->dev, "irq eng%u tc=0x%x err=0x%x\n",
+				eng, tc, err);
 		if (tc)
 			writel(tc, b + PL080_INT_TC_CLEAR);
 		if (err)
@@ -765,6 +891,9 @@ static irqreturn_t s5l_pl080_irq(int irq, void *data)
 				spin_lock_irqsave(&ch->vc.lock, flags);
 				d = ch->running;
 				if (d && d->cyclic) {
+					d->periods_done++;
+					if (d->periods)
+						d->periods_done %= d->periods;
 					vchan_cyclic_callback(&d->vd);
 					spin_unlock_irqrestore(&ch->vc.lock,
 							       flags);
@@ -806,6 +935,27 @@ static struct dma_chan *s5l_pl080_xlate_args(struct s5l_pl080 *pl,
 	} else {
 		eng_lo = 0;
 		eng_hi = PL080_CH_COUNT * 2;
+	}
+	/*
+	 * RetailOS music: peri 10 on physical ch2 (EnbldChns=0x4). Prefer it.
+	 * (ASoC often already holds ch2 — dma_tone must reuse via lookup_peri,
+	 * not allocate a second peri-10 channel on ch3.)
+	 */
+	if (force_ch >= 0 && force_ch < PL080_CH_COUNT && peri == 10) {
+		unsigned int prefer = eng_lo + force_ch;
+
+		if (prefer < eng_hi) {
+			ch = &pl->chans[prefer];
+			if (ch->base && !ch->vc.chan.client_count) {
+				ch->peri = peri;
+				ch->src_burst = clamp(m2p_src_burst, 0, 7);
+				ch->dst_burst = clamp(m2p_dst_burst, 0, 7);
+				dev_info(pl->dev,
+					 "xlate DT peri=%u -> ch%u (forced) peri=%u\n",
+					 spec->args[0] & 0x1f, prefer, ch->peri);
+				return dma_get_slave_channel(&ch->vc.chan);
+			}
+		}
 	}
 	for (i = eng_lo; i < eng_hi; i++) {
 		ch = &pl->chans[i];
@@ -859,6 +1009,70 @@ struct dma_chan *s5l_pl080_request_slave(struct device *consumer,
 	return chan;
 }
 EXPORT_SYMBOL_GPL(s5l_pl080_request_slave);
+
+/*
+ * Return an already-owned channel for peri (no client_count bump).
+ * dma_tone uses this so it rides RetailOS ch2 held by ASoC instead of
+ * allocating a second peri-10 channel.
+ */
+struct dma_chan *s5l_pl080_lookup_peri(unsigned int peri)
+{
+	struct device_node *np;
+	struct platform_device *pdev;
+	struct s5l_pl080 *pl;
+	unsigned int i;
+	struct dma_chan *found = NULL;
+
+	np = of_find_compatible_node(NULL, NULL, "apple,s5l8740-pl080");
+	if (!np)
+		np = of_find_compatible_node(NULL, NULL, "arm,pl080");
+	if (!np)
+		return NULL;
+	pdev = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!pdev)
+		return NULL;
+	pl = platform_get_drvdata(pdev);
+	if (!pl) {
+		put_device(&pdev->dev);
+		return NULL;
+	}
+	peri &= 0x1f;
+	for (i = 0; i < PL080_CH_COUNT * 2; i++) {
+		struct s5l_pl080_chan *ch = &pl->chans[i];
+
+		if (!ch->base || ch->peri != peri || !ch->vc.chan.client_count)
+			continue;
+		found = &ch->vc.chan;
+		dev_dbg(pl->dev, "lookup peri=%u -> ch%u clients=%u\n",
+			peri, ch->id, ch->vc.chan.client_count);
+		break;
+	}
+	put_device(&pdev->dev);
+	return found;
+}
+EXPORT_SYMBOL_GPL(s5l_pl080_lookup_peri);
+
+int s5l_pl080_peri_snapshot(unsigned int peri, u32 *src, u32 *dst, u32 *en)
+{
+	struct dma_chan *chan;
+	struct s5l_pl080_chan *ch;
+	u8 id;
+
+	chan = s5l_pl080_lookup_peri(peri);
+	if (!chan)
+		return -ENODEV;
+	ch = to_s5l_chan(chan);
+	id = ch->id % PL080_CH_COUNT;
+	if (src)
+		*src = readl(ch->base + PL080_Cx_SRC(id));
+	if (dst)
+		*dst = readl(ch->base + PL080_Cx_DST(id));
+	if (en)
+		*en = readl(ch->base + PL080_ENBLD_CHNS);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(s5l_pl080_peri_snapshot);
 
 static ssize_t chregs_show(struct device *dev, struct device_attribute *attr,
 			   char *buf)
@@ -1057,6 +1271,15 @@ static int s5l_pl080_probe(struct platform_device *pdev)
 	if (!pl->dummy_cpu)
 		dev_warn(dev, "dummy DMA sink alloc failed\n");
 
+	pl->lli_pool = dmam_alloc_coherent(dev,
+					   s5l_pl080_lli_size(PL080_LLI_POOL_NODES),
+					   &pl->lli_pool_phys, GFP_KERNEL);
+	if (!pl->lli_pool)
+		dev_warn(dev, "LLI pool alloc failed — GFP_NOWAIT fallback only\n");
+	else
+		dev_info(dev, "LLI pool %u nodes pa=%pad\n",
+			 PL080_LLI_POOL_NODES, &pl->lli_pool_phys);
+
 	pl->pump = kthread_run(s5l_pl080_pump, pl, "n31-pl080-pump");
 	if (IS_ERR(pl->pump)) {
 		dev_warn(dev, "soft-req pump: %ld\n", PTR_ERR(pl->pump));
@@ -1068,7 +1291,7 @@ static int s5l_pl080_probe(struct platform_device *pdev)
 	if (ret)
 		dev_warn(dev, "chregs sysfs: %d\n", ret);
 	dev_info(dev,
-		 "PL080 dmaengine @%pR id=%02x peri IIS0=10/11 (glass) OSOS=12/13\n",
+		 "PL080 dmaengine @%pR id=%02x peri IIS0=10/11 IIS2 RX=13 (RetailOS)\n",
 		 platform_get_resource(pdev, IORESOURCE_MEM, 0), id0);
 	return 0;
 }

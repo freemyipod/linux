@@ -98,7 +98,7 @@
 #define FMSS_GREP_MAX_BLOCKS	64
 #define FMSS_VFL_MAP_MAX	512
 #define FMSS_L2V_DEFAULT_BLOCKS	256
-/* Map is keyed by page LPN (YaFTL); early LBAs also in early_lba_map. */
+/* Map is keyed by page LPN (YaFTL); full LBA map preferred for block I/O. */
 #define FMSS_L2V_DEFAULT_MAX_LPN \
 	((FMSS_FTL_DEFAULT_CAPACITY / FMSS_FTL_SECTORS_PER_LPN) + 64)
 
@@ -108,18 +108,31 @@
 #define WMR_MOUNT_MAX_BLOCKS	64u
 #define WMR_FTLCTRL_MAX		3u
 
-/* Packed L2V entry: valid|ce[1:0]|cau[1:0]|sec[1:0]|block[11:0]|page[6:0]
+/* Packed L2V entry:
+ *   valid|ce[1:0]|cau[1:0]|PHYS|sec[1:0]|block[11:0]|page[6:0]
  * sec = 4K index within the NAND page (SFTL VBA). 0x3 = “use LBA%4”.
+ * PHYS: block is already physical (BTOC/BTE/META/carve) — do NOT VFL-remap.
  */
 #define L2V_VALID		BIT(31)
 #define L2V_CE_SHIFT		29
 #define L2V_CAU_SHIFT		27
+#define L2V_PHYS		BIT(26)	/* already-physical block */
 #define L2V_SEC_SHIFT		19
 #define L2V_SEC_MASK		0x3u
 #define L2V_SEC_FROM_LBA	0x3u	/* sentinel: derive sec from lba%4 */
 #define L2V_BLOCK_SHIFT		7
 #define L2V_PAGE_MASK		0x7fu
 #define L2V_BLOCK_MASK		0xfffu
+
+/* Claim source priority for newest-wins (higher wins on equal weave). */
+enum {
+	L2V_SRC_NONE = 0,
+	L2V_SRC_CARVE = 1,
+	L2V_SRC_WMR = 2,	/* classic virt block-map (may need VFL) */
+	L2V_SRC_BTOC = 3,
+	L2V_SRC_BTE = 4,
+	L2V_SRC_META = 5,
+};
 
 struct fmss_vfl_map {
 	unsigned int cau;
@@ -166,18 +179,55 @@ static unsigned int vfl_build_blocks = 32;
 module_param(vfl_build_blocks, uint, 0644);
 MODULE_PARM_DESC(vfl_build_blocks, "max blocks per CAU for vfl_build (default 32, tail only)");
 
+/*
+ * VFL remap of map entries that are NOT marked L2V_PHYS.
+ * BTOC/BTE/carve store physical scan blocks — remapping those double-translates.
+ * Default off until wrmx+0x100 is proven as direct virt→phys.
+ */
+static char vfl_remap_mode[16] = "off";
+module_param_string(vfl_remap_mode, vfl_remap_mode, sizeof(vfl_remap_mode), 0644);
+MODULE_PARM_DESC(vfl_remap_mode,
+		 "off (default) | direct256 | tail_only — VFL remap for non-PHYS map entries");
+
+static unsigned int vfl_remap_applied;
+static unsigned int vfl_remap_skipped_phys;
+
 /* Tiny list for sysfs lpn_index (debug); dense map is authoritative. */
 static struct fmss_lpn_map lpn_index[FMSS_LPN_INDEX_MAX];
 static unsigned int lpn_index_count;
 
 /* Dense LPN → physical page map (vzalloc). */
 static u32 *l2v_map;
+static u64 *l2v_weave;
+static u8 *l2v_src;
 static unsigned int l2v_map_size;
 static unsigned int l2v_mapped;
 static unsigned int l2v_max_lpn;
 static unsigned int l2v_btoc_hits;
 static unsigned int l2v_bmap_hits;
 static unsigned int l2v_meta_hits;
+
+/*
+ * Full LBA → packed phys+sec map (SFTL BTE / boot carve). Preferred over LPN
+ * dense map for block I/O.
+ *
+ * WARNING: FMSS_FTL_DEFAULT_CAPACITY is ~3.8M *sectors* (~15GB media). A dense
+ * map of that size is ~50MB+ RAM (u32+u64+u8) and OOMs N31 before RNDIS.
+ * Cap with lba_map_max (default 262144 ≈ 1GB LBA space ≈ 3.4MB RAM).
+ */
+#define FMSS_LBA_MAP_HARDMAX	FMSS_FTL_DEFAULT_CAPACITY
+static unsigned int lba_map_max = 262144;
+module_param(lba_map_max, uint, 0644);
+MODULE_PARM_DESC(lba_map_max,
+		 "max LBA entries for dense map (default 262144; full media is ~3.8M / ~50MB)");
+static u32 *lba_map;
+static u64 *lba_weave;
+static u8 *lba_src;
+static unsigned int lba_mapped;
+
+/* Last resolution chain for sysfs resolve_log. */
+static char resolve_log[512];
+static unsigned int resolve_log_len;
 
 /* Carved Apple FAT boot (*UOKJIHC); sector 0 served from here. */
 static bool boot_carve_valid;
@@ -210,10 +260,19 @@ MODULE_PARM_DESC(boot_carve_block,
 		 "cached aligned boot block (0=BTOC hunt for LPN0)");
 
 /* Default l2v_build width when sysfs omits NBLOCKS (user blocks to scan). */
-static unsigned int l2v_auto_blocks = 512;
+static unsigned int l2v_auto_blocks = 256;
 module_param(l2v_auto_blocks, uint, 0644);
 MODULE_PARM_DESC(l2v_auto_blocks,
 		 "default l2v_build block span per CE/CAU (0=carve/boot hunt only)");
+
+/*
+ * Legacy dense-map META ingest. Off unless l2v_build/whimory_mount is
+ * running — FIL reads from the Whimory driver must not allocate the
+ * ~50MB LBA map as a side effect.
+ */
+static bool fmss_legacy_meta_ingest;
+
+static int (*fmss_ftl_read_hook)(u64 lba, void *buf);
 
 /* Root-dir physical page when LPN(DataStart) is otherwise unmapped. */
 static bool root_dir_valid;
@@ -265,12 +324,14 @@ struct fmss_n31 {
 	int last_page_ret;
 	int last_page_chunk;
 	unsigned int last_page_len;
+	unsigned int last_clean_chunks;
 	u8 last_param[FMSS_PARAM_LEN];
 	int last_param_ce;
 	int last_param_ret;
 	u32 last_stat48;
 	u32 last_nandstat;
 	unsigned int pages_since_reset;
+	unsigned int ecc_soft_fails;
 	int dma_ok;
 	int dma_mapped;
 	struct device *dev;
@@ -332,9 +393,22 @@ static unsigned int page_chunks = 16;
 module_param(page_chunks, uint, 0644);
 MODULE_PARM_DESC(page_chunks, "1K PIO chunks per page_read (16=full 16KiB data)");
 
-static unsigned int spare_len = 16;
+static unsigned int spare_len = 64;
 module_param(spare_len, uint, 0644);
-MODULE_PARM_DESC(spare_len, "extra PIO bytes after data (OSOS meta is 16)");
+MODULE_PARM_DESC(spare_len,
+		 "PIO META bytes after data (default 64 = 4×16B slots; was 16)");
+
+/*
+ * 50D960 parity FIFO is 53 bytes per 1K: 16B host spare (Sogeti META) + ECC.
+ * Draining it before 4EB458 steals the syndrome (whitened data). A second
+ * 50D960 with ecc_before_drain=0 copies META and keeps the first pass's data.
+ * Extra style-1 FMLEN=15 beats after a style-0 page returned 0xFF and made
+ * the next programmed page ECC-clean (glass 2026-08-27).
+ */
+static bool meta_pass = true;
+module_param(meta_pass, bool, 0644);
+MODULE_PARM_DESC(meta_pass,
+		 "Second 50D960 to stash 53-byte parity into META slots (default Y)");
 
 /*
  * 4EDDDC: D14 = (v40 ? 8D102F0 : 8D102EC) - 1.
@@ -744,6 +818,10 @@ static int fmss_ecc_chunk(struct fmss_n31 *f, unsigned int seed_a1)
  * Per 1KiB chunk: parity beat → data xfer wait → 4EB458 → PIO drain.
  * Linux previously drained before ECC — that left DATA pages whitened.
  */
+static void fmss_meta_ingest_spare(struct fmss_n31 *f, unsigned int ce,
+				   unsigned int cau, unsigned int block,
+				   unsigned int page, unsigned int slot0);
+
 static int fmss_page_read(struct fmss_n31 *f, unsigned int ce, u32 addr)
 {
 	int i, ret = -EIO, ecc_ret;
@@ -759,10 +837,13 @@ static int fmss_page_read(struct fmss_n31 *f, unsigned int ce, u32 addr)
 		chunks = 3;
 
 	memset(dst, 0, FMSS_PAGE_LEN);
+	memset(f->last_spare, 0, sizeof(f->last_spare));
+	f->last_spare_len = 0;
 	f->last_page_ce = (int)ce;
 	f->last_page_addr = addr;
 	f->last_page_chunk = -1;
 	f->last_page_len = 0;
+	f->last_clean_chunks = 0;
 
 	writel(7, f->base + FMUNK38);
 	writel(fmss_page_ctrl0(ce), f->base + FMCTRL0);
@@ -828,11 +909,31 @@ static int fmss_page_read(struct fmss_n31 *f, unsigned int ce, u32 addr)
 
 				memset(dig, 0, sizeof(dig));
 				if (!fmss_pio_read(f, dig, 53)) {
-					memcpy(f->last_spare, dig, 53);
-					f->last_spare_len = 53;
+					memcpy(f->last_parity[i], dig, 53);
+					f->last_parity_len[i] = 53;
+					/*
+					 * Host-visible spare is the first 16 of
+					 * the 53-byte beat, once per 4K slot.
+					 */
+					if ((i & 3) == 0) {
+						unsigned int slot = (unsigned int)i / 4u;
+						unsigned int pick = 0;
+
+						if (slot < 4) {
+							if (dig[0] != 0x30) {
+								if (dig[16] == 0x30)
+									pick = 16;
+								else if (dig[32] == 0x30)
+									pick = 32;
+							}
+							memcpy(f->last_spare + slot * 16,
+							       dig + pick, 16);
+							f->last_spare_len = (slot + 1) * 16;
+						}
+					}
 					if (!quiet)
-						fmss_info("stripped parity-fifo %02x%02x%02x%02x…\n",
-							  dig[0], dig[1], dig[2], dig[3]);
+						fmss_info("stripped parity-fifo ch=%d %02x%02x%02x%02x…\n",
+							  i, dig[0], dig[1], dig[2], dig[3]);
 				}
 			}
 		}
@@ -858,17 +959,21 @@ static int fmss_page_read(struct fmss_n31 *f, unsigned int ce, u32 addr)
 		if (with_parity && ecc_before_drain) {
 			ecc_ret = fmss_ecc_chunk(f, 0);
 			if (ecc_ret == 1) {
-				/* Clean page — leave zeros already in dst. */
-				f->last_page_ret = 0;
-				f->last_page_len = chunks * FMSS_CHUNK;
-				fmss_cmd(f, 0x77);
-				writel(0, f->base + FMCTRL0);
-				return 0;
+				/*
+				 * Chunk is erased/clean — leave zeros and
+				 * keep going. Aborting the whole page on
+				 * chunk0 made FPart/VFL miss SLC specials
+				 * (glass: 4096 tail reads, tag30=0).
+				 */
+				f->last_clean_chunks++;
+				continue;
 			}
 			if (ecc_ret) {
-				/* Fall through to raw drain — better than wedge. */
-				pr_info("s5l8740-fmss: ECC soft-fail ce=%u addr=%08x chunk=%d ret=%d (raw drain)\n",
-					ce, addr, i, ecc_ret);
+				/* Blank BTOC pages are normal during l2v_build — count, don't spam. */
+				f->ecc_soft_fails++;
+				if (!quiet && i == 0)
+					fmss_info("ECC soft-fail ce=%u addr=%08x ret=%d (raw drain)\n",
+						  ce, addr, ecc_ret);
 			}
 		}
 		if (fmss_pio_read(f, dst + i * FMSS_CHUNK, FMSS_CHUNK)) {
@@ -878,26 +983,80 @@ static int fmss_page_read(struct fmss_n31 *f, unsigned int ce, u32 addr)
 		}
 	}
 
-	memset(f->last_spare, 0, sizeof(f->last_spare));
-	f->last_spare_len = 0;
-	if (spare_len && spare_len <= sizeof(f->last_spare)) {
-		if (fmss_data_in(f, f->last_spare, spare_len)) {
-			pr_info("s5l8740-fmss: spare timeout ce=%u addr=%08x len=%u\n",
-				ce, addr, spare_len);
-		} else {
-			f->last_spare_len = spare_len;
-		}
-	}
+	/*
+	 * Trailing fmss_data_in(64) after 16×1K is an empty FIFO (zeros) and
+	 * must not be treated as META (that polluted lba_map with type 0x00).
+	 * Extra style-1 FMLEN=15 beats after this path desynced the next page.
+	 */
 
 	fmss_cmd(f, 0x77);
 	writel(0, f->base + FMCTRL0);
 	f->last_page_ret = 0;
 	f->last_page_len = chunks * FMSS_CHUNK;
+	/* Full-page PIO: ingest all META slots into lba_map (pass 2). */
+	if (chunks >= 16 && f->last_spare_len >= 16) {
+		unsigned int pg = addr & L2V_PAGE_MASK;
+		unsigned int blk = (addr >> FMSS_PAGE_BITS) & L2V_BLOCK_MASK;
+		unsigned int cau = (addr >> (FMSS_PAGE_BITS + FMSS_BLOCK_BITS)) &
+				   ((1u << FMSS_CAU_BITS) - 1u);
+
+		fmss_meta_ingest_spare(f, ce, cau, blk, pg, 0);
+	}
 	return 0;
 
 fail_ctrl0:
 	writel(0, f->base + FMCTRL0);
 	f->last_page_ret = ret;
+	return ret;
+}
+
+/*
+ * FIL needs both descrambled data (pass 1, ECC) and 16B Sogeti META
+ * (pass 2, drain 53-byte parity FIFO). Mutex is already held.
+ */
+static int fmss_page_read_with_meta(struct fmss_n31 *f, unsigned int ce,
+				    u32 addr)
+{
+	static u8 page_bak[FMSS_PAGE_LEN];
+	unsigned int dlen;
+	int ret, ret2;
+	bool saved_ecc;
+	int saved_ce, saved_chunk;
+	u32 saved_addr;
+
+	ret = fmss_page_read(f, ce, addr);
+	if (ret || !meta_pass)
+		return ret;
+	/*
+	 * Erased PPN page: all 16 chunks ECC-clean. Spare is 0xFF; a second
+	 * 50D960 only burns the controller (tail+brute are mostly empty).
+	 */
+	if (f->last_clean_chunks &&
+	    f->last_clean_chunks >= (page_chunks ? page_chunks : 16)) {
+		memset(f->last_spare, 0xff, sizeof(f->last_spare));
+		f->last_spare_len = 64;
+		return ret;
+	}
+	dlen = f->last_page_len;
+	if (dlen > FMSS_PAGE_LEN)
+		dlen = FMSS_PAGE_LEN;
+	memcpy(page_bak, f->last_page, dlen);
+	saved_ce = f->last_page_ce;
+	saved_addr = f->last_page_addr;
+	saved_chunk = f->last_page_chunk;
+	saved_ecc = ecc_before_drain;
+	ecc_before_drain = false;
+	ret2 = fmss_page_read(f, ce, addr);
+	ecc_before_drain = saved_ecc;
+	memcpy(f->last_page, page_bak, dlen);
+	f->last_page_len = dlen;
+	f->last_page_ce = saved_ce;
+	f->last_page_addr = saved_addr;
+	f->last_page_chunk = saved_chunk;
+	f->last_page_ret = ret;
+	if (ret2 && !quiet)
+		pr_info("s5l8740-fmss: meta pass ce=%u addr=%08x ret=%d (data kept)\n",
+			ce, addr, ret2);
 	return ret;
 }
 
@@ -1220,6 +1379,14 @@ dma_done:
 		  cl[0], cl[1], cl[2], cl[3], cl[4], cl[5], cl[6], cl[7], cl[8],
 		  (u32)f->seq_dma, (u32)f->cmdl_dma, (u32)f->data_dma,
 		  (u32)f->spare_dma);
+	if (!ret && f->last_spare_len >= 16) {
+		unsigned int pg = addr & L2V_PAGE_MASK;
+		unsigned int blk = (addr >> FMSS_PAGE_BITS) & L2V_BLOCK_MASK;
+		unsigned int cau = (addr >> (FMSS_PAGE_BITS + FMSS_BLOCK_BITS)) &
+				   ((1u << FMSS_CAU_BITS) - 1u);
+
+		fmss_meta_ingest_spare(f, ce, cau, blk, pg, dma_slot);
+	}
 	return ret;
 }
 
@@ -1336,11 +1503,19 @@ static int fmss_nand_reset(struct fmss_n31 *f)
 	unsigned int ce;
 	int ret;
 
+	/* Abort a wedged 50D960 (glass: STAT48 stuck 0x080c3002, FIL -110). */
+	writel(0, f->base + FMCTRL0);
+	writel(0x0FF00FFE, f->base + FMSTAT48);
+	writel(13, f->base + FMSEQIRQ);
+	udelay(100);
+	writel(1, f->base + FMCTRL0);
+
 	ret = fmss_ctrl_reset(f);
 	if (ret)
 		return ret;
 	for (ce = 0; ce < 2; ce++) {
 		writel((2u * (1u << ce)) | 0xFF001u, f->base + FMCTRL0);
+		writel(2, f->base + FMSTAT48);
 		if (fmss_cmd(f, 0xff))
 			pr_info("s5l8740-fmss: cmd 0xFF timeout ce=%u st=%08x\n",
 				ce, f->last_stat48);
@@ -2162,20 +2337,24 @@ static unsigned int fmss_bpb_data_start(const u8 *bpb)
 
 static u32 fmss_l2v_pack_sec(unsigned int ce, unsigned int cau,
 			     unsigned int block, unsigned int page,
-			     unsigned int sec)
+			     unsigned int sec, bool phys)
 {
-	return L2V_VALID |
-	       ((ce & 3u) << L2V_CE_SHIFT) |
-	       ((cau & 3u) << L2V_CAU_SHIFT) |
-	       ((sec & L2V_SEC_MASK) << L2V_SEC_SHIFT) |
-	       ((block & L2V_BLOCK_MASK) << L2V_BLOCK_SHIFT) |
-	       (page & L2V_PAGE_MASK);
+	u32 e = L2V_VALID |
+		((ce & 3u) << L2V_CE_SHIFT) |
+		((cau & 3u) << L2V_CAU_SHIFT) |
+		((sec & L2V_SEC_MASK) << L2V_SEC_SHIFT) |
+		((block & L2V_BLOCK_MASK) << L2V_BLOCK_SHIFT) |
+		(page & L2V_PAGE_MASK);
+
+	if (phys)
+		e |= L2V_PHYS;
+	return e;
 }
 
 static u32 fmss_l2v_pack(unsigned int ce, unsigned int cau,
-			 unsigned int block, unsigned int page)
+			 unsigned int block, unsigned int page, bool phys)
 {
-	return fmss_l2v_pack_sec(ce, cau, block, page, L2V_SEC_FROM_LBA);
+	return fmss_l2v_pack_sec(ce, cau, block, page, L2V_SEC_FROM_LBA, phys);
 }
 
 static void fmss_l2v_unpack_sec(u32 e, unsigned int *ce, unsigned int *cau,
@@ -2198,6 +2377,18 @@ static void fmss_l2v_unpack(u32 e, unsigned int *ce, unsigned int *cau,
 	(void)sec;
 }
 
+static bool fmss_claim_better(u8 old_src, u64 old_weave, u8 new_src,
+			      u64 new_weave)
+{
+	if (!old_src)
+		return true;
+	if (new_weave > old_weave)
+		return true;
+	if (new_weave < old_weave)
+		return false;
+	return new_src > old_src;
+}
+
 static void fmss_wmr_map_free(void)
 {
 	vfree(wmr_block_map);
@@ -2205,10 +2396,55 @@ static void fmss_wmr_map_free(void)
 	wmr_block_map_n = 0;
 }
 
+static void fmss_lba_map_free(void)
+{
+	vfree(lba_map);
+	vfree(lba_weave);
+	vfree(lba_src);
+	lba_map = NULL;
+	lba_weave = NULL;
+	lba_src = NULL;
+	lba_mapped = 0;
+}
+
+static unsigned int fmss_lba_map_cap(void)
+{
+	unsigned int cap = lba_map_max;
+
+	if (!cap)
+		cap = 262144;
+	if (cap > FMSS_LBA_MAP_HARDMAX)
+		cap = FMSS_LBA_MAP_HARDMAX;
+	return cap;
+}
+
+static int fmss_lba_map_ensure(void)
+{
+	unsigned int cap;
+
+	if (lba_map)
+		return 0;
+	cap = fmss_lba_map_cap();
+	lba_map = vzalloc(array_size(cap, sizeof(*lba_map)));
+	lba_weave = vzalloc(array_size(cap, sizeof(*lba_weave)));
+	lba_src = vzalloc(array_size(cap, sizeof(*lba_src)));
+	if (!lba_map || !lba_weave || !lba_src) {
+		fmss_lba_map_free();
+		return -ENOMEM;
+	}
+	pr_info("fmss-s5l8740: LBA dense map cap=%u (~%u KiB)\n",
+		cap, (cap * (4 + 8 + 1)) / 1024);
+	return 0;
+}
+
 static void fmss_l2v_free(void)
 {
 	vfree(l2v_map);
+	vfree(l2v_weave);
+	vfree(l2v_src);
 	l2v_map = NULL;
+	l2v_weave = NULL;
+	l2v_src = NULL;
 	l2v_map_size = 0;
 	l2v_mapped = 0;
 	l2v_max_lpn = 0;
@@ -2222,19 +2458,35 @@ static int fmss_l2v_ensure(unsigned int max_lpn)
 {
 	unsigned int need = max_lpn + 1;
 	u32 *n;
+	u64 *nw;
+	u8 *ns;
 
 	if (l2v_map && l2v_map_size >= need) {
 		l2v_max_lpn = max_lpn;
 		return 0;
 	}
 	n = vzalloc(array_size(need, sizeof(*n)));
-	if (!n)
+	nw = vzalloc(array_size(need, sizeof(*nw)));
+	ns = vzalloc(array_size(need, sizeof(*ns)));
+	if (!n || !nw || !ns) {
+		vfree(n);
+		vfree(nw);
+		vfree(ns);
 		return -ENOMEM;
+	}
 	if (l2v_map) {
 		memcpy(n, l2v_map, l2v_map_size * sizeof(*n));
+		if (l2v_weave)
+			memcpy(nw, l2v_weave, l2v_map_size * sizeof(*nw));
+		if (l2v_src)
+			memcpy(ns, l2v_src, l2v_map_size * sizeof(*ns));
 		vfree(l2v_map);
+		vfree(l2v_weave);
+		vfree(l2v_src);
 	}
 	l2v_map = n;
+	l2v_weave = nw;
+	l2v_src = ns;
 	l2v_map_size = need;
 	l2v_max_lpn = max_lpn;
 	return 0;
@@ -2265,72 +2517,85 @@ static void fmss_l2v_index_note(unsigned int lpn, unsigned int ce,
 	lpn_index_count++;
 }
 
-static void fmss_l2v_set(unsigned int lpn, unsigned int ce, unsigned int cau,
-			 unsigned int block, unsigned int page)
+static void fmss_l2v_set_ex(unsigned int lpn, unsigned int ce, unsigned int cau,
+			    unsigned int block, unsigned int page, bool phys,
+			    u8 src, u64 weave)
 {
-	u32 prev;
+	u32 prev, packed;
+	u8 old_src;
+	u64 old_weave;
 
 	if (!l2v_map || lpn >= l2v_map_size)
 		return;
 	prev = l2v_map[lpn];
-	l2v_map[lpn] = fmss_l2v_pack(ce, cau, block, page);
+	old_src = l2v_src ? l2v_src[lpn] : 0;
+	old_weave = l2v_weave ? l2v_weave[lpn] : 0;
+	if ((prev & L2V_VALID) &&
+	    !fmss_claim_better(old_src, old_weave, src, weave))
+		return;
+	packed = fmss_l2v_pack(ce, cau, block, page, phys);
+	l2v_map[lpn] = packed;
+	if (l2v_src)
+		l2v_src[lpn] = src;
+	if (l2v_weave)
+		l2v_weave[lpn] = weave;
 	if (!(prev & L2V_VALID))
 		l2v_mapped++;
 	fmss_l2v_index_note(lpn, ce, cau, block, page);
+	if (!quiet && l2v_mapped <= 8)
+		pr_info("s5l8740-fmss: l2v_set lpn=%u src=%u phys=%d ce=%u cau=%u blk=%u pg=%u weave=%llx\n",
+			lpn, src, phys, ce, cau, block, page,
+			(unsigned long long)weave);
 }
 
-/* Early LBA map (boot+FAT+root): SFTL LBA → packed phys+sec. */
-#define FMSS_EARLY_LBA_MAX	8192u
-static u32 *early_lba_map;
-static unsigned int early_lba_mapped;
-
-static void fmss_early_lba_free(void)
+static void fmss_lba_set(unsigned int lba, unsigned int ce, unsigned int cau,
+			 unsigned int block, unsigned int page, unsigned int sec,
+			 bool phys, u8 src, u64 weave)
 {
-	vfree(early_lba_map);
-	early_lba_map = NULL;
-	early_lba_mapped = 0;
-}
+	u32 prev, packed;
+	u8 old_src;
+	u64 old_weave;
 
-static int fmss_early_lba_ensure(void)
-{
-	if (early_lba_map)
-		return 0;
-	early_lba_map = vzalloc(FMSS_EARLY_LBA_MAX * sizeof(*early_lba_map));
-	return early_lba_map ? 0 : -ENOMEM;
-}
-
-static void fmss_early_lba_set(unsigned int lba, unsigned int ce,
-			       unsigned int cau, unsigned int block,
-			       unsigned int page, unsigned int sec)
-{
-	u32 prev;
-
-	if (lba >= FMSS_EARLY_LBA_MAX || fmss_early_lba_ensure())
+	if (lba >= fmss_lba_map_cap() || fmss_lba_map_ensure())
 		return;
-	prev = early_lba_map[lba];
-	early_lba_map[lba] = fmss_l2v_pack_sec(ce, cau, block, page, sec & 3u);
+	prev = lba_map[lba];
+	old_src = lba_src[lba];
+	old_weave = lba_weave[lba];
+	if ((prev & L2V_VALID) &&
+	    !fmss_claim_better(old_src, old_weave, src, weave))
+		return;
+	packed = fmss_l2v_pack_sec(ce, cau, block, page, sec & 3u, phys);
+	lba_map[lba] = packed;
+	lba_src[lba] = src;
+	lba_weave[lba] = weave;
 	if (!(prev & L2V_VALID))
-		early_lba_mapped++;
+		lba_mapped++;
+	if (!quiet && lba_mapped <= 8)
+		pr_info("s5l8740-fmss: lba_set lba=%u src=%u phys=%d ce=%u cau=%u blk=%u pg=%u sec=%u weave=%llx\n",
+			lba, src, phys, ce, cau, block, page, sec & 3u,
+			(unsigned long long)weave);
 }
 
-static int fmss_early_lba_lookup(unsigned int lba, unsigned int *ce,
-				 unsigned int *cau, unsigned int *block,
-				 unsigned int *page, unsigned int *sec)
+static int fmss_lba_lookup(unsigned int lba, unsigned int *ce,
+			   unsigned int *cau, unsigned int *block,
+			   unsigned int *page, unsigned int *sec, u32 *packed)
 {
 	u32 e;
 
-	if (!early_lba_map || lba >= FMSS_EARLY_LBA_MAX)
+	if (!lba_map || lba >= fmss_lba_map_cap())
 		return -ENOENT;
-	e = early_lba_map[lba];
+	e = lba_map[lba];
 	if (!(e & L2V_VALID))
 		return -ENOENT;
 	fmss_l2v_unpack_sec(e, ce, cau, block, page, sec);
+	if (packed)
+		*packed = e;
 	return 0;
 }
 
-static int fmss_l2v_lookup(unsigned int lpn, unsigned int *ce,
-			   unsigned int *cau, unsigned int *block,
-			   unsigned int *page)
+static int fmss_l2v_lookup_ex(unsigned int lpn, unsigned int *ce,
+			      unsigned int *cau, unsigned int *block,
+			      unsigned int *page, u32 *packed)
 {
 	u32 e;
 
@@ -2340,7 +2605,96 @@ static int fmss_l2v_lookup(unsigned int lpn, unsigned int *ce,
 	if (!(e & L2V_VALID))
 		return -ENOENT;
 	fmss_l2v_unpack(e, ce, cau, block, page);
+	if (packed)
+		*packed = e;
 	return 0;
+}
+
+static int fmss_l2v_lookup(unsigned int lpn, unsigned int *ce,
+			   unsigned int *cau, unsigned int *block,
+			   unsigned int *page)
+{
+	return fmss_l2v_lookup_ex(lpn, ce, cau, block, page, NULL);
+}
+
+static void fmss_early_lba_free(void)
+{
+	fmss_lba_map_free();
+}
+
+/*
+ * Pass 2: promote PIO/DMA META slots into full lba_map.
+ * type 0x01 data records; weave newest-wins via fmss_lba_set.
+ */
+static void fmss_meta_ingest_spare(struct fmss_n31 *f, unsigned int ce,
+				   unsigned int cau, unsigned int block,
+				   unsigned int page, unsigned int slot0)
+{
+	unsigned int s, nslots;
+
+	if (!fmss_legacy_meta_ingest)
+		return;
+	if (!f || f->last_page_ret || f->last_spare_len < 16)
+		return;
+	if (fmss_lba_map_ensure())
+		return;
+	nslots = f->last_spare_len / 16;
+	if (nslots > FMSS_VBAS_PER_PAGE)
+		nslots = FMSS_VBAS_PER_PAGE;
+	if (slot0 >= FMSS_VBAS_PER_PAGE)
+		slot0 = 0;
+	if (slot0 + nslots > FMSS_VBAS_PER_PAGE)
+		nslots = FMSS_VBAS_PER_PAGE - slot0;
+	for (s = 0; s < nslots; s++) {
+		const u8 *meta = f->last_spare + s * 16;
+		u32 lba, before;
+		u64 weave;
+
+		if (meta[0] != 0x01)
+			continue;
+		lba = get_unaligned_le32(meta + 8);
+		if (lba >= fmss_lba_map_cap())
+			continue;
+		weave = fmss_ppn_weave48(meta);
+		before = lba_map[lba];
+		fmss_lba_set(lba, ce, cau, block, page, slot0 + s, true,
+			     L2V_SRC_META, weave);
+		if (lba_map[lba] != before)
+			l2v_meta_hits++;
+	}
+}
+
+/* Compat: physical BTOC-style set (legacy callers). */
+static void __maybe_unused fmss_l2v_set(unsigned int lpn, unsigned int ce,
+					unsigned int cau, unsigned int block,
+					unsigned int page)
+{
+	fmss_l2v_set_ex(lpn, ce, cau, block, page, true, L2V_SRC_BTOC, 0);
+}
+
+/* Thin wrapper — BTOC/carve physical fills. */
+static void __maybe_unused fmss_early_lba_set(unsigned int lba, unsigned int ce,
+					      unsigned int cau,
+					      unsigned int block,
+					      unsigned int page,
+					      unsigned int sec)
+{
+	fmss_lba_set(lba, ce, cau, block, page, sec, true, L2V_SRC_BTOC, 0);
+}
+
+static int __maybe_unused fmss_early_lba_lookup(unsigned int lba,
+						unsigned int *ce,
+						unsigned int *cau,
+						unsigned int *block,
+						unsigned int *page,
+						unsigned int *sec)
+{
+	return fmss_lba_lookup(lba, ce, cau, block, page, sec, NULL);
+}
+
+static int __maybe_unused fmss_early_lba_ensure(void)
+{
+	return fmss_lba_map_ensure();
 }
 
 /*
@@ -2458,14 +2812,15 @@ static void fmss_l2v_ingest_btoc(struct fmss_n31 *f, unsigned int ce,
 			 */
 			continue;
 		}
-		fmss_l2v_set(lpn, ce, cau, block, p);
-		/* Also fill early LBA map for boot/FAT (4 LBAs per page LPN). */
-		if (lpn < FMSS_EARLY_LBA_MAX / FMSS_VBAS_PER_PAGE) {
+		fmss_l2v_set_ex(lpn, ce, cau, block, p, true, L2V_SRC_BTOC, 0);
+		/* Fill LBA map for all 4 sectors of this page LPN. */
+		{
 			unsigned int s;
 
 			for (s = 0; s < FMSS_VBAS_PER_PAGE; s++)
-				fmss_early_lba_set(lpn * FMSS_VBAS_PER_PAGE + s,
-						   ce, cau, block, p, s);
+				fmss_lba_set(lpn * FMSS_VBAS_PER_PAGE + s,
+					     ce, cau, block, p, s, true,
+					     L2V_SRC_BTOC, 0);
 		}
 	}
 }
@@ -2503,19 +2858,25 @@ static void fmss_l2v_ingest_bte(struct fmss_n31 *f, unsigned int ce,
 				const u8 *page, unsigned int max_lpn)
 {
 	unsigned int i, recs, vba_ofs = 0, hit = 0;
-	unsigned int usable = 1024; /* page_chunks=1 BTOC walk only has 1 KiB */
+	unsigned int usable = 1024;
 
-	(void)f;
 	(void)max_lpn;
 	if (!fmss_page_looks_bte(page))
 		return;
-	if (fmss_early_lba_ensure())
+	if (fmss_lba_map_ensure())
 		return;
+	/* Prefer full page when available (pass 2: fill full lba_map). */
+	if (f && f->last_page_len)
+		usable = f->last_page_len;
+	if (usable > FMSS_PAGE_LEN)
+		usable = FMSS_PAGE_LEN;
 	recs = usable / 16;
 	for (i = 0; i < recs; i++) {
 		const u8 *r = page + i * 16;
 		u32 lba = get_unaligned_be32(r + 8);
 		u32 span = r[15];
+		u64 weave = ((u64)get_unaligned_be32(r) << 16) |
+			    (get_unaligned_be16(r + 4) & 0xffffu);
 		unsigned int j;
 
 		if (!span || span > 128)
@@ -2530,8 +2891,9 @@ static void fmss_l2v_ingest_bte(struct fmss_n31 *f, unsigned int ce,
 
 			if (pg >= FMSS_BTOC_PAGE)
 				goto done;
-			if (cur < FMSS_EARLY_LBA_MAX)
-				fmss_early_lba_set(cur, ce, cau, block, pg, sec);
+			if (cur < fmss_lba_map_cap())
+				fmss_lba_set(cur, ce, cau, block, pg, sec,
+					     true, L2V_SRC_BTE, weave);
 			vba_ofs++;
 		}
 	}
@@ -2583,6 +2945,9 @@ static bool fmss_page_looks_block_map(const u8 *page, unsigned int len,
 }
 
 static unsigned int fmss_vfl_phys(unsigned int cau, unsigned int virt);
+static unsigned int fmss_vfl_resolve(unsigned int cau, unsigned int virt);
+static unsigned int fmss_map_to_phys(unsigned int cau, unsigned int block,
+				    u32 packed);
 static int fmss_vfl_ingest(struct fmss_n31 *f, unsigned int cau,
 			   unsigned int block, const u8 *hdr);
 static int fmss_read_lpn_page(struct fmss_n31 *f, unsigned int ce,
@@ -2921,7 +3286,9 @@ static unsigned int fmss_wmr_fill_l2v(unsigned int max_lpn)
 		if (l2v_map && lpn < l2v_map_size &&
 		    (l2v_map[lpn] & L2V_VALID))
 			continue;
-		fmss_l2v_set(lpn, ce, cau, block, page);
+		/* Classic WMR vpage already resolved to physical block. */
+		fmss_l2v_set_ex(lpn, ce, cau, block, page, true,
+				L2V_SRC_WMR, 0);
 		filled++;
 	}
 	return filled;
@@ -2972,6 +3339,51 @@ static unsigned int fmss_vfl_phys(unsigned int cau, unsigned int virt)
 			return vfl_map[i].phys;
 	}
 	return virt;
+}
+
+/*
+ * Resolve virt→phys according to vfl_remap_mode.
+ * Never call this for L2V_PHYS entries — use fmss_map_to_phys().
+ */
+static unsigned int fmss_vfl_resolve(unsigned int cau, unsigned int virt)
+{
+	unsigned int phys, i;
+
+	if (!strncmp(vfl_remap_mode, "off", 3))
+		return virt;
+
+	phys = fmss_vfl_phys(cau, virt);
+	if (phys == virt)
+		return virt;
+
+	if (!strncmp(vfl_remap_mode, "tail_only", 9)) {
+		if (virt < FMSS_BLOCKS_PER_CAU - FMSS_VFL_TAIL)
+			return virt;
+	} else if (strncmp(vfl_remap_mode, "direct256", 9)) {
+		/* Unknown mode → treat as off. */
+		return virt;
+	}
+
+	for (i = 0; i < vfl_map_count; i++) {
+		if (vfl_map[i].cau == cau && vfl_map[i].virt == virt) {
+			vfl_remap_applied++;
+			if (!quiet && vfl_remap_applied <= 32)
+				pr_info("s5l8740-fmss: vfl_remap mode=%s cau=%u in=%u out=%u idx=%u\n",
+					vfl_remap_mode, cau, virt, phys, i);
+			return phys;
+		}
+	}
+	return virt;
+}
+
+static unsigned int fmss_map_to_phys(unsigned int cau, unsigned int block,
+				    u32 packed)
+{
+	if (packed & L2V_PHYS) {
+		vfl_remap_skipped_phys++;
+		return block;
+	}
+	return fmss_vfl_resolve(cau, block);
 }
 
 /*
@@ -3177,18 +3589,19 @@ static int fmss_read_lpn_page(struct fmss_n31 *f, unsigned int ce,
 			      unsigned int cau, unsigned int block,
 			      unsigned int page, u8 *dst, unsigned int dst_len)
 {
-	unsigned int vblock, saved;
+	unsigned int pblock, saved;
 	u32 addr;
 	int ret;
 
-	vblock = fmss_vfl_phys(cau, block);
+	/* Callers pass physical scan blocks (find_lpn / BTOC). Do not VFL-remap. */
+	pblock = fmss_map_to_phys(cau, block, L2V_PHYS);
 	saved = page_chunks;
 	page_chunks = 16;
 	if (reset_every && f->pages_since_reset >= reset_every) {
 		fmss_nand_reset(f);
 		f->pages_since_reset = 0;
 	}
-	addr = fmss_ppn_addr(cau, vblock, page, 0);
+	addr = fmss_ppn_addr(cau, pblock, page, 0);
 	if (f->dma_ok && use_dma) {
 		ret = fmss_dma_page_read(f, ce, addr);
 		if (ret)
@@ -3293,8 +3706,9 @@ static void fmss_boot_apply_bpb(struct fmss_n31 *f, unsigned int ce,
 		boot_reserved_sects = 32;
 	if (fatz && fatz < 0x100000u)
 		boot_fat_sects = fatz;
-	/* L2V[0] must point at this real boot page. */
-	fmss_l2v_set(0, ce, cau, block, page);
+	/* L2V[0] / LBA0 must point at this real boot page (physical). */
+	fmss_l2v_set_ex(0, ce, cau, block, page, true, L2V_SRC_CARVE, 0);
+	fmss_lba_set(0, ce, cau, block, page, 0, true, L2V_SRC_CARVE, 0);
 	fmss_dev_info(f->dev,
 		      "boot_sb ce=%u cau=%u blk=%u pg=%u DataStart=%u rsv=%u fatz=%u\n",
 		      ce, cau, block, page, boot_data_start,
@@ -3508,8 +3922,8 @@ static int fmss_boot_carve_discover(struct fmss_n31 *f, unsigned int start,
 							if (!fmss_apple_fat_boot(s))
 								continue;
 							fmss_boot_apply_bpb(f, ce, cau, b, pg, s);
-							fmss_early_lba_ensure();
-							fmss_early_lba_set(0, ce, cau, b, pg, sec);
+							fmss_lba_set(0, ce, cau, b, pg, sec,
+								     true, L2V_SRC_CARVE, 0);
 							page_chunks = saved;
 							fmss_dev_info(f->dev,
 								      "boot_sb open-SB sec=%u ce=%u cau=%u blk=%u pg=%u\n",
@@ -3596,7 +4010,8 @@ static int fmss_root_dir_discover(struct fmss_n31 *f, unsigned int start,
 					root_dir_block = b;
 					root_dir_page = p;
 					root_dir_lpn = lpn;
-					fmss_l2v_set(lpn, ce, cau, b, p);
+					fmss_l2v_set_ex(lpn, ce, cau, b, p, true,
+							L2V_SRC_CARVE, 0);
 					page_chunks = saved;
 					fmss_dev_info(f->dev,
 						      "root_dir N31OS ce=%u cau=%u blk=%u pg=%u lpn=%u\n",
@@ -3646,13 +4061,18 @@ static void fmss_l2v_try_block_map_page(struct fmss_n31 *f, unsigned int ce,
 			fmss_nand_reset(f);
 			f->pages_since_reset = 0;
 		}
-		addr = fmss_ppn_addr(cau, fmss_vfl_phys(cau, vbn),
-				     FMSS_BTOC_PAGE, 0);
-		ret = fmss_page_read(f, ce, addr);
-		f->pages_since_reset++;
-		if (ret || fmss_page_blankish(f->last_page, 64))
-			continue;
-		fmss_l2v_ingest_btoc(f, ce, cau, vbn, f->last_page, max_lpn);
+		{
+			unsigned int pblk = fmss_vfl_resolve(cau, vbn);
+
+			addr = fmss_ppn_addr(cau, pblk, FMSS_BTOC_PAGE, 0);
+			ret = fmss_page_read(f, ce, addr);
+			f->pages_since_reset++;
+			if (ret || fmss_page_blankish(f->last_page, 64))
+				continue;
+			/* Store physical block + PHYS (already VFL-resolved). */
+			fmss_l2v_ingest_btoc(f, ce, cau, pblk, f->last_page,
+					     max_lpn);
+		}
 	}
 	page_chunks = saved;
 	kfree(mapbuf);
@@ -3682,8 +4102,14 @@ static int fmss_l2v_build(struct fmss_n31 *f, unsigned int max_lpn,
 	if (ret)
 		return ret;
 
+	fmss_legacy_meta_ingest = true;
+
 	/* Rebuild map contents for this pass (keep allocation). */
 	memset(l2v_map, 0, l2v_map_size * sizeof(*l2v_map));
+	if (l2v_weave)
+		memset(l2v_weave, 0, l2v_map_size * sizeof(*l2v_weave));
+	if (l2v_src)
+		memset(l2v_src, 0, l2v_map_size * sizeof(*l2v_src));
 	l2v_mapped = 0;
 	l2v_btoc_hits = 0;
 	l2v_bmap_hits = 0;
@@ -3691,13 +4117,19 @@ static int fmss_l2v_build(struct fmss_n31 *f, unsigned int max_lpn,
 	lpn_index_count = 0;
 	boot_carve_valid = false;
 	root_dir_valid = false;
-	if (early_lba_map) {
-		memset(early_lba_map, 0,
-		       FMSS_EARLY_LBA_MAX * sizeof(*early_lba_map));
-		early_lba_mapped = 0;
+	f->ecc_soft_fails = 0;
+	if (lba_map) {
+		memset(lba_map, 0, fmss_lba_map_cap() * sizeof(*lba_map));
+		if (lba_weave)
+			memset(lba_weave, 0, fmss_lba_map_cap() * sizeof(*lba_weave));
+		if (lba_src)
+			memset(lba_src, 0, fmss_lba_map_cap() * sizeof(*lba_src));
+		lba_mapped = 0;
 	} else {
-		fmss_early_lba_ensure();
+		fmss_lba_map_ensure();
 	}
+	vfl_remap_applied = 0;
+	vfl_remap_skipped_phys = 0;
 
 	saved = page_chunks;
 	page_chunks = 1;
@@ -3725,10 +4157,24 @@ static int fmss_l2v_build(struct fmss_n31 *f, unsigned int max_lpn,
 						fmss_l2v_ingest_btoc(f, ce, cau, b,
 								     f->last_page,
 								     max_lpn);
-					else
-						fmss_l2v_ingest_bte(f, ce, cau, b,
-								    f->last_page,
-								    max_lpn);
+					else if (fmss_page_looks_bte(f->last_page)) {
+						/*
+						 * Pass 2: BTE needs the full
+						 * 16 KiB page; walk used 1-chunk
+						 * probe — re-read full page.
+						 */
+						unsigned int saved2 = page_chunks;
+
+						page_chunks = 16;
+						ret = fmss_page_read(f, ce, addr);
+						f->pages_since_reset++;
+						page_chunks = saved2;
+						if (!ret)
+							fmss_l2v_ingest_bte(
+								f, ce, cau, b,
+								f->last_page,
+								max_lpn);
+					}
 				}
 
 				/*
@@ -3752,10 +4198,13 @@ static int fmss_l2v_build(struct fmss_n31 *f, unsigned int max_lpn,
 		fmss_root_dir_discover(f, start ? start : 32,
 				       min_t(unsigned int, nblocks, 48));
 
+	fmss_legacy_meta_ingest = false;
+
 	fmss_dev_info(f->dev,
-		      "l2v_build max_lpn=%u range=%u+%u mapped=%u btoc=%u bmap=%u boot=%d root=%d\n",
+		      "l2v_build max_lpn=%u range=%u+%u mapped=%u btoc=%u bmap=%u boot=%d root=%d ecc_soft=%u\n",
 		      max_lpn, start, nblocks, l2v_mapped, l2v_btoc_hits,
-		      l2v_bmap_hits, boot_carve_valid, root_dir_valid);
+		      l2v_bmap_hits, boot_carve_valid, root_dir_valid,
+		      f->ecc_soft_fails);
 	return 0;
 }
 
@@ -3842,19 +4291,20 @@ static ssize_t l2v_status_show(struct device *dev, struct device_attribute *attr
 			       char *buf)
 {
 	return sysfs_emit(buf,
-		"mapped=%u max_lpn=%u size=%u btoc_hits=%u bmap_hits=%u meta_hits=%u early_lba=%u\n"
+		"mapped=%u max_lpn=%u size=%u btoc_hits=%u bmap_hits=%u meta_hits=%u lba_mapped=%u\n"
 		"boot_carve=%u ce=%u cau=%u blk=%u pg=%u off=%u DataStart=%u\n"
 		"root_dir=%u ce=%u cau=%u blk=%u pg=%u lpn=%u\n"
-		"lpn_index=%u\n"
+		"lpn_index=%u vfl_mode=%s remap_applied=%u skipped_phys=%u\n"
 		"whimory ret=%d dis=%u vfl=%u ftlctrl=%u bmap_pages=%u map_ents=%u filled=%u\n",
 		l2v_mapped, l2v_max_lpn, l2v_map_size, l2v_btoc_hits,
-		l2v_bmap_hits, l2v_meta_hits, early_lba_mapped,
+		l2v_bmap_hits, l2v_meta_hits, lba_mapped,
 		boot_carve_valid, boot_carve_ce, boot_carve_cau,
 		boot_carve_block, boot_carve_page, boot_carve_off,
 		boot_data_start,
 		root_dir_valid, root_dir_ce, root_dir_cau, root_dir_block,
 		root_dir_page, root_dir_lpn,
-		lpn_index_count,
+		lpn_index_count, vfl_remap_mode, vfl_remap_applied,
+		vfl_remap_skipped_phys,
 		wmr_mount_ret, wmr_dis_hits, wmr_vfl_hits, wmr_ftlctrl_hits,
 		wmr_bmap_pages, wmr_block_map_n, wmr_l2v_filled);
 }
@@ -3927,8 +4377,8 @@ static DEVICE_ATTR_WO(whimory_mount);
 static int fmss_ftl_read_lpn_locked(struct fmss_n31 *f, unsigned int target_lpn,
 				    unsigned int sector, u8 *buf)
 {
-	unsigned int ce, cau, block, page, vblock, off, saved;
-	u32 addr;
+	unsigned int ce, cau, block, page, pblock, off, saved;
+	u32 addr, packed = L2V_PHYS;
 	int ret;
 
 	if (sector > FMSS_FTL_SECTORS_PER_LPN - 1)
@@ -3939,20 +4389,22 @@ static int fmss_ftl_read_lpn_locked(struct fmss_n31 *f, unsigned int target_lpn,
 		cau = root_dir_cau;
 		block = root_dir_block;
 		page = root_dir_page;
+		packed = L2V_PHYS;
 	} else {
-		ret = fmss_l2v_lookup(target_lpn, &ce, &cau, &block, &page);
+		ret = fmss_l2v_lookup_ex(target_lpn, &ce, &cau, &block, &page,
+					 &packed);
 		if (ret)
 			return ret;
 	}
 
-	vblock = fmss_vfl_phys(cau, block);
+	pblock = fmss_map_to_phys(cau, block, packed);
 	saved = page_chunks;
 	page_chunks = 16;
 	if (reset_every && f->pages_since_reset >= reset_every) {
 		fmss_nand_reset(f);
 		f->pages_since_reset = 0;
 	}
-	addr = fmss_ppn_addr(cau, vblock, page, 0);
+	addr = fmss_ppn_addr(cau, pblock, page, 0);
 	ret = fmss_page_read(f, ce, addr);
 	f->pages_since_reset++;
 	page_chunks = saved;
@@ -3994,26 +4446,36 @@ static ssize_t lpn_read_store(struct device *dev, struct device_attribute *attr,
 		return -ENOMEM;
 
 	mutex_lock(&f->lock);
-	/* Interactive: on-demand BTOC resolve; block I/O uses dense map only. */
-	ret = fmss_lpn_resolve(f, target_lpn, &ce, &cau, &block, &page);
-	if (!ret) {
-		saved = page_chunks;
-		page_chunks = 16;
-		if (reset_every && f->pages_since_reset >= reset_every) {
-			fmss_nand_reset(f);
-			f->pages_since_reset = 0;
-		}
-		addr = fmss_ppn_addr(cau, fmss_vfl_phys(cau, block), page, 0);
-		ret = fmss_page_read(f, ce, addr);
-		f->pages_since_reset++;
-		page_chunks = saved;
+	{
+		u32 packed = L2V_PHYS;
+
+		/* Prefer dense L2V packed flags; else on-demand resolve (PHYS). */
+		ret = fmss_l2v_lookup_ex(target_lpn, &ce, &cau, &block, &page,
+					 &packed);
+		if (ret)
+			ret = fmss_lpn_resolve(f, target_lpn, &ce, &cau,
+					       &block, &page);
 		if (!ret) {
-			poff = sector * FMSS_SECTOR_LEN;
-			if (poff + FMSS_SECTOR_LEN <= f->last_page_len)
-				memcpy(secbuf, f->last_page + poff,
-				       FMSS_SECTOR_LEN);
-			else
-				ret = -ERANGE;
+			saved = page_chunks;
+			page_chunks = 16;
+			if (reset_every && f->pages_since_reset >= reset_every) {
+				fmss_nand_reset(f);
+				f->pages_since_reset = 0;
+			}
+			addr = fmss_ppn_addr(cau,
+					     fmss_map_to_phys(cau, block, packed),
+					     page, 0);
+			ret = fmss_page_read(f, ce, addr);
+			f->pages_since_reset++;
+			page_chunks = saved;
+			if (!ret) {
+				poff = sector * FMSS_SECTOR_LEN;
+				if (poff + FMSS_SECTOR_LEN <= f->last_page_len)
+					memcpy(secbuf, f->last_page + poff,
+					       FMSS_SECTOR_LEN);
+				else
+					ret = -ERANGE;
+			}
 		}
 	}
 	mutex_unlock(&f->lock);
@@ -4040,6 +4502,142 @@ static ssize_t lpn_read_store(struct device *dev, struct device_attribute *attr,
 	return count;
 }
 static DEVICE_ATTR_WO(lpn_read);
+
+static ssize_t resolve_log_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	if (!resolve_log_len)
+		return sysfs_emit(buf, "(no resolve yet)\n");
+	return sysfs_emit(buf, "%s", resolve_log);
+}
+static DEVICE_ATTR_RO(resolve_log);
+
+static ssize_t read_sector_dense_store(struct device *dev,
+				       struct device_attribute *attr,
+				       const char *buf, size_t count)
+{
+	struct fmss_n31 *f = fmss_dev;
+	unsigned int lba;
+	u8 *secbuf;
+	int ret;
+
+	if (!f)
+		return -ENODEV;
+	if (kstrtouint(buf, 0, &lba))
+		return -EINVAL;
+	secbuf = kmalloc(FMSS_SECTOR_LEN, GFP_KERNEL);
+	if (!secbuf)
+		return -ENOMEM;
+	ret = fmss_ftl_read_sector(lba, secbuf);
+	dev_info(dev, "read_sector_dense LBA=%u ret=%d %s",
+		 lba, ret, resolve_log);
+	kfree(secbuf);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(read_sector_dense);
+
+static ssize_t read_sector_slow_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct fmss_n31 *f = fmss_dev;
+	unsigned int lba, lpn, sec, ce, cau, block, page, pblock, saved;
+	u8 *secbuf;
+	u32 addr, packed = L2V_PHYS;
+	int ret;
+
+	if (!f)
+		return -ENODEV;
+	if (kstrtouint(buf, 0, &lba))
+		return -EINVAL;
+	secbuf = kmalloc(FMSS_SECTOR_LEN, GFP_KERNEL);
+	if (!secbuf)
+		return -ENOMEM;
+
+	/* Try dense first. */
+	ret = fmss_ftl_read_sector(lba, secbuf);
+	if (!ret) {
+		dev_info(dev, "read_sector_slow LBA=%u via dense OK\n", lba);
+		kfree(secbuf);
+		return count;
+	}
+
+	lpn = lba / FMSS_FTL_SECTORS_PER_LPN;
+	sec = lba % FMSS_FTL_SECTORS_PER_LPN;
+	mutex_lock(&f->lock);
+	ret = fmss_l2v_lookup_ex(lpn, &ce, &cau, &block, &page, &packed);
+	if (ret) {
+		ret = fmss_lpn_resolve(f, lpn, &ce, &cau, &block, &page);
+		packed = L2V_PHYS;
+	}
+	if (!ret) {
+		pblock = fmss_map_to_phys(cau, block, packed);
+		saved = page_chunks;
+		page_chunks = 16;
+		addr = fmss_ppn_addr(cau, pblock, page, 0);
+		ret = fmss_page_read(f, ce, addr);
+		page_chunks = saved;
+		if (!ret) {
+			memcpy(secbuf, f->last_page + sec * FMSS_SECTOR_LEN,
+			       FMSS_SECTOR_LEN);
+			resolve_log_len = scnprintf(
+				resolve_log, sizeof(resolve_log),
+				"slow LBA=%u via on-demand lpn_resolve phys=%d ce=%u cau=%u blk=%u→%u pg=%u sec=%u head=%02x%02x%02x%02x\n",
+				lba, !!(packed & L2V_PHYS), ce, cau, block,
+				pblock, page, sec,
+				secbuf[0], secbuf[1], secbuf[2], secbuf[3]);
+		}
+	}
+	mutex_unlock(&f->lock);
+	dev_info(dev, "read_sector_slow LBA=%u ret=%d %s", lba, ret, resolve_log);
+	kfree(secbuf);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(read_sector_slow);
+
+static ssize_t read_sector_phys_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct fmss_n31 *f = fmss_dev;
+	unsigned int ce, cau, block, page, sec = 0, saved;
+	u8 *secbuf;
+	u32 addr;
+	int nf, ret;
+
+	if (!f)
+		return -ENODEV;
+	nf = sscanf(buf, "%u %u %u %u %u", &ce, &cau, &block, &page, &sec);
+	if (nf < 4)
+		return -EINVAL;
+	if (sec > 3)
+		return -EINVAL;
+	secbuf = kmalloc(FMSS_SECTOR_LEN, GFP_KERNEL);
+	if (!secbuf)
+		return -ENOMEM;
+	mutex_lock(&f->lock);
+	saved = page_chunks;
+	page_chunks = 16;
+	addr = fmss_ppn_addr(cau, block, page, 0);
+	ret = fmss_page_read(f, ce, addr);
+	page_chunks = saved;
+	if (!ret) {
+		memcpy(secbuf, f->last_page + sec * FMSS_SECTOR_LEN,
+		       FMSS_SECTOR_LEN);
+		resolve_log_len = scnprintf(
+			resolve_log, sizeof(resolve_log),
+			"phys ce=%u cau=%u blk=%u pg=%u sec=%u head=%02x%02x%02x%02x\n",
+			ce, cau, block, page, sec,
+			secbuf[0], secbuf[1], secbuf[2], secbuf[3]);
+		memcpy(f->last_page, secbuf, FMSS_SECTOR_LEN);
+		sector_log_len = 0;
+	}
+	mutex_unlock(&f->lock);
+	dev_info(dev, "read_sector_phys ret=%d %s", ret, resolve_log);
+	kfree(secbuf);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(read_sector_phys);
 
 static char grep_log[4096];
 static unsigned int grep_log_len;
@@ -4256,18 +4854,19 @@ static int fmss_read_ftl_page_pio(struct fmss_n31 *f, unsigned int ce,
 				  unsigned int cau, unsigned int block,
 				  unsigned int page)
 {
-	unsigned int vblock, saved;
+	unsigned int pblock, saved;
 	u32 addr;
 	int ret;
 
-	vblock = fmss_vfl_phys(cau, block);
+	/* Physical block from boot/carve scan — never VFL-remap. */
+	pblock = fmss_map_to_phys(cau, block, L2V_PHYS);
 	saved = page_chunks;
 	page_chunks = 16;
 	if (reset_every && f->pages_since_reset >= reset_every) {
 		fmss_nand_reset(f);
 		f->pages_since_reset = 0;
 	}
-	addr = fmss_ppn_addr(cau, vblock, page, 0);
+	addr = fmss_ppn_addr(cau, pblock, page, 0);
 	ret = fmss_page_read(f, ce, addr);
 	f->pages_since_reset++;
 	page_chunks = saved;
@@ -4982,6 +5581,10 @@ static struct attribute *fmss_attrs[] = {
 	&dev_attr_whimory_mount.attr,
 	&dev_attr_whimory_status.attr,
 	&dev_attr_lpn_read.attr,
+	&dev_attr_read_sector_dense.attr,
+	&dev_attr_read_sector_slow.attr,
+	&dev_attr_read_sector_phys.attr,
+	&dev_attr_resolve_log.attr,
 	&dev_attr_ftl_grep.attr,
 	&dev_attr_readme_read.attr,
 	&dev_attr_boot_read.attr,
@@ -5126,49 +5729,308 @@ EXPORT_SYMBOL_GPL(fmss_ftl_build_map);
 int fmss_ftl_read_sector(u64 logical_sector, void *buf)
 {
 	struct fmss_n31 *f = fmss_dev;
-	unsigned int lpn, sec, ce, cau, block, page, vblock, off, saved;
-	u32 addr;
+	unsigned int lpn, sec, ce, cau, block, page, pblock, off, saved;
+	u32 addr, packed;
 	int ret;
+	int (*hook)(u64, void *);
 
-	if (!f || !buf)
+	if (!buf)
+		return -ENODEV;
+
+	/*
+	 * Whimory registers the real LBA reader after FTL_Open. Call it
+	 * without the FMSS mutex — the FIL page_read wrapper takes that lock.
+	 */
+	hook = READ_ONCE(fmss_ftl_read_hook);
+	if (hook)
+		return hook(logical_sector, buf);
+
+	if (!f)
 		return -ENODEV;
 
 	mutex_lock(&f->lock);
 
-	/* Prefer SFTL BTE early-LBA map (boot/FAT). */
-	if (logical_sector < FMSS_EARLY_LBA_MAX &&
-	    !fmss_early_lba_lookup((unsigned int)logical_sector, &ce, &cau,
-				   &block, &page, &sec)) {
-		vblock = fmss_vfl_phys(cau, block);
+	/* Prefer full LBA map (BTE / BTOC sector fills / carve / META). */
+	if (logical_sector < fmss_lba_map_cap() &&
+	    !fmss_lba_lookup((unsigned int)logical_sector, &ce, &cau,
+			     &block, &page, &sec, &packed)) {
+		pblock = fmss_map_to_phys(cau, block, packed);
 		saved = page_chunks;
 		page_chunks = 16;
 		if (reset_every && f->pages_since_reset >= reset_every) {
 			fmss_nand_reset(f);
 			f->pages_since_reset = 0;
 		}
-		addr = fmss_ppn_addr(cau, vblock, page, 0);
+		addr = fmss_ppn_addr(cau, pblock, page, 0);
 		ret = fmss_page_read(f, ce, addr);
 		f->pages_since_reset++;
 		page_chunks = saved;
 		if (!ret) {
-			off = sec * FMSS_SECTOR_LEN;
-			if (off + FMSS_SECTOR_LEN <= f->last_page_len)
-				memcpy(buf, f->last_page + off, FMSS_SECTOR_LEN);
-			else
-				ret = -ERANGE;
+			if (sec == L2V_SEC_FROM_LBA)
+				sec = (unsigned int)logical_sector %
+				      FMSS_VBAS_PER_PAGE;
+			/* Pass 2: refuse stale map if META LBA disagrees. */
+			if (f->last_spare_len >= 16 * (sec + 1)) {
+				const u8 *m = f->last_spare + sec * 16;
+
+				if (m[0] == 0x01) {
+					u32 mlba = get_unaligned_le32(m + 8);
+
+					if (mlba != (u32)logical_sector)
+						ret = -EIO;
+				}
+			}
+			if (!ret) {
+				off = sec * FMSS_SECTOR_LEN;
+				if (off + FMSS_SECTOR_LEN <= f->last_page_len)
+					memcpy(buf, f->last_page + off,
+					       FMSS_SECTOR_LEN);
+				else
+					ret = -ERANGE;
+			}
+			resolve_log_len = scnprintf(
+				resolve_log, sizeof(resolve_log),
+				"dense LBA=%llu src=lba_map phys=%d ce=%u cau=%u blk=%u→%u pg=%u sec=%u ret=%d head=%02x%02x%02x%02x\n",
+				(unsigned long long)logical_sector,
+				!!(packed & L2V_PHYS), ce, cau, block, pblock,
+				page, sec, ret,
+				ret ? 0 : ((u8 *)buf)[0],
+				ret ? 0 : ((u8 *)buf)[1],
+				ret ? 0 : ((u8 *)buf)[2],
+				ret ? 0 : ((u8 *)buf)[3]);
+			if (!ret) {
+				mutex_unlock(&f->lock);
+				return 0;
+			}
+			/* Mapped read failed / META mismatch — fall through to LPN. */
+		} else {
+			resolve_log_len = scnprintf(
+				resolve_log, sizeof(resolve_log),
+				"dense LBA=%llu src=lba_map PHYS-fail ret=%d; try l2v_lpn\n",
+				(unsigned long long)logical_sector, ret);
+			/* Fall through to LPN path. */
 		}
-		mutex_unlock(&f->lock);
-		return ret;
 	}
 
 	lpn = (unsigned int)(logical_sector / FMSS_FTL_SECTORS_PER_LPN);
 	sec = (unsigned int)(logical_sector % FMSS_FTL_SECTORS_PER_LPN);
 
 	ret = fmss_ftl_read_lpn_locked(f, lpn, sec, buf);
+	if (!ret)
+		resolve_log_len = scnprintf(
+			resolve_log, sizeof(resolve_log),
+			"dense LBA=%llu src=l2v_lpn lpn=%u sec=%u ret=0 head=%02x%02x%02x%02x\n",
+			(unsigned long long)logical_sector, lpn, sec,
+			((u8 *)buf)[0], ((u8 *)buf)[1],
+			((u8 *)buf)[2], ((u8 *)buf)[3]);
+	else
+		resolve_log_len = scnprintf(
+			resolve_log, sizeof(resolve_log),
+			"dense LBA=%llu src=l2v_lpn lpn=%u sec=%u ret=%d\n",
+			(unsigned long long)logical_sector, lpn, sec, ret);
 	mutex_unlock(&f->lock);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(fmss_ftl_read_sector);
+
+int s5l8740_fmss_available(void)
+{
+	return fmss_dev != NULL;
+}
+EXPORT_SYMBOL_GPL(s5l8740_fmss_available);
+
+int s5l8740_fmss_hw_init(void)
+{
+	struct fmss_n31 *f = fmss_dev;
+	int ret;
+
+	if (!f)
+		return -ENODEV;
+	mutex_lock(&f->lock);
+	ret = fmss_nand_reset(f);
+	if (!ret)
+		(void)fmss_param_read(f, 0);
+	mutex_unlock(&f->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(s5l8740_fmss_hw_init);
+
+int s5l8740_fmss_query_geometry(struct s5l8740_fmss_geom *g)
+{
+	struct fmss_n31 *f = fmss_dev;
+	const u8 *p;
+	u32 caus, cau_bits, blocks, block_bits, pages, pages_slc;
+	u32 page_bits, page_size;
+
+	if (!g)
+		return -EINVAL;
+	if (!f)
+		return -ENODEV;
+
+	memset(g, 0, sizeof(*g));
+	g->num_ce = FMSS_NUM_CE;
+	g->num_cau = FMSS_NUM_CAU;
+	g->blocks_per_cau = FMSS_BLOCKS_PER_CAU;
+	g->pages_per_block = 128;
+	g->pages_per_block_slc = 128;
+	g->page_size = FMSS_PAGE_LEN;
+	g->vfl_tail = FMSS_VFL_TAIL;
+	g->page_bits = FMSS_PAGE_BITS;
+	g->block_bits = FMSS_BLOCK_BITS;
+	g->cau_bits = FMSS_CAU_BITS;
+	g->caus_per_channel = FMSS_NUM_CAU;
+
+	mutex_lock(&f->lock);
+	if (f->last_param_ret != 0)
+		(void)fmss_param_read(f, 0);
+	p = f->last_param;
+	if (f->last_param_ret == 0) {
+		caus = fmss_le32(p, 16);
+		cau_bits = fmss_le32(p, 20);
+		blocks = fmss_le32(p, 24);
+		block_bits = fmss_le32(p, 28);
+		pages = fmss_le32(p, 32);
+		pages_slc = fmss_le32(p, 36);
+		page_bits = fmss_le32(p, 40);
+		page_size = fmss_le32(p, 52);
+		if (caus && caus <= 4)
+			g->caus_per_channel = caus;
+		if (cau_bits && cau_bits <= 4)
+			g->cau_bits = cau_bits;
+		if (blocks && blocks <= 8192)
+			g->blocks_per_cau = blocks;
+		if (block_bits && block_bits <= 16)
+			g->block_bits = block_bits;
+		if (pages && pages <= 256)
+			g->pages_per_block = pages;
+		if (pages_slc && pages_slc <= 256)
+			g->pages_per_block_slc = pages_slc;
+		if (page_bits && page_bits <= 16)
+			g->page_bits = page_bits;
+		if (page_size == 4096 || page_size == 8192 ||
+		    page_size == 16384)
+			g->page_size = page_size;
+		g->from_param_page = true;
+	}
+	mutex_unlock(&f->lock);
+
+	/*
+	 * FIL GetInfo (vtable +80, sub_12F83C):
+	 *   101 — NAND present / signature +0x34 geometry (WhimoryBoot.c:169,260)
+	 *         0 → "No NAND device found". Compared to sig[+0x34].
+	 *         Value stored at format is blocks_per_cau (sub_12ED9C → 0x8D102CC
+	 *         is the first geometry word copied from the param page).
+	 *   104 — BUF_Init data bytes (sub_D1960 first arg) = physical page size
+	 *   105 — BUF_Init meta bytes (sub_D1960 second arg) = 16 (sub_12ED9C)
+	 *   135 — stored at 0x8D0CE2C and unused after GetInfo
+	 */
+	g->dev_id = g->blocks_per_cau;
+	g->geom_104 = g->page_size;
+	g->geom_105 = 16;
+	g->geom_135 = g->page_size >> 12;
+	if (!g->dev_id)
+		return -ENODEV;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(s5l8740_fmss_query_geometry);
+
+u32 s5l8740_fmss_fil_get_info(u32 selector)
+{
+	struct s5l8740_fmss_geom g;
+
+	if (s5l8740_fmss_query_geometry(&g))
+		return 0;
+	switch (selector) {
+	case 101:
+		return g.dev_id;
+	case 104:
+		return g.geom_104;
+	case 105:
+		return g.geom_105;
+	case 135:
+		return g.geom_135;
+	default:
+		return 0;
+	}
+}
+EXPORT_SYMBOL_GPL(s5l8740_fmss_fil_get_info);
+
+int s5l8740_fmss_page_read(unsigned int ce, unsigned int cau,
+			   unsigned int block, unsigned int page,
+			   unsigned int slc, unsigned int chunks,
+			   void *data, size_t data_len,
+			   void *meta, size_t meta_len)
+{
+	struct fmss_n31 *f = fmss_dev;
+	unsigned int saved;
+	u32 addr;
+	int ret;
+
+	if (!f)
+		return -ENODEV;
+	if (ce >= FMSS_NUM_CE || cau >= FMSS_NUM_CAU ||
+	    block >= FMSS_BLOCKS_PER_CAU || page > FMSS_BTOC_PAGE)
+		return -EINVAL;
+	if (!chunks || chunks > FMSS_MAX_CHUNKS)
+		chunks = FMSS_MAX_CHUNKS;
+
+	mutex_lock(&f->lock);
+	if (reset_every && f->pages_since_reset >= reset_every) {
+		fmss_nand_reset(f);
+		f->pages_since_reset = 0;
+	}
+	saved = page_chunks;
+	page_chunks = chunks;
+	addr = fmss_ppn_addr(cau, block, page, slc);
+	/*
+	 * PIO last_spare is not proven Sogeti/Whimory META (glass 2026-08-27:
+	 * 53-byte beat is FIFO garbage). Only take the second pass when the
+	 * caller actually asked for a meta buffer.
+	 */
+	if (meta && meta_len)
+		ret = fmss_page_read_with_meta(f, ce, addr);
+	else
+		ret = fmss_page_read(f, ce, addr);
+	f->pages_since_reset++;
+	page_chunks = saved;
+	if (!ret) {
+		if (data && data_len) {
+			if (data_len > f->last_page_len)
+				data_len = f->last_page_len;
+			memcpy(data, f->last_page, data_len);
+		}
+		if (meta && meta_len) {
+			memset(meta, 0xff, meta_len);
+			if (f->last_spare_len)
+				memcpy(meta, f->last_spare,
+				       min_t(size_t, meta_len,
+					     f->last_spare_len));
+		}
+	}
+	mutex_unlock(&f->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(s5l8740_fmss_page_read);
+
+int s5l8740_fmss_nand_reset(void)
+{
+	struct fmss_n31 *f = fmss_dev;
+	int ret;
+
+	if (!f)
+		return -ENODEV;
+	mutex_lock(&f->lock);
+	ret = fmss_nand_reset(f);
+	mutex_unlock(&f->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(s5l8740_fmss_nand_reset);
+
+void s5l8740_fmss_register_ftl_read(int (*fn)(u64 lba, void *buf))
+{
+	WRITE_ONCE(fmss_ftl_read_hook, fn);
+}
+EXPORT_SYMBOL_GPL(s5l8740_fmss_register_ftl_read);
 
 module_init(fmss_init);
 module_exit(fmss_exit);

@@ -26,6 +26,11 @@
         /* U-Boot CONFIG_BOOTARGS overrides this. g_ether is built-in (0525:a4a2). */
         bootargs = "console=tty0 fbcon=font:MINI4x6 earlyprintk nohlt panic=-1 clk_ignore_unused init=/init";
         stdout-path = "serial0";
+        /*
+         * U-Boot ft_board_setup adds apple,n31-isys-addr / apple,n31-isys-size
+         * pointing at a reserved DRAM copy of the A34 IsyS object (0x560).
+         * Do not consume the original 0x2202FE1C pointer from Linux.
+         */
     };
 
     nclk: external_clock {
@@ -56,6 +61,23 @@
     memory@8000000 {
         device_type = "memory";
         reg = <0x08000000 0x04000000>;
+    };
+
+    /*
+     * U-Boot copies the 0x560 A34 IsyS object here (gap below DFU load,
+     * above the 16 MiB bootm window). Chosen apple,n31-isys-* is filled
+     * at ft_board_setup; this node keeps Linux from recycling the page.
+     */
+    reserved-memory {
+        #address-cells = <1>;
+        #size-cells = <1>;
+        ranges;
+
+        n31-isys@9dff000 {
+            compatible = "apple,n31-isys";
+            reg = <0x09DFF000 0x1000>;
+            no-map;
+        };
     };
 
     soc {
@@ -130,6 +152,18 @@
             interrupt-parent = <&vic0>;
             interrupts = <25>;
             status = "okay";
+
+            /* BCM2078KUBG on UART1 @115200 — serdev → hci_bcm → hci0.
+             * Companion GPIO/FM lives under apple,n31-bcm2078-companion. */
+            bluetooth {
+                compatible = "brcm,bcm4329-bt", "brcm,bcm2078";
+                max-speed = <115200>;
+                shutdown-gpios = <&gpio 97 GPIO_ACTIVE_LOW>;
+                device-wakeup-gpios = <&gpio 98 GPIO_ACTIVE_HIGH>;
+                host-wakeup-gpios = <&gpio 119 GPIO_ACTIVE_HIGH>;
+                firmware-name = "brcm/BCM2076B1.hcd";
+                status = "okay";
+            };
         };
 
         uart2: serial@3dc00000 {
@@ -140,7 +174,20 @@
             reg-io-width = <4>;
             interrupt-parent = <&vic0>;
             interrupts = <26>;
+            /*
+             * MikeyBus (GPIO 66/67). uart3 stays first (samsung port 0).
+             * Do NOT serdev_device_open() at probe. Do NOT live-add s5l-uart
+             * (pinmux-then-probe locked glass 2026-08-27). uart_open sysfs
+             * only for remote RX after boot.
+             */
             status = "okay";
+
+            mikeybus {
+                compatible = "apple,mikeybus", "apple,n31-mikeybus";
+                current-speed = <115200>;
+                apple,force-plugged;
+                status = "okay";
+            };
         };
 
         usbphy: usbphy@3c400000 {
@@ -217,6 +264,13 @@
             #gpio-cells = <2>;
             gpio-controller;
             ngpios = <128>;
+            status = "okay";
+        };
+
+        /* Thin N31 helper: RetailOS GPIO mode-2 + FM 0xFC15 debug via hci0.
+         * Does not own UART1 — that is bluetooth { } under uart1 → hci_bcm. */
+        bcm2078_companion: bcm2078-companion {
+            compatible = "apple,n31-bcm2078-companion";
             status = "okay";
         };
 
@@ -363,7 +417,11 @@
             };
         };
 
-        /* PL080 pair from OSOS. Peri 12/13 = IIS0. Not 0x384 (DWC2). */
+        /*
+         * PL080 pair from OSOS. Not 0x384 (DWC2).
+         * RetailOS oracle: IIS0 TX peri 10 (DST 0x3ca00010); IIS0 RX 11 assumed;
+         * IIS2 FM RX peri 13 (SRC 0x3d400038). PL080_1 unused in snaps.
+         */
         dmac: dma-controller@38200000 {
             compatible = "apple,s5l8740-pl080", "arm,pl080";
             reg = <0x38200000 0x1000>, <0x38700000 0x1000>;
@@ -376,8 +434,24 @@
         i2s0: i2s@3ca00000 {
             compatible = "apple,s5l8740-i2s", "samsung,s5l8740-i2s";
             reg = <0x3ca00000 0x1000>;
+            /* RetailOS music: TX peri 10 confirmed. RX 11 still assumed. */
             dmas = <&dmac 10 0>, <&dmac 11 0>;
             dma-names = "tx", "rx";
+            #sound-dai-cells = <0>;
+            status = "okay";
+        };
+
+        /*
+         * BCM2078 digital PCM (SoC IIS2 @ 0x3D400000).
+         * RX FIFO @ +0x38, PL080 peri 13 — FM + module→SoC PCM in.
+         * IIS1 @ 0x3CD00000 is unused (XSP); BT A2DP out = UART1 HCI.
+         * RetailOS: bt-*-scsi-live/, fm-*-scsi-live/
+         */
+        i2s2: i2s@3d400000 {
+            compatible = "apple,s5l8740-bcm2078-pcm", "apple,s5l8740-iis2";
+            reg = <0x3d400000 0x1000>;
+            dmas = <&dmac 13 0>;
+            dma-names = "rx";
             #sound-dai-cells = <0>;
             status = "okay";
         };
@@ -385,6 +459,7 @@
         nano7_audio: audio {
             compatible = "apple,n31-audio";
             apple,cpu = <&i2s0>;
+            apple,fm-cpu = <&i2s2>;
             apple,codec = <&cs42l81>;
             status = "okay";
         };
@@ -399,6 +474,11 @@
         charge-full-design-microamp-hours = <200000>;
     };
 
+    /*
+     * Keep gpio-keys disabled (p5-keys-alsa): Home/Sleep/Play come from
+     * gpio-d1830 I2C poll + nIRQ; Vol± from gpio-s5l8740 DIN poll.
+     * Enabling this node would double-report and risk 0xFFFE on Vol pads.
+     */
     gpio-keys {
         compatible = "gpio-keys";
         status = "disabled";
@@ -425,8 +505,9 @@
         };
     };
 
-    /* Disabled so gpio-keys-polled cannot direction_input/0xFFFE Vol pads.
-     * gpio-s5l8740 polls DIN itself and reports KEY_VOLUMEUP/DOWN.
+    /* Disabled: gpio-keys-polled must not direction_input/0xFFFE Vol pads.
+     * gpio-s5l8740 polls DIN and reports KEY_VOLUMEUP/DOWN; cs42l81-spi
+     * input_handler steps Master Playback Volume.
      */
     gpio-keys-vol {
         compatible = "gpio-keys-polled";

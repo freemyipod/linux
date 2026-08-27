@@ -2,13 +2,20 @@
 /*
  * S5L8702 / S5L8740 Clockgates
  *
- * Bring-up policy: ungate documented PWRCON banks so peripherals stay
- * alive without a Linux consumer. CCF also marks the published gates
- * CLK_IS_CRITICAL | CLK_IGNORE_UNUSED so clk_disable_unused cannot
- * write those bits later.
+ * Bring-up policy (Phases 0–4): ungate-all documented PWRCON banks so
+ * peripherals stay alive without a Linux consumer. CCF also marks the
+ * published gates CLK_IS_CRITICAL | CLK_IGNORE_UNUSED so
+ * clk_disable_unused cannot write those bits later.
+ *
+ * Selective IIS/UART/CG16 CCF consumers are DEFERRED to Phase 5
+ * (p5-ccf-pm). Rationale: HCI/ALSA/FM glass proof still needs a stable
+ * clock baseline; early selective gating caused false leads (timer poke,
+ * SYS remux). Keep absolute CLKCON+0x30 play (0x32190-class) /
+ * idle (0x1c20) in the IIS drivers until audio/BT prove out.
  *
  * Never remux SYS PLL (+0x00/+0x04) — that kills live DRAM.
  * Never write CLKCON+0x50 — that is the fatal/WDT latch (0xA5).
+ * Never poke the TIMER MMIO block @0x3C700000 from here.
  */
 
 #include <linux/clk-provider.h>

@@ -7,24 +7,49 @@
  *   teardown     sub_1A878: IRQ off, RST, 20690(0), rail off, EN mode 1
  *                (13A20 retries: 1A878 + sleep 50 + 1A5AC, max 3)
  *   grape.bin    IS the app. SEC bootloader has no grape/Nimbus path.
- *   bootload cmd sub_20848(6593) = 19 C1 + (18 E1)*
- *   FW load      1A640 204E0: ARM at +0x400, size le32(+0x0c)
- *                rev 3: 422FFA GID-CBC IV=0 decrypt in place
- *                273A0: 2D640(ARM) → 2D7A4(IsyS/cal +350 @ 0x400200) →
- *                2D5B0 (34AD0 + poke 0x011F RequestCal) → 2D54C
- *                2D7A4 window is this unit's NVRAM cal. sub_564 copies
- *                1376B IsyS from A34(0x18)=0x2202FE18 into BSS; 43CFB4
- *                returns that object. DFU Linux never ran sub_564; the
- *                0x22xxxxxx window is Grape-internal. Use grape.bin +350.
- *                chunk pack via 35C1C→3B9D0 (18 E1 / 30 01 / …)
- *   status poll  sub_3D5706: TX 1A A1 → rev16 status
- *   ping         sub_182590 type 490
- *   read         sub_17E404 EA 01 01
- *   report       sub_187AB4 type 0x44 → MT-B
- *   1703E8       10 failed 188FFC → 13A20(0) + 13A20(1)
+ *   1A5AC delays 2075A(1)+5 → 20766(1)+15 → 20690(1)+5 → 11B70 →
+ *                20848 +15 → 2075A(0)+30 → 20E94 (no extra POR pulse)
+ *   bootload cmd sub_20848(6593): 6593 = 0x19C1 = HBPP ENTER (not a
+ *                firmware byte count). TX 19 C1 + (18 E1)* pad.
  *
- * Firmware: request_firmware("apple/grape-nimbus.bin") — optional; without
- * it we still bootload+ping (chip may already be programmed).
+ * Firmware (SPI → controller @ dest=offset, start 0) — 1A640 / 204E0 / 2D640:
+ *   Full "8740" GrapeFirmware-style container on disk:
+ *     0x000..0x3ff  Apple/N31 header (NOT sent over SPI)
+ *     0x400..       ARM app body; length = le32(file+0x0c)
+ *     rev 3: GID-CBC IV=0 decrypt of ARM body before send
+ *   ARM-only cut (no 8740 magic, e.g. 18 F0 9F E5…): whole file = body
+ *   Chunks: max 0x1FF0. Upload = sub_3B9D0 envelope (see below). ACK 0x4BC1.
+ *   Callsite 2D640: r1 = firmware offset (NOT 0x00100000). EXEC 0x00100018
+ *   is the bootloader-mapped app PC, not the upload destination.
+ *
+ * Calibration (SPI → controller @ 0x00400200) — 2D7A4 / 273A0:
+ *   Per-device IsyS comes from the A34 handoff, not a host file:
+ *     desc @ 0x2202FE18 (sub_A34(24)): magic 0x53797349 "IsyS", ptr @ +4
+ *     memcpy 0x560 from ptr (sub_564)
+ *     cal = bytes at decimal +350, length 0x200, reverse each u32 (sub_273A0)
+ *     then 2D7A4 that window; DATA packet still does b1b0b3b2 wire swizzle
+ *   Callsite 2D7A4: r1 = 0x00400200 + offset.
+ *   No grape-nimbus-cal.bin, no FTL IsyS scan, no GrapeFirmware.bin+350.
+ *   Preferred source: U-Boot copy in reserved DRAM, advertised in /chosen
+ *     apple,n31-isys-addr / apple,n31-isys-size. Never consume the original
+ *     A34 pointer. Live A34 ioremap is fallback only.
+ *
+ * sub_3B9D0 upload frame (full SPI length = payload_len + 16):
+ *   [0..1]     18 E1
+ *   [2..3]     30 01
+ *   [4..5]     word_count = len>>2 as hi,lo  (len>>10, len>>2)
+ *   [6..9]     dest swizzled BYTE1,BYTE0,BYTE3,BYTE2
+ *   [10..11]   u16 byte-sum of [4..9], big-endian
+ *   [12..12+len)  payload u32s swizzled B1 B0 B3 B2
+ *   [12+len..] u32 byte-sum of swizzled payload, stored B1 B0 B3 B2
+ *   First FW prefix (dest=0,len=0x1FF0): 18 E1 30 01 07 FC 00 00 00 00 01 03
+ *   Cal prefix (dest=0x400200,len=0x200): 18 E1 30 01 00 80 02 00 00 40 00 C2
+ *
+ *   After cal: 2D5B0 RequestCal → 2D54C EXEC → 40 ms → runtime ping.
+ *   Register input only after runtime ping. runtime_ready = ping csum.
+ *
+ * Firmware host file: request_firmware("apple/grape-nimbus.bin") and/or
+ * FTL gpfw/8740 when fw_prefer_ftl=1. That is the ARM app, not cal.
  */
 #include <crypto/aes.h>
 #include <crypto/skcipher.h>
@@ -51,6 +76,9 @@
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
+#include <linux/sysfs.h>
+#include <linux/kallsyms.h>
+#include <linux/types.h>
 #include <linux/unaligned.h>
 
 #define NIMBUS_MAGIC		0xEA
@@ -65,13 +93,19 @@
 #define NIMBUS_SCALE_Y_DIV	0x1482
 
 #define NIMBUS_CHUNK_MAX	0x1FF0		/* 8176 — sub_2D640 */
-#define NIMBUS_HDR_LEN		16
+#define NIMBUS_HDR_LEN		16		/* 2 outer + 10 body hdr + 4 payload sum */
+#define NIMBUS_CAL_DEST		0x00400200u	/* 2D7A4 literal 0x400200 */
 #define NIMBUS_FW_HDR_OFF	350
 #define NIMBUS_FW_HDR_LEN	0x200
 #define NIMBUS_ARM_OFFICIAL	0xe970		/* 8740 le32(+0x0c); 204E0 2D640 size */
 #define NIMBUS_ISYS_MAGIC	0x53797349u	/* 'IsyS' — sub_564 */
 #define NIMBUS_ISYS_LEN		0x560
 #define NIMBUS_A34_BASE		0x2202fe00UL	/* sub_A34(idx) = 0x2202FE00+idx */
+#define NIMBUS_A34_ISYS_DESC	(NIMBUS_A34_BASE + 0x18)	/* sub_A34(24) */
+
+/* Whimory FTL (fmss-s5l8740.ko) — optional cal/FW from device NAND */
+#define NIMBUS_FTL_SECTOR_SIZE	4096U
+#define NIMBUS_GPFW_TAG		0x67706677u	/* 'gpfw' LE */
 
 #define NIMBUS_ACK_CHUNK	0x4BC1		/* 19393 */
 #define NIMBUS_ACK_34AD0	0x4AD1		/* 19153 */
@@ -109,18 +143,28 @@
 static int spi_clkdiv = 16;
 module_param(spi_clkdiv, int, 0644);
 MODULE_PARM_DESC(spi_clkdiv, "SPI2 CLKDIV (higher=slower; try 8-32 for FW download)");
-static int reset_hold_ms = 10;
+static int reset_hold_ms = 5;
 module_param(reset_hold_ms, int, 0644);
-MODULE_PARM_DESC(reset_hold_ms, "RST low ms before bootload");
-static int reset_release_ms = 100;
+MODULE_PARM_DESC(reset_hold_ms, "RST low ms in optional extra_por_pulse (1A5AC uses 5)");
+/* 1A5AC: 2075A(0) then sleep 30 before 20E94 — not FAMILY 15 / old 100. */
+static int reset_release_ms = 30;
 module_param(reset_release_ms, int, 0644);
-MODULE_PARM_DESC(reset_release_ms, "ms after RST release before SPI FW");
+MODULE_PARM_DESC(reset_release_ms, "ms after RST release before probe/FW (1A5AC=30)");
+static int extra_por_pulse;
+module_param(extra_por_pulse, int, 0644);
+MODULE_PARM_DESC(extra_por_pulse, "1=extra RST low/high/low before 1A5AC (not in RetailOS)");
 static int go_spi_setup;
 module_param(go_spi_setup, int, 0644);
 MODULE_PARM_DESC(go_spi_setup, "SPI2 SETUP override for 2D54C GO (0=11B70)");
+/* 0=8-bit PIO (RetailOS HBPP default), 1=u16 TXDATA pairs, 2=spi_sync */
+static int go_xfer;
+module_param(go_xfer, int, 0644);
+MODULE_PARM_DESC(go_xfer,
+		 "2D54C EXEC xfer: 0=8-bit burst 1=u16 burst 2=spi_sync");
+/* Default 0: N31 RetailOS path has no Z2/5A5A host container. */
 static int prepend_z2_hdr;
 module_param(prepend_z2_hdr, int, 0644);
-MODULE_PARM_DESC(prepend_z2_hdr, "0=none 1=5A5A+BE len+CRC32 2=c3f5 hdr");
+MODULE_PARM_DESC(prepend_z2_hdr, "0=none (N31 default) 1=5A5A+BE len+CRC32 2=c3f5 hdr");
 static int chunk_spi;
 module_param(chunk_spi, int, 0644);
 MODULE_PARM_DESC(chunk_spi, "1=spi_sync chunk xfers (apple_z2-style atomic CS)");
@@ -130,6 +174,65 @@ MODULE_PARM_DESC(quiet, "1=minimal logs (auto after GO fail)");
 static int skip_download;
 module_param(skip_download, int, 0644);
 MODULE_PARM_DESC(skip_download, "1=bootload+ping only, no FW chunks");
+
+static int force_gid;
+module_param(force_gid, int, 0644);
+MODULE_PARM_DESC(force_gid, "1=422FFA decrypt attempt even without 8740 rev3 hdr");
+
+static int cal_try_dt = 1;
+module_param(cal_try_dt, int, 0644);
+MODULE_PARM_DESC(cal_try_dt,
+		 "Read U-Boot IsyS copy from /chosen apple,n31-isys-* (default on)");
+
+static int cal_try_a34 = 1;
+module_param(cal_try_a34, int, 0644);
+MODULE_PARM_DESC(cal_try_a34,
+		 "Fallback: read live A34 descriptor at 0x2202FE18 (default on)");
+
+static unsigned int exec_wait_ms = 40;
+module_param(exec_wait_ms, uint, 0644);
+MODULE_PARM_DESC(exec_wait_ms,
+		 "ms after EXEC before runtime ping (OSOS 2D54C success wait = 40)");
+
+static unsigned int cal_ftl_start;
+module_param(cal_ftl_start, uint, 0644);
+MODULE_PARM_DESC(cal_ftl_start, "FTL LBA to start gpfw/8740 firmware scan (not cal)");
+
+static unsigned int cal_ftl_count = 4096;
+module_param(cal_ftl_count, uint, 0644);
+MODULE_PARM_DESC(cal_ftl_count,
+		 "FTL LBAs to scan for gpfw/8740 firmware (not IsyS cal)");
+
+static int fw_prefer_ftl;
+module_param(fw_prefer_ftl, int, 0644);
+MODULE_PARM_DESC(fw_prefer_ftl,
+		 "1=try gpfw/8740 from FTL before grape-nimbus.bin (DFU default 0)");
+
+static int fw_allow_file = 1;
+module_param(fw_allow_file, int, 0644);
+MODULE_PARM_DESC(fw_allow_file, "1=allow apple/grape-nimbus.bin fallback");
+
+/*
+ * 2D640 r1 = firmware offset (start 0). Do NOT default to 0x00100000 —
+ * that is the EXEC-mapped app window, not the upload dest. Override only
+ * for deliberate A/B experiments.
+ */
+static unsigned int fw_dest;
+module_param(fw_dest, uint, 0644);
+MODULE_PARM_DESC(fw_dest,
+		 "2D640 ARM upload base dest (OSOS offset 0; cal stays 0x400200)");
+
+static unsigned int exec_addr = 0x00100018;
+module_param(exec_addr, uint, 0644);
+MODULE_PARM_DESC(exec_addr,
+		 "2D54C EXEC word0 (OSOS 0x00100018; bootloader-mapped PC)");
+static unsigned int exec_word1 = 0x00000100;
+module_param(exec_word1, uint, 0644);
+MODULE_PARM_DESC(exec_word1, "2D54C EXEC word1 (OSOS 0x00000100)");
+
+/* fmss-s5l8740.ko exports (optional link). */
+bool fmss_ftl_present(void);
+int fmss_ftl_read_sector(u64 logical_sector, void *buf);
 
 static bool nimbus_verbose = true;
 
@@ -151,12 +254,22 @@ struct nimbus {
 	struct task_struct *thread;
 	struct mutex lock;
 	bool stopped;
-	bool fw_loaded;
+	bool fw_uploaded;	/* 2D640/2D7A4 transport ACKs */
+	bool cal_uploaded;
+	bool requestcal_done;	/* 2D5B0 / 1F01 path done */
+	bool exec_sent;		/* 2D54C SPI xfer completed — not runtime */
+	bool runtime_ready;	/* valid 182590 ping checksum */
+	bool fw_loaded;		/* alias of runtime_ready for older call sites */
 	bool fw_tried;
 	bool spi_ok;
 	bool use_irq;
 	bool blob16;	/* S5L TXDATA is 8-bit; 16-bit writes fail 4BC1 */
 	bool parked;	/* give up after recycle budget — stop SPI spam */
+	bool have_isys;
+	bool have_cal;
+	bool isys_sysfs;
+	u8 isys[NIMBUS_ISYS_LEN];
+	u8 cal_upload[NIMBUS_FW_HDR_LEN];
 	int irq;
 	unsigned int ping_fails;
 	unsigned int recycle_count;
@@ -453,6 +566,8 @@ static int nimbus_xfer(struct nimbus *n, const u8 *tx, u8 *rx, unsigned int len)
 /* sub_2C87E — bootloader opcode whitelist */
 static bool nimbus_opcode_known(u16 w);
 static bool nimbus_looks_like_arm(const u8 *p, size_t n);
+static void nimbus_bswap32_words(u8 *p, unsigned int len);
+static u32 nimbus_sum32(const u8 *p, unsigned int len);
 
 static bool nimbus_opcode_known(u16 w)
 {
@@ -518,6 +633,65 @@ static bool nimbus_fw_has_z2fw_hdr(const u8 *data, size_t size)
 		return false;
 	magic = get_unaligned_le32(data);
 	return magic == NIMBUS_Z2FW_MAGIC;
+}
+
+/* Classify host grape file: full 8740 container vs ARM-only cut vs Z2FW. */
+static void nimbus_fwfile_classify(struct nimbus *n, const u8 *data, size_t size)
+{
+	bool h8740 = nimbus_fw_has_8740_hdr(data, size);
+	bool hz2 = nimbus_fw_has_z2fw_hdr(data, size);
+	bool arm0 = size >= 4 && nimbus_looks_like_arm(data, size);
+	bool arm400 = size >= 0x410 && nimbus_looks_like_arm(data + 0x400, 16);
+	u32 le0c = (h8740 && size >= 0x10) ? get_unaligned_le32(data + 0xc) : 0;
+	u8 rev = (h8740 && size >= 5) ? data[4] : 0;
+
+	dev_info(&n->spi->dev,
+		 "FWFILE size=%zu first16=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x has_8740=%d rev=%u le32(+0xc)=0x%x arm@0=%d arm@0x400=%d Z2FW=%d\n",
+		 size,
+		 size > 0 ? data[0] : 0, size > 1 ? data[1] : 0,
+		 size > 2 ? data[2] : 0, size > 3 ? data[3] : 0,
+		 size > 4 ? data[4] : 0, size > 5 ? data[5] : 0,
+		 size > 6 ? data[6] : 0, size > 7 ? data[7] : 0,
+		 size > 8 ? data[8] : 0, size > 9 ? data[9] : 0,
+		 size > 10 ? data[10] : 0, size > 11 ? data[11] : 0,
+		 size > 12 ? data[12] : 0, size > 13 ? data[13] : 0,
+		 size > 14 ? data[14] : 0, size > 15 ? data[15] : 0,
+		 h8740, rev, le0c, arm0, arm400, hz2);
+	if (!h8740 && arm0)
+		dev_warn(&n->spi->dev,
+			 "FWFILE is ARM-only cut — grape file +350 is not IsyS cal\n");
+}
+
+static void __maybe_unused nimbus_log_calcand(struct nimbus *n, const char *name,
+			       const u8 *data, size_t size, unsigned int off)
+{
+	u8 tmp[NIMBUS_FW_HDR_LEN];
+	u32 s;
+
+	if (size < off + NIMBUS_FW_HDR_LEN) {
+		dev_info(&n->spi->dev, "CALCAND %s off=%u OOB (file=%zu)\n",
+			 name, off, size);
+		return;
+	}
+	memcpy(tmp, data + off, NIMBUS_FW_HDR_LEN);
+	nimbus_bswap32_words(tmp, NIMBUS_FW_HDR_LEN);
+	s = nimbus_sum32(tmp, NIMBUS_FW_HDR_LEN);
+	dev_info(&n->spi->dev,
+		 "CALCAND %s off=%u sum32=0x%08x first16=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x (post-bswap)\n",
+		 name, off, s,
+		 tmp[0], tmp[1], tmp[2], tmp[3], tmp[4], tmp[5], tmp[6],
+		 tmp[7], tmp[8], tmp[9], tmp[10], tmp[11], tmp[12], tmp[13],
+		 tmp[14], tmp[15]);
+}
+
+static void __maybe_unused nimbus_dump_calcands(struct nimbus *n, const u8 *data,
+						size_t size)
+{
+	/* Diagnostic only — does not select a candidate for upload. */
+	nimbus_log_calcand(n, "dec350", data, size, 350);
+	nimbus_log_calcand(n, "hex350", data, size, 0x350);
+	nimbus_log_calcand(n, "arm_plus_dec350", data, size, 0x400 + 350);
+	nimbus_log_calcand(n, "arm_plus_hex350", data, size, 0x400 + 0x350);
 }
 
 static u32 nimbus_crc32_payload(const u8 *p, size_t len)
@@ -673,6 +847,81 @@ static void nimbus_peek(struct nimbus *n, const char *tag)
 	}
 }
 
+/* HBPP MemRead, dest packing is B1,B0,B3,B2 — same as DATA offset. */
+static int nimbus_rdmem(struct nimbus *n, u32 addr, u8 *buf, unsigned int len)
+{
+	unsigned int i;
+
+	if (len & 3)
+		return -EINVAL;
+	for (i = 0; i < len; i += 4) {
+		u32 v = 0;
+
+		if (nimbus_rdreg(n, addr + i, &v))
+			return -EIO;
+		put_unaligned_le32(v, buf + i);
+	}
+	return 0;
+}
+
+/*
+ * Prove whether 2D640 landed the ARM image at dest 0 or at the EXEC
+ * word 0x00100018. Cal dest 0x400200 is a separate window.
+ */
+static void nimbus_fw_readback(struct nimbus *n, const char *tag)
+{
+	static const u32 addrs[] = {
+		0x00000000, 0x00000018, 0x00100000, 0x00100018,
+		0x00400000, 0x00400200,
+	};
+	u8 *buf;
+	unsigned int i;
+
+	buf = kmalloc(0x1000, GFP_KERNEL);
+	if (!buf)
+		return;
+	dev_info(&n->spi->dev, "NIMBUS FW_READBACK %s:\n", tag);
+	for (i = 0; i < ARRAY_SIZE(addrs); i++) {
+		u32 crc100, crc1000;
+
+		memset(buf, 0xa5, 0x1000);
+		if (nimbus_rdmem(n, addrs[i], buf, 0x1000)) {
+			dev_warn(&n->spi->dev,
+				 "  addr=%08x RDREG fail\n", addrs[i]);
+			continue;
+		}
+		crc100 = nimbus_crc32_payload(buf, 0x100);
+		crc1000 = nimbus_crc32_payload(buf, 0x1000);
+		dev_info(&n->spi->dev,
+			 "  addr=%08x first32=%32ph crc100=0x%08x crc1000=0x%08x\n",
+			 addrs[i], buf, crc100, crc1000);
+	}
+	kfree(buf);
+}
+
+static void nimbus_cal_readback(struct nimbus *n, const u8 *upload)
+{
+	u8 *buf;
+	u32 crc_chip, crc_host;
+
+	buf = kmalloc(NIMBUS_FW_HDR_LEN, GFP_KERNEL);
+	if (!buf)
+		return;
+	if (nimbus_rdmem(n, NIMBUS_CAL_DEST, buf, NIMBUS_FW_HDR_LEN)) {
+		dev_warn(&n->spi->dev, "cal readback RDREG fail @0x%08x\n",
+			 NIMBUS_CAL_DEST);
+		kfree(buf);
+		return;
+	}
+	crc_chip = nimbus_crc32_payload(buf, NIMBUS_FW_HDR_LEN);
+	crc_host = nimbus_crc32_payload(upload, NIMBUS_FW_HDR_LEN);
+	dev_info(&n->spi->dev,
+		 "NIMBUS CAL_READBACK @%08x first64=%32ph %32ph crc200=0x%08x host_crc=0x%08x match=%d\n",
+		 NIMBUS_CAL_DEST, buf, buf + 32, crc_chip, crc_host,
+		 crc_chip == crc_host && !memcmp(buf, upload, NIMBUS_FW_HDR_LEN));
+	kfree(buf);
+}
+
 /* sub_20848(6593) */
 static int nimbus_bootload_cmd(struct nimbus *n)
 {
@@ -735,141 +984,514 @@ static u32 nimbus_sum32(const u8 *p, unsigned int len)
 	return s;
 }
 
-static bool nimbus_cal_from_isys(struct nimbus *n, const u8 *blob, size_t len,
-				 u8 *win)
+/*
+ * Family clue (iPhone 4S AppleMultitouchN1SPI): cal is a separate
+ * multi-touch-calibration property starting "NI" (4e 49 …), not FW+350.
+ * N31 RetailOS window has been observed as 4e 49 02 01 (vs 4S 4e 49 01 01).
+ * Host/IsyS order is checked BEFORE the RetailOS u32-reverse into win[].
+ */
+static bool nimbus_cal_looks_ni(const u8 *p)
 {
-	if (len < NIMBUS_FW_HDR_OFF + NIMBUS_FW_HDR_LEN)
-		return false;
-	memcpy(win, blob + NIMBUS_FW_HDR_OFF, NIMBUS_FW_HDR_LEN);
-	nimbus_bswap32_words(win, NIMBUS_FW_HDR_LEN);
-	dev_info(&n->spi->dev,
-		 "cal +350 sum32=0x%08x head %02x %02x %02x %02x byte8=%u\n",
-		 nimbus_sum32(win, NIMBUS_FW_HDR_LEN),
-		 win[0], win[1], win[2], win[3], win[8]);
-	return true;
-}
-
-static bool nimbus_try_isys_slot(struct nimbus *n, phys_addr_t slot, u8 *win)
-{
-	void __iomem *p, *src;
-	u32 magic, ptr;
-	u8 *tmp;
-	bool ok = false;
-
-	p = ioremap(slot, 8);
-	if (!p)
-		return false;
-	magic = readl(p);
-	ptr = readl(p + 4);
-	iounmap(p);
-	dev_info(&n->spi->dev, "IsyS slot 0x%lx magic=0x%08x ptr=0x%08x\n",
-		 (unsigned long)slot, magic, ptr);
-	if (magic != NIMBUS_ISYS_MAGIC || !ptr)
-		return false;
-	src = ioremap(ptr, NIMBUS_ISYS_LEN);
-	if (!src)
-		return false;
-	tmp = kmalloc(NIMBUS_ISYS_LEN, GFP_KERNEL);
-	if (!tmp) {
-		iounmap(src);
-		return false;
-	}
-	memcpy_fromio(tmp, src, NIMBUS_ISYS_LEN);
-	iounmap(src);
-	ok = nimbus_cal_from_isys(n, tmp, NIMBUS_ISYS_LEN, win);
-	kfree(tmp);
-	return ok;
+	return p && p[0] == 0x4e && p[1] == 0x49;
 }
 
 /*
- * 2D7A4 payload = 43CFB4()+350, 512B, u32-reversed.
- * RetailOS source is sub_564: A34(0x18) → copy 0x560 into BSS 0x8A8B510.
- * A34 lives at Grape 0x2202FE18; ioremap of that is not AP RAM on DFU.
- * 273A0 uses the grape image itself at +350.
+ * OSOS sub_273A0: copy IsyS[350 : 350+0x200], reverse each u32 in that
+ * copy only (do not mutate the 0x560 object).
  */
-static int nimbus_load_cal_window(struct nimbus *n, u8 *win,
-				  const u8 *fw, size_t fw_len)
+static int nimbus_prepare_cal_from_isys(struct nimbus *n, const u8 *isys,
+					size_t isys_len)
 {
-	if (fw && nimbus_cal_from_isys(n, fw, fw_len, win)) {
-		dev_info(&n->spi->dev,
-			 "2D7A4 cal from grape.bin +350 (skipped A34 0x22)\n");
-		return 0;
+	const u8 *raw;
+	u32 sum;
+
+	if (isys_len != NIMBUS_ISYS_LEN) {
+		dev_err(&n->spi->dev, "IsyS bad size: got=%zu want=0x%x\n",
+			isys_len, NIMBUS_ISYS_LEN);
+		return -EINVAL;
 	}
 
-	dev_warn(&n->spi->dev,
-		 "no grape.bin +350 window — 2D7A4 zeros\n");
-	return -ENOENT;
+	memcpy(n->isys, isys, NIMBUS_ISYS_LEN);
+	n->have_isys = true;
+
+	raw = n->isys + NIMBUS_FW_HDR_OFF;
+	memcpy(n->cal_upload, raw, NIMBUS_FW_HDR_LEN);
+	dev_info(&n->spi->dev,
+		 "cal +350 raw head %02x %02x %02x %02x%s\n",
+		 raw[0], raw[1], raw[2], raw[3],
+		 nimbus_cal_looks_ni(raw) ? " (NI family — good)" :
+		 " (not NI — suspect vs 4S/IOReg cal)");
+	nimbus_bswap32_words(n->cal_upload, NIMBUS_FW_HDR_LEN);
+	sum = nimbus_sum32(n->cal_upload, NIMBUS_FW_HDR_LEN);
+	dev_info(&n->spi->dev,
+		 "Nimbus IsyS cal prepared: off=%u len=0x%x sum32=0x%08x upload_first32=%32ph\n",
+		 NIMBUS_FW_HDR_OFF, NIMBUS_FW_HDR_LEN, sum, n->cal_upload);
+	if (!sum) {
+		dev_err(&n->spi->dev,
+			"IsyS +350 window is all zeros — not a usable cal\n");
+		n->have_cal = false;
+		return -EINVAL;
+	}
+	n->have_cal = true;
+	return 0;
+}
+
+/*
+ * OSOS sub_564: desc = sub_A34(24) = 0x2202FE18
+ *   desc[0] == 0x53797349
+ *   memcpy(0x08A8B510, desc[1], 0x560)
+ * Linux reads the live descriptor if boot preserved that SRAM.
+ */
+static int nimbus_load_isys_from_a34(struct nimbus *n)
+{
+	void __iomem *desc_io;
+	void __iomem *src_io;
+	u32 magic;
+	u32 ptr;
+	u8 *tmp;
+	int ret;
+
+	if (!cal_try_a34)
+		return -ENOENT;
+
+	desc_io = ioremap(NIMBUS_A34_ISYS_DESC, 8);
+	if (!desc_io)
+		return -ENOMEM;
+
+	magic = readl(desc_io);
+	ptr = readl(desc_io + 4);
+	iounmap(desc_io);
+
+	dev_info(&n->spi->dev,
+		 "A34 IsyS descriptor: magic=0x%08x ptr=0x%08x\n",
+		 magic, ptr);
+
+	if (magic != NIMBUS_ISYS_MAGIC) {
+		dev_warn(&n->spi->dev,
+			 "A34 IsyS missing: magic=0x%08x want=0x%08x\n",
+			 magic, NIMBUS_ISYS_MAGIC);
+		return -ENOENT;
+	}
+	if (!ptr) {
+		dev_warn(&n->spi->dev, "A34 IsyS pointer is NULL\n");
+		return -ENOENT;
+	}
+
+	src_io = ioremap(ptr, NIMBUS_ISYS_LEN);
+	if (!src_io)
+		return -ENOMEM;
+
+	tmp = kmalloc(NIMBUS_ISYS_LEN, GFP_KERNEL);
+	if (!tmp) {
+		iounmap(src_io);
+		return -ENOMEM;
+	}
+
+	memcpy_fromio(tmp, src_io, NIMBUS_ISYS_LEN);
+	iounmap(src_io);
+
+	dev_info(&n->spi->dev,
+		 "A34 IsyS read: ptr=0x%08x len=0x%x first32=%32ph calraw_first16=%16ph\n",
+		 ptr, NIMBUS_ISYS_LEN, tmp, tmp + NIMBUS_FW_HDR_OFF);
+
+	ret = nimbus_prepare_cal_from_isys(n, tmp, NIMBUS_ISYS_LEN);
+	kfree(tmp);
+	return ret;
+}
+
+/*
+ * U-Boot copies the 0x560 IsyS object to reserved DRAM and publishes
+ * apple,n31-isys-addr / apple,n31-isys-size on /chosen. That copy is the
+ * safe address — never the original A34 pointer.
+ */
+static int nimbus_load_isys_from_dt(struct nimbus *n)
+{
+	struct device_node *chosen;
+	u32 addr;
+	u32 size;
+	void *p;
+	u8 *tmp;
+	int ret;
+
+	if (!cal_try_dt)
+		return -ENOENT;
+
+	chosen = of_find_node_by_path("/chosen");
+	if (!chosen)
+		return -ENOENT;
+
+	ret = of_property_read_u32(chosen, "apple,n31-isys-addr", &addr);
+	if (ret)
+		goto out;
+
+	ret = of_property_read_u32(chosen, "apple,n31-isys-size", &size);
+	if (ret)
+		goto out;
+
+	dev_info(&n->spi->dev, "DT IsyS: addr=0x%08x size=0x%x\n", addr, size);
+
+	if (!addr || size != NIMBUS_ISYS_LEN) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	p = memremap(addr, size, MEMREMAP_WB);
+	if (!p) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	tmp = kmemdup(p, size, GFP_KERNEL);
+	memunmap(p);
+	if (!tmp) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	dev_info(&n->spi->dev,
+		 "DT IsyS read: addr=0x%08x len=0x%x first32=%32ph calraw_first16=%16ph\n",
+		 addr, size, tmp, tmp + NIMBUS_FW_HDR_OFF);
+
+	ret = nimbus_prepare_cal_from_isys(n, tmp, size);
+	kfree(tmp);
+
+out:
+	of_node_put(chosen);
+	return ret;
+}
+
+static int nimbus_acquire_isys_cal(struct nimbus *n)
+{
+	int ret;
+
+	if (n->have_cal)
+		return 0;
+
+	ret = nimbus_load_isys_from_dt(n);
+	if (!ret)
+		return 0;
+
+	dev_info(&n->spi->dev, "DT IsyS unavailable: %d; trying A34 live\n",
+		 ret);
+
+	ret = nimbus_load_isys_from_a34(n);
+	if (!ret)
+		return 0;
+
+	dev_err(&n->spi->dev,
+		"No IsyS calibration from DT or A34; not registering input\n");
+	return ret;
+}
+
+/* Optional fmss FTL export — grape firmware only, not IsyS cal. */
+static bool (*nimbus_ftl_present_fn)(void);
+static int (*nimbus_ftl_read_fn)(u64 logical_sector, void *buf);
+static bool nimbus_ftl_inited;
+
+static void nimbus_ftl_init_once(void)
+{
+	if (nimbus_ftl_inited)
+		return;
+	nimbus_ftl_inited = true;
+	nimbus_ftl_present_fn = symbol_get(fmss_ftl_present);
+	nimbus_ftl_read_fn = symbol_get(fmss_ftl_read_sector);
+}
+
+static bool nimbus_ftl_ready(void)
+{
+	nimbus_ftl_init_once();
+	return nimbus_ftl_present_fn && nimbus_ftl_read_fn &&
+	       nimbus_ftl_present_fn();
+}
+
+/*
+ * Walk FTL for Apple 8740 / gpfw IMG1. Returns kmalloc'd buffer + size.
+ * Caller kfree() on success. This is the ARM app, not IsyS cal.
+ */
+static u8 *nimbus_try_gpfw_from_ftl(struct device *dev, size_t *out_len)
+{
+	u8 *sec, *buf = NULL;
+	u64 lba, end;
+	unsigned int off;
+	size_t need, got;
+	u32 body_sz;
+
+	if (!fw_prefer_ftl || !nimbus_ftl_ready())
+		return NULL;
+
+	sec = kmalloc(NIMBUS_FTL_SECTOR_SIZE, GFP_KERNEL);
+	if (!sec)
+		return NULL;
+
+	end = min_t(u64, cal_ftl_start + cal_ftl_count, 256ULL);
+	for (lba = 0; lba < end; lba++) {
+		if (nimbus_ftl_read_fn(lba, sec))
+			continue;
+		for (off = 0; off + 0x410 <= NIMBUS_FTL_SECTOR_SIZE; off += 4) {
+			if (memcmp(sec + off, "8740", 4))
+				continue;
+			body_sz = get_unaligned_le32(sec + off + 0x0c);
+			if (!body_sz || body_sz > 1024 * 1024)
+				continue;
+			need = 0x400 + round_up(body_sz, 16);
+			buf = kmalloc(need, GFP_KERNEL);
+			if (!buf)
+				goto out;
+			memcpy(buf, sec + off, min_t(size_t, need,
+						    NIMBUS_FTL_SECTOR_SIZE - off));
+			got = min_t(size_t, need, NIMBUS_FTL_SECTOR_SIZE - off);
+			while (got < need && lba + 1 < end) {
+				lba++;
+				if (nimbus_ftl_read_fn(lba, sec)) {
+					kfree(buf);
+					buf = NULL;
+					goto out;
+				}
+				memcpy(buf + got, sec,
+				       min_t(size_t, need - got,
+					       NIMBUS_FTL_SECTOR_SIZE));
+				got += min_t(size_t, need - got,
+					     NIMBUS_FTL_SECTOR_SIZE);
+			}
+			if (got >= 0x410) {
+				dev_info(dev,
+					 "gpfw/8740 from FTL lba=%llu off=%u need=%zu got=%zu rev=%u\n",
+					 lba, off, need, got, buf[7]);
+				*out_len = got;
+				goto out;
+			}
+			kfree(buf);
+			buf = NULL;
+		}
+	}
+
+out:
+	kfree(sec);
+	return buf;
+}
+
+static int nimbus_acquire_fw(struct device *dev, const u8 **data,
+			     size_t *size, const struct firmware **fw_out,
+			     u8 **kbuf_out)
+{
+	size_t flen = 0;
+	u8 *ftl;
+
+	*fw_out = NULL;
+	*kbuf_out = NULL;
+	if (fw_prefer_ftl) {
+		ftl = nimbus_try_gpfw_from_ftl(dev, &flen);
+		if (ftl) {
+			*data = ftl;
+			*size = flen;
+			*kbuf_out = ftl;
+			return 0;
+		}
+	}
+	if (!fw_allow_file)
+		return -ENOENT;
+	if (request_firmware(fw_out, "apple/grape-nimbus.bin", dev) ||
+	    !*fw_out)
+		return -ENOENT;
+	*data = (*fw_out)->data;
+	*size = (*fw_out)->size;
+	return 0;
+}
+
+static void nimbus_release_fw(const struct firmware *fw, u8 *kbuf)
+{
+	if (kbuf)
+		kfree(kbuf);
+	else if (fw)
+		release_firmware(fw);
+}
+
+/*
+ * 2D7A4 payload → controller @ 0x00400200.
+ * Cal is the transformed A34 IsyS window only.
+ */
+static int nimbus_load_cal_window(struct nimbus *n, u8 *win)
+{
+	int ret;
+
+	ret = nimbus_acquire_isys_cal(n);
+	if (ret)
+		return ret;
+	memcpy(win, n->cal_upload, NIMBUS_FW_HDR_LEN);
+	return 0;
 }
 
 /*
  * sub_2D640 / 2D7A4 + trampoline sub_35C1C → sub_3B9D0:
- *   [0..1]   18 E1
- *   [2..3]   30 01
- *   [4..5]   (len>>10), (len>>2)          — len must be multiple of 4
- *   [6..9]   offset packed BYTE1,0,3,2
- *   [10..11] sum16 of bytes [4..9]
- *   [12 .. 12+len)  swizzled payload
- *   [12+len .. +4)  sum32 of payload, stored BYTE1,0,3,2
- * SPI len = len + 16; ACK 0x4BC1 (retry ≤5).
+ *   frame[0..1]  18 E1
+ *   body @ +2:
+ *     30 01
+ *     word_count hi/lo = (len>>10),(len>>2)
+ *     dest B1 B0 B3 B2
+ *     u16 byte-sum of previous 6 body bytes (words+dest), BE
+ *     payload u32s swizzled B1 B0 B3 B2
+ *     u32 byte-sum of swizzled payload, stored B1 B0 B3 B2
+ * SPI len = payload_len + 16; max payload 0x1FF0; ACK 0x4BC1 (retry ≤5).
+ *
+ * Expected prefixes (exact glass check):
+ *   FW chunk0 dest=0 len=0x1FF0:
+ *     18 E1 30 01 07 FC 00 00 00 00 01 03
+ *   CAL chunk0 dest=0x00400200 len=0x200:
+ *     18 E1 30 01 00 80 02 00 00 40 00 C2
  */
-static int nimbus_send_chunk_ex(struct nimbus *n, const u8 *data,
-				unsigned int offset, unsigned int len,
-				unsigned int cs_flags)
+static unsigned int nimbus_build_upload_frame(u8 *buf, u32 dest,
+					      const u8 *src, unsigned int len)
 {
-	u8 *buf;
 	u16 hdr_sum;
-	u32 body_sum;
-	unsigned int i;
-	int ret, try;
-
-	if (!len || len > NIMBUS_CHUNK_MAX || (len & 3))
-		return -EINVAL;
-
-	buf = kzalloc(len + NIMBUS_HDR_LEN, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
+	u32 payload_sum;
 
 	buf[0] = 0x18;
 	buf[1] = 0xe1;
 	buf[2] = 0x30;
 	buf[3] = 0x01;
+	/* word_count = len/4 as big-endian u16 via (len>>10),(len>>2) */
 	buf[4] = (len >> 10) & 0xff;
 	buf[5] = (len >> 2) & 0xff;
-	buf[6] = (offset >> 8) & 0xff;
-	buf[7] = offset & 0xff;
-	buf[8] = (offset >> 24) & 0xff;
-	buf[9] = (offset >> 16) & 0xff;
+	/* dest swizzle B1 B0 B3 B2 */
+	buf[6] = (dest >> 8) & 0xff;
+	buf[7] = dest & 0xff;
+	buf[8] = (dest >> 24) & 0xff;
+	buf[9] = (dest >> 16) & 0xff;
 	hdr_sum = nimbus_sum16(buf + 4, 6);
 	buf[10] = (hdr_sum >> 8) & 0xff;
 	buf[11] = hdr_sum & 0xff;
 
-	nimbus_grape_swizzle32(buf + 12, data, len);
+	nimbus_grape_swizzle32(buf + 12, src, len);
 
-	body_sum = 0;
-	for (i = 0; i < len; i++)
-		body_sum += buf[12 + i];
-	buf[12 + len]     = (body_sum >> 8) & 0xff;
-	buf[12 + len + 1] = body_sum & 0xff;
-	buf[12 + len + 2] = (body_sum >> 24) & 0xff;
-	buf[12 + len + 3] = (body_sum >> 16) & 0xff;
+	payload_sum = nimbus_sum32(buf + 12, len);
+	buf[12 + len]     = (payload_sum >> 8) & 0xff;
+	buf[12 + len + 1] = payload_sum & 0xff;
+	buf[12 + len + 2] = (payload_sum >> 24) & 0xff;
+	buf[12 + len + 3] = (payload_sum >> 16) & 0xff;
+
+	return len + NIMBUS_HDR_LEN;
+}
+
+/* Glass/oracle prefixes from RetailOS 2D640 / 2D7A4 — fail loud if wrong. */
+static void nimbus_check_upload_prefix(struct nimbus *n, u32 dest,
+				       unsigned int len, const u8 *tx)
+{
+	static const u8 fw0[12] = {
+		0x18, 0xe1, 0x30, 0x01, 0x07, 0xfc, 0x00, 0x00,
+		0x00, 0x00, 0x01, 0x03
+	};
+	static const u8 cal0[12] = {
+		0x18, 0xe1, 0x30, 0x01, 0x00, 0x80, 0x02, 0x00,
+		0x00, 0x40, 0x00, 0xc2
+	};
+
+	if (dest == 0 && len == NIMBUS_CHUNK_MAX && memcmp(tx, fw0, 12)) {
+		dev_err(&n->spi->dev,
+			"FW_UPLOAD prefix MISMATCH want 18 e1 30 01 07 fc 00 00 00 00 01 03 got %12ph\n",
+			tx);
+	}
+	if (dest == NIMBUS_CAL_DEST && len == NIMBUS_FW_HDR_LEN &&
+	    memcmp(tx, cal0, 12)) {
+		dev_err(&n->spi->dev,
+			"CAL_UPLOAD prefix MISMATCH want 18 e1 30 01 00 80 02 00 00 40 00 c2 got %12ph\n",
+			tx);
+	}
+}
+
+static void nimbus_log_upload_prefix(struct nimbus *n, const char *tag,
+				     unsigned int chunk_idx, u32 dest,
+				     unsigned int len, const u8 *tx,
+				     unsigned int xfer_len, u16 ack, int ack_ret)
+{
+	dev_info(&n->spi->dev,
+		 "NIMBUS %s chunk=%u dest=%08x len=%04x xfer=%u ACK=0x%04x ret=%d\n",
+		 tag, chunk_idx, dest, len, xfer_len, ack, ack_ret);
+	dev_info(&n->spi->dev,
+		 "  tx[0:16] = %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+		 tx[0], tx[1], tx[2], tx[3], tx[4], tx[5], tx[6], tx[7],
+		 tx[8], tx[9], tx[10], tx[11],
+		 xfer_len > 12 ? tx[12] : 0, xfer_len > 13 ? tx[13] : 0,
+		 xfer_len > 14 ? tx[14] : 0, xfer_len > 15 ? tx[15] : 0);
+}
+
+static void nimbus_dump_hbpp_tx(struct nimbus *n, const char *tag,
+				const u8 *raw, unsigned int chunk_idx,
+				unsigned int dest, unsigned int chunk_len,
+				const u8 *tx, unsigned int xfer_len, u16 ack,
+				int ack_ret)
+{
+	unsigned int last_off;
+
+	nimbus_log_upload_prefix(n, tag, chunk_idx, dest, chunk_len,
+				 tx, xfer_len, ack, ack_ret);
+	if (raw && chunk_len >= 64)
+		dev_info(&n->spi->dev, "  raw first64=%32ph %32ph\n",
+			 raw, raw + 32);
+	else if (raw)
+		dev_info(&n->spi->dev, "  raw first%u=%*ph\n",
+			 chunk_len, chunk_len, raw);
+	if (xfer_len >= 96)
+		dev_info(&n->spi->dev,
+			 "  tx first96=%32ph %32ph %32ph\n",
+			 tx, tx + 32, tx + 64);
+	else if (xfer_len > 16)
+		dev_info(&n->spi->dev, "  tx first%u=%*ph\n",
+			 xfer_len, xfer_len, tx);
+	if (xfer_len >= 32) {
+		last_off = xfer_len - 32;
+		dev_info(&n->spi->dev, "  tx last32=%32ph\n", tx + last_off);
+	}
+}
+
+static int nimbus_send_chunk_ex(struct nimbus *n, const u8 *data,
+				unsigned int dest, unsigned int len,
+				unsigned int cs_flags, bool dump,
+				const char *tag, unsigned int chunk_idx,
+				unsigned int file_off)
+{
+	u8 *buf;
+	unsigned int xfer_len;
+	int ret = -EIO, try, ack_ret = -ETIMEDOUT;
+	u16 ack = 0;
+
+	if (!len || len > NIMBUS_CHUNK_MAX || (len & 3))
+		return -EINVAL;
+
+	xfer_len = len + NIMBUS_HDR_LEN;
+	buf = kzalloc(xfer_len, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	if (nimbus_build_upload_frame(buf, dest, data, len) != xfer_len) {
+		kfree(buf);
+		return -EINVAL;
+	}
+	nimbus_check_upload_prefix(n, dest, len, buf);
 
 	/* Z2 SEND_BLOB: spi_sync keeps CS down for whole HBPP frame. */
 	for (try = 0; try < 5; try++) {
 		if (chunk_spi)
-			ret = nimbus_xfer(n, buf, NULL, len + NIMBUS_HDR_LEN);
+			ret = nimbus_xfer(n, buf, NULL, xfer_len);
 		else if (n->blob16)
 			ret = nimbus_burst_u16_ex(n, buf, NULL,
-						  len + NIMBUS_HDR_LEN, cs_flags);
+						  xfer_len, cs_flags);
 		else
-			ret = nimbus_burst_ex(n, buf, NULL,
-					      len + NIMBUS_HDR_LEN, cs_flags);
+			ret = nimbus_burst_ex(n, buf, NULL, xfer_len, cs_flags);
 		if (ret)
 			continue;
-		if (nimbus_wait_ack(n, NIMBUS_ACK_CHUNK, 8) == 0) {
-			if (!offset)
-				dev_info(&n->spi->dev,
-					 "chunk0 %u bytes ACK 0x4BC1 (%s)\n",
-					 len, n->blob16 ? "u16" : "u8");
+		/* 1A A1 → 2 bytes → rev16; expect 0x4BC1 */
+		ack_ret = nimbus_wait_ack(n, NIMBUS_ACK_CHUNK, 8);
+		if (ack_ret == 0) {
+			ack = NIMBUS_ACK_CHUNK;
+			if (dump)
+				nimbus_dump_hbpp_tx(n, tag, data, chunk_idx,
+						    dest, len, buf, xfer_len,
+						    ack, ack_ret);
+			else if (!chunk_idx)
+				nimbus_log_upload_prefix(n, tag, chunk_idx,
+							 dest, len, buf,
+							 xfer_len, ack,
+							 ack_ret);
 			kfree(buf);
 			return 0;
 		}
@@ -879,26 +1501,38 @@ static int nimbus_send_chunk_ex(struct nimbus *n, const u8 *data,
 				 "16-bit DATA no 4BC1 — falling back to 8-bit PIO\n");
 		}
 	}
+	if (dump || !chunk_idx)
+		nimbus_dump_hbpp_tx(n, tag, data, chunk_idx, dest, len, buf,
+				    xfer_len, ack, ack_ret);
 	kfree(buf);
 	return -EIO;
 }
 
 static int nimbus_send_chunk(struct nimbus *n, const u8 *data,
-			     unsigned int offset, unsigned int len)
+			     unsigned int dest, unsigned int len, bool dump,
+			     unsigned int file_off, const char *tag,
+			     unsigned int chunk_idx)
 {
-	return nimbus_send_chunk_ex(n, data, offset, len,
-				    NIMBUS_CS_BEGIN | NIMBUS_CS_END);
+	return nimbus_send_chunk_ex(n, data, dest, len,
+				    NIMBUS_CS_BEGIN | NIMBUS_CS_END, dump,
+				    tag, chunk_idx, file_off);
 }
 
 static int nimbus_send_blob(struct nimbus *n, const u8 *data, unsigned int len,
 			    unsigned int dest_off)
 {
 	unsigned int off = 0;
+	unsigned int chunk_idx = 0;
 	u8 pad[4];
+	const char *tag;
+	bool is_cal = (dest_off == NIMBUS_CAL_DEST);
+
+	tag = is_cal ? "CAL_UPLOAD" : "FW_UPLOAD";
 
 	while (off < len) {
 		unsigned int chunk = min_t(unsigned int, len - off, NIMBUS_CHUNK_MAX);
 		int ret;
+		bool last, dump;
 
 		/* RetailOS always transfers whole words */
 		if (chunk & 3)
@@ -906,12 +1540,18 @@ static int nimbus_send_blob(struct nimbus *n, const u8 *data, unsigned int len,
 		if (!chunk) {
 			memset(pad, 0, sizeof(pad));
 			memcpy(pad, data + off, len - off);
-			return nimbus_send_chunk(n, pad, dest_off + off, 4);
+			return nimbus_send_chunk(n, pad, dest_off + off, 4,
+						 true, off, tag, chunk_idx);
 		}
-		ret = nimbus_send_chunk(n, data + off, dest_off + off, chunk);
+		last = (off + chunk >= len);
+		/* Always dump first + last FW chunk and the sole cal chunk. */
+		dump = (off == 0) || last || is_cal;
+		ret = nimbus_send_chunk(n, data + off, dest_off + off, chunk,
+					dump, off, tag, chunk_idx);
 		if (ret)
 			return ret;
 		off += chunk;
+		chunk_idx++;
 	}
 	return 0;
 }
@@ -971,10 +1611,17 @@ static int nimbus_post_download(struct nimbus *n)
 	};
 
 	for (i = 0; i < ARRAY_SIZE(pokes); i++) {
+		u32 rb = 0;
+
 		ret = nimbus_cmd_34ad0(n, pokes[i].a1, pokes[i].a2, pokes[i].a3);
 		dev_info(&n->spi->dev, "34AD0[%d] %d\n", i, ret);
 		if (ret)
 			return ret;
+		/* 4AD1 = write ACK only; verify with RDREG while still in HBPP. */
+		if (nimbus_rdreg(n, pokes[i].a1, &rb) == 0)
+			dev_info(&n->spi->dev,
+				 "34AD0[%d] RDREG 0x%08x -> 0x%08x (wrote %u)\n",
+				 i, pokes[i].a1, rb, pokes[i].a2);
 	}
 
 	put_unaligned_le16(NIMBUS_POST_POKE, tx);
@@ -985,6 +1632,7 @@ static int nimbus_post_download(struct nimbus *n)
 	/* 2D5B0: 3D5706 success only — does not require 0x4BC1 */
 	if (nimbus_status_poll(n, &st) == 0) {
 		dev_info(&n->spi->dev, "post-poke status 0x%04x\n", st);
+		n->requestcal_done = true;
 		return 0;
 	}
 	return -EIO;
@@ -1013,38 +1661,61 @@ static int nimbus_cmd_2d54c_raw(struct nimbus *n, u32 word0, u32 word1)
 				 go_spi_setup, saved_setup);
 		}
 	}
-	ret = nimbus_burst(n, tx, rx, 12);
+	if (go_xfer == 2)
+		ret = nimbus_xfer(n, tx, rx, 12);
+	else if (go_xfer == 1)
+		ret = nimbus_burst_u16(n, tx, rx, 12);
+	else
+		ret = nimbus_burst(n, tx, rx, 12);
 	if (saved_setup)
 		writel(saved_setup, n->spi2 + SPI2_SETUP);
 	dev_info(&n->spi->dev,
-		 "2D54C %08x %08x ret=%d rx %02x %02x %02x %02x %02x %02x\n",
-		 word0, word1, ret, rx[0], rx[1], rx[2], rx[3], rx[4], rx[5]);
+		 "2D54C %08x %08x ret=%d xfer=%d rx %02x %02x %02x %02x %02x %02x\n",
+		 word0, word1, ret, go_xfer, rx[0], rx[1], rx[2], rx[3],
+		 rx[4], rx[5]);
 	return ret;
 }
 
-static void nimbus_drain(struct nimbus *n, unsigned int bytes)
+static void __maybe_unused nimbus_drain(struct nimbus *n, unsigned int bytes)
 {
 	u8 tx[NIMBUS_FRAME_LEN] = { 0 };
 	u8 rx[NIMBUS_FRAME_LEN] = { 0 };
 	unsigned int nxf = bytes < NIMBUS_FRAME_LEN ? bytes : NIMBUS_FRAME_LEN;
 
+	/* Optional post-fail diagnostics only — never call on EXEC path. */
 	nimbus_burst(n, tx, rx, nxf);
 }
 
+static void nimbus_pre_exec_verify(struct nimbus *n)
+{
+	static const u32 addrs[] = {
+		0x00000000, 0x00000004, 0x00000008, 0x00000020,
+		0x00400200, 0x00400204, 0x004003fc,
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(addrs); i++) {
+		u32 v = 0;
+
+		if (nimbus_rdreg(n, addrs[i], &v) == 0)
+			dev_info(&n->spi->dev, "pre-EXEC RDREG 0x%08x=0x%08x\n",
+				 addrs[i], v);
+	}
+}
+
+/*
+ * sub_2D54C — one-shot EXEC packet only.
+ * Do NOT poll 1A A1 / drain after EXEC: that keeps speaking HBPP across the
+ * bootloader→runtime boundary. Success is proven only by 182590 ping csum.
+ */
 static int nimbus_cmd_2d54c(struct nimbus *n)
 {
-	u16 st = 0;
 	int ret;
 
-	/* 273A0: 2D54C immediately after 2D5B0. No HBPP MemRead around go. */
-	nimbus_drain(n, 16);
-	ret = nimbus_cmd_2d54c_raw(n, 0x00100018, 0x00000100);
-	if (!ret) {
-		msleep(40);
-		if (nimbus_status_poll(n, &st) == 0)
-			dev_info(&n->spi->dev, "post-2D54C status 0x%04x\n", st);
-		nimbus_drain(n, 16);
-	}
+	nimbus_pre_exec_verify(n);
+	ret = nimbus_cmd_2d54c_raw(n, exec_addr, exec_word1);
+	if (!ret)
+		n->exec_sent = true;
 	return ret;
 }
 
@@ -1122,9 +1793,6 @@ static int nimbus_probe_ping16(struct nimbus *n)
  *   for 8740 rev 3 only. grape-nimbus.bin on DFU is usually pre-decrypted-cut.
  * force_gid=1 tries 422FFA even when loading plaintext blob (bring-up).
  */
-static int force_gid;
-module_param(force_gid, int, 0644);
-MODULE_PARM_DESC(force_gid, "1=422FFA decrypt attempt even without 8740 rev3 hdr");
 static int nimbus_422ffa_mmio(struct device *dev, u8 *buf, unsigned int len,
 			      bool encrypt)
 {
@@ -1255,6 +1923,57 @@ static bool nimbus_looks_like_arm(const u8 *p, size_t n)
 }
 
 /*
+ * v6 RE (2026-08-25): post-GID plaintext may already be a preconstructed
+ * HBPP DATA object (18 E1 30 01 …) — Corellium GEN_1 sends Constructed
+ * Firmware unchanged. Detect that and SPI-send as-is (ACK 0x4BC1).
+ */
+static bool nimbus_looks_like_hbpp_data(const u8 *p, size_t n)
+{
+	if (n >= 4 && p[0] == 0x18 && p[1] == 0xe1 &&
+	    p[2] == 0x30 && p[3] == 0x01)
+		return true;
+	if (n >= 2 && p[0] == 0x30 && p[1] == 0x01)
+		return true;
+	return false;
+}
+
+/**
+ * nimbus_send_preconstructed_hbpp - SPI the whole HBPP frame, expect 0x4BC1
+ * (DATA ACK). Do not re-wrap or swizzle — bytes are already HBPP.
+ */
+static int nimbus_send_preconstructed_hbpp(struct nimbus *n, const u8 *data,
+					   size_t len)
+{
+	int try, ret;
+
+	if (len < 16)
+		return -EINVAL;
+
+	for (try = 0; try < 5; try++) {
+		if (chunk_spi)
+			ret = nimbus_xfer(n, data, NULL, len);
+		else if (n->blob16)
+			ret = nimbus_burst_u16_ex(n, data, NULL, len, 0);
+		else
+			ret = nimbus_burst_ex(n, data, NULL, len, 0);
+		if (ret)
+			continue;
+		if (nimbus_wait_ack(n, NIMBUS_ACK_CHUNK, 8) == 0) {
+			dev_info(&n->spi->dev,
+				 "preconstructed HBPP %zuB ACK 0x4BC1 try=%d\n",
+				 len, try);
+			return 0;
+		}
+		if (n->blob16 && try == 0) {
+			n->blob16 = false;
+			dev_info(&n->spi->dev,
+				 "preconstructed HBPP: fall back to 8-bit\n");
+		}
+	}
+	return -EIO;
+}
+
+/*
  * 204E0 sends le32(8740+0x0c)=0xe970. The decrypted cut is 0xecf0 and the
  * extra 896 bytes are 0x53/0x43 fill. Downloading that fill to dest 0xe970
  * stomps SRAM just past the official image (likely BSS / bootloader workspace).
@@ -1282,6 +2001,7 @@ static int nimbus_download_fw(struct nimbus *n, const u8 *data, size_t size,
 	bool apple_hdr = nimbus_fw_has_8740_hdr(data, size);
 
 	(void)arm_at_zero;
+	nimbus_fwfile_classify(n, data, size);
 
 	/*
 	 * 1A640 NOR 8740 → 204E0. ARM at +0x400, size le32(+0x0c).
@@ -1301,7 +2021,10 @@ static int nimbus_download_fw(struct nimbus *n, const u8 *data, size_t size,
 		/* Short NOR slice: take the ARM bytes we have. Never expand. */
 		if (!hdr_sz || hdr_sz > size - 0x400)
 			hdr_sz = size - 0x400;
-		hdr_sz &= ~3u;
+		/* 204E0: size rounded up to 16 for 422FFA; keep ≤ available. */
+		hdr_sz = round_up(hdr_sz, 16);
+		if (hdr_sz > size - 0x400)
+			hdr_sz = (size - 0x400) & ~15u;
 		body = data + 0x400;
 		body_len = hdr_sz;
 		rev = data[7];
@@ -1408,6 +2131,24 @@ static int nimbus_download_fw(struct nimbus *n, const u8 *data, size_t size,
 	}
 
 send:
+	/*
+	 * v6: if body is already 18 E1 30 01… (post-GID constructed FW),
+	 * send once and run post-download. Do not re-packetize ARM.
+	 */
+	if (nimbus_looks_like_hbpp_data(body, body_len)) {
+		dev_info(&n->spi->dev,
+			 "preconstructed HBPP DATA %zuB — direct SPI (no ARM wrap)\n",
+			 body_len);
+		ret = nimbus_send_preconstructed_hbpp(n, body, body_len);
+		if (!ret) {
+				ret = nimbus_post_download(n);
+				if (!ret)
+					ret = nimbus_cmd_2d54c(n);
+			}
+		kfree(dec);
+		return ret;
+	}
+
 	{
 		size_t official = nimbus_official_arm_len(body, body_len);
 		size_t dl_len = body_len;
@@ -1450,27 +2191,59 @@ send:
 			kfree(dec);
 			return -ENOMEM;
 		}
-		/* 273A0: 43CFB4()+350 from the grape image, not A34 0x22. */
-		cal = nimbus_load_cal_window(n, win, data, size);
+		/*
+		 * Host cal source ≠ controller address.
+		 * 2D640 ARM → dest = fw_dest + offset (OSOS fw_dest=0).
+		 * 2D7A4 cal → dest = 0x00400200 + offset.
+		 * EXEC 0x00100018 is mapped app PC — not upload dest.
+		 */
+		cal = nimbus_load_cal_window(n, win);
+		if (cal < 0) {
+			dev_err(&n->spi->dev, "2D7A4 aborted: no device cal\n");
+			kfree(win);
+			kfree(z2_prep);
+			kfree(pad_buf);
+			kfree(dec);
+			return cal;
+		}
+
+		dev_info(&n->spi->dev,
+			 "2D640 ARM dest_base=0x%08x EXEC=0x%08x cal=0x%08x\n",
+			 fw_dest, exec_addr, NIMBUS_CAL_DEST);
+		if (fw_dest == 0)
+			dev_info(&n->spi->dev,
+				 "expect FW prefix: 18 e1 30 01 07 fc 00 00 00 00 01 03 (len=0x1ff0)\n");
+		else
+			dev_warn(&n->spi->dev,
+				 "fw_dest override 0x%08x — OSOS uses 0 (A/B only)\n",
+				 fw_dest);
+		dev_info(&n->spi->dev,
+			 "expect CAL prefix: 18 e1 30 01 00 80 02 00 00 40 00 c2\n");
 
 		/* 20E94: 273A0 up to 3 times, no 1A878 between. */
 		for (try = 0; try < 3; try++) {
-			ret = nimbus_send_blob(n, dl_body, dl_len, 0);
+			ret = nimbus_send_blob(n, dl_body, dl_len, fw_dest);
 			if (ret) {
 				dev_err(&n->spi->dev,
-					"2D640 try %d: %d\n", try, ret);
+					"2D640 ARM@0x%08x try %d: %d\n",
+					fw_dest, try, ret);
 				continue;
 			}
+			n->fw_uploaded = true;
+			nimbus_fw_readback(n, "post-2D640");
 			ret = nimbus_send_blob(n, win, NIMBUS_FW_HDR_LEN,
-					       0x400200);
+					       NIMBUS_CAL_DEST);
 			if (ret) {
 				dev_err(&n->spi->dev,
-					"2D7A4 try %d: %d\n", try, ret);
+					"2D7A4 cal@0x%08x try %d: %d\n",
+					NIMBUS_CAL_DEST, try, ret);
 				continue;
 			}
+			n->cal_uploaded = true;
 			dev_info(&n->spi->dev,
-				 "2D7A4 512B %s @0x400200 ACK\n",
-				 cal ? "zeros" : "grape+350");
+				 "2D7A4 512B cal @0x%08x ACK (transport only)\n",
+				 NIMBUS_CAL_DEST);
+			nimbus_cal_readback(n, win);
 			ret = nimbus_post_download(n);
 			if (ret) {
 				dev_warn(&n->spi->dev,
@@ -1478,8 +2251,12 @@ send:
 				continue;
 			}
 			ret = nimbus_cmd_2d54c(n);
-			if (!ret)
+			if (!ret) {
+				dev_info(&n->spi->dev,
+					 "2D54C EXEC sent (try %d) — await runtime ping\n",
+					 try);
 				break;
+			}
 			dev_warn(&n->spi->dev, "2D54C try %d: %d\n", try, ret);
 		}
 		kfree(win);
@@ -1487,10 +2264,8 @@ send:
 		kfree(pad_buf);
 	}
 	kfree(dec);
-	if (ret)
-		return ret;
-	n->fw_loaded = true;
-	return 0;
+	/* EXEC transport success is NOT runtime_ready / fw_loaded. */
+	return ret;
 }
 
 static int nimbus_ping(struct nimbus *n, u16 *status_out)
@@ -1504,9 +2279,14 @@ static int nimbus_ping(struct nimbus *n, u16 *status_out)
 	csum = nimbus_sum16(tx, 14);
 	put_unaligned_le16(csum, tx + 14);
 
-	/* 182590: up to 5 retries, sleep 1 between. Burst matches DMA. */
+	/* 182590: up to 5 retries, sleep 1 between. After EXEC, 16-bit
+	 * pairs match the app SPI width; 8-bit PIO is bootloader-only.
+	 */
 	for (tries = 0; tries < 6; tries++) {
-		ret = nimbus_burst16(n, tx, rx);
+		if (n->exec_sent && go_xfer)
+			ret = nimbus_burst_u16(n, tx, rx, NIMBUS_FRAME_LEN);
+		else
+			ret = nimbus_burst16(n, tx, rx);
 		if (ret)
 			return ret;
 
@@ -1675,19 +2455,26 @@ static void nimbus_dump_pad(struct nimbus *n, unsigned int gpio, const char *nam
 		 !!(readl(b + 0x10) & BIT(pin)));
 }
 
+/*
+ * Optional glass experiment only — not in OSOS sub_1A5AC.
+ * Default off (extra_por_pulse=0).
+ */
 static void nimbus_gpio_por_reset(struct nimbus *n)
 {
-	/* Clear latched download mode from a prior failed attempt. */
 	nimbus_gpiocmd_mode(n, NIMBUS_GPIO_RST, 1, 0);
 	msleep(reset_hold_ms);
 	nimbus_gpiocmd_mode(n, NIMBUS_GPIO_RST, 1, 1);
 	msleep(reset_release_ms);
 	nimbus_gpiocmd_mode(n, NIMBUS_GPIO_RST, 1, 0);
 	msleep(5);
-	dev_info(&n->spi->dev, "POR RST %dms low / %dms high\n",
+	dev_info(&n->spi->dev, "extra POR RST %dms low / %dms high\n",
 		 reset_hold_ms, reset_release_ms);
 }
 
+/*
+ * 1A5AC GPIO half (before 20848):
+ *   2075A(1) sleep5 → 20766(1) sleep15 → 20690(1) sleep5 → 11B70
+ */
 static void nimbus_gpio_bringup(struct nimbus *n)
 {
 	int rail;
@@ -1724,6 +2511,7 @@ static void nimbus_gpio_bringup(struct nimbus *n)
 	nimbus_dump_pad(n, 90, "spi2-90");
 }
 
+/* 1A5AC: 2075A(0) then sleep reset_release_ms (default 30). */
 static void nimbus_gpio_release_reset(struct nimbus *n)
 {
 	nimbus_gpiocmd_mode(n, NIMBUS_GPIO_RST, 1, 1);
@@ -1746,23 +2534,23 @@ static int nimbus_1a5ac_and_download(struct nimbus *n, const u8 *data,
 {
 	int err;
 
-	nimbus_gpio_por_reset(n);
+	/* Dump path has no pre-1A5AC POR; gate for glass A/B only. */
+	if (extra_por_pulse)
+		nimbus_gpio_por_reset(n);
 	nimbus_gpio_bringup(n);
 	err = nimbus_bootload_cmd(n);
 	if (err)
 		dev_warn(&n->spi->dev, "bootload %s: %d\n", tag, err);
-	msleep(15);
+	msleep(15); /* 1A5AC: after 20848, before 2075A(0) */
 	nimbus_gpio_release_reset(n);
 	if (skip_download) {
 		dev_info(&n->spi->dev, "skip_download — no 2D640\n");
 		return 0;
 	}
+	/* 20E94: 26494 then 273A0; settle already done in release (30ms). */
 	if (nimbus_probe_26494(n, tag)) {
-		msleep(30);
-		if (nimbus_probe_26494(n, tag)) {
-			dev_warn(&n->spi->dev, "26494 %s failed\n", tag);
-			return -EIO;
-		}
+		dev_warn(&n->spi->dev, "26494 %s failed\n", tag);
+		return -EIO;
 	}
 	err = nimbus_download_fw(n, data, size, false);
 	n->fw_tried = true;
@@ -1790,6 +2578,9 @@ static void nimbus_park(struct nimbus *n, const char *why)
 static void nimbus_recycle(struct nimbus *n)
 {
 	const struct firmware *fw = NULL;
+	const u8 *data;
+	u8 *kbuf = NULL;
+	size_t size;
 	u16 st = 0;
 
 	if (n->parked)
@@ -1808,14 +2599,13 @@ static void nimbus_recycle(struct nimbus *n)
 	n->spi_ok = false;
 	n->ping_fails = 0;
 	msleep(50);
-	if (request_firmware(&fw, "apple/grape-nimbus.bin", &n->spi->dev) ||
-	    !fw) {
-		dev_warn(&n->spi->dev, "recycle: no grape-nimbus.bin\n");
+	if (nimbus_acquire_fw(&n->spi->dev, &data, &size, &fw, &kbuf)) {
+		dev_warn(&n->spi->dev, "recycle: no FW (FTL or file)\n");
 		nimbus_park(n, "no firmware");
 		return;
 	}
-	nimbus_1a5ac_and_download(n, fw->data, fw->size, "recycle");
-	release_firmware(fw);
+	nimbus_1a5ac_and_download(n, data, size, "recycle");
+	nimbus_release_fw(fw, kbuf);
 	msleep(2);
 	if (!nimbus_ping(n, &st)) {
 		n->spi_ok = true;
@@ -1861,7 +2651,9 @@ static irqreturn_t nimbus_irq_thread(int irq, void *data)
 static void nimbus_try_firmware(struct nimbus *n)
 {
 	const struct firmware *fw = NULL;
-	int err;
+	const u8 *data;
+	u8 *kbuf = NULL;
+	size_t size;
 
 	if (n->fw_tried || n->fw_loaded)
 		return;
@@ -1874,13 +2666,12 @@ static void nimbus_try_firmware(struct nimbus *n)
 		n->spi_ok = true;
 	}
 
-	err = request_firmware(&fw, "apple/grape-nimbus.bin", &n->spi->dev);
-	if (err || !fw)
+	if (nimbus_acquire_fw(&n->spi->dev, &data, &size, &fw, &kbuf))
 		return;
 
 	n->fw_tried = true;
-	nimbus_download_fw(n, fw->data, fw->size, false);
-	release_firmware(fw);
+	nimbus_download_fw(n, data, size, false);
+	nimbus_release_fw(fw, kbuf);
 }
 
 static int nimbus_poll_thread(void *data)
@@ -1942,11 +2733,48 @@ static int nimbus_poll_thread(void *data)
 	return 0;
 }
 
+static ssize_t isys_blob_read(struct file *filp, struct kobject *kobj,
+			      struct bin_attribute *attr, char *buf,
+			      loff_t off, size_t count)
+{
+	struct device *dev = kobj_to_dev(kobj);
+	struct nimbus *n = dev_get_drvdata(dev);
+
+	if (!n || !n->have_isys)
+		return -ENODATA;
+	if (off >= NIMBUS_ISYS_LEN)
+		return 0;
+	if (off + count > NIMBUS_ISYS_LEN)
+		count = NIMBUS_ISYS_LEN - off;
+	memcpy(buf, n->isys + off, count);
+	return count;
+}
+
+static struct bin_attribute isys_blob_attr = {
+	.attr = {
+		.name = "isys_blob",
+		.mode = 0444,
+	},
+	.size = NIMBUS_ISYS_LEN,
+	.read = isys_blob_read,
+};
+
+static void nimbus_isys_sysfs_remove(struct nimbus *n)
+{
+	if (!n || !n->isys_sysfs)
+		return;
+	sysfs_remove_bin_file(&n->spi->dev.kobj, &isys_blob_attr);
+	n->isys_sysfs = false;
+}
+
 static int nimbus_probe(struct spi_device *spi)
 {
 	struct nimbus *n;
 	struct input_dev *input;
 	const struct firmware *fw = NULL;
+	const u8 *data;
+	u8 *kbuf = NULL;
+	size_t size;
 	u16 ping_st = 0;
 	int err;
 
@@ -1975,11 +2803,25 @@ static int nimbus_probe(struct spi_device *spi)
 	if (IS_ERR(n->attn))
 		return PTR_ERR(n->attn);
 
-	err = request_firmware(&fw, "apple/grape-nimbus.bin", &spi->dev);
-	if (err || !fw)
-		dev_warn(&spi->dev, "grape-nimbus.bin missing (%d)\n", err);
+	err = nimbus_acquire_isys_cal(n);
+	if (err)
+		return err;
+	if (!sysfs_create_bin_file(&spi->dev.kobj, &isys_blob_attr))
+		n->isys_sysfs = true;
+	else
+		dev_warn(&spi->dev, "isys_blob sysfs failed\n");
 
-	{
+	data = NULL;
+	size = 0;
+	err = nimbus_acquire_fw(&spi->dev, &data, &size, &fw, &kbuf);
+	if (err)
+		dev_warn(&spi->dev,
+			 "no grape firmware (%d) — A34 IsyS is present but 2D640 cannot run\n",
+			 err);
+
+	if (!data || !size) {
+		nimbus_park(n, "no grape firmware");
+	} else {
 		int attempt;
 
 		/*
@@ -1987,46 +2829,67 @@ static int nimbus_probe(struct spi_device *spi)
 		 * only after a failed 1A5AC, max 3. remove() already
 		 * 1A878s on reload.
 		 */
-		for (attempt = 0; attempt < 3 && fw; attempt++) {
+		for (attempt = 0; attempt < 3; attempt++) {
 			if (attempt) {
 				nimbus_power_down(n);
 				msleep(50);
 			}
 			/* 0xEE is iOS3 Z2-only; N31 wake is 19 C1 in reset. */
 			mutex_lock(&n->lock);
-			nimbus_1a5ac_and_download(n, fw->data, fw->size,
+			n->fw_uploaded = false;
+			n->cal_uploaded = false;
+			n->requestcal_done = false;
+			n->exec_sent = false;
+			n->runtime_ready = false;
+			n->fw_loaded = false;
+			n->spi_ok = false;
+			nimbus_1a5ac_and_download(n, data, size,
 						  attempt ? "retry" : "1A5AC");
 			{
 				u16 st = 0;
 
-				/* 20E94: sleep 2 after 273A0; 1703E8 pings next. */
-				msleep(2);
+				/*
+				 * Cross EXEC boundary: short wait then runtime
+				 * ping only. No HBPP 1A A1 until ping fails.
+				 */
+				if (n->exec_sent)
+					msleep(exec_wait_ms ? exec_wait_ms : 1);
+				else
+					msleep(2);
 				err = nimbus_ping(n, &ping_st);
 				if (!err) {
 					n->spi_ok = true;
+					n->runtime_ready = true;
+					n->fw_loaded = true;
 					dev_info(&spi->dev,
-						 "ping ok, status=0x%04x\n",
+						 "runtime ping ok status=0x%04x (ready)\n",
 						 ping_st);
 				} else {
+					dev_warn(&spi->dev,
+						 "runtime ping fail attempt %d (exec_sent=%d)\n",
+						 attempt, n->exec_sent);
 					nimbus_peek(n, "post-go-fail");
+					/* Diagnostics only after runtime fail. */
 					if (nimbus_status_poll(n, &st) == 0)
 						dev_info(&spi->dev,
-							 "post-go status 0x%04x\n",
+							 "post-fail HBPP status 0x%04x\n",
 							 st);
+					err = 0; /* keep 1A878 retries going */
 				}
 			}
 			mutex_unlock(&n->lock);
-			/* 20E94 does not 1A878 after a successful 273A0. */
-			if (n->fw_loaded)
+			/* Only runtime_ready ends the 1A878 retry loop. */
+			if (n->runtime_ready)
 				break;
 		}
 	}
-	if (fw)
-		release_firmware(fw);
-	dev_info(&spi->dev, "fw download attempted, fw_loaded=%d spi_ok=%d\n",
-		 n->fw_loaded, n->spi_ok);
+	nimbus_release_fw(fw, kbuf);
+	dev_info(&spi->dev,
+		 "nimbus state uploaded=%d cal=%d reqcal=%d exec=%d runtime=%d spi_ok=%d\n",
+		 n->fw_uploaded, n->cal_uploaded, n->requestcal_done,
+		 n->exec_sent, n->runtime_ready, n->spi_ok);
 
-	if (n->fw_loaded || n->spi_ok) {
+	if (n->cal_uploaded && n->exec_sent && n->runtime_ready) {
 		/* 1A5AC: 20490 after 20E94, then MultitouchTask 1703E8/188FFC. */
 		nimbus_irq_enable(n);
 		n->irq = spi->irq;
@@ -2048,12 +2911,19 @@ static int nimbus_probe(struct spi_device *spi)
 			}
 		}
 	} else {
-		dev_info(&spi->dev, "SPI not talking — IRQ/poll parked\n");
+		dev_err(&spi->dev,
+			"Nimbus boot failed: cal=%d exec=%d runtime=%d; not registering input\n",
+			n->cal_uploaded, n->exec_sent, n->runtime_ready);
+		if (!n->parked)
+			nimbus_park(n, "boot incomplete");
+		return 0;
 	}
 
 	input = devm_input_allocate_device(&spi->dev);
-	if (!input)
+	if (!input) {
+		nimbus_isys_sysfs_remove(n);
 		return -ENOMEM;
+	}
 	n->input = input;
 	input->name = "Apple Nimbus";
 	input->phys = "nimbus/input0";
@@ -2063,39 +2933,31 @@ static int nimbus_probe(struct spi_device *spi)
 	input_set_abs_params(input, ABS_MT_POSITION_X, 0, NIMBUS_ABS_X_MAX, 0, 0);
 	input_set_abs_params(input, ABS_MT_POSITION_Y, 0, NIMBUS_ABS_Y_MAX, 0, 0);
 	err = input_mt_init_slots(input, NIMBUS_SLOTS, INPUT_MT_DIRECT);
-	if (err)
+	if (err) {
+		nimbus_isys_sysfs_remove(n);
 		return err;
+	}
 	err = input_register_device(input);
-	if (err)
+	if (err) {
+		nimbus_isys_sysfs_remove(n);
 		return err;
-
-	/*
-	 * FW chunk ACK alone is not enough — RDREG still shows bootloader
-	 * after GO. Only run MultitouchTask when ping works; otherwise park
-	 * so we do not recycle forever while MtCl/cal is unfinished.
-	 */
-	if (n->spi_ok) {
-		if (ping_st) {
-			mutex_lock(&n->lock);
-			nimbus_read_reports(n, ping_st);
-			mutex_unlock(&n->lock);
-		}
-		n->thread = kthread_run(nimbus_poll_thread, n, "nimbus-poll");
-		if (IS_ERR(n->thread)) {
-			dev_warn(&spi->dev,
-				 "nimbus-poll kthread %ld — poll via IRQ only\n",
-				 PTR_ERR(n->thread));
-			n->thread = NULL;
-		}
-	} else if (n->fw_loaded) {
-		nimbus_park(n, "GO left chip in bootloader");
 	}
 
-	if (n->parked)
-		dev_info_once(&spi->dev, "Nimbus parked (touch offline)\n");
-	else
-		dev_info(&spi->dev, "Nimbus up (attn=%d spi_ok=%d)\n",
-			 !!n->attn, n->spi_ok);
+	if (ping_st) {
+		mutex_lock(&n->lock);
+		nimbus_read_reports(n, ping_st);
+		mutex_unlock(&n->lock);
+	}
+	n->thread = kthread_run(nimbus_poll_thread, n, "nimbus-poll");
+	if (IS_ERR(n->thread)) {
+		dev_warn(&spi->dev,
+			 "nimbus-poll kthread %ld — poll via IRQ only\n",
+			 PTR_ERR(n->thread));
+		n->thread = NULL;
+	}
+
+	dev_info(&spi->dev, "Nimbus up (attn=%d runtime=%d)\n",
+		 !!n->attn, n->runtime_ready);
 	return 0;
 }
 
@@ -2106,6 +2968,7 @@ static void nimbus_remove(struct spi_device *spi)
 	n->stopped = true;
 	if (n->thread)
 		kthread_stop(n->thread);
+	nimbus_isys_sysfs_remove(n);
 	nimbus_power_down(n);
 }
 

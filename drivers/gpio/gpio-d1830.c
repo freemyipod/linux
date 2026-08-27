@@ -413,9 +413,9 @@ static void d1830_btn_poll_once(struct d1830_gpio *gpio_dev)
 
 	if (!sleep) {
 		if (gpio_dev->last_sleep) {
-			dev_dbg(&client->dev,
-				"n31-btn SLEEP PRESS r7=0x%02x (bit5 1->0)\n",
-				r7);
+			dev_info(&client->dev,
+				 "n31-btn SLEEP PRESS r7=0x%02x (bit5 1->0)\n",
+				 r7);
 			s5l8740_n31_report_key(KEY_POWER, 1);
 			if (gpio_dev->input) {
 				input_report_key(gpio_dev->input, KEY_POWER, 1);
@@ -423,13 +423,20 @@ static void d1830_btn_poll_once(struct d1830_gpio *gpio_dev)
 			}
 		}
 		/* Hold Sleep across 5 polls (~500ms) before cutting power.
-		 * One noisy I2C byte must not hibernate. */
+		 * Short press still emits KEY_POWER for power-watch /
+		 * pm_power_off; hold is the kernel-direct fallback when
+		 * userspace is not watching. One noisy I2C byte must not
+		 * hibernate. */
 		if (gpio_dev->sleep_hold < 5)
 			gpio_dev->sleep_hold++;
 		if (gpio_dev->sleep_hold == 5) {
 			dev_warn(&client->dev,
 				 "n31-btn SLEEP held — poweroff\n");
-			d1830_cut_power(client);
+			/* Prefer machine pm_power_off (same cut_power). */
+			if (pm_power_off)
+				pm_power_off();
+			else
+				d1830_cut_power(client);
 		}
 	} else {
 		if (!gpio_dev->last_sleep) {

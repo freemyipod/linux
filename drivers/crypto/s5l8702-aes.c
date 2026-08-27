@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  * S5L8702 AES Accelerator Driver
+ *
+ * Used on N31 (S5L8740) via compatible "samsung,s5l8702-aes".
+ * Fused UID/GID CFG follows N31 RetailOS (0x0F enc / 0x0E dec), not
+ * Rockbox S5L8702 hwkeyaes 0x09/0x08 — see s5l8702_aes_hw_init().
  */
 
 #include <linux/clk.h>
@@ -71,7 +75,8 @@
 #define S5L8702_AES_CMD_CONTINUE	3
 
 #define S5L8702_AES_CFG_KEYSIZE	GENMASK(5, 4)
-#define S5L8702_AES_CFG_PAUSE	GENMASK(2, 1)
+/* Bits 2:1 — semantics unproven ("pause" was a guess). N31 fused GID uses them. */
+#define S5L8702_AES_CFG_UNK_2_1	GENMASK(2, 1)
 
 #define S5L8702_AES_IRQ_ALL				GENMASK(3, 0)
 #define S5L8702_AES_IRQ_XFR_DONE	BIT(0)
@@ -259,6 +264,8 @@ static inline int s5l8702_aes_check_fused_key_length(struct crypto_skcipher *tfm
 		return -EINVAL;
 	}
 
+	/* Fused keys ignore key bytes; still record length for ctx consistency. */
+	ctx->keylen = keylen;
 	return 0;
 }
 
@@ -310,48 +317,62 @@ static int s5l8702_aes_hw_init(struct s5l8702_aes_ctx *ctx, bool encrypt)
 		}
 	}
 
-	// unknown register
+	/* Unknown register; Rockbox/OSOS write 0 for fused and software paths. */
 	s5l8702_aes_writel(aes_dev, S5L8702_AES_UNK8C, 0);
 
-	// config
-	cfg = s5l8702_aes_readl(aes_dev, S5L8702_AES_CFG);
+	/*
+	 * UID/GID fused CFG: N31/S5L8740 RetailOS (OSOS sub_422FFA / nimbus
+	 * 422FFA MMIO) writes exactly (encrypt ? 1 : 0) | 0xE → 0x0F / 0x0E
+	 * (CBC + bits 2:1 + direction; no software key-size field).
+	 *
+	 * Rockbox S5L8702 hwkeyaes() uses 0x09 encrypt / 0x08 decrypt — do
+	 * NOT transplant that encoding onto this N31 driver without separate
+	 * proof; the SoCs are related but CFG fused encoding differs here.
+	 */
+	if (hw_key_type == S5L8702_AES_KEY_TYPE_GLOBAL_ID ||
+	    hw_key_type == S5L8702_AES_KEY_TYPE_USER_ID) {
+		cfg = (encrypt ? BIT(0) : 0) | 0xeu;
+	} else {
+		/* Software / zero-key ECB/CBC — keep existing RMW path. */
+		cfg = s5l8702_aes_readl(aes_dev, S5L8702_AES_CFG);
 
-	// encrypt/decrypt
-	if (encrypt)
-		cfg |= BIT(0);
-	else
-		cfg &= ~BIT(0);
+		if (encrypt)
+			cfg |= BIT(0);
+		else
+			cfg &= ~BIT(0);
 
-	// pause engine
-	cfg |= S5L8702_AES_CFG_PAUSE;
+		cfg |= S5L8702_AES_CFG_UNK_2_1;
 
-	// chaining mode
-	if (ctx->cbc)
-		cfg |= BIT(3);	// CBC
-	else
-		cfg &= ~BIT(3);	// ECB
+		if (ctx->cbc)
+			cfg |= BIT(3);	/* CBC */
+		else
+			cfg &= ~BIT(3);	/* ECB */
 
-	// key size
-	cfg &= ~S5L8702_AES_CFG_KEYSIZE;
+		cfg &= ~S5L8702_AES_CFG_KEYSIZE;
 
-	if (hw_key_type == S5L8702_AES_KEY_TYPE_USER_DEFINE) {
-		switch (ctx->keylen) {
+		/* Zero-key selector: leave KEYSIZE cleared (same as before). */
+		if (hw_key_type == S5L8702_AES_KEY_TYPE_USER_DEFINE) {
+			switch (ctx->keylen) {
 			case AES_KEYSIZE_128:
-				cfg |= FIELD_PREP(S5L8702_AES_CFG_KEYSIZE, S5L8702_AES_KEY_SIZE_128);
+				cfg |= FIELD_PREP(S5L8702_AES_CFG_KEYSIZE,
+						  S5L8702_AES_KEY_SIZE_128);
 				break;
 			case AES_KEYSIZE_192:
-				cfg |= FIELD_PREP(S5L8702_AES_CFG_KEYSIZE, S5L8702_AES_KEY_SIZE_192);
+				cfg |= FIELD_PREP(S5L8702_AES_CFG_KEYSIZE,
+						  S5L8702_AES_KEY_SIZE_192);
 				break;
 			case AES_KEYSIZE_256:
-				cfg |= FIELD_PREP(S5L8702_AES_CFG_KEYSIZE, S5L8702_AES_KEY_SIZE_256);
+				cfg |= FIELD_PREP(S5L8702_AES_CFG_KEYSIZE,
+						  S5L8702_AES_KEY_SIZE_256);
 				break;
 			default:
-				dev_err(dev, "Invalid key length: %u\n", ctx->keylen);
+				dev_err(dev, "Invalid key length: %u\n",
+					ctx->keylen);
 				ret = -EINVAL;
 				goto err_hw;
+			}
 		}
 	}
-	// else i.e. for key types UID and GID, key size is set to 0 - nothing to do
 
 	s5l8702_aes_writel(aes_dev, S5L8702_AES_CFG, cfg);
 
@@ -368,10 +389,15 @@ static int s5l8702_aes_hw_crypt(struct s5l8702_aes_dev *aes_dev, dma_addr_t src,
 	u32 irq;
 	int ret;
 
-	// set src/dst buffer addresses and size
+	/* set src/dst buffer addresses and size */
 	s5l8702_aes_write_buf(aes_dev, src, dst, len);
 
-	// go!
+	dev_dbg(dev,
+		"AES pre-START CIPHERKEY_SEL=0x%x COMPLIMENT=0x%x CFG=0x%x len=%u\n",
+		s5l8702_aes_readl(aes_dev, S5L8702_AES_CIPHERKEY_SEL),
+		s5l8702_aes_readl(aes_dev, S5L8702_AES_COMPLIMENT),
+		s5l8702_aes_readl(aes_dev, S5L8702_AES_CFG), len);
+
 	s5l8702_aes_writel(aes_dev, S5L8702_AES_COMMAND, S5L8702_AES_CMD_START);
 
 	// wait for completion
@@ -393,17 +419,6 @@ out_clear_irq:
 	s5l8702_aes_writel(aes_dev, S5L8702_AES_IRQ, S5L8702_AES_IRQ_ALL);
 
 	return ret;
-}
-
-static void s5l8702_aes_update_walk_iv(struct skcipher_walk *walk, unsigned int nbytes, bool encrypt)
-{
-    const u8 *src = walk->src.virt.addr;
-    const u8 *dst = walk->dst.virt.addr;
-
-    if (encrypt)
-        memcpy(walk->iv, dst + nbytes - AES_BLOCK_SIZE, AES_BLOCK_SIZE);
-    else
-        memcpy(walk->iv, src + nbytes - AES_BLOCK_SIZE, AES_BLOCK_SIZE);
 }
 
 static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
@@ -430,12 +445,27 @@ static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 
 	while (walk.nbytes) {
 		dma_addr_t src, dst;
+		u8 next_iv[AES_BLOCK_SIZE];
 
-		// set IV for the current operation if needed
+		/* set IV for the current operation if needed */
 		if (ctx->cbc)
 			s5l8702_aes_write_iv(aes_dev, walk.iv);
 
-		// map addresses
+		/*
+		 * CBC decrypt next-IV must be the last *ciphertext* block.
+		 * Save it before DMA: in-place decrypt overwrites src.
+		 */
+		if (ctx->cbc && !encrypt) {
+			if (walk.nbytes < AES_BLOCK_SIZE) {
+				ret = -EINVAL;
+				break;
+			}
+			memcpy(next_iv,
+			       walk.src.virt.addr + walk.nbytes - AES_BLOCK_SIZE,
+			       AES_BLOCK_SIZE);
+		}
+
+		/* map addresses */
 		src = dma_map_single(dev, walk.src.virt.addr, walk.nbytes, DMA_TO_DEVICE);
 		if (dma_mapping_error(dev, src)) {
 			ret = -ENOMEM;
@@ -451,18 +481,24 @@ static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 
 		ret = s5l8702_aes_hw_crypt(aes_dev, src, dst, walk.nbytes);
 
-		// unmap addresses
+		/* unmap addresses */
 		dma_unmap_single(dev, dst, walk.nbytes, DMA_FROM_DEVICE);
 		dma_unmap_single(dev, src, walk.nbytes, DMA_TO_DEVICE);
 
 		if (ret)
 			break;
 
-		// prepare IV for the next operation if needed
-		if (ctx->cbc)
-			s5l8702_aes_update_walk_iv(&walk, walk.nbytes, encrypt);
+		/* prepare IV for the next walk chunk if needed */
+		if (ctx->cbc) {
+			if (encrypt)
+				memcpy(walk.iv,
+				       walk.dst.virt.addr + walk.nbytes - AES_BLOCK_SIZE,
+				       AES_BLOCK_SIZE);
+			else
+				memcpy(walk.iv, next_iv, AES_BLOCK_SIZE);
+		}
 
-		// update remaining bytes and process next chunk
+		/* update remaining bytes and process next chunk */
 		ret = skcipher_walk_done(&walk, 0);
 		if (ret)
 			break;

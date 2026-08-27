@@ -335,6 +335,59 @@ static void s5l8740_sec_gpio86(struct s5l8740_gpio *sg)
 	s5l8740_log_pinmux_map(sg, "after-SEC-86-iis0");
 }
 
+/* SEC sub_223C IIS0 ASP pins: func2 + DIR (table @ 0x22004C6C). */
+static void s5l8740_iis0_pinmux_sec(struct s5l8740_gpio *sg)
+{
+	s5l8740_pinmux_apply_word(sg->base, 0x00061002u); /* GPIO6 BCLK? */
+	s5l8740_pinmux_apply_word(sg->base, 0x00071002u); /* GPIO7 */
+	s5l8740_pinmux_apply_word(sg->base, 0x02041002u); /* GPIO20 */
+}
+
+/*
+ * OSOS BCB60 IIS0 pad enable. mode 3=on, 2=off (BCB60 teardown).
+ * Re-applies SEC func2 on 6/7/20 then GPIOCMD.
+ */
+void s5l8740_iis0_pads_enable(unsigned int mode)
+{
+	struct s5l8740_gpio *sg = s5l8740_n31;
+	u16 m = mode ? mode : 3;
+
+	if (!sg)
+		return;
+	s5l8740_iis0_pinmux_sec(sg);
+	s5l8740_gpiocmd_mode(sg, 20, m, 0);
+	s5l8740_gpiocmd_mode(sg, 7, m, 0);
+}
+EXPORT_SYMBOL_GPL(s5l8740_iis0_pads_enable);
+
+void s5l8740_iis0_pads_disable(void)
+{
+	s5l8740_iis0_pads_enable(2);
+}
+EXPORT_SYMBOL_GPL(s5l8740_iis0_pads_disable);
+
+void s5l8740_iis0_pad6_enable(unsigned int mode)
+{
+	struct s5l8740_gpio *sg = s5l8740_n31;
+	u16 m = mode ? mode : 3;
+
+	if (!sg)
+		return;
+	s5l8740_pinmux_apply_word(sg->base, 0x00061002u);
+	s5l8740_gpiocmd_mode(sg, 6, m, 0);
+}
+EXPORT_SYMBOL_GPL(s5l8740_iis0_pad6_enable);
+
+void s5l8740_gpio_log_iis0_pads(const char *tag)
+{
+	struct s5l8740_gpio *sg = s5l8740_n31;
+
+	if (!sg)
+		return;
+	s5l8740_log_pinmux_map(sg, tag ? tag : "iis0");
+}
+EXPORT_SYMBOL_GPL(s5l8740_gpio_log_iis0_pads);
+
 int s5l8740_n31_din86(void)
 {
 	if (!s5l8740_n31)
