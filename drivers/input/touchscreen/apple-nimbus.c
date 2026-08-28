@@ -112,6 +112,7 @@
 #define NIMBUS_ACK_CHUNK	0x4BC1		/* 19393 */
 #define NIMBUS_ACK_34AD0	0x4AD1		/* 19153 */
 #define NIMBUS_POST_POKE	0x011F		/* 287 */
+#define NIMBUS_EXEC_SETTLE_MS	40		/* 273A0 tail: 410522(40) */
 
 #define NIMBUS_GPIO_EN		0x0E
 #define NIMBUS_GPIO_RST		0x27
@@ -142,9 +143,30 @@
 #define NIMBUS_CS_BEGIN		BIT(0)
 #define NIMBUS_CS_END		BIT(1)
 
-static int spi_clkdiv = 16;
+/*
+ * 0 lets the SPI controller own the engine setup, which is what the stock
+ * firmware does: one sub_11B70 configuration, divider 2 for a 12 MHz bus.
+ * This driver used to reprogram the same registers afterwards with a much
+ * larger divider, quietly running the bus eight times too slow.
+ */
+static int spi_clkdiv;
 module_param(spi_clkdiv, int, 0644);
-MODULE_PARM_DESC(spi_clkdiv, "SPI2 CLKDIV (higher=slower; try 8-32 for FW download)");
+MODULE_PARM_DESC(spi_clkdiv,
+		 "Override SPI2 CLKDIV (0 = leave it to the SPI controller)");
+/*
+ * The stock code retries the transfer itself three times before giving
+ * up; the caller's retry re-runs the whole bring-up.
+ */
+static unsigned int download_tries = 3;
+module_param(download_tries, uint, 0644);
+MODULE_PARM_DESC(download_tries,
+		 "Firmware download attempts before re-running bring-up");
+
+/*
+ * The stock path does nothing after a good download but wait 2 ms and
+ * enable the interrupt. These register pokes keep speaking the boot
+ * protocol at a part that should already be running its application.
+ */
 static int reset_hold_ms = 5;
 module_param(reset_hold_ms, int, 0644);
 MODULE_PARM_DESC(reset_hold_ms, "RST low ms in optional extra_por_pulse (1A5AC uses 5)");
@@ -384,22 +406,32 @@ static void nimbus_power_down(struct nimbus *n)
  */
 static void nimbus_spi2_11b70(struct nimbus *n)
 {
+	void (*reinit)(void);
 	u32 setup;
 
 	if (!n->spi2)
 		return;
-	writel(0xf, n->spi2 + SPI2_STATUS);
-	writel(readl(n->spi2 + SPI2_CTRL) | SPI2_CTRL_FIFO_RST,
-	       n->spi2 + SPI2_CTRL);
-	writel(10, n->spi2 + 0x44);
-	writel(24, n->spi2 + 0x38);	/* 24 * a4=1 */
-	writel(255, n->spi2 + 0x40);
-	writel(144, n->spi2 + 0x3c);	/* 3 * 24 * (1+1) */
-	writel(clamp(spi_clkdiv, 1, 255), n->spi2 + SPI2_CLKDIV);
-	writel(SPI2_SETUP_11B70, n->spi2 + SPI2_SETUP);
-	writel(readl(n->spi2 + SPI2_CTRL) | SPI2_CTRL_FIFO_RST,
-	       n->spi2 + SPI2_CTRL);
-	writel(SPI2_CTRL_ENABLE, n->spi2 + SPI2_CTRL);
+	reinit = (void (*)(void))__symbol_get("s5l8702_spi2_reinit");
+	if (reinit) {
+		reinit();
+		__symbol_put("s5l8702_spi2_reinit");
+	} else {
+		/* Controller absent: same sequence, same numbers. */
+		writel(0xf, n->spi2 + SPI2_STATUS);
+		writel(readl(n->spi2 + SPI2_CTRL) | SPI2_CTRL_FIFO_RST,
+		       n->spi2 + SPI2_CTRL);
+		writel(10, n->spi2 + 0x44);
+		writel(24, n->spi2 + 0x38);	/* 24 * a4=1 */
+		writel(255, n->spi2 + 0x40);
+		writel(144, n->spi2 + 0x3c);	/* 3 * 24 * (1+1) */
+		writel(2, n->spi2 + SPI2_CLKDIV);	/* 24000/12000 */
+		writel(SPI2_SETUP_11B70, n->spi2 + SPI2_SETUP);
+		writel(readl(n->spi2 + SPI2_CTRL) | SPI2_CTRL_FIFO_RST,
+		       n->spi2 + SPI2_CTRL);
+		writel(SPI2_CTRL_ENABLE, n->spi2 + SPI2_CTRL);
+	}
+	if (spi_clkdiv)
+		writel(clamp(spi_clkdiv, 1, 255), n->spi2 + SPI2_CLKDIV);
 	setup = readl(n->spi2 + SPI2_SETUP);
 	nimbus_vinfo(n, "11B70 SPI2 SETUP=0x%x CLKDIV=%u\n",
 		 setup, readl(n->spi2 + SPI2_CLKDIV));
@@ -606,8 +638,18 @@ static int nimbus_probe_26494(struct nimbus *n, const char *tag)
 		 "26494 %s ret=%d words 0x%04x 0x%04x known=%d rx %02x %02x %02x %02x %02x %02x %02x %02x\n",
 		 tag, ret, w0, w1, nimbus_opcode_known(w0) && nimbus_opcode_known(w1),
 		 rx[0], rx[1], rx[2], rx[3], rx[4], rx[5], rx[6], rx[7]);
-	if (ret)
-		return ret;
+	/*
+	 * The stock probe only rejects the part when the transfer worked and
+	 * came back with words it does not recognise. A failed transfer is not
+	 * a verdict, and treating it as one meant a single soft SPI error
+	 * skipped the firmware download entirely.
+	 */
+	if (ret) {
+		dev_warn(&n->spi->dev,
+			 "26494 %s transfer %d; continuing to download\n",
+			 tag, ret);
+		return 0;
+	}
 	if (!nimbus_opcode_known(w0) || !nimbus_opcode_known(w1))
 		return -EIO;
 	return 0;
@@ -886,6 +928,13 @@ static void nimbus_fw_readback(struct nimbus *n, const char *tag)
 	u8 *buf;
 	unsigned int i;
 
+	/*
+	 * Six 4 KB reads in the middle of the download sequence. Harmless to
+	 * look at, but not something to put on the bus by default.
+	 */
+	if (!verbose)
+		return;
+
 	buf = kmalloc(0x1000, GFP_KERNEL);
 	if (!buf)
 		return;
@@ -912,6 +961,9 @@ static void nimbus_cal_readback(struct nimbus *n, const u8 *upload)
 {
 	u8 *buf;
 	u32 crc_chip, crc_host;
+
+	if (!verbose)
+		return;
 
 	buf = kmalloc(NIMBUS_FW_HDR_LEN, GFP_KERNEL);
 	if (!buf)
@@ -1626,8 +1678,13 @@ static int nimbus_post_download(struct nimbus *n)
 		nimbus_vinfo(n, "34AD0[%d] %d\n", i, ret);
 		if (ret)
 			return ret;
-		/* 4AD1 = write ACK only; verify with RDREG while still in HBPP. */
-		if (nimbus_rdreg(n, pokes[i].a1, &rb) == 0)
+		/*
+		 * 4AD1 acknowledges the write without echoing it, so the only
+		 * way to see the value is a separate RDREG. Stock sub_2D5B0
+		 * does not do this, and it inserts a transfer between pokes
+		 * that the part was not told to expect. Verbose runs only.
+		 */
+		if (verbose && nimbus_rdreg(n, pokes[i].a1, &rb) == 0)
 			nimbus_vinfo(n,
 				 "34AD0[%d] RDREG 0x%08x -> 0x%08x (wrote %u)\n",
 				 i, pokes[i].a1, rb, pokes[i].a2);
@@ -1703,6 +1760,9 @@ static void nimbus_pre_exec_verify(struct nimbus *n)
 	};
 	unsigned int i;
 
+	if (!verbose)
+		return;
+
 	for (i = 0; i < ARRAY_SIZE(addrs); i++) {
 		u32 v = 0;
 
@@ -1723,8 +1783,11 @@ static int nimbus_cmd_2d54c(struct nimbus *n)
 
 	nimbus_pre_exec_verify(n);
 	ret = nimbus_cmd_2d54c_raw(n, exec_addr, exec_word1);
-	if (!ret)
+	if (!ret) {
 		n->exec_sent = true;
+		/* Stock waits 40 ms here before touching the part again. */
+		msleep(NIMBUS_EXEC_SETTLE_MS);
+	}
 	return ret;
 }
 
@@ -2541,6 +2604,7 @@ static void nimbus_irq_enable(struct nimbus *n)
 static int nimbus_1a5ac_and_download(struct nimbus *n, const u8 *data,
 				     size_t size, const char *tag)
 {
+	unsigned int attempt;
 	int err;
 
 	/* Dump path has no pre-1A5AC POR; gate for glass A/B only. */
@@ -2561,7 +2625,18 @@ static int nimbus_1a5ac_and_download(struct nimbus *n, const u8 *data,
 		dev_warn(&n->spi->dev, "26494 %s failed\n", tag);
 		return -EIO;
 	}
-	err = nimbus_download_fw(n, data, size, false);
+	/*
+	 * Retry the transfer before escalating. The caller's retry re-runs the
+	 * whole rail/reset/HBPP bring-up, which is a lot of disruption for what
+	 * is usually a transient bus error; the stock code retries just this.
+	 */
+	for (attempt = 0; attempt < download_tries; attempt++) {
+		err = nimbus_download_fw(n, data, size, false);
+		if (!err)
+			break;
+		dev_warn(&n->spi->dev, "download %s attempt %u: %d\n",
+			 tag, attempt + 1, err);
+	}
 	n->fw_tried = true;
 	return err;
 }
@@ -2583,6 +2658,115 @@ static void nimbus_park(struct nimbus *n, const char *why)
 		 "nimbus parked (%s) — rmmod/insmod to retry\n", why);
 	nimbus_power_down(n);
 }
+
+/* ------------------------------------------------------------------ */
+/* Screen-sleep suspend / resume                                        */
+/*                                                                      */
+/* Two levels, because they trade power against wake latency:           */
+/*                                                                      */
+/*   touch_power_down=0  IRQ masked and SPI2 released, controller still */
+/*                       powered. Resume is immediate.                  */
+/*   touch_power_down=1  full 1A878 power cut including the PMU rail.   */
+/*                       Resume has to re-run bring-up and download the */
+/*                       firmware again, so it costs a few hundred ms.  */
+/* ------------------------------------------------------------------ */
+
+static struct nimbus *nimbus_pm_dev;
+
+static bool touch_power_down = true;
+module_param(touch_power_down, bool, 0644);
+MODULE_PARM_DESC(touch_power_down,
+		 "Cut the touch rail on screen sleep (default Y; N keeps it powered)");
+
+static bool nimbus_pm_suspended;
+
+int n31_touch_suspend(void)
+{
+	struct nimbus *n = nimbus_pm_dev;
+
+	if (!n)
+		return -ENODEV;
+	if (nimbus_pm_suspended)
+		return 0;
+
+	if (n->irq > 0)
+		disable_irq(n->irq);
+
+	if (touch_power_down) {
+		mutex_lock(&n->lock);
+		nimbus_power_down(n);
+		n->runtime_ready = false;
+		n->spi_ok = false;
+		mutex_unlock(&n->lock);
+	} else {
+		/* Stop driving the bus, leave the controller alive. */
+		mutex_lock(&n->lock);
+		nimbus_spi2_pinmux(n, false);
+		mutex_unlock(&n->lock);
+	}
+
+	nimbus_pm_suspended = true;
+	nimbus_vinfo(n, "touch suspended (power_down=%d)\n", touch_power_down);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(n31_touch_suspend);
+
+int n31_touch_resume(void)
+{
+	struct nimbus *n = nimbus_pm_dev;
+	const struct firmware *fw = NULL;
+	const u8 *data = NULL;
+	u8 *kbuf = NULL;
+	size_t size = 0;
+	int ret = 0;
+
+	if (!n)
+		return -ENODEV;
+	if (!nimbus_pm_suspended)
+		return 0;
+
+	if (!touch_power_down) {
+		mutex_lock(&n->lock);
+		nimbus_spi2_pinmux(n, true);
+		mutex_unlock(&n->lock);
+		goto done;
+	}
+
+	/*
+	 * The controller lost its firmware with the rail, so this is the same
+	 * bring-up the probe runs. Storage is back by the time a wake reaches
+	 * here, so fetching the blob again is safe.
+	 */
+	ret = nimbus_acquire_fw(&n->spi->dev, &data, &size, &fw, &kbuf);
+	if (ret) {
+		dev_warn(&n->spi->dev, "touch resume: no firmware (%d)\n", ret);
+		goto done;
+	}
+
+	mutex_lock(&n->lock);
+	n->fw_uploaded = false;
+	n->cal_uploaded = false;
+	n->requestcal_done = false;
+	n->exec_sent = false;
+	n->runtime_ready = false;
+	n->fw_loaded = false;
+	n->spi_ok = false;
+	ret = nimbus_1a5ac_and_download(n, data, size, "resume");
+	mutex_unlock(&n->lock);
+
+	nimbus_release_fw(fw, kbuf);
+	if (ret)
+		dev_warn(&n->spi->dev, "touch resume download: %d\n", ret);
+
+done:
+	if (n->irq > 0)
+		enable_irq(n->irq);
+	nimbus_pm_suspended = false;
+	nimbus_vinfo(n, "touch resumed (%d)\n", ret);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(n31_touch_resume);
+
 
 static void nimbus_recycle(struct nimbus *n)
 {
@@ -2795,6 +2979,7 @@ static int nimbus_probe(struct spi_device *spi)
 	nimbus_verbose = verbose || !quiet;
 	mutex_init(&n->lock);
 	spi_set_drvdata(spi, n);
+	nimbus_pm_dev = n;
 
 	n->gpio_base = devm_ioremap(&spi->dev, S5L8740_GPIO_PHYS, 0x400);
 	n->gpiocmd = devm_ioremap(&spi->dev, S5L8740_GPIOCMD_PHYS, 4);
@@ -2972,6 +3157,7 @@ static int nimbus_probe(struct spi_device *spi)
 
 static void nimbus_remove(struct spi_device *spi)
 {
+	nimbus_pm_dev = NULL;
 	struct nimbus *n = spi_get_drvdata(spi);
 
 	n->stopped = true;

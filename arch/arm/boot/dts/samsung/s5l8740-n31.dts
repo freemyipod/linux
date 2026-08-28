@@ -158,9 +158,15 @@
             bluetooth {
                 compatible = "brcm,bcm4329-bt", "brcm,bcm2078";
                 max-speed = <115200>;
-                shutdown-gpios = <&gpio 97 GPIO_ACTIVE_LOW>;
-                device-wakeup-gpios = <&gpio 98 GPIO_ACTIVE_HIGH>;
-                host-wakeup-gpios = <&gpio 119 GPIO_ACTIVE_HIGH>;
+                /*
+                 * No control GPIOs here on purpose. 97/98/119 were
+                 * listed as shutdown/device-wakeup/host-wakeup, but
+                 * sub_15DD5C claims those three at function 2 when FM
+                 * powers on and releases them when it powers off --
+                 * they are the IIS2 PCM pads. Handing them to hci_bcm
+                 * made it drive the capture bus as GPIOs. The real BT
+                 * control pins are not identified yet.
+                 */
                 firmware-name = "brcm/BCM2076B1.hcd";
                 status = "okay";
             };
@@ -219,7 +225,9 @@
 
         lcdif: lcdif@38300000 {
             compatible = "samsung,s5l8740-lcdif";
-            reg = <0x38300000 0x10000>;
+            /* LCDIF, then the clock controller: an LCDIF reset has to
+             * cycle two gates in it. */
+            reg = <0x38300000 0x10000>, <0x3c500000 0x100>;
         };
 
         /* MMIO backlight only. Never LCDIF CON/PHTIME. U-Boot already
@@ -275,6 +283,10 @@
 
         i2c0: i2c@3c600000 {
             compatible = "samsung,s5l8702-i2c";
+            /* sub_5714EE bus 0. Nothing muxed these before, which is
+             * why this bus reads as noise while i2c1 works: the
+             * bootloader leaves i2c1 configured and this one not. */
+            apple,pads = <4 5>;
             #address-cells = <1>;
             #size-cells = <0>;
             reg = <0x3c600000 0x100>;
@@ -291,6 +303,9 @@
 
         i2c1: i2c@3c900000 {
             compatible = "samsung,s5l8702-i2c";
+            /* sub_5714EE bus 1. Already live at boot; re-applying the
+             * stock mux is a no-op rather than a change. */
+            apple,pads = <78 79>;
             #address-cells = <1>;
             #size-cells = <0>;
             reg = <0x3c900000 0x100>;
@@ -411,7 +426,10 @@
             nimbus: touchscreen@0 {
                 compatible = "apple,nimbus";
                 reg = <0>;
-                spi-max-frequency = <1000000>;
+                /* Stock runs this bus at 12 MHz (divider 2 from 24 MHz).
+                 * The controller programs its own divider, so this is
+                 * documentation rather than a control. */
+                spi-max-frequency = <12000000>;
                 enable-gpios = <&gpio 14 GPIO_ACTIVE_HIGH>;
                 reset-gpios = <&gpio 39 GPIO_ACTIVE_LOW>;
                 attn-gpios = <&gpio 38 GPIO_ACTIVE_LOW>;

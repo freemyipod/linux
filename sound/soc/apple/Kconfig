@@ -11,28 +11,20 @@ config SND_SOC_APPLE_NANO7
 	tristate "iPod nano 7G audio machine"
 	depends on SND_SOC
 	select SND_SOC_APPLE_S5L8740_I2S
-	select SND_SOC_APPLE_S5L8740_IIS2
 	select SND_SOC_APPLE_CS42L81_SPI
 	help
-	  Registers ASoC card: S5L8740 IIS0+CS42 playback and optional
-	  IIS2 FM capture (local speakers/HP only; no FM→BT).
+	  Registers the ASoC card: CS42L81 headphone playback on IIS0 and
+	  BCM2078 FM capture on IIS2, as the two PCMs of one card.
 
 config SND_SOC_APPLE_S5L8740_I2S
-	tristate "S5L8740 IIS0 I2S CPU DAI"
+	tristate "S5L8740 I2S CPU DAIs (IIS0 playback, IIS2 capture)"
 	depends on SND_SOC && HAS_IOMEM
 	select SND_SOC_GENERIC_DMAENGINE_PCM
 	select SND_DMAENGINE_PCM
 	help
-	  IIS0 @0x3CA00000 CPU DAI with optional PL080 dmaengine PCM.
-
-config SND_SOC_APPLE_S5L8740_IIS2
-	tristate "S5L8740 IIS2 FM capture CPU DAI"
-	depends on SND_SOC && HAS_IOMEM
-	select SND_SOC_GENERIC_DMAENGINE_PCM
-	select SND_DMAENGINE_PCM
-	help
-	  IIS2 @0x3D400000 FM digital RX (peri 13 ← FIFO +0x38). Oracle
-	  register program from RetailOS fm-playing MMIO. Local PCM only.
+	  IIS0 @0x3CA00000 playback (PL080 peri 10) and IIS2 @0x3D400000
+	  BCM2078 digital PCM capture (peri 13). Both ports are in one
+	  driver because they share the SoC audio clock gate.
 
 config SND_SOC_APPLE_CS42L81_SPI
 	tristate "CS42L81 / 338S1146 SPI codec (N31)"

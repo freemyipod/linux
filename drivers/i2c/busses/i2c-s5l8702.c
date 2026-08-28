@@ -111,6 +111,10 @@ struct s5l8702_i2c_dev {
 	struct i2c_adapter adapter;
 	struct clk_bulk_data *clks;
 	int num_clks;
+	void __iomem *gpio;
+	void __iomem *gpiocmd;
+	u32 pads[2];
+	unsigned int npads;
 };
 
 static inline u32 s5l8702_i2c_readl(struct s5l8702_i2c_dev *i2c_dev, u32 reg)
@@ -658,6 +662,129 @@ static int s5l8702_i2c_init(struct s5l8702_i2c_dev *i2c_dev)
 	return 0;
 }
 
+/*
+ * Pad mux.
+ *
+ * Nothing else in this port muxes the I2C pads, which is fine for the bus
+ * the bootloader leaves configured but not for one it does not. Stock does
+ * it per bus in sub_5714EE:
+ *
+ *   bus 0 (0x3C600000)  GPIO 4, 5      bus 2  GPIO 66, 67
+ *   bus 1 (0x3C900000)  GPIO 78, 79    bus 3  GPIO 83, 84
+ *
+ * Each pad goes to function 2 via the GPIO command port, and the first of
+ * the pair additionally gets its bit set in the bank's +0x0C register --
+ * stock applies that to one pad only, so this does the same rather than
+ * guessing that both want it.
+ *
+ * The pads come from DT rather than a bus-index table here: the index a
+ * controller has in the stock enumeration is not something the driver can
+ * see, and getting it wrong would mux somebody else's pins.
+ */
+#define S5L8702_I2C_GPIO_PHYS		0x3cf00000ul
+#define S5L8702_I2C_GPIO_LEN		0x200
+#define S5L8702_I2C_GPIOCMD_PHYS	0x3cf001e0ul
+#define S5L8702_I2C_PAD_FUNC		2
+#define S5L8702_I2C_PAD_RELEASE		0
+#define S5L8702_I2C_BANK_STRIDE		32
+#define S5L8702_I2C_BANK_DIR		0x14
+#define S5L8702_I2C_BANK_ENABLE		0x0c
+#define S5L8702_I2C_PADS		2
+
+static void s5l8702_i2c_pad_func(struct s5l8702_i2c_dev *i2c_dev,
+				 unsigned int gpio, u8 func, bool claim)
+{
+	void __iomem *bank;
+	unsigned int pin;
+	u32 dir;
+
+	if (!i2c_dev->gpio || !i2c_dev->gpiocmd)
+		return;
+	bank = i2c_dev->gpio + S5L8702_I2C_BANK_STRIDE * (gpio >> 3);
+	pin = gpio & 7;
+
+	dir = readl(bank + S5L8702_I2C_BANK_DIR);
+	if (claim)
+		dir |= BIT(pin);
+	else
+		dir &= ~BIT(pin);
+	writel(dir, bank + S5L8702_I2C_BANK_DIR);
+
+	writel(((gpio >> 3) << 16) | (pin << 8) | func, i2c_dev->gpiocmd);
+}
+
+static void s5l8702_i2c_pad_enable(struct s5l8702_i2c_dev *i2c_dev,
+				   unsigned int gpio, bool on)
+{
+	void __iomem *bank;
+	unsigned int pin;
+	u32 v;
+
+	if (!i2c_dev->gpio)
+		return;
+	bank = i2c_dev->gpio + S5L8702_I2C_BANK_STRIDE * (gpio >> 3);
+	pin = gpio & 7;
+	v = readl(bank + S5L8702_I2C_BANK_ENABLE);
+	if (on)
+		v |= BIT(pin);
+	else
+		v &= ~BIT(pin);
+	writel(v, bank + S5L8702_I2C_BANK_ENABLE);
+}
+
+static void s5l8702_i2c_pads(struct s5l8702_i2c_dev *i2c_dev, bool claim)
+{
+	unsigned int i;
+
+	if (!i2c_dev->npads)
+		return;
+
+	if (claim) {
+		for (i = 0; i < i2c_dev->npads; i++)
+			s5l8702_i2c_pad_func(i2c_dev, i2c_dev->pads[i],
+					     S5L8702_I2C_PAD_FUNC, true);
+		s5l8702_i2c_pad_enable(i2c_dev, i2c_dev->pads[0], true);
+		dev_info(i2c_dev->dev, "pads %u/%u -> function %u\n",
+			 i2c_dev->pads[0], i2c_dev->pads[1],
+			 S5L8702_I2C_PAD_FUNC);
+	} else {
+		s5l8702_i2c_pad_enable(i2c_dev, i2c_dev->pads[0], false);
+		for (i = 0; i < i2c_dev->npads; i++)
+			s5l8702_i2c_pad_func(i2c_dev, i2c_dev->pads[i],
+					     S5L8702_I2C_PAD_RELEASE, false);
+	}
+}
+
+static int s5l8702_i2c_pads_init(struct s5l8702_i2c_dev *i2c_dev,
+				 struct device *dev)
+{
+	u32 pads[S5L8702_I2C_PADS];
+	int n;
+
+	n = of_property_count_u32_elems(dev->of_node, "apple,pads");
+	if (n <= 0)
+		return 0;
+	if (n != S5L8702_I2C_PADS) {
+		dev_warn(dev, "apple,pads needs %d entries, got %d\n",
+			 S5L8702_I2C_PADS, n);
+		return 0;
+	}
+	if (of_property_read_u32_array(dev->of_node, "apple,pads", pads, n))
+		return 0;
+
+	i2c_dev->gpio = devm_ioremap(dev, S5L8702_I2C_GPIO_PHYS,
+				     S5L8702_I2C_GPIO_LEN);
+	i2c_dev->gpiocmd = devm_ioremap(dev, S5L8702_I2C_GPIOCMD_PHYS, 4);
+	if (!i2c_dev->gpio || !i2c_dev->gpiocmd) {
+		dev_warn(dev, "pad mux unavailable (ioremap)\n");
+		return 0;
+	}
+	i2c_dev->pads[0] = pads[0];
+	i2c_dev->pads[1] = pads[1];
+	i2c_dev->npads = S5L8702_I2C_PADS;
+	return 0;
+}
+
 static int s5l8702_i2c_probe(struct platform_device *pdev)
 {
 	struct s5l8702_i2c_dev *i2c_dev;
@@ -687,6 +814,9 @@ static int s5l8702_i2c_probe(struct platform_device *pdev)
 		if (ret)
 			return ret;
 	}
+
+	s5l8702_i2c_pads_init(i2c_dev, &pdev->dev);
+	s5l8702_i2c_pads(i2c_dev, true);
 
 	s5l8702_i2c_init(i2c_dev);
 

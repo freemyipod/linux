@@ -68,14 +68,33 @@
 #include <linux/sysfs.h>
 #include <linux/workqueue.h>
 #include <sound/control.h>
+#include <sound/tlv.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
 #include <sound/soc.h>
 
+#include <linux/apple-n31.h>
+
 #include "n31-audio-rates.h"
 
-#define CS42L81_USER_VOL_MAX	256
-#define CS42L81_VOL_STEP	16	/* ~16 presses full 0..256 range */
+/*
+ * Output gain, register 0x0227. sub_400330 takes a signed value and
+ * writes the low seven bits of it; sub_D2C98 turns a dB figure into that
+ * value:
+ *
+ *   -50 dB .. +12 dB   code = dB               (1 dB per step)
+ *   below -50 dB       code = -50 + (dB+50)/2  (2 dB per step)
+ *   clamped to         -76 dB .. +12 dB, i.e. code -63 .. +12
+ *
+ * The mixer control is in whole dB so it stays linear for the user; the
+ * kink lives in the register encoding, not in the control.
+ */
+#define CS42L81_VOL_DB_MIN	(-76)
+#define CS42L81_VOL_DB_MAX	12
+#define CS42L81_VOL_DB_KNEE	(-50)
+#define CS42L81_USER_VOL_MAX	(CS42L81_VOL_DB_MAX - CS42L81_VOL_DB_MIN)
+#define CS42L81_VOL_DEFAULT	(CS42L81_USER_VOL_MAX - 32)	/* -20 dB */
+#define CS42L81_VOL_STEP	4	/* dB per Vol+/- press */
 
 /*
  * Play rate for D34C0/183138. 0 = follow PCM hw_params (OSOS 44100 if none).
@@ -301,7 +320,6 @@ void cs42l81_cancel_post_iis(void);
 static int cs42l81_write(struct cs42l81 *c, u16 reg, u8 val);
 static int cs42l81_apply_user_vol(struct cs42l81 *c);
 static void cs42l81_log_start_state(struct cs42l81 *c, const char *tag);
-static void cs42l81_push_pcm_q8(unsigned int vol);
 
 static int cs42l81_write(struct cs42l81 *c, u16 reg, u8 val)
 {
@@ -1182,11 +1200,38 @@ static void cs42_jack_poll_start(struct cs42l81 *c)
  * OSOS sub_400330 → sub_3FA0E0(551=0x227, value&0x7f).
  * D3280(4) calls this with 64 then 65 before final 0x229=0x41.
  */
-static int cs42l81_set_output_gain(struct cs42l81 *c, u8 val)
+/* Mixer position (0..CS42L81_USER_VOL_MAX) to dB. */
+static int cs42l81_vol_to_db(unsigned int vol)
 {
-	if (val & 0x40)
-		val |= 0x80;
-	return cs42l81_write(c, 0x0227, val);
+	return (int)vol + CS42L81_VOL_DB_MIN;
+}
+
+/* sub_D2C98: dB to the signed code that register 0x0227 carries. */
+static int cs42l81_db_to_code(int db)
+{
+	if (db > CS42L81_VOL_DB_MAX)
+		db = CS42L81_VOL_DB_MAX;
+	if (db < CS42L81_VOL_DB_MIN)
+		db = CS42L81_VOL_DB_MIN;
+	if (db > CS42L81_VOL_DB_KNEE)
+		return db;
+	/*
+	 * Below the knee the register carries 2 dB per code, and sub_D2C98
+	 * steps an odd figure down before halving it rather than rounding.
+	 */
+	if (db & 1)
+		db--;
+	return CS42L81_VOL_DB_KNEE + (db - CS42L81_VOL_DB_KNEE) / 2;
+}
+
+/*
+ * sub_400330 sign-extends bit 6 only so it can compare the value, then
+ * writes `v4 & 0x7F`. Writing the sign-extended byte instead sets a bit 7
+ * that is not part of the gain field.
+ */
+static int cs42l81_set_output_gain(struct cs42l81 *c, int code)
+{
+	return cs42l81_write(c, 0x0227, (u8)(code & 0x7f));
 }
 
 /*
@@ -1596,7 +1641,7 @@ static int cs42_codec_prepare(struct cs42l81 *c, unsigned int rate)
 
 	cs42l81_read(c, 0x0227, &st);
 	cs42l81_read(c, 0x0219, &r219);
-	cs42l81_push_pcm_q8(c->user_vol);
+	cs42l81_apply_user_vol(c);
 	cs42_log_graph_snapshot(c, "pre_play");
 	cs42l81_log_start_state(c, "codec_prepare");
 	dev_info(&c->spi->dev,
@@ -1660,24 +1705,22 @@ static int __maybe_unused cs42l81_set_mute(struct cs42l81 *c, int mute)
 	return 0;
 }
 
-static void cs42l81_push_pcm_q8(unsigned int vol)
-{
-	void (*set)(unsigned int);
-
-	set = (void (*)(unsigned int))__symbol_get("s5l8740_set_user_vol_q8");
-	if (set) {
-		set(vol);
-		__symbol_put("s5l8740_set_user_vol_q8");
-	}
-}
-
-/* User vol mute during play: F141C(0) only — not full 42D364 teardown. */
+/*
+ * Push the mixer state at the hardware: the gain register always carries
+ * the selected level, and mute is the codec's own analog mute (F141C /
+ * 0x0527) rather than a digital scale. Nothing here scales PCM in
+ * software -- that only ever worked on the PIO path, and the codec gain
+ * applies to both paths anyway.
+ */
 static int cs42l81_apply_user_vol(struct cs42l81 *c)
 {
-	unsigned int q8 = c->dai_mute ? 0 : c->user_vol;
+	int ret;
 
-	cs42l81_push_pcm_q8(q8);
-	if (q8 == 0)
+	ret = cs42l81_set_output_gain(c,
+			cs42l81_db_to_code(cs42l81_vol_to_db(c->user_vol)));
+	if (ret)
+		return ret;
+	if (c->dai_mute)
 		return cs42_f141c_play_unmute(c, false);
 	if (c->play_started)
 		return cs42_play_unmute(c);
@@ -1695,8 +1738,9 @@ static void cs42l81_log_start_state(struct cs42l81 *c, const char *tag)
 	cs42l81_read(c, 0x0219, &r219);
 	cs42l81_read(c, 0xc96f, &rc96f);
 	dev_info(&c->spi->dev,
-		 "CS42 %s: vol=%u/%u dai_mute=%d 2F=%02x 527=%02x 401=%02x 219=%02x C96F=%02x\n",
-		 tag, c->user_vol, CS42L81_USER_VOL_MAX, c->dai_mute,
+		 "CS42 %s: vol=%u/%u (%d dB) dai_mute=%d 2F=%02x 527=%02x 401=%02x 219=%02x C96F=%02x\n",
+		 tag, c->user_vol, CS42L81_USER_VOL_MAX,
+		 cs42l81_vol_to_db(c->user_vol), c->dai_mute,
 		 r2f, r527, r401, r219, rc96f);
 }
 
@@ -1877,11 +1921,13 @@ static ssize_t volume_show(struct device *dev, struct device_attribute *attr,
 	if (ra || rb || rc)
 		return sysfs_emit(buf, "read err %d/%d/%d\n", ra, rb, rc);
 	return sysfs_emit(buf,
-			  "user=%u/%u dai_mute=%d\n"
+			  "user=%u/%u (%d dB, 0x227 code %d) dai_mute=%d\n"
 			  "0x403=0x%02x 0x404=0x%02x (taps, play 2/1)\n"
 			  "0x527=0x%02x analog_mute=%d\n",
-			  c->user_vol, CS42L81_USER_VOL_MAX, c->dai_mute,
-			  tap_l, tap_r, analog, analog == 0xff);
+			  c->user_vol, CS42L81_USER_VOL_MAX,
+			  cs42l81_vol_to_db(c->user_vol),
+			  cs42l81_db_to_code(cs42l81_vol_to_db(c->user_vol)),
+			  c->dai_mute, tap_l, tap_r, analog, analog == 0xff);
 }
 static DEVICE_ATTR_RW(volume);
 
@@ -2333,6 +2379,19 @@ static int cs42l81_dai_mute_stream(struct snd_soc_dai *dai, int mute, int stream
 	return 0;
 }
 
+/*
+ * True while the analog play graph is latched. Used by the power-button
+ * policy to decide how deeply it may sleep; the codec has no dedicated
+ * PMU rail to infer this from.
+ */
+bool n31_audio_playback_active(void)
+{
+	struct cs42l81 *c = cs42l81_dev;
+
+	return c && c->play_started;
+}
+EXPORT_SYMBOL_GPL(n31_audio_playback_active);
+
 static const struct snd_soc_dai_ops cs42l81_dai_ops = {
 	.hw_params = cs42l81_dai_hw_params,
 	.trigger = cs42l81_dai_trigger,
@@ -2366,7 +2425,7 @@ static void cs42l81_notify_master_vol(struct cs42l81 *c)
 
 	if (!comp || !comp->card || !comp->card->snd_card)
 		return;
-	kctl = snd_soc_component_get_kcontrol(comp, "Master Playback Volume");
+	kctl = snd_soc_component_get_kcontrol(comp, "Headphones Playback Volume");
 	if (!kctl)
 		return;
 	snd_ctl_notify(comp->card->snd_card, SNDRV_CTL_EVENT_MASK_VALUE,
@@ -2374,7 +2433,7 @@ static void cs42l81_notify_master_vol(struct cs42l81 *c)
 }
 
 /*
- * Vol± from gpio-s5l8740 (KEY_VOLUMEUP/DOWN) → Master Playback Volume.
+ * Vol± from gpio-s5l8740 (KEY_VOLUMEUP/DOWN) → Headphones Playback Volume.
  * Input softirq must not SPI; defer apply + ALSA notify to process context.
  */
 static void cs42l81_vol_workfn(struct work_struct *work)
@@ -2413,8 +2472,9 @@ static void cs42l81_vol_workfn(struct work_struct *work)
 	if (vol != prev || unmute) {
 		cs42l81_notify_master_vol(c);
 		dev_info(&c->spi->dev,
-			 "Vol%c → Master %u/%u%s\n",
+			 "Vol%c → Headphones %u/%u (%d dB)%s\n",
 			 delta > 0 ? '+' : '-', vol, CS42L81_USER_VOL_MAX,
+			 cs42l81_vol_to_db(vol),
 			 unmute ? " (unmuted)" : "");
 	}
 }
@@ -2460,7 +2520,7 @@ static int cs42l81_input_connect(struct input_handler *handler,
 	if (err)
 		goto err_unregister;
 
-	dev_info(&c->spi->dev, "Vol± keys → Master Playback Volume (%s)\n",
+	dev_info(&c->spi->dev, "Vol± keys → Headphones Playback Volume (%s)\n",
 		 dev->name ? dev->name : "input");
 	return 0;
 
@@ -2546,17 +2606,24 @@ static int cs42l81_sw_put(struct snd_kcontrol *kcontrol,
 	return changed;
 }
 
+/* Whole-dB steps, so a plain dB scale describes the control exactly. */
+static const DECLARE_TLV_DB_SCALE(cs42l81_hp_tlv,
+				  CS42L81_VOL_DB_MIN * 100, 100, 0);
+
 static const struct snd_kcontrol_new cs42l81_controls[] = {
 	{
 		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
-		.name = "Master Playback Volume",
+		.name = "Headphones Playback Volume",
+		.access = SNDRV_CTL_ELEM_ACCESS_READWRITE |
+			  SNDRV_CTL_ELEM_ACCESS_TLV_READ,
 		.info = cs42l81_vol_info,
 		.get = cs42l81_vol_get,
 		.put = cs42l81_vol_put,
+		.tlv.p = cs42l81_hp_tlv,
 	},
 	{
 		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
-		.name = "Master Playback Switch",
+		.name = "Headphones Playback Switch",
 		.info = cs42l81_sw_info,
 		.get = cs42l81_sw_get,
 		.put = cs42l81_sw_put,
@@ -2600,7 +2667,7 @@ static int cs42l81_probe(struct spi_device *spi)
 	if (!c)
 		return -ENOMEM;
 	c->spi = spi;
-	c->user_vol = CS42L81_USER_VOL_MAX;
+	c->user_vol = CS42L81_VOL_DEFAULT;
 	c->dai_mute = false;
 	mutex_init(&c->lock);
 	atomic_set(&c->vol_steps, 0);

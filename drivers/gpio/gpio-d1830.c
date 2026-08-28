@@ -21,6 +21,7 @@
  *
  * Copyright (C) 2026 Vencislav Atanasov <user890104@freemyipod.org>
  */
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/gpio/driver.h>
 #include <linux/i2c.h>
@@ -32,6 +33,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_irq.h>
+#include <linux/seq_file.h>
 #include <linux/power_supply.h>
 #include <linux/reboot.h>
 #include <linux/sysfs.h>
@@ -407,6 +409,11 @@ static irqreturn_t d1830_irq_thread(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+/* Screen-sleep and power-button policy; defined with the PMU rail code. */
+static void n31_power_button(bool pressed);
+static void n31_power_button_poll(void);
+static void n31_home_button(bool pressed);
+
 static void d1830_key_active_low(struct d1830_gpio *gpio_dev, unsigned int code,
 				 u8 now_bit, u8 *last, const char *name)
 {
@@ -423,7 +430,8 @@ static void d1830_key_active_low(struct d1830_gpio *gpio_dev, unsigned int code,
 	dev_dbg(&gpio_dev->client->dev,
 		"n31-btn %s %s (bit=%u, 0=pressed OSOS)\n",
 		name, pressed ? "PRESS" : "release", now_bit);
-	s5l8740_n31_report_key(code, pressed);
+	if (code == KEY_HOMEPAGE)
+		n31_home_button(pressed);
 	if (gpio_dev->input) {
 		input_report_key(gpio_dev->input, code, pressed);
 		input_sync(gpio_dev->input);
@@ -503,7 +511,7 @@ static void d1830_btn_poll_once(struct d1830_gpio *gpio_dev)
 			d1830_vinfo(&client->dev,
 				 "n31-btn SLEEP PRESS r7=0x%02x (bit5 1->0)\n",
 				 r7);
-			s5l8740_n31_report_key(KEY_POWER, 1);
+			n31_power_button(true);
 			if (gpio_dev->input) {
 				input_report_key(gpio_dev->input, KEY_POWER, 1);
 				input_sync(gpio_dev->input);
@@ -515,6 +523,7 @@ static void d1830_btn_poll_once(struct d1830_gpio *gpio_dev)
 		 * userspace is not watching. One noisy I2C byte must not
 		 * hibernate.
 		 */
+		n31_power_button_poll();
 		if (gpio_dev->sleep_hold < 5)
 			gpio_dev->sleep_hold++;
 		if (gpio_dev->sleep_hold == 5) {
@@ -535,7 +544,7 @@ static void d1830_btn_poll_once(struct d1830_gpio *gpio_dev)
 		if (!gpio_dev->last_sleep) {
 			dev_dbg(&client->dev,
 				"n31-btn SLEEP release r7=0x%02x\n", r7);
-			s5l8740_n31_report_key(KEY_POWER, 0);
+			n31_power_button(false);
 			if (gpio_dev->input) {
 				input_report_key(gpio_dev->input, KEY_POWER, 0);
 				input_sync(gpio_dev->input);
@@ -874,6 +883,862 @@ static int d1830_rmw(struct i2c_client *client, u8 reg, u8 clear, u8 set)
 	return i2c_smbus_write_byte_data(client, reg, newv);
 }
 
+/* ------------------------------------------------------------------ */
+/* N31 PMU register / rail decode                                       */
+/*                                                                      */
+/* Read-only by default. The point is to make the boot rail model       */
+/* visible so audio and display power can be debugged from evidence     */
+/* rather than by poking registers and watching what breaks. Names are  */
+/* driver-local: they describe what the boot sequence does with each    */
+/* register, and carry no claim about which peripheral owns a rail      */
+/* until a snapshot diff proves it.                                     */
+/* ------------------------------------------------------------------ */
+
+#define N31_PMU_VARIANT		"n31_d1830_pmu_v1"
+#define N31_PMU_REG_MAX		0x88	/* dump 0x00..0x87 */
+#define N31_PMU_VSEL_MASK	0x1f
+#define N31_PMU_NO_VSEL		0xff
+
+static char *pmu_variant = N31_PMU_VARIANT;
+module_param(pmu_variant, charp, 0444);
+MODULE_PARM_DESC(pmu_variant, "PMU register-map variant this driver decodes");
+
+static bool allow_pmu_writes;
+module_param(allow_pmu_writes, bool, 0644);
+MODULE_PARM_DESC(allow_pmu_writes,
+		 "Permit PMU rail writes at all (default N — decode only)");
+
+static bool apply_boot_rails;
+module_param(apply_boot_rails, bool, 0644);
+MODULE_PARM_DESC(apply_boot_rails,
+		 "Replay the boot rail sequence exactly (needs allow_pmu_writes)");
+
+static bool audio_rail_test;
+module_param(audio_rail_test, bool, 0644);
+MODULE_PARM_DESC(audio_rail_test,
+		 "Arm the analog rail experiment (needs allow_pmu_writes)");
+
+static bool restore_after_test = true;
+module_param(restore_after_test, bool, 0644);
+MODULE_PARM_DESC(restore_after_test,
+		 "Restore the pre-test register values afterwards (default Y)");
+
+struct n31_pmu_regname {
+	u8 reg;
+	const char *name;
+};
+
+static const struct n31_pmu_regname n31_pmu_names[] = {
+	{ 0x00, "PMU_CHIP_ID" },
+	{ 0x01, "PMU_EVENT_A" },
+	{ 0x02, "PMU_EVENT_B" },
+	{ 0x03, "PMU_EVENT_C" },
+	{ 0x04, "PMU_EVENT_D" },
+	{ 0x05, "PMU_STATUS_A" },
+	{ 0x06, "PMU_STATUS_B" },
+	{ 0x07, "PMU_STATUS_C" },
+	{ 0x08, "PMU_STATUS_D" },
+	{ 0x09, "PMU_IRQ_MASK_A" },
+	{ 0x0a, "PMU_IRQ_MASK_B" },
+	{ 0x0b, "PMU_IRQ_MASK_C" },
+	{ 0x0c, "PMU_IRQ_MASK_D" },
+	{ 0x0d, "PMU_SYS_CONTROL" },
+	{ 0x0e, "PMU_FAULT_LOG" },
+	{ 0x10, "PMU_ACTIVE_1" },
+	{ 0x11, "PMU_ACTIVE_2" },
+	{ 0x12, "PMU_STANDBY_1" },
+	{ 0x13, "PMU_HIBERNATE_1" },
+	{ 0x14, "PMU_BUCK_1_CFG" },
+	{ 0x15, "PMU_BUCK_2_CFG" },
+	{ 0x16, "PMU_SPECIAL_CFG" },
+	{ 0x17, "PMU_LDO_1_CFG" },
+	{ 0x18, "PMU_LDO_2_CFG" },
+	{ 0x19, "PMU_LDO_3_CFG" },
+	{ 0x1a, "PMU_LDO_4_CFG" },
+	{ 0x1b, "PMU_LDO_5_CFG" },
+	{ 0x1c, "PMU_LDO_6_CFG" },
+	{ 0x1d, "PMU_LDO_7_CFG" },
+	{ 0x1e, "PMU_LDO_8_CFG" },
+	{ 0x1f, "PMU_LDO_9_CFG" },
+	{ 0x20, "PMU_LDO_10_CFG" },
+	{ 0x21, "PMU_LDO_11_CFG" },
+	{ 0x22, "PMU_LDO_CONTROL" },
+	{ 0x23, "PMU_BUCK_CONTROL" },
+	{ 0x24, "PMU_BUCK_CONTROL_2" },
+	{ 0x25, "PMU_WLED_ISET" },
+	{ 0x26, "PMU_WLED_CONTROL" },
+	{ 0x27, "PMU_CHARGE_BUCK_CONTROL" },
+	{ 0x28, "PMU_CHARGE_CONTROL_A" },
+	{ 0x29, "PMU_CHARGE_CONTROL_B" },
+	{ 0x2a, "PMU_CHARGE_TIME" },
+	{ 0x2b, "PMU_CHARGE_MISC" },
+	{ 0x30, "PMU_ADC_CONTROL" },
+	{ 0x31, "PMU_ADC_LSB" },
+	{ 0x32, "PMU_ADC_MSB" },
+	{ 0x35, "PMU_ICHG_AVG" },
+	{ 0x3c, "PMU_MISC_ENABLE" },
+	{ 0x5f, "PMU_SYS_CONFIG" },
+	{ 0x6e, "PMU_N31_STATE" },
+	{ 0x6f, "PMU_N31_CAL_INPUT" },
+};
+
+/* Named ranges; 0x6E/0x6F are looked up before the MEMBYTE range wins. */
+static const char *n31_pmu_reg_name(u8 reg, char *buf, size_t len)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(n31_pmu_names); i++)
+		if (n31_pmu_names[i].reg == reg)
+			return n31_pmu_names[i].name;
+
+	if (reg >= 0x40 && reg <= 0x4f)
+		scnprintf(buf, len, "PMU_RTC_OR_UPCOUNT_%u", reg - 0x40);
+	else if (reg >= 0x50 && reg <= 0x57)
+		scnprintf(buf, len, "PMU_GPIO_%u", reg - 0x50 + 1);
+	else if (reg >= 0x59 && reg <= 0x5b)
+		scnprintf(buf, len, "PMU_GPIO_DEBOUNCE_%u", reg - 0x59 + 1);
+	else if (reg >= 0x5c && reg <= 0x5e)
+		scnprintf(buf, len, "PMU_BUTTON_%u", reg - 0x5c + 1);
+	else if (reg >= 0x60 && reg <= 0x87)
+		scnprintf(buf, len, "PMU_MEMBYTE_%u", reg - 0x60);
+	else
+		scnprintf(buf, len, "PMU_RESERVED_%02X", reg);
+	return buf;
+}
+
+/*
+ * Rail decode. `active` names the register whose `mask` bit gates the rail;
+ * `vsel` holds the 5-bit voltage code. Ownership is deliberately unassigned:
+ * which peripheral each rail feeds should come out of a snapshot diff.
+ */
+struct n31_pmu_rail {
+	const char *name;
+	u8 vsel;
+	u8 active_reg;
+	u8 active_mask;
+	u16 base_mv;
+	u16 step_mv;
+};
+
+static const struct n31_pmu_rail n31_pmu_rails[] = {
+	{ "PMU_LDO_1",  0x17, 0x10, 0x08, 2500,  50 },
+	{ "PMU_LDO_2",  0x18, 0x10, 0x10, 1500,  50 },
+	{ "PMU_LDO_3",  0x19, 0x10, 0x20, 2500,  50 },
+	{ "PMU_LDO_4",  0x1a, 0x10, 0x40, 1800,  50 },
+	{ "PMU_LDO_5",  0x1b, 0x10, 0x80, 2500,  50 },
+	{ "PMU_LDO_6",  0x1c, 0x11, 0x01, 2500,  50 },
+	{ "PMU_LDO_7",  0x1d, 0x11, 0x02, 1500, 100 },
+	{ "PMU_LDO_8",  0x1e, 0x11, 0x04, 2000,  50 },
+	{ "PMU_LDO_9",  0x1f, 0x11, 0x80, 1200,  25 },
+	{ "PMU_LDO_10", 0x20, 0x11, 0x10, 1700,  50 },
+	{ "PMU_LDO_11", 0x21, 0x11, 0x20, 1700,  50 },
+	{ "PMU_WDIG",   N31_PMU_NO_VSEL, 0x11, 0x40, 0, 0 },
+};
+
+/* Registers worth watching across an audio or display state change. */
+static const u8 n31_pmu_watch[] = {
+	0x0d, 0x0e, 0x10, 0x11, 0x13, 0x14, 0x15, 0x16, 0x17, 0x1a,
+	0x23, 0x24, 0x25, 0x26, 0x29, 0x2a, 0x2b, 0x30, 0x3c,
+};
+
+/*
+ * Registers the PMU updates on its own: measurement results, counters and
+ * latched status. They differ between any two reads, so a diff marks them
+ * instead of letting them bury a real rail change.
+ */
+static bool n31_pmu_reg_is_live(u8 reg)
+{
+	if (reg >= 0x01 && reg <= 0x08)		/* events and status */
+		return true;
+	if (reg >= 0x31 && reg <= 0x35)		/* ADC result, charge current */
+		return true;
+	if (reg >= 0x3d && reg <= 0x3f)		/* observed ticking with the ADC */
+		return true;
+	if (reg >= 0x40 && reg <= 0x4f)		/* RTC / up-counter */
+		return true;
+	return false;
+}
+
+static u8 n31_pmu_snap[N31_PMU_REG_MAX];
+static bool n31_pmu_snap_valid;
+static struct dentry *n31_pmu_debugfs;
+
+static int n31_pmu_read(u8 reg)
+{
+	struct i2c_client *client = d1830_poweroff_client;
+
+	if (!client)
+		return -ENODEV;
+	return i2c_smbus_read_byte_data(client, reg);
+}
+
+static void n31_pmu_read_all(u8 *out, bool *ok)
+{
+	unsigned int r;
+
+	for (r = 0; r < N31_PMU_REG_MAX; r++) {
+		int v = n31_pmu_read((u8)r);
+
+		ok[r] = v >= 0;
+		out[r] = ok[r] ? (u8)v : 0;
+	}
+}
+
+static int n31_pmu_variant_show(struct seq_file *s, void *unused)
+{
+	seq_printf(s, "%s\n", pmu_variant ? pmu_variant : N31_PMU_VARIANT);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(n31_pmu_variant);
+
+static int n31_pmu_regs_raw_show(struct seq_file *s, void *unused)
+{
+	unsigned int r;
+
+	for (r = 0; r < N31_PMU_REG_MAX; r += 16) {
+		unsigned int i;
+
+		seq_printf(s, "%02x:", r);
+		for (i = 0; i < 16 && r + i < N31_PMU_REG_MAX; i++) {
+			int v = n31_pmu_read((u8)(r + i));
+
+			if (v < 0)
+				seq_puts(s, " --");
+			else
+				seq_printf(s, " %02x", v);
+		}
+		seq_puts(s, "\n");
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(n31_pmu_regs_raw);
+
+static int n31_pmu_regs_named_show(struct seq_file *s, void *unused)
+{
+	char buf[32];
+	unsigned int r;
+
+	for (r = 0; r < N31_PMU_REG_MAX; r++) {
+		int v = n31_pmu_read((u8)r);
+
+		if (v < 0)
+			continue;
+		seq_printf(s, "0x%02x  %-24s 0x%02x\n", r,
+			   n31_pmu_reg_name((u8)r, buf, sizeof(buf)), v);
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(n31_pmu_regs_named);
+
+static int n31_pmu_rails_show(struct seq_file *s, void *unused)
+{
+	unsigned int i;
+
+	seq_puts(s, "rail        vsel active      raw  on  mV\n");
+	for (i = 0; i < ARRAY_SIZE(n31_pmu_rails); i++) {
+		const struct n31_pmu_rail *ra = &n31_pmu_rails[i];
+		int act = n31_pmu_read(ra->active_reg);
+		int cfg = ra->vsel == N31_PMU_NO_VSEL ? -1 :
+			  n31_pmu_read(ra->vsel);
+		bool on = act >= 0 && (act & ra->active_mask);
+
+		seq_printf(s, "%-11s ", ra->name);
+		if (ra->vsel == N31_PMU_NO_VSEL)
+			seq_puts(s, "---- ");
+		else
+			seq_printf(s, "0x%02x ", ra->vsel);
+		seq_printf(s, "0x%02x/0x%02x ", ra->active_reg, ra->active_mask);
+		if (cfg < 0)
+			seq_puts(s, "  -- ");
+		else
+			seq_printf(s, "0x%02x ", cfg);
+		seq_printf(s, "%-3s ", act < 0 ? "?" : (on ? "yes" : "no"));
+		if (cfg >= 0 && ra->step_mv)
+			seq_printf(s, "%u",
+				   ra->base_mv +
+				   (cfg & N31_PMU_VSEL_MASK) * ra->step_mv);
+		else
+			seq_puts(s, "-");
+		seq_puts(s, "\n");
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(n31_pmu_rails);
+
+/*
+ * The boot rail sequence in this driver's register names. Blind writes and
+ * read-modify-writes are shown as they appear, because reproducing one as the
+ * other would change what the hardware ends up with.
+ */
+static int n31_pmu_bootseq_decode_show(struct seq_file *s, void *unused)
+{
+	seq_puts(s, "sub_23EC — rail configuration and active state\n");
+	seq_puts(s, "  PMU_BUCK_CONTROL   [0x23] &= 0xFC\n");
+	seq_puts(s, "  PMU_BUCK_1_CFG     [0x14]  = computed 5-bit A\n");
+	seq_puts(s, "  PMU_BUCK_2_CFG     [0x15]  = computed 5-bit B\n");
+	seq_puts(s, "  PMU_SPECIAL_CFG    [0x16]  = computed 5-bit B\n");
+	seq_puts(s, "  PMU_LDO_1_CFG      [0x17]  = computed 5-bit B\n");
+	seq_puts(s, "  PMU_LDO_4_CFG      [0x1A]  = 0xB2   (written twice)\n");
+	seq_puts(s, "  PMU_ACTIVE_1       [0x10]  = (old & 0x2F) | 0x10\n");
+	seq_puts(s, "                             cold boot also | 0x20\n");
+	seq_puts(s, "  PMU_ACTIVE_2       [0x11] |= 0x07\n");
+	seq_puts(s, "  PMU_HIBERNATE_1    [0x13] |= 0x02\n");
+	seq_puts(s, "\n");
+	seq_puts(s, "sub_27F4 — board power initialisation tail\n");
+	seq_puts(s, "  PMU_SYS_CONTROL    [0x0D] &= 0x8F\n");
+	seq_puts(s, "  (apply sub_23EC)\n");
+	seq_puts(s, "  PMU_ADC_CONTROL    [0x30] |= 0x40\n");
+	seq_puts(s, "  PMU_GPIO_DEBOUNCE_1[0x59] &= 0xE3\n");
+	seq_puts(s, "  PMU_MISC_ENABLE    [0x3C]  = 0x01\n");
+	seq_puts(s, "  PMU_CHARGE_CONTROL_B[0x29] = (old & 0xEC) | 0x10\n");
+	seq_puts(s, "  PMU_CHARGE_TIME    [0x2A]  = (old & 0xC0) | 0x14\n");
+	seq_puts(s, "  PMU_CHARGE_MISC    [0x2B]  = (old & 0xF0) | 0x01\n");
+	seq_puts(s, "  PMU_FAULT_LOG      [0x0E]  = 0x20\n");
+	seq_puts(s, "  PMU_BUCK_CONTROL_2 [0x24]  = f(cal) >> 1\n");
+	seq_puts(s, "  PMU_WLED_ISET      [0x25]  = 4 * (f(cal) & 1)\n");
+	seq_puts(s, "  PMU_WLED_CONTROL   [0x26] &= ~0x01\n");
+	seq_puts(s, "  PMU_SYS_CONTROL    [0x0D] &= 0xF3\n");
+	seq_puts(s, "\n");
+	seq_puts(s, "sub_1E7C — low-power boot finish\n");
+	seq_puts(s, "  PMU_CHARGE_CONTROL_B[0x29] = (old & 0xF8) | 0x06\n");
+	seq_puts(s, "  PMU_BUCK_CONTROL_2 [0x24]  = f(0x28) >> 1\n");
+	seq_puts(s, "  PMU_WLED_ISET      [0x25]  = 4 * (f(0x28) & 1)\n");
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(n31_pmu_bootseq_decode);
+
+/* Reading this captures the current register file; diff_last compares to it. */
+static int n31_pmu_snapshot_show(struct seq_file *s, void *unused)
+{
+	bool ok[N31_PMU_REG_MAX];
+	char buf[32];
+	unsigned int r;
+
+	n31_pmu_read_all(n31_pmu_snap, ok);
+	n31_pmu_snap_valid = true;
+
+	seq_puts(s, "captured; compare with diff_last\n");
+	for (r = 0; r < N31_PMU_REG_MAX; r++) {
+		if (!ok[r])
+			continue;
+		seq_printf(s, "0x%02x  %-24s 0x%02x\n", r,
+			   n31_pmu_reg_name((u8)r, buf, sizeof(buf)),
+			   n31_pmu_snap[r]);
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(n31_pmu_snapshot);
+
+static int n31_pmu_diff_last_show(struct seq_file *s, void *unused)
+{
+	char buf[32];
+	unsigned int r, n = 0;
+
+	if (!n31_pmu_snap_valid) {
+		seq_puts(s, "no snapshot yet; read snapshot first\n");
+		return 0;
+	}
+	for (r = 0; r < N31_PMU_REG_MAX; r++) {
+		int v = n31_pmu_read((u8)r);
+		u8 old, xor;
+
+		if (v < 0)
+			continue;
+		old = n31_pmu_snap[r];
+		if (old == (u8)v)
+			continue;
+		xor = old ^ (u8)v;
+		seq_printf(s, "0x%02x  %-24s 0x%02x -> 0x%02x  xor=0x%02x  set=0x%02x cleared=0x%02x%s\n",
+			   r, n31_pmu_reg_name((u8)r, buf, sizeof(buf)),
+			   old, v, xor, (u8)(xor & v), (u8)(xor & old),
+			   n31_pmu_reg_is_live((u8)r) ? "  [live]" : "");
+		if (!n31_pmu_reg_is_live((u8)r))
+			n++;
+	}
+	if (!n)
+		seq_puts(s,
+			 "no change since snapshot (ignoring [live] registers)\n");
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(n31_pmu_diff_last);
+
+static void n31_pmu_show_watch(struct seq_file *s, const char *tag)
+{
+	char buf[32];
+	unsigned int i;
+
+	seq_printf(s, "=== %s ===\n", tag);
+	for (i = 0; i < ARRAY_SIZE(n31_pmu_watch); i++) {
+		u8 reg = n31_pmu_watch[i];
+		int v = n31_pmu_read(reg);
+
+		seq_printf(s, "0x%02x  %-24s ", reg,
+			   n31_pmu_reg_name(reg, buf, sizeof(buf)));
+		if (v < 0)
+			seq_puts(s, "--\n");
+		else
+			seq_printf(s, "0x%02x\n", v);
+	}
+}
+
+static int n31_pmu_audio_snapshot_show(struct seq_file *s, void *unused)
+{
+	n31_pmu_show_watch(s, "audio rail watch");
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(n31_pmu_audio_snapshot);
+
+static int n31_pmu_display_snapshot_show(struct seq_file *s, void *unused)
+{
+	n31_pmu_show_watch(s, "display rail watch");
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(n31_pmu_display_snapshot);
+
+/*
+ * Show what the boot sequence would write given the registers as they stand,
+ * without writing any of it. The read-modify-write steps are evaluated
+ * against live values so the result is what would actually land.
+ */
+static int n31_pmu_apply_bootseq_dryrun_show(struct seq_file *s, void *unused)
+{
+	int r10, r11, r13, r23, r0d, r29, r2a, r2b, r26, r30, r59;
+
+	seq_printf(s, "allow_pmu_writes=%d apply_boot_rails=%d (dry run only)\n\n",
+		   allow_pmu_writes, apply_boot_rails);
+
+	r23 = n31_pmu_read(0x23);
+	r10 = n31_pmu_read(0x10);
+	r11 = n31_pmu_read(0x11);
+	r13 = n31_pmu_read(0x13);
+	r0d = n31_pmu_read(0x0d);
+	r29 = n31_pmu_read(0x29);
+	r2a = n31_pmu_read(0x2a);
+	r2b = n31_pmu_read(0x2b);
+	r26 = n31_pmu_read(0x26);
+	r30 = n31_pmu_read(0x30);
+	r59 = n31_pmu_read(0x59);
+	if (r23 < 0 || r10 < 0 || r11 < 0 || r13 < 0) {
+		seq_puts(s, "PMU read failed\n");
+		return 0;
+	}
+
+	seq_puts(s, "sub_23EC:\n");
+	seq_printf(s, "  PMU_BUCK_CONTROL   0x%02x -> 0x%02x\n",
+		   r23, r23 & 0xfc);
+	seq_printf(s, "  PMU_LDO_4_CFG      ---- -> 0xb2 (blind, twice)\n");
+	seq_printf(s, "  PMU_ACTIVE_1       0x%02x -> 0x%02x (cold: 0x%02x)\n",
+		   r10, (r10 & 0x2f) | 0x10, (r10 & 0x2f) | 0x30);
+	seq_printf(s, "  PMU_ACTIVE_2       0x%02x -> 0x%02x\n",
+		   r11, r11 | 0x07);
+	seq_printf(s, "  PMU_HIBERNATE_1    0x%02x -> 0x%02x\n",
+		   r13, r13 | 0x02);
+
+	seq_puts(s, "sub_27F4 tail:\n");
+	if (r0d >= 0)
+		seq_printf(s, "  PMU_SYS_CONTROL    0x%02x -> 0x%02x then 0x%02x\n",
+			   r0d, r0d & 0x8f, (r0d & 0x8f) & 0xf3);
+	if (r30 >= 0)
+		seq_printf(s, "  PMU_ADC_CONTROL    0x%02x -> 0x%02x\n",
+			   r30, r30 | 0x40);
+	if (r59 >= 0)
+		seq_printf(s, "  PMU_GPIO_DEBOUNCE_1 0x%02x -> 0x%02x\n",
+			   r59, r59 & 0xe3);
+	seq_puts(s, "  PMU_MISC_ENABLE    ---- -> 0x01 (blind)\n");
+	if (r29 >= 0)
+		seq_printf(s, "  PMU_CHARGE_CONTROL_B 0x%02x -> 0x%02x\n",
+			   r29, (r29 & 0xec) | 0x10);
+	if (r2a >= 0)
+		seq_printf(s, "  PMU_CHARGE_TIME    0x%02x -> 0x%02x\n",
+			   r2a, (r2a & 0xc0) | 0x14);
+	if (r2b >= 0)
+		seq_printf(s, "  PMU_CHARGE_MISC    0x%02x -> 0x%02x\n",
+			   r2b, (r2b & 0xf0) | 0x01);
+	seq_puts(s, "  PMU_FAULT_LOG      ---- -> 0x20 (blind)\n");
+	if (r26 >= 0)
+		seq_printf(s, "  PMU_WLED_CONTROL   0x%02x -> 0x%02x\n",
+			   r26, r26 & ~0x01);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(n31_pmu_apply_bootseq_dryrun);
+
+
+/* ------------------------------------------------------------------ */
+/* Consumer rail control                                                */
+/*                                                                      */
+/* A rail is enabled while at least one consumer holds it and is turned */
+/* off again once the last reference has been gone for rail_off_delay_ms.*/
+/* The delay matters for the analog rail: track changes drop and retake  */
+/* it within a second, and cycling it each time both wastes power and    */
+/* risks an audible pop.                                                 */
+/*                                                                      */
+/* Only the rail's own enable bit in PMU_ACTIVE_* is touched, never the  */
+/* whole register.                                                       */
+/* ------------------------------------------------------------------ */
+
+static bool rail_control = true;
+module_param(rail_control, bool, 0644);
+MODULE_PARM_DESC(rail_control,
+		 "Let drivers enable/disable their rail via n31_pmu_rail_get/put");
+
+static unsigned int rail_off_delay_ms = 5000;
+module_param(rail_off_delay_ms, uint, 0644);
+MODULE_PARM_DESC(rail_off_delay_ms,
+		 "Idle time before a released rail is powered down (ms)");
+
+struct n31_pmu_rail_state {
+	int users;
+	bool on;
+	struct delayed_work off_work;
+};
+
+static struct n31_pmu_rail_state n31_pmu_rail_state[ARRAY_SIZE(n31_pmu_rails)];
+static DEFINE_MUTEX(n31_pmu_rail_lock);
+
+/* Enable bits in `active_reg` belonging to rails a consumer still holds. */
+static u8 n31_pmu_rail_held_mask(u8 active_reg)
+{
+	unsigned int i;
+	u8 mask = 0;
+
+	mutex_lock(&n31_pmu_rail_lock);
+	for (i = 0; i < ARRAY_SIZE(n31_pmu_rails); i++)
+		if (n31_pmu_rails[i].active_reg == active_reg &&
+		    n31_pmu_rail_state[i].users)
+			mask |= n31_pmu_rails[i].active_mask;
+	mutex_unlock(&n31_pmu_rail_lock);
+	return mask;
+}
+
+static int n31_pmu_rail_apply(unsigned int id, bool on)
+{
+	const struct n31_pmu_rail *ra = &n31_pmu_rails[id];
+	struct i2c_client *client = d1830_poweroff_client;
+	int ret;
+
+	if (!client)
+		return -ENODEV;
+	if (!rail_control)
+		return -EPERM;
+
+	ret = d1830_rmw(client, ra->active_reg,
+			on ? 0 : ra->active_mask,
+			on ? ra->active_mask : 0);
+	if (ret) {
+		dev_warn(&client->dev, "%s %s failed: %d\n",
+			 ra->name, on ? "enable" : "disable", ret);
+		return ret;
+	}
+	d1830_vinfo(&client->dev, "%s %s\n", ra->name, on ? "on" : "off");
+	return 0;
+}
+
+static void n31_pmu_rail_off_work(struct work_struct *work)
+{
+	struct n31_pmu_rail_state *st = container_of(to_delayed_work(work),
+						     struct n31_pmu_rail_state,
+						     off_work);
+	unsigned int id = st - n31_pmu_rail_state;
+
+	mutex_lock(&n31_pmu_rail_lock);
+	if (!st->users && st->on && !n31_pmu_rail_apply(id, false))
+		st->on = false;
+	mutex_unlock(&n31_pmu_rail_lock);
+}
+
+/* Enable a rail and hold it. Balanced by n31_pmu_rail_put(). */
+int n31_pmu_rail_get(unsigned int id)
+{
+	struct n31_pmu_rail_state *st;
+	int ret = 0;
+
+	if (id >= ARRAY_SIZE(n31_pmu_rails))
+		return -EINVAL;
+	st = &n31_pmu_rail_state[id];
+
+	mutex_lock(&n31_pmu_rail_lock);
+	cancel_delayed_work(&st->off_work);
+	if (!st->on) {
+		ret = n31_pmu_rail_apply(id, true);
+		if (!ret)
+			st->on = true;
+	}
+	if (!ret)
+		st->users++;
+	mutex_unlock(&n31_pmu_rail_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(n31_pmu_rail_get);
+
+/* Drop a reference; the rail powers down once idle for rail_off_delay_ms. */
+void n31_pmu_rail_put(unsigned int id)
+{
+	struct n31_pmu_rail_state *st;
+
+	if (id >= ARRAY_SIZE(n31_pmu_rails))
+		return;
+	st = &n31_pmu_rail_state[id];
+
+	mutex_lock(&n31_pmu_rail_lock);
+	if (st->users)
+		st->users--;
+	if (!st->users && st->on)
+		schedule_delayed_work(&st->off_work,
+				      msecs_to_jiffies(rail_off_delay_ms));
+	mutex_unlock(&n31_pmu_rail_lock);
+}
+EXPORT_SYMBOL_GPL(n31_pmu_rail_put);
+
+static void n31_pmu_rail_init(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(n31_pmu_rail_state); i++)
+		INIT_DELAYED_WORK(&n31_pmu_rail_state[i].off_work,
+				  n31_pmu_rail_off_work);
+}
+
+static void n31_pmu_rail_exit(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(n31_pmu_rail_state); i++) {
+		cancel_delayed_work_sync(&n31_pmu_rail_state[i].off_work);
+		/*
+		 * Leave rail state as-is on unbind: the boot configuration is
+		 * what the rest of the system expects to find.
+		 */
+	}
+}
+
+
+/* ------------------------------------------------------------------ */
+/* Screen sleep and power-button policy                                 */
+/*                                                                      */
+/* Short press toggles screen sleep: fade the backlight out and quiesce */
+/* touch. Holding the button past power_hold_ms asks the kernel to shut */
+/* down, which reaches the PMU through the machine pm_power_off this    */
+/* driver already installs.                                             */
+/*                                                                      */
+/* The panel itself is deliberately left running. Nothing in this stack  */
+/* can re-initialise it, so powering it down would be a one-way trip     */
+/* until the panel init sequence is recovered. Backlight and touch are   */
+/* where the current draw is anyway.                                     */
+/*                                                                      */
+/* Two tiers are selected from whether the analog audio rail is held:    */
+/* with playback running a press only sleeps the screen, and the deeper  */
+/* path is left for when nothing is playing.                             */
+/* ------------------------------------------------------------------ */
+
+static bool screen_sleep_enable = true;
+module_param(screen_sleep_enable, bool, 0644);
+MODULE_PARM_DESC(screen_sleep_enable,
+		 "Short press toggles screen sleep (default Y)");
+
+static unsigned int power_hold_ms = 4000;
+module_param(power_hold_ms, uint, 0644);
+MODULE_PARM_DESC(power_hold_ms,
+		 "Hold the power button this long to power off (0 = never)");
+
+static unsigned int backlight_fade_ms = 400;
+module_param(backlight_fade_ms, uint, 0644);
+MODULE_PARM_DESC(backlight_fade_ms, "Backlight ramp duration either way (ms)");
+
+static bool n31_screen_asleep;
+static int n31_screen_saved_level = -1;
+static unsigned long n31_power_press_jiffies;
+static bool n31_power_off_pending;
+static DEFINE_MUTEX(n31_screen_lock);
+
+/*
+ * True while audio is playing. The codec has no PMU rail of its own, so
+ * this asks the codec directly rather than inferring it from rail state.
+ */
+static bool n31_audio_active(void)
+{
+	bool (*active)(void);
+	bool r = false;
+
+	active = (bool (*)(void))__symbol_get("n31_audio_playback_active");
+	if (active) {
+		r = active();
+		__symbol_put("n31_audio_playback_active");
+	}
+	return r;
+}
+
+static void n31_screen_set(bool asleep)
+{
+	int (*fade)(int, unsigned int);
+	int (*level)(void);
+	int (*touch)(void);
+	int (*lcd)(bool);
+
+	mutex_lock(&n31_screen_lock);
+	if (asleep == n31_screen_asleep)
+		goto out;
+
+	fade = (int (*)(int, unsigned int))__symbol_get("n31_backlight_fade");
+	level = (int (*)(void))__symbol_get("n31_backlight_level");
+
+	if (asleep) {
+		if (level) {
+			n31_screen_saved_level = level();
+			__symbol_put("n31_backlight_level");
+		}
+		if (fade) {
+			fade(0, backlight_fade_ms);
+			__symbol_put("n31_backlight_fade");
+		}
+		touch = (int (*)(void))__symbol_get("n31_touch_suspend");
+		if (touch) {
+			touch();
+			__symbol_put("n31_touch_suspend");
+		}
+		/* Panel last, once nothing is drawing to it. */
+		lcd = (int (*)(bool))__symbol_get("n31_lcd_power");
+		if (lcd) {
+			lcd(false);
+			__symbol_put("n31_lcd_power");
+		}
+	} else {
+		/* Panel first: it has to be scanning before the light comes up. */
+		lcd = (int (*)(bool))__symbol_get("n31_lcd_power");
+		if (lcd) {
+			lcd(true);
+			__symbol_put("n31_lcd_power");
+		}
+		touch = (int (*)(void))__symbol_get("n31_touch_resume");
+		if (touch) {
+			touch();
+			__symbol_put("n31_touch_resume");
+		}
+		if (level)
+			__symbol_put("n31_backlight_level");
+		if (fade) {
+			fade(n31_screen_saved_level > 0 ?
+			     n31_screen_saved_level : 1,
+			     backlight_fade_ms);
+			__symbol_put("n31_backlight_fade");
+		}
+	}
+
+	n31_screen_asleep = asleep;
+	pr_info("n31: screen %s (audio %s)\n",
+		asleep ? "asleep" : "awake",
+		n31_audio_active() ? "active" : "idle");
+out:
+	mutex_unlock(&n31_screen_lock);
+}
+
+bool n31_screen_is_asleep(void)
+{
+	return n31_screen_asleep;
+}
+EXPORT_SYMBOL_GPL(n31_screen_is_asleep);
+
+static void n31_power_off_work(struct work_struct *work)
+{
+	pr_warn("n31: power button held — shutting down\n");
+	orderly_poweroff(true);
+}
+static DECLARE_WORK(n31_power_off_worker, n31_power_off_work);
+
+/*
+ * Called on every observed Sleep-button edge. Press only records when it
+ * started; the decision happens on release, or as soon as the hold passes
+ * power_hold_ms while still down.
+ */
+static void n31_power_button(bool pressed)
+{
+	unsigned long held_ms;
+
+	if (pressed) {
+		n31_power_press_jiffies = jiffies;
+		n31_power_off_pending = false;
+		return;
+	}
+
+	if (!n31_power_press_jiffies)
+		return;
+	held_ms = jiffies_to_msecs(jiffies - n31_power_press_jiffies);
+	n31_power_press_jiffies = 0;
+
+	if (power_hold_ms && held_ms >= power_hold_ms) {
+		if (!n31_power_off_pending) {
+			n31_power_off_pending = true;
+			schedule_work(&n31_power_off_worker);
+		}
+		return;
+	}
+
+	if (!screen_sleep_enable)
+		return;
+
+	/*
+	 * A press while asleep only wakes; it should not immediately put the
+	 * screen back down.
+	 */
+	n31_screen_set(!n31_screen_asleep);
+}
+
+/* Long holds must act while the button is still down, not on release. */
+static void n31_power_button_poll(void)
+{
+	unsigned long held_ms;
+
+	if (!n31_power_press_jiffies || !power_hold_ms)
+		return;
+	if (n31_power_off_pending)
+		return;
+	held_ms = jiffies_to_msecs(jiffies - n31_power_press_jiffies);
+	if (held_ms < power_hold_ms)
+		return;
+	n31_power_off_pending = true;
+	schedule_work(&n31_power_off_worker);
+}
+
+/* Home wakes the screen but is otherwise left to userspace. */
+static void n31_home_button(bool pressed)
+{
+	if (pressed && n31_screen_asleep)
+		n31_screen_set(false);
+}
+
+static void n31_pmu_debugfs_init(void)
+{
+	struct dentry *d;
+
+	d = debugfs_create_dir("n31_pmu", NULL);
+	if (IS_ERR(d))
+		return;
+	n31_pmu_debugfs = d;
+
+	debugfs_create_file("variant", 0444, d, NULL, &n31_pmu_variant_fops);
+	debugfs_create_file("regs_raw", 0444, d, NULL, &n31_pmu_regs_raw_fops);
+	debugfs_create_file("regs_named", 0444, d, NULL,
+			    &n31_pmu_regs_named_fops);
+	debugfs_create_file("rails", 0444, d, NULL, &n31_pmu_rails_fops);
+	debugfs_create_file("bootseq_decode", 0444, d, NULL,
+			    &n31_pmu_bootseq_decode_fops);
+	debugfs_create_file("snapshot", 0444, d, NULL, &n31_pmu_snapshot_fops);
+	debugfs_create_file("diff_last", 0444, d, NULL,
+			    &n31_pmu_diff_last_fops);
+	debugfs_create_file("audio_snapshot", 0444, d, NULL,
+			    &n31_pmu_audio_snapshot_fops);
+	debugfs_create_file("display_snapshot", 0444, d, NULL,
+			    &n31_pmu_display_snapshot_fops);
+	debugfs_create_file("apply_bootseq_dryrun", 0444, d, NULL,
+			    &n31_pmu_apply_bootseq_dryrun_fops);
+}
+
+static void n31_pmu_debugfs_exit(void)
+{
+	debugfs_remove_recursive(n31_pmu_debugfs);
+	n31_pmu_debugfs = NULL;
+}
+
+
 static void d1830_log_audio_regs(struct i2c_client *client, const char *tag)
 {
 	static const u8 regs[] = {
@@ -959,6 +1824,12 @@ static int d1830_sec_trim_seq(struct i2c_client *client, u8 boot_mode)
 	r16 = (u8)((v21 & 0x2f) | 0x10);
 	if (!boot_mode)
 		r16 |= 0x20;
+	/*
+	 * The boot form of this write clears bits 6 and 7, which is correct
+	 * at boot but would drop a rail a driver is currently holding. Put
+	 * those back before writing.
+	 */
+	r16 |= n31_pmu_rail_held_mask(0x10);
 	d1830_write8(client, 16, r16);
 
 	d1830_rmw(client, 17, 0, 0x07);
@@ -1210,6 +2081,11 @@ static int d1830_gpio_probe(struct i2c_client *client)
 
 	gpio_dev->input = devm_input_allocate_device(dev);
 	if (gpio_dev->input) {
+		/*
+		 * Home, Sleep and Play live on the PMIC status registers, so
+		 * they are reported here and nowhere else. n31-buttons keeps
+		 * Vol+/Vol-, which are SoC GPIOs.
+		 */
 		gpio_dev->input->name = "n31-pmic-buttons";
 		gpio_dev->input->phys = "d1830/gpio";
 		gpio_dev->input->dev.parent = dev;
@@ -1231,6 +2107,8 @@ static int d1830_gpio_probe(struct i2c_client *client)
 	INIT_DELAYED_WORK(&gpio_dev->confirm, d1830_confirm_work);
 	schedule_delayed_work(&gpio_dev->trace,
 			      msecs_to_jiffies(btn_poll_ms ? btn_poll_ms : 1000));
+	n31_pmu_rail_init();
+	n31_pmu_debugfs_init();
 	d1830_n31_din_nirq_hook = d1830_n31_din_nirq;
 	return 0;
 }
@@ -1249,6 +2127,8 @@ static void d1830_gpio_remove(struct i2c_client *client)
 	if (pm_power_off == d1830_pm_power_off)
 		pm_power_off = NULL;
 	d1830_n31_din_nirq_hook = NULL;
+	n31_pmu_debugfs_exit();
+	n31_pmu_rail_exit();
 	d1830_poweroff_client = NULL;
 }
 

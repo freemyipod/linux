@@ -127,6 +127,11 @@ static struct s5l8740_gpio *s5l8740_n31;
 void (*d1830_n31_din_nirq_hook)(void);
 EXPORT_SYMBOL_GPL(d1830_n31_din_nirq_hook);
 
+/*
+ * Report a key on n31-buttons. Only for keys this driver actually sources;
+ * PMIC-sourced keys go out on n31-pmic-buttons instead, so that a single
+ * physical press produces a single event.
+ */
 void s5l8740_n31_report_key(unsigned int code, int pressed)
 {
 	if (!s5l8740_n31 || !s5l8740_n31->input)
@@ -538,11 +543,13 @@ static int s5l8740_gpio_probe(struct platform_device *pdev)
 		sg->input->phys = "s5l8740/gpio";
 		sg->input->dev.parent = dev;
 		sg->input->id.bustype = BUS_HOST;
+		/*
+		 * Vol+/Vol- only. Home, Sleep and Play are PMIC-sourced and
+		 * are reported on n31-pmic-buttons; declaring them here too
+		 * made one press look like two events to userspace.
+		 */
 		input_set_capability(sg->input, EV_KEY, KEY_VOLUMEUP);
 		input_set_capability(sg->input, EV_KEY, KEY_VOLUMEDOWN);
-		input_set_capability(sg->input, EV_KEY, KEY_POWER);
-		input_set_capability(sg->input, EV_KEY, KEY_HOMEPAGE);
-		input_set_capability(sg->input, EV_KEY, KEY_PLAYPAUSE);
 		if (input_register_device(sg->input))
 			sg->input = NULL;
 	}

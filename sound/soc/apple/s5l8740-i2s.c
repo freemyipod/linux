@@ -1,7 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * S5L8740 IIS0 (I2S) platform DAI — N31
- * IIS0 @ 0x3CA00000, TX FIFO @ +0x10. Optional PL080 dmaengine PCM.
+ * S5L8740 I2S platform DAIs — N31
+ *
+ * Both of the board's audio ports live here because they share the
+ * SoC audio clock gate at CLKCON+0x30, and arbitrating that across two
+ * modules is not worth the symbol traffic:
+ *
+ *   IIS0 @ 0x3CA00000  TX FIFO +0x10, PL080 peri 10 -> CS42L81 headphones
+ *   IIS2 @ 0x3D400000  RX FIFO +0x38, PL080 peri 13 <- BCM2078 digital PCM
+ *
+ * They face different chips, but to userspace they are simply the
+ * playback and capture PCMs of one card.
+ *
+ * IIS2 register program is from the RetailOS fm-playing MMIO capture:
+ *   CLKCON +0x00 = 0x1        TXCON  +0x04 = 0x0b000099
+ *   RXCON  +0x30 = 0x1000     RXCOM  +0x34 = 0x6 running, 0x2 idle
+ *   CLKDIV +0x40 = 0x96       REG44  +0x44 = 0x00010007
+ * IIS1 @ 0x3CD00000 is XSP and always reads zero -- it is not a BCM port.
+ * A2DP does not appear here at all: it is host-encoded over UART1 HCI.
  */
 #include <linux/atomic.h>
 #include <linux/bitops.h>
@@ -16,6 +32,7 @@
 #include <linux/mutex.h>
 #include <linux/module.h>
 #include <linux/sched.h>
+#include <linux/spinlock.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/workqueue.h>
@@ -37,6 +54,7 @@
 #define I2STXFIFO	0x10
 #define I2SRXCON	0x30
 #define I2SRXCOM	0x34
+#define I2SRXFIFO	0x38
 #define I2SSTATUS	0x3c
 #define I2SCLKDIV	0x40	/* OSOS 4F716: *(base+64). Not Rockbox +0x24. */
 /* RetailOS music IIS0+0x44 readback 0x00010007 (oracle 2026-08-25). */
@@ -93,7 +111,8 @@ MODULE_PARM_DESC(sustain_ms, "ignore ALSA STOP for this many ms after START (def
 
 static uint fifo_prefill = 16;
 module_param(fifo_prefill, uint, 0644);
-MODULE_PARM_DESC(fifo_prefill, "stereo words to push into TX FIFO before TXCOM kick");
+MODULE_PARM_DESC(fifo_prefill,
+		 "silent stereo words to push into TX FIFO before TXCOM kick");
 /*
  * OSOS B6620(port,0) does TXCOM |= 6 after PL080 is armed (peri 10).
  * RE body: sub_B6620 only ORs 0x6 — not 0xC. Hybrid 0xE was Linux invention.
@@ -106,6 +125,42 @@ MODULE_PARM_DESC(fifo_prefill, "stereo words to push into TX FIFO before TXCOM k
 #define CLKCON_AUDIO_OFF	0x30
 #define CLKCON_AUDIO_PLAY	0x32190u
 #define CLKCON_AUDIO_IDLE	0x1c20u
+/* FM additionally regates CLKCON+0x10; music/idle leaves it at 0x8004. */
+#define CLKCON_FM_GATE		0x10
+#define CLKCON_FM_GATE_ON	0x4u
+#define CLKCON_FM_GATE_IDLE	0x8004u
+
+/* fm-playing oracle values for the IIS2 side. */
+#define IIS2_CLKCON_ON		0x1u
+#define IIS2_TXCON_FM		0x0b000099u
+#define IIS2_RXCON_FM		0x1000u
+#define IIS2_RXCOM_DMA		0x6u
+#define IIS2_RXCOM_IDLE		0x2u
+#define IIS2_CLKDIV_FM_ORACLE	0x96u
+#define IIS2_REG44_ORACLE	0x00010007u
+#define IIS2_REGS_LEN		0x48
+
+/*
+ * IIS2 PCM pads. sub_15DD5C claims these three at function 2 when FM
+ * powers on and releases them to input when it powers off, in the same
+ * breath as programming device 2 (0x3D400000) and kicking RXCOM -- so
+ * they belong to this port, not to the Bluetooth controller. They were
+ * previously described as BCM shutdown / device-wakeup / host-wakeup and
+ * handed to hci_bcm, which drove the capture bus as GPIOs.
+ *
+ * Claimed alongside the register program rather than from FM power-on,
+ * so opening the capture PCM works regardless of who owns the tuner.
+ */
+#define IIS2_PAD_BCLK		97	/* 0x61 */
+#define IIS2_PAD_SYNC		98	/* 0x62 */
+#define IIS2_PAD_DATA		119	/* 0x77 */
+#define IIS2_PAD_FUNC		2
+#define IIS2_PAD_RELEASE	0
+
+/* Ports sharing the CLKCON+0x30 gate. */
+#define S5L8740_AUDIO_PORT_IIS0	0
+#define S5L8740_AUDIO_PORT_IIS2	1
+#define S5L8740_AUDIO_PORTS	2
 #define GPIO_PHYS	0x3cf00000ul
 #define GPIOCMD_PHYS	0x3cf001e0ul
 
@@ -286,11 +341,39 @@ static void s5l8740_i2s_ungate(struct s5l8740_i2s *i2s)
 }
 
 /* RetailOS absolute dword — better than sticky play when idle. */
+/*
+ * CLKCON+0x30 gates the audio clock for IIS0 and IIS2 together. Each port
+ * used to write it directly, so stopping FM capture also idled the clock
+ * out from under music that was still playing. Track which ports want it
+ * running and only idle the gate once nobody does.
+ */
+static DEFINE_SPINLOCK(s5l8740_audio_clk_lock);
+static bool s5l8740_audio_clk_wanted[S5L8740_AUDIO_PORTS];
+
+static void s5l8740_audio_clk_set(void __iomem *clkcon, unsigned int port,
+				  bool on)
+{
+	unsigned long flags;
+	unsigned int i;
+	bool any = false;
+
+	if (!clkcon)
+		return;
+	spin_lock_irqsave(&s5l8740_audio_clk_lock, flags);
+	s5l8740_audio_clk_wanted[port] = on;
+	for (i = 0; i < S5L8740_AUDIO_PORTS; i++)
+		any |= s5l8740_audio_clk_wanted[i];
+	writel(any ? CLKCON_AUDIO_PLAY : CLKCON_AUDIO_IDLE,
+	       clkcon + CLKCON_AUDIO_OFF);
+	spin_unlock_irqrestore(&s5l8740_audio_clk_lock, flags);
+}
+
 static void s5l8740_i2s_clkcon_audio(struct s5l8740_i2s *i2s, u32 val)
 {
-	if (!i2s || !i2s->clkcon)
+	if (!i2s)
 		return;
-	writel(val, i2s->clkcon + CLKCON_AUDIO_OFF);
+	s5l8740_audio_clk_set(i2s->clkcon, S5L8740_AUDIO_PORT_IIS0,
+			      val != CLKCON_AUDIO_IDLE);
 }
 
 /*
@@ -368,7 +451,23 @@ static void s5l8740_i2s_log_iis_gpio(struct s5l8740_i2s *i2s, const char *tag)
 	}
 }
 
-/* sub_43D38C(7,3) and (20,3) — IIS0 pads. Optional (6,3) in pad_mode 1/4. */
+/*
+ * GPIO 4/5 are deliberately left alone. Two stock paths claim them and it
+ * is not settled which applies here: sub_71B8 drives them as a two-bit
+ * output mux, while the per-bus I2C pinmux helper puts them at function 2
+ * as a SCL/SDA pair. i2c0 is the Tristar bus and it times out on glass,
+ * so the I2C reading is the more likely one and forcing them to outputs
+ * would make that permanent. Nothing in the audio path needs them.
+ */
+
+/*
+ * sub_BCB60 muxes both IIS0 pads together on every TX enable:
+ * sub_43D38C(0x14, 3) and sub_43D38C(7, 3), and puts them back to
+ * function 2 on disable. GPIO 7 is an I2S pad, not a display pad -- the
+ * panel is driven entirely from the LCDIF and no display code here
+ * touches GPIO at all. Claiming only GPIO 20 leaves the bus incomplete
+ * and the jack silent. Optional (6,3) in pad_mode 1/4.
+ */
 static void s5l8740_i2s_pads(struct s5l8740_i2s *i2s)
 {
 	static const u8 sec_words[] = { 6, 7, 20 };
@@ -416,22 +515,6 @@ static void s5l8740_i2s_pads(struct s5l8740_i2s *i2s)
 			continue;
 		if (pad_oe || g == 7 || g == 20)
 			s5l8740_i2s_gpiocmd(i2s, g, 3);
-	}
-
-	/*
-	 * RetailOS music/idle gpio.bin bank0 PCON = 0x32112224
-	 * (pins4/5 = func1). Linux often left 0x32222224 — force stock.
-	 */
-	if (i2s->gpio) {
-		u32 p0 = readl(i2s->gpio);
-
-		if (p0 != 0x32112224u) {
-			writel(0x32112224u, i2s->gpio);
-			if (i2s->dev)
-				dev_info(i2s->dev,
-					 "PCON0 %08x -> 32112224 (RetailOS music)\n",
-					 p0);
-		}
 	}
 
 	s5l8740_i2s_log_iis_gpio(i2s, "pads-applied");
@@ -658,18 +741,19 @@ static void s5l8740_i2s_tx_kick(struct s5l8740_i2s *i2s, bool dma)
 	if (!i2s || !i2s->base)
 		return;
 	s5l8740_i2s_pre_codec();
+	/*
+	 * Prime the FIFO with silence so the serialiser has something to
+	 * clock out between the kick and the first DMA burst. This used to
+	 * push a generated tone, which mixed a chirp into the front of every
+	 * stream the card played.
+	 */
 	{
 		unsigned int n = fifo_prefill, i;
-		unsigned int rate = i2s->rate ? i2s->rate : N31_RATE_DEFAULT;
-		s16 s;
 
 		if (n > 64)
 			n = 64;
-		for (i = 0; i < n; i++) {
-			s = s5l8740_scale_s16(n31_tone_s16(i, rate));
-			writel(((u32)(u16)s << 16) | (u16)s,
-			       i2s->base + I2STXFIFO);
-		}
+		for (i = 0; i < n; i++)
+			writel(0, i2s->base + I2STXFIFO);
 	}
 	before = readl(i2s->base + I2STXCOM);
 	if (txcom_exact >= 0) {
@@ -1376,7 +1460,338 @@ static struct platform_driver s5l8740_i2s_driver = {
 		.of_match_table = s5l8740_i2s_of_match,
 	},
 };
-module_platform_driver(s5l8740_i2s_driver);
 
-MODULE_DESCRIPTION("S5L8740 IIS0 DAI + optional PL080 PCM (N31)");
+/* ------------------------------------------------------------------ */
+/* IIS2 — BCM2078 digital PCM capture                                   */
+/* ------------------------------------------------------------------ */
+
+static uint iis2_clkdiv;
+module_param(iis2_clkdiv, uint, 0644);
+MODULE_PARM_DESC(iis2_clkdiv, "IIS2 CLKDIV override; 0 = FM oracle 0x96");
+
+struct s5l8740_iis2 {
+	void __iomem *base;
+	void __iomem *clkcon;
+	void __iomem *gpio;
+	void __iomem *gpiocmd;
+	struct device *dev;
+	struct clk_bulk_data *clks;
+	int num_clks;
+	bool has_dma;
+	struct snd_dmaengine_dai_dma_data cap_dma;
+	u32 fm_gate_saved;
+	bool fm_gate_held;
+	unsigned int rate;
+};
+
+static u32 iis2_pick_clkdiv(unsigned int rate)
+{
+	const struct n31_rate_cfg *r;
+
+	if (iis2_clkdiv)
+		return iis2_clkdiv;
+	/*
+	 * The FM capture uses 0x96 where IIS0 runs 0x177 in the same session,
+	 * so this divider is not derived from the IIS0 rate table.
+	 */
+	if (rate == 44100 || rate == 48000)
+		return IIS2_CLKDIV_FM_ORACLE;
+	r = n31_find_rate(rate);
+	if (r)
+		return r->clkdiv;
+	if (!rate)
+		rate = 44100;
+	return MCLK_ASSUME_HZ / rate;
+}
+
+static void iis2_pads(struct s5l8740_iis2 *iis2, bool claim)
+{
+	static const u8 pads[] = {
+		IIS2_PAD_BCLK, IIS2_PAD_SYNC, IIS2_PAD_DATA,
+	};
+	void __iomem *bank;
+	unsigned int i, pin;
+	u32 dir;
+
+	if (!iis2->gpio || !iis2->gpiocmd)
+		return;
+	for (i = 0; i < ARRAY_SIZE(pads); i++) {
+		bank = iis2->gpio + 32u * (pads[i] >> 3);
+		pin = pads[i] & 7;
+		dir = readl(bank + 0x14);
+		if (claim)
+			dir |= BIT(pin);
+		else
+			dir &= ~BIT(pin);
+		writel(dir, bank + 0x14);
+		writel(((u32)(pads[i] >> 3) << 16) | (pin << 8) |
+		       (claim ? IIS2_PAD_FUNC : IIS2_PAD_RELEASE),
+		       iis2->gpiocmd);
+	}
+	if (iis2->dev)
+		dev_dbg(iis2->dev, "IIS2 pads 97/98/119 %s\n",
+			claim ? "claimed" : "released");
+}
+
+static void iis2_fm_gate(struct s5l8740_iis2 *iis2, bool on)
+{
+	u32 cur;
+
+	if (!iis2 || !iis2->clkcon)
+		return;
+	cur = readl(iis2->clkcon + CLKCON_FM_GATE);
+	if (on) {
+		if (!iis2->fm_gate_held) {
+			iis2->fm_gate_saved = cur;
+			iis2->fm_gate_held = true;
+		}
+		writel(CLKCON_FM_GATE_ON, iis2->clkcon + CLKCON_FM_GATE);
+	} else if (iis2->fm_gate_held) {
+		writel(iis2->fm_gate_saved ? iis2->fm_gate_saved :
+					     CLKCON_FM_GATE_IDLE,
+		       iis2->clkcon + CLKCON_FM_GATE);
+		iis2->fm_gate_held = false;
+	}
+}
+
+/* Peri 13 must be armed by dmaengine before RXCOM is kicked. */
+static void iis2_program_rx(struct s5l8740_iis2 *iis2)
+{
+	iis2_pads(iis2, true);
+	iis2_fm_gate(iis2, true);
+	s5l8740_audio_clk_set(iis2->clkcon, S5L8740_AUDIO_PORT_IIS2, true);
+	writel(IIS2_CLKCON_ON, iis2->base + I2SCLKCON);
+	writel(IIS2_TXCON_FM, iis2->base + I2STXCON);
+	writel(IIS2_RXCON_FM, iis2->base + I2SRXCON);
+	writel(iis2_pick_clkdiv(iis2->rate), iis2->base + I2SCLKDIV);
+	writel(IIS2_REG44_ORACLE, iis2->base + I2SREG44);
+}
+
+static void iis2_hw_stop(struct s5l8740_iis2 *iis2)
+{
+	if (!iis2 || !iis2->base)
+		return;
+	writel(IIS2_RXCOM_IDLE, iis2->base + I2SRXCOM);
+	s5l8740_audio_clk_set(iis2->clkcon, S5L8740_AUDIO_PORT_IIS2, false);
+	iis2_fm_gate(iis2, false);
+	iis2_pads(iis2, false);
+}
+
+static int s5l8740_iis2_hw_params(struct snd_pcm_substream *substream,
+				  struct snd_pcm_hw_params *params,
+				  struct snd_soc_dai *dai)
+{
+	struct s5l8740_iis2 *iis2 = snd_soc_dai_get_drvdata(dai);
+
+	if (!iis2 || !iis2->base)
+		return -ENODEV;
+	if (substream->stream != SNDRV_PCM_STREAM_CAPTURE)
+		return -EINVAL;
+	iis2->rate = params_rate(params);
+	iis2_program_rx(iis2);
+	dev_info(dai->dev,
+		 "IIS2 hw_params rate=%u ch=%u clkdiv=0x%x reg44=0x%x status=0x%x\n",
+		 iis2->rate, params_channels(params),
+		 readl(iis2->base + I2SCLKDIV), readl(iis2->base + I2SREG44),
+		 readl(iis2->base + I2SSTATUS));
+	return 0;
+}
+
+static int s5l8740_iis2_trigger(struct snd_pcm_substream *substream, int cmd,
+				struct snd_soc_dai *dai)
+{
+	struct s5l8740_iis2 *iis2 = snd_soc_dai_get_drvdata(dai);
+
+	if (!iis2 || !iis2->base)
+		return -ENODEV;
+	if (substream->stream != SNDRV_PCM_STREAM_CAPTURE)
+		return -EINVAL;
+
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+	case SNDRV_PCM_TRIGGER_RESUME:
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		iis2_program_rx(iis2);
+		writel(IIS2_RXCOM_DMA, iis2->base + I2SRXCOM);
+		dev_info(dai->dev,
+			 "IIS2 capture start rxcom=0x%x status=0x%x\n",
+			 readl(iis2->base + I2SRXCOM),
+			 readl(iis2->base + I2SSTATUS));
+		return 0;
+	case SNDRV_PCM_TRIGGER_STOP:
+	case SNDRV_PCM_TRIGGER_SUSPEND:
+	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		iis2_hw_stop(iis2);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int s5l8740_iis2_dai_probe(struct snd_soc_dai *dai)
+{
+	struct s5l8740_iis2 *iis2 = snd_soc_dai_get_drvdata(dai);
+
+	if (iis2->has_dma)
+		snd_soc_dai_init_dma_data(dai, NULL, &iis2->cap_dma);
+	return 0;
+}
+
+static const struct snd_soc_dai_ops s5l8740_iis2_dai_ops = {
+	.probe = s5l8740_iis2_dai_probe,
+	.hw_params = s5l8740_iis2_hw_params,
+	.trigger = s5l8740_iis2_trigger,
+};
+
+static struct snd_soc_dai_driver s5l8740_iis2_dai = {
+	.name = "bcm2078-pcm",
+	.capture = {
+		.stream_name = "BCM2078 PCM Capture",
+		.channels_min = 1,
+		.channels_max = 2,
+		.rates = S5L8740_I2S_RATES,
+		.formats = S5L8740_I2S_FORMATS,
+	},
+	.ops = &s5l8740_iis2_dai_ops,
+};
+
+static const struct snd_soc_component_driver s5l8740_iis2_component = {
+	.name = "bcm2078-pcm",
+	.legacy_dai_naming = 1,
+};
+
+static ssize_t iis2_regs_show(struct device *dev,
+			      struct device_attribute *a, char *buf)
+{
+	struct s5l8740_iis2 *iis2 = dev_get_drvdata(dev);
+	unsigned int i;
+	ssize_t n = 0;
+
+	if (!iis2 || !iis2->base)
+		return sysfs_emit(buf, "not mapped\n");
+
+	for (i = 0; i < IIS2_REGS_LEN; i += 4) {
+		n += sysfs_emit_at(buf, n, "%02x: %08x\n", i,
+				   readl(iis2->base + i));
+		if (n >= PAGE_SIZE - 32)
+			break;
+	}
+	if (iis2->clkcon) {
+		n += sysfs_emit_at(buf, n, "clk+10: %08x\n",
+				   readl(iis2->clkcon + CLKCON_FM_GATE));
+		n += sysfs_emit_at(buf, n, "clk+30: %08x\n",
+				   readl(iis2->clkcon + CLKCON_AUDIO_OFF));
+	}
+	return n;
+}
+/* Same sysfs name as the IIS0 dump; different device, different symbol. */
+static struct device_attribute dev_attr_iis2_regs =
+	__ATTR(regs, 0444, iis2_regs_show, NULL);
+
+static int s5l8740_iis2_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct s5l8740_iis2 *iis2;
+	struct resource *res;
+	int ret;
+
+	iis2 = devm_kzalloc(dev, sizeof(*iis2), GFP_KERNEL);
+	if (!iis2)
+		return -ENOMEM;
+	iis2->dev = dev;
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	iis2->base = devm_ioremap_resource(dev, res);
+	if (IS_ERR(iis2->base))
+		return PTR_ERR(iis2->base);
+
+	iis2->clkcon = devm_ioremap(dev, CLKCON_PHYS, 0x80);
+	iis2->gpio = devm_ioremap(dev, GPIO_PHYS, 0x200);
+	iis2->gpiocmd = devm_ioremap(dev, GPIOCMD_PHYS, 4);
+
+	ret = devm_clk_bulk_get_all(dev, &iis2->clks);
+	if (ret > 0) {
+		iis2->num_clks = ret;
+		ret = clk_bulk_prepare_enable(iis2->num_clks, iis2->clks);
+		if (ret)
+			dev_warn(dev, "clk_bulk: %d\n", ret);
+	}
+
+	if (res) {
+		iis2->cap_dma.addr = res->start + I2SRXFIFO;
+		iis2->cap_dma.addr_width = DMA_SLAVE_BUSWIDTH_2_BYTES;
+		iis2->cap_dma.maxburst = 1;
+	}
+
+	platform_set_drvdata(pdev, iis2);
+	dev_set_drvdata(dev, iis2);
+
+	if (!of_property_present(dev->of_node, "dmas")) {
+		dev_err(dev, "missing dmas (need peri 13 rx)\n");
+		return -EINVAL;
+	}
+	ret = devm_snd_dmaengine_pcm_register(dev, NULL, 0);
+	if (ret)
+		return dev_err_probe(dev, ret, "dmaengine_pcm\n");
+	iis2->has_dma = true;
+
+	ret = devm_snd_soc_register_component(dev, &s5l8740_iis2_component,
+					      &s5l8740_iis2_dai, 1);
+	if (ret)
+		return ret;
+
+	ret = device_create_file(dev, &dev_attr_iis2_regs);
+	if (ret)
+		dev_warn(dev, "regs sysfs: %d\n", ret);
+
+	dev_info(dev, "BCM2078 PCM RX @%pR peri13 FIFO@+0x38\n", res);
+	return 0;
+}
+
+static void s5l8740_iis2_remove(struct platform_device *pdev)
+{
+	struct s5l8740_iis2 *iis2 = platform_get_drvdata(pdev);
+
+	device_remove_file(&pdev->dev, &dev_attr_iis2_regs);
+	iis2_hw_stop(iis2);
+	if (iis2 && iis2->num_clks)
+		clk_bulk_disable_unprepare(iis2->num_clks, iis2->clks);
+}
+
+static const struct of_device_id s5l8740_iis2_of_match[] = {
+	{ .compatible = "apple,s5l8740-bcm2078-pcm" },
+	{ .compatible = "apple,s5l8740-iis2" },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, s5l8740_iis2_of_match);
+
+static struct platform_driver s5l8740_iis2_driver = {
+	.probe = s5l8740_iis2_probe,
+	.remove = s5l8740_iis2_remove,
+	.driver = {
+		.name = "s5l8740-iis2",
+		.of_match_table = s5l8740_iis2_of_match,
+	},
+};
+
+static struct platform_driver * const s5l8740_audio_drivers[] = {
+	&s5l8740_i2s_driver,
+	&s5l8740_iis2_driver,
+};
+
+static int __init s5l8740_audio_init(void)
+{
+	return platform_register_drivers(s5l8740_audio_drivers,
+					 ARRAY_SIZE(s5l8740_audio_drivers));
+}
+module_init(s5l8740_audio_init);
+
+static void __exit s5l8740_audio_exit(void)
+{
+	platform_unregister_drivers(s5l8740_audio_drivers,
+				    ARRAY_SIZE(s5l8740_audio_drivers));
+}
+module_exit(s5l8740_audio_exit);
+
+MODULE_DESCRIPTION("S5L8740 I2S DAIs: IIS0 playback + IIS2 capture (N31)");
 MODULE_LICENSE("GPL");

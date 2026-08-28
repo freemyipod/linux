@@ -64,6 +64,20 @@
 
 #define SPI_WAIT_GUARD		500000
 
+/* Verbose 11B70/CS setup spam off by default. */
+static bool verbose;
+module_param(verbose, bool, 0644);
+MODULE_PARM_DESC(verbose, "Verbose S5L SPI controller logs (default N)");
+
+#define spi_vinfo(dev, fmt, ...)					\
+	do {							\
+		if (verbose)					\
+			dev_info((dev), fmt, ##__VA_ARGS__);	\
+		else						\
+			dev_dbg((dev), fmt, ##__VA_ARGS__);	\
+	} while (0)
+
+
 struct s5l8702_spi {
 	void __iomem *base;
 	struct device *dev;
@@ -151,7 +165,7 @@ static void s5l8702_spi0_11b70(struct s5l8702_spi *sspi)
 	       sspi->base + SPICTRL);
 	writel(SPICTRL_ENABLE, sspi->base + SPICTRL);
 	sspi->prepared = true;
-	dev_info(sspi->dev,
+	spi_vinfo(sspi->dev,
 		 "SPI0 11B70 SETUP=0x%x CLKDIV=%u dd=%u u3c=%u u40=255 u44=10\n",
 		 SPISETUP_SPI0_11B70, clkdiv, dd, u3c);
 }
@@ -161,6 +175,8 @@ static void s5l8702_spi0_11b70(struct s5l8702_spi *sspi)
  * CLKDIV stays 2 (440A58(24000, 0x2EE0)). Do not use the generic
  * CLKDIV=4 path; that left +0x38/+0x3c at reset and ping RX was junk.
  */
+static struct s5l8702_spi *s5l8702_spi2_dev;
+
 static void s5l8702_spi2_11b70(struct s5l8702_spi *sspi)
 {
 	const unsigned int a4 = 1;
@@ -182,10 +198,22 @@ static void s5l8702_spi2_11b70(struct s5l8702_spi *sspi)
 	writel(SPISETUP_SPI0_11B70, sspi->base + SPISETUP);
 	writel(SPICTRL_ENABLE, sspi->base + SPICTRL);
 	sspi->prepared = true;
-	dev_info(sspi->dev,
+	spi_vinfo(sspi->dev,
 		 "SPI2 11B70 SETUP=0x%x CLKDIV=%u dd=%u u3c=%u (mode 0x1A)\n",
 		 SPISETUP_SPI0_11B70, clkdiv, dd, u3c);
 }
+
+/*
+ * Re-run the SPI2 engine setup. The stock firmware reapplies sub_11B70
+ * after every pinmux enable, and the touch driver does the same on
+ * bring-up; routing it here keeps one owner for the divider and timing.
+ */
+void s5l8702_spi2_reinit(void)
+{
+	if (s5l8702_spi2_dev)
+		s5l8702_spi2_11b70(s5l8702_spi2_dev);
+}
+EXPORT_SYMBOL_GPL(s5l8702_spi2_reinit);
 
 static void s5l8702_spi_cs(struct s5l8702_spi *sspi, bool assert)
 {
@@ -454,7 +482,7 @@ static int s5l8702_spi_probe(struct platform_device *pdev)
 		if (ret)
 			dev_warn(&pdev->dev, "clk_bulk_prepare_enable failed: %d\n", ret);
 		else
-			dev_info(&pdev->dev, "enabled %d SPI clockgate(s)\n", sspi->num_clks);
+			spi_vinfo(&pdev->dev, "enabled %d SPI clockgate(s)\n", sspi->num_clks);
 	} else {
 		sspi->num_clks = 0;
 	}
@@ -476,7 +504,7 @@ static int s5l8702_spi_probe(struct platform_device *pdev)
 		}
 		s5l8702_spi0_pinmux(sspi);
 		s5l8702_spi0_11b70(sspi);
-		dev_info(&pdev->dev, "SPI0 CS42 4043D0 CS=SPIPIN.1 PWRCON1=%08x\n",
+		spi_vinfo(&pdev->dev, "SPI0 CS42 4043D0 CS=SPIPIN.1 PWRCON1=%08x\n",
 			 readl(sspi->pwrcon1));
 	} else if (sspi->spi2_nimbus) {
 		void __iomem *pwrcon4;
@@ -494,11 +522,12 @@ static int s5l8702_spi_probe(struct platform_device *pdev)
 			writel(readl(pwrcon4) & ~BIT(15), pwrcon4); /* SPI2_2 */
 			iounmap(pwrcon4);
 		}
-		dev_info(&pdev->dev, "SPI2 PWRCON1=%08x (after ungate)\n",
+		spi_vinfo(&pdev->dev, "SPI2 PWRCON1=%08x (after ungate)\n",
 			 readl(sspi->pwrcon1));
 		s5l8702_spi2_pinmux(sspi);
 		s5l8702_spi2_11b70(sspi);
-		dev_info(&pdev->dev,
+		s5l8702_spi2_dev = sspi;
+		spi_vinfo(&pdev->dev,
 			 "SPI2 Nimbus 4043D0 PIO (SETUP=0x%x CLKDIV=2 CS=SPIPIN.1 11B70)\n",
 			 SPISETUP_SPI0_11B70);
 	}

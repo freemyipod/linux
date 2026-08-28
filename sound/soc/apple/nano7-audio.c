@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * N31 ASoC machine — IIS0+CS42 playback + IIS2 FM capture (local only).
+ * iPod nano 7G ASoC machine.
  *
- * Playback: IIS0 CPU DAI + CS42L81 SPI codec (peri 10 TX).
- * Capture:  IIS2 CPU DAI + snd-soc-dummy (peri 13 RX). Userspace loops
- * arecord/tinycap → aplay/tinyplay. No FM→BT / A2DP path.
+ * One card, two PCMs:
+ *   playback  IIS0 -> CS42L81 -> 3.5 mm headphones   (PL080 peri 10)
+ *   capture   IIS2 <- BCM2078 digital PCM (FM)       (PL080 peri 13)
  *
- * CS42 path has no snd_soc_dapm_route table — analog routing uses explicit
- * register writes: cs42_codec_prepare() + cs42_retailos_play_start/stop().
- * (SoC master, codec slave, 16-bit S16_LE).
+ * The two ports face different chips, which is why the capture side has
+ * no codec of its own and uses the dummy DAI. Bluetooth audio is not
+ * here and cannot be: A2DP is host-encoded and leaves over UART1 HCI.
+ *
+ * The CS42 path has no DAPM route table. Analog routing is done with
+ * explicit register writes in cs42_codec_prepare() and
+ * cs42_retailos_play_start/stop(). SoC is master, codec is slave, S16_LE.
  */
 #include <linux/module.h>
 #include <linux/of.h>
@@ -27,15 +31,21 @@ SND_SOC_DAILINK_DEFS(fm_capture,
 
 static struct snd_soc_dai_link nano7_dais[] = {
 	{
-		.name = "CS42L81",
-		.stream_name = "Playback",
+		.name = "CS42L81 Headphones",
+		.stream_name = "Headphones",
 		SND_SOC_DAILINK_REG(playback),
 		.playback_only = 1,
+		/*
+		 * The IIS0 trigger latches the codec play graph over SPI, and
+		 * spi_sync() sleeps. ASoC runs trigger atomically unless the
+		 * link opts out, so this is required, not a preference.
+		 */
+		.nonatomic = 1,
 		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
 			   SND_SOC_DAIFMT_CBS_CFS,
 	},
 	{
-		.name = "BCM2078-PCM",
+		.name = "BCM2078 FM",
 		.stream_name = "BCM2078 PCM Capture",
 		SND_SOC_DAILINK_REG(fm_capture),
 		.capture_only = 1,
@@ -106,8 +116,8 @@ static int nano7_audio_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	dev_info(dev, "nano7g-audio: IIS0+CS42 play%s (no FM→BT)\n",
-		 nano7_card.num_links > 1 ? " + BCM2078 PCM capture (IIS2 RX)" : "");
+	dev_info(dev, "nano7g-audio: headphone playback%s\n",
+		 nano7_card.num_links > 1 ? " + BCM2078 FM capture" : "");
 	return 0;
 }
 
@@ -128,5 +138,5 @@ static struct platform_driver nano7_audio_driver = {
 module_platform_driver(nano7_audio_driver);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("iPod nano 7G ASoC machine (play + FM capture)");
-MODULE_SOFTDEP("pre: cs42l81_spi s5l8740_i2s s5l8740_iis2");
+MODULE_DESCRIPTION("iPod nano 7G ASoC machine (headphones + FM capture)");
+MODULE_SOFTDEP("pre: cs42l81_spi s5l8740_i2s");
