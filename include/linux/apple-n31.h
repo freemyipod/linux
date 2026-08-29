@@ -41,6 +41,10 @@ int d1830_audio_rails(void);
 
 /* gpio-d1830.c — power the touch controller rail, for the Nimbus driver. */
 int d1830_nimbus_rail(bool on);
+/* Bluetooth companion rails: reg 87 bits 7:6, reg 88 bit 0 and bits 6:4,
+ * the fields sub_51688C zeroes on de-init. Saves the boot values on the
+ * first power-off so power-on can restore them. */
+int d1830_bt_rails(bool on);
 
 /*
  * gpio-d1830.c — refcounted rail control. Rail ids index the PMU rail
@@ -58,9 +62,29 @@ int d1830_nimbus_rail(bool on);
  * No stock path enables a rail for the audio codec: its analog supply is
  * always on. Do not add one.
  */
-#define N31_PMU_RAIL_TOUCH	2	/* PMU_LDO_3 */
-#define N31_PMU_RAIL_DISPLAY	3	/* PMU_LDO_4 */
-#define N31_PMU_RAIL_ACCESSORY	4	/* PMU_LDO_5 */
+/*
+ * Indexes into n31_pmu_rails[], NOT RetailOS logical rail IDs. The two
+ * numbering systems overlap and disagree, which is a trap worth naming:
+ *
+ *   this table index 2  -> 0x10 bit 5 -> Nimbus
+ *   RetailOS logical 4  -> 0x10 bit 5 -> Nimbus
+ *
+ * Same physical bit, different number, and sub_6644 converts logical
+ * IDs 1..10 into selectors 6..15 before sub_7484 turns those into
+ * register and bit. So a bare 4 in a decompiler listing and a bare 4
+ * here mean different rails. Always carry the {register, mask} pair.
+ *
+ * The physical assignments, from sub_7484:
+ *   0x10 bits 2..7 are selectors 6..11
+ *   0x11 bits 0..3 are selectors 12..15
+ * Only 0x10 bit 5 has a proven consumer -- Nimbus, via the call chain
+ * sub_20766(1) to sub_439B00(1) to sub_6644(4) to sub_7484(9). The
+ * display and accessory names below are this project's mapping and are
+ * not re-proven from the firmware.
+ */
+#define N31_PMU_RAIL_TOUCH	2	/* PMU_LDO_3, 0x10 bit 5, Nimbus */
+#define N31_PMU_RAIL_DISPLAY	3	/* PMU_LDO_4, 0x10 bit 6, unproven */
+#define N31_PMU_RAIL_ACCESSORY	4	/* PMU_LDO_5, 0x10 bit 7, unproven */
 
 int n31_pmu_rail_get(unsigned int id);
 void n31_pmu_rail_put(unsigned int id);

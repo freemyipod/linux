@@ -66,6 +66,7 @@
 	/* display power */
 	struct mutex power_lock;
 	bool powered;
+	bool rail_held;
 
 	/* modesetting */
     uint32_t formats[8];
@@ -534,6 +535,58 @@ static struct drm_driver s5l8740_driver = {
  * Platform driver
  */
 
+/*
+ * Power control from userspace. The panel has no command interface, so
+ * an off/on cycle here is the whole recovery path after anything glitches
+ * the display rail: rail on, settle, LCDIF reset, reprogram, run, repaint.
+ *
+ *   cat lcd_power    1 while the interface is running
+ *   echo 0 > ...     stop the interface and drop the rail
+ *   echo 1 > ...     full bring-up
+ */
+static ssize_t lcd_power_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct s5l8740_device *sdev = s5l8740_lcd_dev;
+
+	if (!sdev)
+		return -ENODEV;
+	return sysfs_emit(buf, "%d\n", sdev->powered ? 1 : 0);
+}
+
+static ssize_t lcd_power_store(struct device *dev,
+			       struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	unsigned int on;
+	int ret;
+
+	if (kstrtouint(buf, 0, &on))
+		return -EINVAL;
+	ret = n31_lcd_power(on != 0);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(lcd_power);
+
+static ssize_t lcd_state_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct s5l8740_device *sdev = s5l8740_lcd_dev;
+
+	if (!sdev || !sdev->lcdif)
+		return -ENODEV;
+	return sysfs_emit(buf,
+			  "powered=%d rail_held=%d\n"
+			  "CON=%08x STATUS=%08x SIZE=%08x\n"
+			  "clkcon_window=%s\n",
+			  sdev->powered, sdev->rail_held,
+			  readl(sdev->lcdif + S5L8740_LCD_CON),
+			  readl(sdev->lcdif + S5L8740_LCD_STATUS),
+			  readl(sdev->lcdif + S5L8740_LCD_SIZE),
+			  sdev->clkcon ? "mapped" : "absent");
+}
+static DEVICE_ATTR_RO(lcd_state);
+
 static int s5l8740_probe(struct platform_device *pdev)
 {
     struct s5l8740_device *sdev;
@@ -576,9 +629,18 @@ static int s5l8740_probe(struct platform_device *pdev)
      */
     res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
     if (res) {
-    	sdev->clkcon = devm_ioremap_resource(&pdev->dev, res);
-    	if (IS_ERR(sdev->clkcon))
-    		sdev->clkcon = NULL;
+    	/*
+    	 * Map without claiming. This window is the clock controller, which
+    	 * the clock-controller node already owns and the IIS driver also
+    	 * maps, so an exclusive devm_ioremap_resource() always lost the
+    	 * race and returned -EBUSY. The driver then carried on with
+    	 * clkcon = NULL and quietly stopped gating the clocks across an
+    	 * LCDIF reset -- a real behaviour change reported only as an error
+    	 * line nobody acted on. CLKCON is a shared block; sharing it is
+    	 * correct, claiming it is not.
+    	 */
+    	sdev->clkcon = devm_ioremap(&pdev->dev, res->start,
+    				    resource_size(res));
     }
     if (!sdev->clkcon)
     	drm_info(dev,
@@ -587,6 +649,34 @@ static int s5l8740_probe(struct platform_device *pdev)
     /* The panel is already running from the boot loader handoff. */
     sdev->powered = true;
     s5l8740_lcd_dev = sdev;
+
+    /*
+     * Take the display rail for the panel we inherited. Without this
+     * nobody holds LDO_4, so the PMU's global rail repair -- which
+     * clears bits 6 and 7 by design -- has nothing to preserve and
+     * switches the panel off underneath us. That is the white screen:
+     * the first audio bring-up after boot replays that sequence.
+     */
+    if (lcd_manage_rail) {
+	int (*get)(unsigned int) =
+		(int (*)(unsigned int))__symbol_get("n31_pmu_rail_get");
+
+	if (get) {
+		if (get(N31_PMU_RAIL_DISPLAY))
+			drm_warn(dev, "display rail claim failed\n");
+		else
+			sdev->rail_held = true;
+		__symbol_put("n31_pmu_rail_get");
+	} else {
+		drm_info(dev,
+			 "PMIC absent; display rail unprotected\n");
+	}
+    }
+
+    if (device_create_file(&pdev->dev, &dev_attr_lcd_power))
+	drm_warn(dev, "lcd_power sysfs\n");
+    if (device_create_file(&pdev->dev, &dev_attr_lcd_state))
+	drm_warn(dev, "lcd_state sysfs\n");
 
     /* GATE0: log WTF handoff, never rewrite CON/PHTIME */
     drm_info(dev, "LCDIF handoff CON=%08x PHTIME=%08x (untouched)\n",
@@ -680,6 +770,18 @@ static int s5l8740_probe(struct platform_device *pdev)
     return 0;
  }
  
+/*
+ * The LCDIF scans out of the framebuffer by DMA. Across a kexec that
+ * memory belongs to the next kernel, so the controller would keep
+ * fetching whatever landed there and the panel would show it. Powering
+ * down stops the fetch; n31_lcd_power suspends the DRM clients on the
+ * way, so nothing is left drawing into a stopped interface.
+ */
+static void s5l8740_shutdown(struct platform_device *pdev)
+{
+	n31_lcd_power(false);
+}
+
 static void s5l8740_remove(struct platform_device *pdev)
 {
     struct s5l8740_device *sdev = platform_get_drvdata(pdev);
@@ -701,6 +803,7 @@ static struct platform_driver s5l8740_platform_driver = {
     },
     .probe = s5l8740_probe,
     .remove = s5l8740_remove,
+    .shutdown = s5l8740_shutdown,
 };
  
 module_platform_driver(s5l8740_platform_driver);

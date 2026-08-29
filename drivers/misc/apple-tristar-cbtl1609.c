@@ -846,6 +846,131 @@ static ssize_t poll_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RW(poll);
 
+/*
+ * Read-only telemetry.
+ *
+ * TriStar is not the charger -- it decides what is attached to Lightning
+ * and where the signal paths go, while the D1830 owns the battery and the
+ * power path. What it does hold is the attach/detach state, which is the
+ * missing input to any charging policy, so making its state observable is
+ * the useful contribution here rather than trying to drive anything.
+ *
+ *   tristar_stats  counters and decoded state in one place
+ *   tristar_regs   the dump with labels on the registers we can justify
+ *   tristar_watch  echo 1 to snapshot, read to see only what moved
+ *
+ * The watch is the one that matters for attach detection: snapshot, change
+ * the cable, read back, and whatever moved is the short list.
+ */
+static ssize_t tristar_stats_show(struct device *dev,
+				  struct device_attribute *a, char *buf)
+{
+	struct apple_tristar *ts = dev_get_drvdata(dev);
+
+	if (!ts)
+		return -ENODEV;
+
+	return sysfs_emit(buf,
+		"polls=%u deltas=%u writes=%u i2c_fail_streak=%u poll_disabled=%d\n"
+		"dump_ok=%d dump_flat=%d i2c_echo=%d seen_mask=%08x\n"
+		"id=%s id_valid=%d id_off=%u accx=%02x dx=%02x\n"
+		"reg11=%02x reg11_ret=%d osos_event=%02x prev=%02x cf9_latch=%d cfa=%02x\n",
+		ts->polls, ts->deltas, ts->writes, ts->i2c_fail_streak,
+		ts->poll_disabled,
+		ts->dump_ok, ts->dump_flat, ts->i2c_echo, ts->seen_mask,
+		ts->id_name ? ts->id_name : "unknown", ts->id_valid,
+		ts->id_off, ts->accx, ts->dx,
+		ts->reg11, ts->reg11_ret, ts->osos_event, ts->prev_osos_event,
+		ts->cf9_latch, ts->cfa_state);
+}
+static DEVICE_ATTR_RO(tristar_stats);
+
+/*
+ * Only 0x11 has a name we can defend -- CBTL1610 configuration status,
+ * and it may NAK or echo on a 1609. The rest are listed as offsets with
+ * their observed values so a diff has somewhere to point; naming them
+ * before correlation would turn guesses into apparent fact, which is
+ * exactly how a rail block at 0x40 got invented for the PMIC.
+ */
+static ssize_t tristar_regs_show(struct device *dev,
+				 struct device_attribute *a, char *buf)
+{
+	struct apple_tristar *ts = dev_get_drvdata(dev);
+	unsigned int i;
+	int len = 0;
+
+	if (!ts)
+		return -ENODEV;
+	if (!ts->dump_ok)
+		return sysfs_emit(buf, "no valid dump (dump_ok=0)\n");
+
+	mutex_lock(&ts->lock);
+	for (i = 0; i < TRISTAR_DUMP_LEN && len < PAGE_SIZE - 48; i++) {
+		if (!ts->last_dump[i])
+			continue;	/* zeros are the overwhelming majority */
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+				 "0x%02x = %02x%s\n", i, ts->last_dump[i],
+				 i == 0x11 ? "  (CBTL1610 config status)" : "");
+	}
+	mutex_unlock(&ts->lock);
+	len += scnprintf(buf + len, PAGE_SIZE - len,
+			 "# non-zero offsets only; flat=%d echo=%d\n",
+			 ts->dump_flat, ts->i2c_echo);
+	return len;
+}
+static DEVICE_ATTR_RO(tristar_regs);
+
+static u8 tristar_snap[TRISTAR_DUMP_LEN];
+static bool tristar_snap_valid;
+
+static ssize_t tristar_watch_show(struct device *dev,
+				  struct device_attribute *a, char *buf)
+{
+	struct apple_tristar *ts = dev_get_drvdata(dev);
+	unsigned int i, changed = 0;
+	int len = 0;
+
+	if (!ts)
+		return -ENODEV;
+	if (!tristar_snap_valid)
+		return sysfs_emit(buf,
+				  "no snapshot; echo 1 > tristar_watch first\n");
+
+	mutex_lock(&ts->lock);
+	for (i = 0; i < TRISTAR_DUMP_LEN && len < PAGE_SIZE - 64; i++) {
+		if (ts->last_dump[i] == tristar_snap[i])
+			continue;
+		changed++;
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+				 "0x%02x %02x -> %02x  (xor %02x)\n",
+				 i, tristar_snap[i], ts->last_dump[i],
+				 tristar_snap[i] ^ ts->last_dump[i]);
+	}
+	mutex_unlock(&ts->lock);
+	if (!changed)
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+				 "no change\n");
+	return len;
+}
+
+static ssize_t tristar_watch_store(struct device *dev,
+				   struct device_attribute *a,
+				   const char *buf, size_t count)
+{
+	struct apple_tristar *ts = dev_get_drvdata(dev);
+
+	if (!ts)
+		return -ENODEV;
+	if (buf[0] != '1')
+		return -EINVAL;
+	mutex_lock(&ts->lock);
+	memcpy(tristar_snap, ts->last_dump, TRISTAR_DUMP_LEN);
+	tristar_snap_valid = true;
+	mutex_unlock(&ts->lock);
+	return count;
+}
+static DEVICE_ATTR_RW(tristar_watch);
+
 static struct attribute *tristar_attrs[] = {
 	&dev_attr_dump.attr,
 	&dev_attr_poke.attr,
@@ -857,6 +982,9 @@ static struct attribute *tristar_attrs[] = {
 	&dev_attr_value.attr,
 	&dev_attr_verify.attr,
 	&dev_attr_poll.attr,
+	&dev_attr_tristar_stats.attr,
+	&dev_attr_tristar_regs.attr,
+	&dev_attr_tristar_watch.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(tristar);
