@@ -22,6 +22,7 @@
  */
 #include <linux/delay.h>
 #include <linux/io.h>
+#include <linux/regulator/consumer.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -35,6 +36,84 @@
 
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
+/*
+ * The PMIC driver is a module and this file is built in, so the link
+ * can only go the other way: expose a hook and let gpio-d1830 register
+ * its rail control when it probes. Everything here still works with
+ * nothing registered -- the rails simply stay as the bootloader left
+ * them, which is the behaviour we had before.
+ */
+static int (*bcm_bt_rails_fn)(bool on);
+
+/*
+ * What we asked for while nobody was listening.
+ *
+ * This driver is built in and probes at about t=2.4s. gpio-d1830, which
+ * owns the PMIC rails, is a module that userspace loads later -- it
+ * registered here at t=7.1s on the boot that exposed this. In between,
+ * every bcm_bt_rails() call returned -ENODEV and the rails were simply
+ * never switched on, so the controller had no supply. hci_bcm sent
+ * 0xFC18 into a dead part at t=4.8s, timed out, and gave up two seconds
+ * before the rails became available.
+ *
+ * The hook was always the right shape for a built-in talking to a module;
+ * it just had no memory. Record the last request and apply it when the
+ * provider finally shows up.
+ */
+static bool bcm_bt_rails_want;
+static bool bcm_bt_rails_pending;
+
+void bcm2078_register_bt_rails(int (*fn)(bool on))
+{
+	bcm_bt_rails_fn = fn;
+
+	if (fn && bcm_bt_rails_pending) {
+		int ret = fn(bcm_bt_rails_want);
+
+		bcm_bt_rails_pending = false;
+		pr_info("bcm2078-bt: rails provider arrived late; applied %s: %d\n",
+			bcm_bt_rails_want ? "on" : "off", ret);
+	}
+}
+EXPORT_SYMBOL_GPL(bcm2078_register_bt_rails);
+
+/*
+ * The rail, taken as a regulator.
+ *
+ * This is the ordering fix. The hook below can only report that no provider
+ * exists yet; a regulator makes the kernel wait for one. devm_regulator_get()
+ * returns -EPROBE_DEFER while gpio-d1830 is still unloaded, probe is retried
+ * once it registers, and by the time this driver runs the rail is reachable.
+ *
+ * Power belongs here, in the chip driver, and not in the UART-to-HCI bridge:
+ * the bridge should move bytes and nothing else. hci_bcm carries supplies and
+ * shutdown-gpios upstream because on most boards it is also the chip driver,
+ * which is not true on this one.
+ */
+static struct regulator *bcm_bt_vreg;
+
+static int bcm_bt_rails(bool on)
+{
+	if (bcm_bt_vreg) {
+		int ret = on ? regulator_enable(bcm_bt_vreg)
+			     : regulator_disable(bcm_bt_vreg);
+
+		if (ret)
+			pr_warn("bcm2078-bt: bt rail %s failed: %d\n",
+				on ? "enable" : "disable", ret);
+		return ret;
+	}
+
+	if (!bcm_bt_rails_fn) {
+		/* Remember it; the provider may still be loading. */
+		bcm_bt_rails_want = on;
+		bcm_bt_rails_pending = true;
+		pr_info("bcm2078-bt: rails %s deferred, no provider yet\n",
+			on ? "on" : "off");
+		return -ENODEV;
+	}
+	return bcm_bt_rails_fn(on);
+}
 
 #define BCM_GPIO_PHYS		0x3cf00000UL
 #define BCM_GPIOCMD_OFF		0x1e0
@@ -42,7 +121,21 @@
 #define BCM_GPIO_A		0x61	/* 97 — shutdown / REG_ON */
 #define BCM_GPIO_B		0x62	/* 98 — device-wakeup */
 #define BCM_GPIO_C		0x77	/* 119 — host-wakeup */
+/*
+ * 0xC8 = 200 is not a no-op. sub_17D4DC selects the Bluetooth power
+ * control by board variant:
+ *
+ *   variant 1 or 2:  sub_428F70(0xC8, 1); sub_43D38C(0xC8, 1, 1);
+ *   variant 5:       sub_43D38C(0x46, 1, 1); sub_428F70(0x46, 1);
+ *
+ * and sphwBluetooth_Init then drives 0x46 = 70 high unconditionally.
+ * Both orders pair the pad write with sub_428F70, which sets the pad's
+ * +0x0C bit -- something a gpiod output cannot express, so hci_bcm
+ * driving shutdown-gpios does not cover it.
+ */
 #define BCM_GPIO_NOP		0xC8
+#define BCM_GPIO_PWR		0x46	/* 70 — power control, all variants */
+#define BCM_GPIO_PWR_ALT	0xC8	/* 200 — variants 1 and 2 */
 #define BCM_MODE_POWER		2
 #define BCM_MODE_CLEAR		0xFFFE
 
@@ -151,7 +244,33 @@
 /*
  * Off by default: these pins belong to hci_bcm. See the file header.
  */
-static bool gpio_poke;
+/*
+ * On. Without it the BCM part is never actually powered.
+ *
+ * hci_bcm drives shutdown-gpios, which the device tree points at GPIO 70 --
+ * the power control pin. REG_ON is GPIO 97, and device-wake and host-wake
+ * are 98 and 119. Stock sets all three to mode 2 as part of its power
+ * sequence:
+ *
+ *   sub_43D38C(0x61u, 2, 0)   97   REG_ON
+ *   sub_43D38C(0x62u, 2, 0)   98   device-wake
+ *   sub_43D38C(0x77u, 2, 0)   119  host-wake
+ *   sub_43D38C(0x46u, 1, 1)   70   power control, paired with 428F70
+ *
+ * With this off we did the rails and the +0x0C pad gate and then stopped,
+ * so REG_ON was never asserted and the controller stayed in reset. The
+ * symptom is unambiguous: vendor command 0xFC18 times out, hci_bcm reports
+ * "failed to write update baudrate (-110)", and /proc/interrupts shows
+ * zero interrupts on 3db00000.serial -- the chip has never sent a byte.
+ *
+ * It defaulted off because driving these pads early once correlated with a
+ * reset back to RetailOS. That is a single observation against a sequence
+ * the stock firmware performs on every power-on, and the cost of honouring
+ * it is that Bluetooth cannot work at all. If the reset returns, the thing
+ * to investigate is ordering against the rails, not whether to power the
+ * part.
+ */
+static bool gpio_poke = true;
 module_param(gpio_poke, bool, 0644);
 MODULE_PARM_DESC(gpio_poke,
 		 "Drive the BCM control pins directly (default N; hci_bcm owns them)");
@@ -224,6 +343,39 @@ static void bcm_43D38C(struct bcm2078_bt *bt, unsigned int gpio, u16 mode, int v
 		writel(dir | BIT(pin), bank + 0x14);
 	}
 	writel(((gpio >> 3) << 16) | (pin << 8) | cmd, bt->gpiocmd);
+}
+
+/* sub_428F70(gpio, on): the pad's +0x0C bit, paired with every
+ * sub_43D38C power write in sub_17D4DC. */
+static void bcm_428F70(struct bcm2078_bt *bt, unsigned int gpio, int on)
+{
+	void __iomem *bank;
+	u32 pin, v;
+
+	if (!bt->gpio)
+		return;
+	bank = bt->gpio + 32 * (gpio >> 3);
+	pin = gpio & 7;
+	v = readl(bank + 0x0c);
+	if (on)
+		v |= BIT(pin);
+	else
+		v &= ~BIT(pin);
+	writel(v, bank + 0x0c);
+}
+
+/*
+ * The +0x0C half of the power sequence, kept separate from the mode-2
+ * level pokes below. Those drive pads 97/98/119, which are the IIS2 PCM
+ * bus, and doing that early once correlated with resets back to
+ * RetailOS -- hence gpio_poke defaulting off. This is only an input
+ * enable on the power pad, so it is safe to run whenever the caller
+ * asks for power, and hci_bcm cannot do it through gpiod.
+ */
+static void bcm_power_pad_gate(struct bcm2078_bt *bt, int on)
+{
+	bcm_428F70(bt, BCM_GPIO_PWR, on);
+	dev_dbg(bt->dev, "pad %#x +0x0C -> %d\n", BCM_GPIO_PWR, on);
 }
 
 static void bcm_power_pins_on(struct bcm2078_bt *bt)
@@ -629,7 +781,18 @@ static int bcm_fm_seek(struct bcm2078_bt *bt, int up, u8 rssi)
 
 static int bcm_power_on(struct bcm2078_bt *bt)
 {
+	int ret;
+
 	bt->powered = true;
+	/*
+	 * Rails first, then the pad gate, then the level: powering a pin
+	 * before its supply is the wrong order and is what the de-init
+	 * sequence unwinds.
+	 */
+	ret = bcm_bt_rails(true);
+	if (ret && ret != -ENODEV)
+		dev_warn(bt->dev, "bt rails on: %d\n", ret);
+	bcm_power_pad_gate(bt, 1);
 	if (!gpio_poke) {
 		dev_dbg(bt->dev,
 			"control pins left to hci_bcm (gpio_poke=0)\n");
@@ -642,12 +805,26 @@ static int bcm_power_on(struct bcm2078_bt *bt)
 	return 0;
 }
 
+/*
+ * sub_51688C: two delays, then sub_158C82 zeroing entries 3 and 5.
+ * Unwound in the reverse order of power-on -- levels, then the pad
+ * gate, then the rails -- so the part is not left driving a pin whose
+ * supply has already gone. Doing the rails is also what makes this a
+ * real off rather than an idle: without it the companion keeps drawing
+ * even with the control pin low.
+ */
 static void bcm_power_off(struct bcm2078_bt *bt)
 {
+	int ret;
+
 	bt->powered = false;
-	if (!gpio_poke)
-		return;
-	bcm_power_pins_off(bt);
+	if (gpio_poke)
+		bcm_power_pins_off(bt);
+	msleep(2);
+	bcm_power_pad_gate(bt, 0);
+	ret = bcm_bt_rails(false);
+	if (ret && ret != -ENODEV)
+		dev_warn(bt->dev, "bt rails off: %d\n", ret);
 }
 
 /* ---------- V4L2 radio (tuner control only; PCM is ALSA IIS2) ---------- */
@@ -1182,7 +1359,36 @@ static int bcm2078_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct bcm2078_bt *bt;
+	struct regulator *bt_vreg;
 	int ret;
+
+	/*
+	 * Take the rail first, and let the kernel handle the ordering.
+	 *
+	 * This driver is built in and probes at about t=2.4s; gpio-d1830,
+	 * which owns the PMIC, is a module userspace loads at about t=7.1s.
+	 * Everything in between used to fail with -ENODEV and there was no
+	 * way to wait, so the controller was never powered and hci_bcm timed
+	 * out talking to a dead part. Deferring is the whole point: the
+	 * kernel re-probes this driver once the provider registers.
+	 *
+	 * Optional on purpose. A device tree without bt-supply keeps the old
+	 * hook path rather than refusing to probe at all.
+	 */
+	bt_vreg = devm_regulator_get_optional(dev, "bt");
+	if (IS_ERR(bt_vreg)) {
+		ret = PTR_ERR(bt_vreg);
+		bt_vreg = NULL;
+		if (ret == -EPROBE_DEFER) {
+			dev_info(dev, "waiting for the bt rail provider\n");
+			return ret;
+		}
+		dev_info(dev, "no bt-supply (%d); using the legacy rails hook\n",
+			 ret);
+	} else {
+		bcm_bt_vreg = bt_vreg;
+		dev_info(dev, "bt rail acquired as a regulator\n");
+	}
 
 	bt = devm_kzalloc(dev, sizeof(*bt), GFP_KERNEL);
 	if (!bt)
@@ -1214,6 +1420,23 @@ static int bcm2078_probe(struct platform_device *pdev)
 	return 0;
 }
 
+/*
+ * sub_51688C is the de-init OSOS runs when Bluetooth goes away, and
+ * bcm_power_off now implements it. Reaching it only from remove() meant
+ * the companion kept its rails across a reboot, so the part came up in
+ * whatever state the previous kernel left it rather than from reset.
+ */
+static void bcm2078_shutdown(struct platform_device *pdev)
+{
+	struct bcm2078_bt *bt = platform_get_drvdata(pdev);
+
+	if (!bt)
+		return;
+	mutex_lock(&bt->lock);
+	bcm_power_off(bt);
+	mutex_unlock(&bt->lock);
+}
+
 static void bcm2078_remove(struct platform_device *pdev)
 {
 	struct bcm2078_bt *bt = platform_get_drvdata(pdev);
@@ -1240,6 +1463,7 @@ MODULE_DEVICE_TABLE(of, bcm2078_of_match);
 static struct platform_driver bcm2078_driver = {
 	.probe = bcm2078_probe,
 	.remove = bcm2078_remove,
+	.shutdown = bcm2078_shutdown,
 	.driver = {
 		.name = "bcm2078-bt",
 		.of_match_table = bcm2078_of_match,
