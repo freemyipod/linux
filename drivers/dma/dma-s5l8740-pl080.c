@@ -120,6 +120,16 @@ static int xfer_width = 1;
 module_param(xfer_width, int, 0644);
 MODULE_PARM_DESC(xfer_width, "PL080 src/dst width 0=8 1=16 2=32");
 /* RetailOS music SBSIZE/DBSIZE enc = 1 (4-beat? enc1) — CTL 0x84249000. */
+static bool start_verbose = true;
+module_param(start_verbose, bool, 0644);
+MODULE_PARM_DESC(start_verbose,
+		 "Log channel CFG write and read-back at every start");
+
+static bool xfer_width_override;
+module_param(xfer_width_override, bool, 0644);
+MODULE_PARM_DESC(xfer_width_override,
+		 "Force xfer_width on every channel, ignoring dma_slave_config");
+
 static int m2p_src_burst = 1;
 module_param(m2p_src_burst, int, 0644);
 MODULE_PARM_DESC(m2p_src_burst, "M2P SBSIZE enc (default 1 = RetailOS music)");
@@ -185,9 +195,23 @@ struct s5l_pl080_chan {
 	u8			peri;
 	u8			src_burst;
 	u8			dst_burst;
+	/*
+	 * Encoded PL080 width (0 = 8-bit, 1 = 16, 2 = 32) taken from the
+	 * slave config, or -1 when the client never set one.
+	 */
+	s8			src_wid;
+	s8			dst_wid;
 	enum dma_transfer_direction dir;
 	dma_addr_t		fifo_addr;
 	struct s5l_pl080_desc	*running;
+	/*
+	 * DMA errors seen on this channel, and whether we have stopped
+	 * trying. Bounded because an error that re-arms itself is an
+	 * interrupt storm, and a storm on this SoC is a dead device rather
+	 * than a slow one.
+	 */
+	unsigned int		err_count;
+	bool			err_stuck;
 };
 
 struct s5l_pl080_desc {
@@ -366,6 +390,46 @@ static struct s5l_pl080_desc *to_s5l_desc(struct virt_dma_desc *vd)
 	return container_of(vd, struct s5l_pl080_desc, vd);
 }
 
+/*
+ * PL080 encodes transfer width as log2(bytes): 0 = 8-bit, 1 = 16-bit,
+ * 2 = 32-bit. Anything wider than 32-bit has no encoding here.
+ */
+static int s5l_pl080_width_enc(enum dma_slave_buswidth w)
+{
+	switch (w) {
+	case DMA_SLAVE_BUSWIDTH_1_BYTE:
+		return 0;
+	case DMA_SLAVE_BUSWIDTH_2_BYTES:
+		return 1;
+	case DMA_SLAVE_BUSWIDTH_4_BYTES:
+		return 2;
+	default:
+		return -1;
+	}
+}
+
+/*
+ * Width actually used for a channel. The slave config wins when the
+ * client set one -- this driver used to ignore dma_slave_config
+ * entirely and apply the xfer_width module parameter to every channel,
+ * so a client asking for 32-bit FIFO writes silently got 16-bit ones.
+ * xfer_width remains the fallback and the override for bring-up.
+ */
+static unsigned int s5l_pl080_chan_width(struct s5l_pl080_chan *ch,
+					 bool dst)
+{
+	unsigned int w = xfer_width & 7;
+	s8 cfgw = -1;
+
+	if (ch)
+		cfgw = dst ? ch->dst_wid : ch->src_wid;
+	if (!xfer_width_override && cfgw >= 0)
+		w = (unsigned int)cfgw;
+	if (w > 2)
+		w = 1;
+	return w;
+}
+
 static unsigned int s5l_pl080_unit(void)
 {
 	unsigned int w = xfer_width & 7;
@@ -383,13 +447,12 @@ static unsigned int s5l_pl080_unit(void)
 static u32 s5l_pl080_build_ctl(struct s5l_pl080_chan *ch, u32 words,
 			      bool src_inc, bool dst_inc, bool irq)
 {
-	unsigned int w = xfer_width & 7;
+	unsigned int sw = s5l_pl080_chan_width(ch, false);
+	unsigned int dw = s5l_pl080_chan_width(ch, true);
 	unsigned int sb, db;
 	u32 ctl;
 
 	(void)words;
-	if (w > 2)
-		w = 1;
 	if (ch && (ch->dir == DMA_MEM_TO_DEV || ch->dir == DMA_DEV_TO_MEM)) {
 		sb = ch->src_burst;
 		db = ch->dst_burst;
@@ -400,7 +463,8 @@ static u32 s5l_pl080_build_ctl(struct s5l_pl080_chan *ch, u32 words,
 		db = 1;
 		ctl = CTL_PROT_PRIV | CTL_PROT_BUFF | CTL_PROT_CACHE;
 	}
-	ctl |= (w << CTL_WIDTH_SHIFT) | (w << (CTL_WIDTH_SHIFT + 3)) |
+	/* SWIDTH is the low field, DWIDTH sits three bits above it. */
+	ctl |= (sw << CTL_WIDTH_SHIFT) | (dw << (CTL_WIDTH_SHIFT + 3)) |
 	      (sb << CTL_SBSIZE_SHIFT) | (db << CTL_DBSIZE_SHIFT);
 	if (ahb_s)
 		ctl |= BIT(24);
@@ -459,6 +523,16 @@ static void s5l_pl080_sync_buffer(struct s5l_pl080_chan *ch,
 static void s5l_pl080_start(struct s5l_pl080_chan *ch, struct s5l_pl080_desc *d)
 {
 	void __iomem *b = ch->base;
+
+	/* A channel the error path gave up on stays down until it is
+	 * reconfigured; restarting it just resumes the storm.
+	 */
+	if (ch->err_stuck) {
+		dev_warn_ratelimited(ch->host->dev,
+				     "ch%u start refused: %u DMA errors\n",
+				     ch->id, ch->err_count);
+		return;
+	}
 	u8 id = ch->id % PL080_CH_COUNT;
 	struct pl080_lli *first = d->lli;
 
@@ -473,6 +547,24 @@ static void s5l_pl080_start(struct s5l_pl080_chan *ch, struct s5l_pl080_desc *d)
 	writel(le32_to_cpu(first->ctrl2) & PL080S_XFER_COUNT_MASK,
 	       b + PL080S_Cx_CONTROL2(id));
 	writel(d->cfg | CFG_ENABLE, b + PL080_Cx_CFG(id));
+	/*
+	 * Read CFG straight back. If the enable does not stick, the channel
+	 * never starts and every later symptom is downstream noise, so this
+	 * distinguishes "never programmed" from "programmed then halted".
+	 */
+	if (start_verbose) {
+		u32 rb = readl(b + PL080_Cx_CFG(id));
+
+		dev_info(ch->host->dev,
+			 "ch%u START peri=%u dir=%d cfg_want=0x%08x cfg_read=0x%08x en=0x%x ctl=0x%08x c2=0x%08x src=0x%08x dst=0x%08x\n",
+			 ch->id, ch->peri, (int)ch->dir,
+			 (u32)(d->cfg | CFG_ENABLE), rb,
+			 readl(b + PL080_ENBLD_CHNS),
+			 le32_to_cpu(first->ctrl),
+			 le32_to_cpu(first->ctrl2),
+			 le32_to_cpu(first->src),
+			 le32_to_cpu(first->dst));
+	}
 	/* M2M / force_flow 0|4: software request. M2P peri waits for IIS DRQ. */
 	if (s5l_pl080_need_soft()) {
 		writel(BIT(id), b + PL080_SOFT_BREQ);
@@ -836,8 +928,18 @@ static int s5l_pl080_config(struct dma_chan *c,
 {
 	struct s5l_pl080_chan *ch = to_s5l_chan(c);
 
+	ch->src_wid = s5l_pl080_width_enc(cfg->src_addr_width);
+	ch->dst_wid = s5l_pl080_width_enc(cfg->dst_addr_width);
+
 	if (cfg->direction == DMA_MEM_TO_DEV) {
 		ch->fifo_addr = cfg->dst_addr;
+		/*
+		 * Memory side is read linearly, so if the client only
+		 * described the device side, match it rather than leaving
+		 * the source at the module default.
+		 */
+		if (ch->src_wid < 0)
+			ch->src_wid = ch->dst_wid;
 		/*
 		 * ALSA/dma_tone often pass maxburst=1. burst_enc(1)=0, but
 		 * RetailOS music CTL 0x84249000 needs SB/DB enc=1. Prefer
@@ -853,6 +955,8 @@ static int s5l_pl080_config(struct dma_chan *c,
 			ch->dst_burst = clamp(m2p_dst_burst, 0, 7);
 	} else {
 		ch->fifo_addr = cfg->src_addr;
+		if (ch->dst_wid < 0)
+			ch->dst_wid = ch->src_wid;
 		ch->src_burst = cfg->src_maxburst ?
 			s5l_pl080_burst_enc(cfg->src_maxburst) : 0;
 		ch->dst_burst = cfg->dst_maxburst ?
@@ -895,11 +999,37 @@ static int s5l_pl080_terminate(struct dma_chan *c)
 	return 0;
 }
 
+/*
+ * The DMA interrupt.
+ *
+ * Two things here were capable of hanging the whole device rather than just
+ * stopping the audio, and playback that runs for a few seconds and then
+ * takes the system with it is their shape exactly.
+ *
+ * The error latch was cleared and nothing else was done. The channel stayed
+ * enabled, so whatever raised the error raised it again immediately, and the
+ * handler cleared it again -- an interrupt storm on a single core with the
+ * watchdog disarmed, which looks identical to a lockup from outside. An
+ * error now disables the channel and ends its transfer, and a channel that
+ * keeps erroring is shut down for good after a bounded number of tries
+ * rather than being allowed to spin.
+ *
+ * And the handler returned IRQ_HANDLED unconditionally, including when
+ * neither engine had anything pending. That tells the kernel every
+ * interrupt on the line was ours and dealt with, which disables the
+ * spurious-interrupt protection that would otherwise notice a line stuck
+ * active and mask it. Claiming only what we actually serviced lets that
+ * protection do its job -- the audio still dies, but the device stays up
+ * and says why.
+ */
+#define PL080_MAX_CH_ERRS	8
+
 static irqreturn_t s5l_pl080_irq(int irq, void *data)
 {
 	struct s5l_pl080 *pl = data;
 	unsigned int eng, i;
 	u32 tc, err;
+	bool serviced = false;
 
 	for (eng = 0; eng < 2; eng++) {
 		void __iomem *b = pl->base[eng];
@@ -908,13 +1038,50 @@ static irqreturn_t s5l_pl080_irq(int irq, void *data)
 			continue;
 		tc = readl(b + PL080_INT_TC_STATUS);
 		err = readl(b + PL080_INT_ERR_STATUS);
-		if (tc || err)
-			dev_dbg(pl->dev, "irq eng%u tc=0x%x err=0x%x\n",
-				eng, tc, err);
+		if (!tc && !err)
+			continue;
+		serviced = true;
+		dev_dbg(pl->dev, "irq eng%u tc=0x%x err=0x%x\n",
+			eng, tc, err);
 		if (tc)
 			writel(tc, b + PL080_INT_TC_CLEAR);
 		if (err)
 			writel(err, b + PL080_INT_ERR_CLEAR);
+
+		for (i = 0; i < PL080_CH_COUNT; i++) {
+			struct s5l_pl080_chan *ech =
+				&pl->chans[eng * PL080_CH_COUNT + i];
+			struct s5l_pl080_desc *ed;
+			unsigned long eflags;
+
+			if (!(err & BIT(i)))
+				continue;
+
+			/*
+			 * Stop the channel before anything else. Leaving it
+			 * enabled is what turns one error into a storm.
+			 */
+			s5l_pl080_chan_disable(ech);
+
+			spin_lock_irqsave(&ech->vc.lock, eflags);
+			ed = ech->running;
+			ech->running = NULL;
+			if (++ech->err_count >= PL080_MAX_CH_ERRS)
+				ech->err_stuck = true;
+			spin_unlock_irqrestore(&ech->vc.lock, eflags);
+
+			dev_err_ratelimited(pl->dev,
+					    "ch%u DMA error (%u so far)%s -- channel stopped\n",
+					    ech->id, ech->err_count,
+					    ech->err_stuck ? ", giving up on it" : "");
+
+			if (ed) {
+				spin_lock_irqsave(&ech->vc.lock, eflags);
+				vchan_cookie_complete(&ed->vd);
+				spin_unlock_irqrestore(&ech->vc.lock, eflags);
+			}
+		}
+
 		for (i = 0; i < PL080_CH_COUNT; i++) {
 			if (!(tc & BIT(i)))
 				continue;
@@ -951,7 +1118,7 @@ static irqreturn_t s5l_pl080_irq(int irq, void *data)
 			}
 		}
 	}
-	return IRQ_HANDLED;
+	return serviced ? IRQ_HANDLED : IRQ_NONE;
 }
 
 static struct dma_chan *s5l_pl080_xlate_args(struct s5l_pl080 *pl,
@@ -1348,6 +1515,34 @@ static void s5l_pl080_remove(struct platform_device *pdev)
 	s5l_pl080_free_work(&pl->free_work);
 }
 
+/*
+ * kexec hands the machine to a new kernel with the old one's memory map
+ * already forgotten. A channel still running writes into whatever now
+ * occupies its destination, so the controller has to be stopped before
+ * the jump -- and remove() does not do it, because unregistering a
+ * dma_device says nothing to the hardware.
+ *
+ * Clearing CONFIG_EN halts both controllers outright rather than
+ * unwinding channel by channel, which is what you want here: nothing
+ * after this point needs the engine, and a per-channel teardown has
+ * more ways to get stuck than to succeed.
+ */
+static void s5l_pl080_shutdown(struct platform_device *pdev)
+{
+	struct s5l_pl080 *pl = platform_get_drvdata(pdev);
+	unsigned int i;
+
+	if (!pl)
+		return;
+	for (i = 0; i < ARRAY_SIZE(pl->base); i++) {
+		if (!pl->base[i])
+			continue;
+		writel(readl(pl->base[i] + PL080_CONFIG) & ~PL080_CONFIG_EN,
+		       pl->base[i] + PL080_CONFIG);
+	}
+	dev_info(&pdev->dev, "PL080 halted for shutdown/kexec\n");
+}
+
 static const struct of_device_id s5l_pl080_of_match[] = {
 	{ .compatible = "apple,s5l8740-pl080" },
 	{ .compatible = "arm,pl080" },
@@ -1358,6 +1553,7 @@ MODULE_DEVICE_TABLE(of, s5l_pl080_of_match);
 static struct platform_driver s5l_pl080_driver = {
 	.probe = s5l_pl080_probe,
 	.remove = s5l_pl080_remove,
+	.shutdown = s5l_pl080_shutdown,
 	.driver = {
 		.name = "s5l8740-pl080",
 		.of_match_table = s5l_pl080_of_match,
