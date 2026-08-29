@@ -107,6 +107,12 @@ int s5l8740_nand_query_geometry(struct s5l8740_nand_geom *g);
  * fills 4 data + 4 meta slots; no lba_map ingest
  * Requires dma_dry=0 and dma_armed=1 (one-shot friendly).
  */
+int s5l8740_nand_cs_phys_read_slot0(u8 ce, u8 cau, u16 block, u8 page,
+				    struct s5l8740_cs_page *out);
+int s5l8740_nand_cs_phys_read_span(u8 ce, u8 cau, u16 block, u8 page,
+				   struct s5l8740_cs_page *out, unsigned int span);
+int s5l8740_nand_cs_phys_read_slc(u8 ce, u8 cau, u16 block, u8 page, u8 slc,
+				  struct s5l8740_cs_page *out, unsigned int span);
 int s5l8740_nand_cs_phys_read(u8 ce, u8 cau, u16 block, u8 page,
 			      struct s5l8740_cs_page *out);
 

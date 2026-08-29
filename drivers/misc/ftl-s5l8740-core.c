@@ -46,15 +46,47 @@ module_param(import_l2v_oracle, bool, 0644);
 MODULE_PARM_DESC(import_l2v_oracle,
 		 "Load L2V root/nodes/globals from /lib/firmware/apple/");
 
-static unsigned int max_open_sbs = 16;
+/*
+ * Rebuild every open superblock we find, up to a backstop.
+ *
+ * This was 16, which was a bring-up number and never lifted. It is not a
+ * tuning knob: an open superblock holds writes that happened after the
+ * checkpoint, so a cap on how many get rebuilt is a cap on how much recent
+ * data ends up in the map. With 1619 open superblocks on this volume it was
+ * rebuilding one percent of them and silently dropping the rest, which is a
+ * second and entirely separate cause of the missing-recent-files symptom
+ * that the page-0 weave bug caused.
+ *
+ * 4096 is above the number of blocks a CAU has, so in practice this is "all
+ * of them" -- it stays a finite number only so a corrupt classify cannot turn
+ * into an unbounded loop. The cost is real and is reported: each rebuild
+ * reads pages from page 0 until it finds a blank one, so a genuinely open
+ * block stops early and a block that is actually full reads all 127.
+ */
+static unsigned int max_open_sbs = 4096;
 module_param(max_open_sbs, uint, 0644);
 MODULE_PARM_DESC(max_open_sbs,
-		 "Max open superblocks to META-rebuild (0 = all; default 16)");
+		 "Max open superblocks to META-rebuild (0 = all; default 4096)");
 
-static unsigned int scan_blocks = 256;
+/*
+ * Scan every block. 256 was a bring-up limit that was never lifted, and
+ * it quietly disabled the CXT fast path: the snapshot blocks sit above
+ * that mark, so classify never saw one and every boot fell back to
+ * replaying the whole device. Measured on this unit, 256 against 0:
+ *
+ *   replayed superblocks   624   ->      0
+ *   skipped_by_cxt           0   ->   2274
+ *   cxt_seeded               0   -> 239525
+ *   classified_cxt           0   ->      4
+ *   mapped_ranges         1933   -> 200000
+ *
+ * so it was not only slow, it was building a far less complete map.
+ * Classifying more blocks costs less than replaying 624 superblocks.
+ */
+static unsigned int scan_blocks;
 module_param(scan_blocks, uint, 0644);
 MODULE_PARM_DESC(scan_blocks,
-		 "User blocks per CE/CAU to classify (0 = all; default 256)");
+		 "User blocks per CE/CAU to classify (0 = all, the default)");
 
 /*
  * BTOC meta-confirm re-reads every candidate data page over CS. Full-SB
@@ -67,10 +99,71 @@ module_param(btoc_meta_confirm, bool, 0644);
 MODULE_PARM_DESC(btoc_meta_confirm,
 		 "CS-read data pages to take meta_lba as L2V key (default Y)");
 
-static unsigned int btoc_confirm_max = 512;
+/*
+ * BTOC confirmation budget.
+ *
+ * This was 512, and on a full volume that is not a budget, it is a
+ * truncation. Measured on an N31 with the same flash contents:
+ *
+ *              512          65536
+ *   pages_valid      6            312
+ *   l2v_updates   2048          97820
+ *   confirm_capped 23943             0
+ *   mapped_lbas   7468          77553
+ *   mapped_ranges 1933          20596
+ *
+ * Every one of the extra confirmations was good -- meta_mismatch stayed
+ * at 0 -- so the old default was discarding about nine tenths of the
+ * mapping and reporting success while doing it. That is the same shape
+ * of bug as the old max_range_nodes ceiling: the statistic sits exactly
+ * on the limit, which means the limit chose the answer.
+ *
+ * This was reverted to 512 once, after a single run where the richer map
+ * flipped BPB selection to the other candidate (49285) and the volume
+ * would not mount. That revert was wrong. It let one observation override
+ * a measurement, and the cost is not subtle: at 512 the volume mounts but
+ * only about a tenth of it is mapped, so most files simply are not there.
+ * On the boot that settled it, 65536 bound to 49279 and mounted with Apps,
+ * iPod_Control and n31os all present.
+ *
+ * If BPB selection ever does pick an unmountable candidate again, fix the
+ * selection -- it should prefer a candidate whose FAT actually reads --
+ * rather than starving the map to steer it.
+ *
+ * 24455 confirm pages were needed here, so 65536 leaves headroom for a
+ * fuller volume without being unbounded. Raise it (or set 0) if
+ * btoc_confirm_capped is ever non-zero -- that value being non-zero is
+ * the signal that recovery is being cut short.
+ */
+/*
+ * Read page 127 only when page 0 leaves the question open.
+ *
+ * This is a large IO saving and it is why classify dropped from ~57s to
+ * ~26s. It is also the kind of optimisation that can quietly change what
+ * gets classified, so it is switchable: set btoc_page_lazy=0 to go back
+ * to reading page 127 for every block and compare the classify totals.
+ * If the two disagree, the laziness is wrong, not the flash.
+ */
+/*
+ * Probe blocks for "empty" with a one-record read before doing the full
+ * four-record page read. On by default: it is a strict reduction in NAND
+ * traffic for the majority case and changes no classification, because a
+ * negative probe falls through to exactly the old path.
+ */
+static bool fast_empty_probe = true;
+module_param(fast_empty_probe, bool, 0644);
+MODULE_PARM_DESC(fast_empty_probe,
+		 "1=one-record empty probe before the full page read (default)");
+
+static bool btoc_page_lazy = true;
+module_param(btoc_page_lazy, bool, 0644);
+MODULE_PARM_DESC(btoc_page_lazy,
+		 "1=read page 127 only when page 0 is inconclusive (default); 0=always read it");
+
+static unsigned int btoc_confirm_max = 65536;
 module_param(btoc_confirm_max, uint, 0644);
 MODULE_PARM_DESC(btoc_confirm_max,
-		 "Max BTOC CS page confirms per recover (default 512; 0=unlimited)");
+		 "Max BTOC CS page confirms per recover (default 65536; 0=unlimited). Non-zero btoc_confirm_capped means this is too low");
 /* Alias name from bring-up notes. */
 module_param_named(btoc_confirm_pages_cap, btoc_confirm_max, uint, 0644);
 
@@ -92,7 +185,32 @@ MODULE_PARM_DESC(recover_yield_us,
  * OOM panic (panic=-1 → reboot to RetailOS), which costs a DFU cycle and
  * loses the log. Stop adding mappings at the budget and report instead.
  */
-static unsigned int max_range_nodes = 200000;
+/*
+ * 200000 was below what this device actually needs, and the failure is
+ * silent in the worst way: the map fills to exactly the ceiling and the
+ * rest of the volume is simply absent.
+ *
+ * Measured here, with the CXT fast path working:
+ *
+ *   CXT_SEED extents=239525
+ *   mapped_ranges=200000  range_budget_stop=39512
+ *
+ * so 39512 ranges were dropped on the floor. Reads past them return
+ * UNMAPPED, FAT cannot fetch its directory blocks, and the mount comes
+ * up with "invalid cluster chain" and missing folders -- which looks
+ * like a corrupt disk rather than a driver that stopped writing down
+ * where things are. L2V packing then fails with -12 and it falls back
+ * to the truncated interval map.
+ *
+ * A whimory_range is about 32 bytes, so this ceiling is roughly 16 MB
+ * if it were ever reached. It is a ceiling rather than an allocation:
+ * nodes are only created for extents that exist, so a device with
+ * fewer extents pays nothing for the headroom. Set well above this
+ * unit's 239525 deliberately, so a fuller or more fragmented volume
+ * on another device does not hit the same silent truncation.
+ * Set 0 for unlimited.
+ */
+static unsigned int max_range_nodes = 500000;
 module_param(max_range_nodes, uint, 0644);
 MODULE_PARM_DESC(max_range_nodes,
 		 "Interval-map node ceiling; stop mapping past it (0=unlimited)");
@@ -144,9 +262,15 @@ static bool ftl_progress = true;
 module_param_named(progress, ftl_progress, bool, 0644);
 MODULE_PARM_DESC(progress, "Periodic recover progress lines (default Y)");
 
-static unsigned int progress_ms = 5000;
+/*
+ * 5 s suited a console log but is far too coarse to drive a progress
+ * bar, which needs to move several times a second or it reads as hung.
+ * This gates the sysfs counters as well as the log lines, so it is now
+ * a UI refresh rate rather than a logging interval.
+ */
+static unsigned int progress_ms = 500;
 module_param(progress_ms, uint, 0644);
-MODULE_PARM_DESC(progress_ms, "Minimum ms between progress lines");
+MODULE_PARM_DESC(progress_ms, "Minimum ms between progress updates");
 
 /* Rate-limit: emit at most this many of a repeating diagnostic. */
 static unsigned int diag_max_lines = 3;
@@ -165,6 +289,14 @@ static bool ftl_progress_due(struct whimory *w)
 		return false;
 	w->progress_jiffies = now;
 	return true;
+}
+
+static void ftl_progress_set(struct whimory *w, const char *phase,
+			     unsigned int cur, unsigned int total)
+{
+	w->prog_phase = phase;
+	w->prog_cur = cur;
+	w->prog_total = total;
 }
 
 static bool range_coalesce = true;
@@ -394,6 +526,90 @@ static bool whimory_meta_erased(const u8 *m, unsigned int n)
 	return true;
 }
 
+/*
+ * Cheap "is this block empty" probe.
+ *
+ * classify visits every block and, for seventy percent of them, only needs
+ * to answer "empty?" -- 64 bytes of slot-0 data and slot-0's 16-byte meta.
+ * The full page read moves 16448 bytes to obtain those 80. This reads one
+ * record, 4112 bytes.
+ *
+ * Deliberately narrow: it answers empty/not-empty and nothing else. Every
+ * other question classify asks, CXT detection above all, reads all four
+ * slots' meta, so a "no" here must be followed by the full read. Returning
+ * a bool rather than filling meta0 makes that impossible to get wrong by
+ * accident.
+ */
+/*
+ * Read slot 0 of a page: 4112 bytes instead of 16448.
+ *
+ * The controller takes a column offset and length -- col_len packs the
+ * length in the low half and the start column in the high half -- so a
+ * one-record read is a genuine short transfer, not a full page quietly
+ * discarded. Slot 0 carries the first 4096 data bytes and its own 16-byte
+ * meta, which between them settle almost every question classify asks.
+ *
+ * The exception is whimory_meta_slot0_or_any_cxt(), which scans all four
+ * slots, so a meta this read cannot classify must escalate to the full
+ * page. That is rare: on this volume the meta type histogram is 5492
+ * erased, 2268 data, 2 data2, 2 at 0x4b and 76 zero, so slot 0 answers for
+ * all but the last hundred or so.
+ *
+ * Returns 0 with data and meta filled, or negative on a read error.
+ */
+static int whimory_cs_read_slot0(struct whimory *w, unsigned int ce,
+				 unsigned int cau, unsigned int block,
+				 unsigned int page, const u8 **data,
+				 u8 *meta0)
+{
+	struct s5l8740_cs_page *csp = w->sftl.cs_page;
+	unsigned int i;
+	int ret;
+
+	if (!csp)
+		return -ENOMEM;
+	ret = s5l8740_nand_cs_phys_read_slot0((u8)ce, (u8)cau, (u16)block,
+					      (u8)page, csp);
+	if (ret)
+		return ret;
+	for (i = 0; i < WHIMORY_META_SIZE; i++)
+		meta0[i] = csp->meta_raw[0][i];
+	*data = csp->data[0];
+	return 0;
+}
+
+/*
+ * Can slot 0 alone classify this block?
+ *
+ * The only thing classify needs the other three slots for is
+ * whimory_meta_slot0_or_any_cxt(), which exists to catch a partially
+ * written CXT page whose slot 0 never got its meta. So the question is
+ * narrower than it looks: does this slot-0 type rule out a CXT hiding in
+ * slots 1..3?
+ *
+ * Plain user data and a slot-0 CXT do. A page is written slot 0 first with
+ * one kind of content, so DATA in slot 0 means the page is user data, and
+ * SFTL_CXT in slot 0 answers the CXT question outright.
+ *
+ * Everything else escalates, deliberately -- an erased or zero or
+ * unrecognised slot-0 meta is exactly the partial-write shape that
+ * _or_any_cxt() was written for, and misreading one of those loses a
+ * checkpoint. On this volume that leaves about eighty blocks paying for a
+ * full read against roughly 2270 settling from slot 0.
+ */
+static bool whimory_meta0_is_conclusive(const u8 *meta0)
+{
+	switch (meta0[0]) {
+	case WHIMORY_META_TYPE_DATA:
+	case WHIMORY_META_TYPE_DATA2:
+	case WHIMORY_META_TYPE_SFTL_CXT:
+		return true;
+	default:
+		return false;
+	}
+}
+
+
 static bool whimory_meta_is_user_data(const struct whimory_meta *m)
 {
 	return m->type == WHIMORY_META_TYPE_DATA ||
@@ -514,10 +730,11 @@ static u32 whimory_vfl_virt(struct whimory *w, u32 cau, u32 phys)
 	return phys;
 }
 
-static u32 s_g_addr_to_vba(const struct whimory *w, u32 sb, u32 ofs)
-{
-	return sb * w->sftl.vbas_per_sb + ofs;
-}
+/*
+ * Removed with the move to the native VBA space: nothing builds a VBA from
+ * a bank-major superblock index any more. whimory_sb_ofs_to_vba() is the
+ * replacement and converts at the boundary instead.
+ */
 
 static u32 s_g_vba_to_sb(const struct whimory *w, u32 vba)
 {
@@ -539,36 +756,123 @@ static u32 whimory_sb_index(const struct whimory *w, u32 ce, u32 cau,
 	return (ce * w->geom.num_cau + cau) * w->sftl.user_blocks + vblock;
 }
 
+/*
+ * The VBA space is the FTL's native one.
+ *
+ * Apple treats a superblock as the same virtual block across every
+ * (ce, cau) plane, so the plane index sits between the page and the slot:
+ *
+ *   vba = vblock * (pages_per_sb * planes * vbas_per_page)
+ *       + page   * (planes * vbas_per_page)
+ *       + plane  * vbas_per_page
+ *       + slot
+ *
+ * This used to be bank-major -- every (ce, cau, vblock) triple got its own
+ * superblock index -- which meant CXT VBAs had to be translated on the way
+ * in, and a run of consecutive CXT VBAs was only contiguous here within one
+ * 4-slot group, because the next group belonged to a different plane. The
+ * cost of that was not subtle: the CXT seed produced 236675 ranges for
+ * 938395 LBAs, just under four LBAs per range, when the same data in the
+ * native space is a few thousand contiguous runs.
+ *
+ * Matching the native layout removes the translation entirely and lets
+ * extents stay whole, which is what the range budget was fighting.
+ */
+/*
+ * How many virtual blocks a VBA may name.
+ *
+ * Not user_blocks. user_blocks is blocks_per_cau minus the VFL tail -- 1960
+ * of 2088 here -- and it is the right number for "how much space may be
+ * allocated to the user". It is the wrong number for "which blocks may a
+ * stored VBA refer to", and using it as the range check silently discarded
+ * 81 CXT records:
+ *
+ *   CXT_XLATE_FAIL vba=0x003e3883 (vblk=1991 pg=8 plane=0 slot=3)
+ *                  lba=841408 span=256 user_blocks=1960
+ *
+ * Those are not corrupt entries. They cluster in vblocks 1987..1991, their
+ * spans are large and ordinary (93, 116, 125, 128, 256, 384), and their VBAs
+ * run contiguously through the plane interleave exactly as the arithmetic
+ * predicts -- 0x3e3883 + 256 lands on 0x3e3983 and the next record begins at
+ * 0x3e3984. That is the FTL telling us, correctly, where it put roughly two
+ * thousand LBAs around 839k-842k. We were throwing them away.
+ *
+ * The VFL is an identity map over blocks_per_cau, so any block below that is
+ * addressable and a VBA naming one is legitimate.
+ */
+static u32 whimory_vba_blocks(const struct whimory *w)
+{
+	if (w->geom.blocks_per_cau)
+		return w->geom.blocks_per_cau;
+	return w->sftl.user_blocks;
+}
+
 static u32 whimory_pack_vba(const struct whimory *w, u32 ce, u32 cau,
 			    u32 vblock, u32 page, u32 slot)
 {
-	u32 sb = whimory_sb_index(w, ce, cau, vblock);
-	u32 ofs = page * w->sftl.vbas_per_page + slot;
+	u32 planes = w->geom.num_ce * w->geom.num_cau;
+	u32 plane = ce * w->geom.num_cau + cau;
+	u32 per_page = planes * w->sftl.vbas_per_page;
+	u32 per_sb = w->sftl.pages_per_sb * per_page;
 
-	return s_g_addr_to_vba(w, sb, ofs);
+	return vblock * per_sb + page * per_page +
+	       plane * w->sftl.vbas_per_page + slot;
+}
+
+/*
+ * Build a VBA from a bank-major superblock index and an in-superblock
+ * offset. The replay paths still enumerate one (ce, cau, vblock) at a
+ * time, which is a bank-major idea; this converts at the boundary so the
+ * stored VBA is native.
+ */
+static u32 whimory_sb_ofs_to_vba(const struct whimory *w, u32 sb_idx, u32 ofs)
+{
+	u32 per_ce = w->geom.num_cau * w->sftl.user_blocks;
+	u32 ce, cau, vblock, rem;
+
+	if (!per_ce || !w->sftl.user_blocks || !w->sftl.vbas_per_page)
+		return 0;
+	ce = sb_idx / per_ce;
+	rem = sb_idx % per_ce;
+	cau = rem / w->sftl.user_blocks;
+	vblock = rem % w->sftl.user_blocks;
+
+	return whimory_pack_vba(w, ce, cau, vblock,
+				ofs / w->sftl.vbas_per_page,
+				ofs % w->sftl.vbas_per_page);
 }
 
 static int whimory_unpack_vba(const struct whimory *w, u32 vba,
 			      u32 *ce, u32 *cau, u32 *vblock,
 			      u32 *page, u32 *slot)
 {
-	u32 sb, ofs, per_ce;
-
 	if (!w->sftl.vbas_per_sb || !w->sftl.vbas_per_page ||
 	    !w->sftl.user_blocks)
 		return -EINVAL;
-	sb = s_g_vba_to_sb(w, vba);
-	ofs = s_g_vba_to_ofs(w, vba);
-	*page = ofs / w->sftl.vbas_per_page;
-	*slot = ofs % w->sftl.vbas_per_page;
-	per_ce = w->geom.num_cau * w->sftl.user_blocks;
-	if (!per_ce)
-		return -EINVAL;
-	*ce = sb / per_ce;
-	sb %= per_ce;
-	*cau = sb / w->sftl.user_blocks;
-	*vblock = sb % w->sftl.user_blocks;
+	/* Exact inverse of whimory_pack_vba(); see the layout there. */
+	{
+		u32 planes = w->geom.num_ce * w->geom.num_cau;
+		u32 per_page, per_sb, rem, plane;
+
+		if (!planes)
+			return -EINVAL;
+		per_page = planes * w->sftl.vbas_per_page;
+		per_sb = w->sftl.pages_per_sb * per_page;
+		if (!per_sb)
+			return -EINVAL;
+
+		*vblock = vba / per_sb;
+		rem = vba % per_sb;
+		*page = rem / per_page;
+		plane = (rem % per_page) / w->sftl.vbas_per_page;
+		*slot = rem % w->sftl.vbas_per_page;
+		*ce = plane / w->geom.num_cau;
+		*cau = plane % w->geom.num_cau;
+	}
+
 	if (*ce >= w->geom.num_ce || *cau >= w->geom.num_cau)
+		return -ERANGE;
+	if (*vblock >= whimory_vba_blocks(w))
 		return -ERANGE;
 	if (*page >= w->sftl.pages_per_sb)
 		return -ERANGE;
@@ -1851,12 +2155,29 @@ static bool fpart_has_xrmw(const u8 *page);
  *op=1 analogue. Special objects often live on SLC; try SLC
  * then MLC. Full 16 KiB data + 64B META; special uses first 16 META bytes.
  */
+/*
+ * Read one FPart page, trying SLC plane 1 then 0.
+ *
+ * This went through s5l8740_nand_page_read() until now, and never once
+ * reached the NAND. That function refuses any request carrying a meta buffer
+ * unless meta_dma_read is set, and meta_dma_read is deliberately off -- a
+ * permanent live CS kick reboots the device, so the sanctioned path is a
+ * temporary dma_session around cs_phys instead. Every FPart read therefore
+ * returned -EOPNOTSUPP: the log said reads=512 fail=512 in sixty
+ * milliseconds, which is far too fast to have been a NAND access at all, and
+ * "sig=0, not a native open" was a verdict about a region nobody had looked
+ * at.
+ *
+ * cs_phys is the same path classify uses, and it needs the caller to hold a
+ * DMA session -- fpart_scan_region() opens one.
+ */
 static int fpart_fil_read_page(struct whimory *w, u16 bank, u32 block,
-			       u32 page, void *data, u8 *meta)
+			       u32 page, struct s5l8740_cs_page *csp,
+			       void *data, u8 *meta)
 {
-	unsigned int ce, cau, i;
+	unsigned int ce, cau, i, sl;
 	int last = -EIO;
-	const unsigned int slc_order[2] = { 1, 0 };
+	const u8 slc_order[2] = { 1, 0 };
 
 	fpart_bank_to_ce_cau(w, bank, &ce, &cau);
 	if (ce >= w->geom.num_ce || cau >= w->geom.num_cau ||
@@ -1867,11 +2188,25 @@ static int fpart_fil_read_page(struct whimory *w, u16 bank, u32 block,
 	for (i = 0; i < 2; i++) {
 		int ret;
 
-		ret = s5l8740_nand_page_read(ce, cau, block, page, slc_order[i],
-					     16, data, w->geom.page_size,
-					     meta, S5L8740_NAND_META_SIZE);
+		ret = s5l8740_nand_cs_phys_read_slc((u8)ce, (u8)cau, (u16)block,
+						    (u8)page, slc_order[i],
+						    csp, 4);
 		if (ret)
 			continue;
+
+		/* Flatten the four records back into the flat page and the
+		 * 64-byte meta the FPart parsers expect.
+		 */
+		for (sl = 0; sl < N31_DATA_SLOTS; sl++) {
+			size_t doff = (size_t)sl * N31_DATA_SLOT_SIZE;
+
+			if (doff + N31_DATA_SLOT_SIZE <= w->geom.page_size)
+				memcpy((u8 *)data + doff, csp->data[sl],
+				       N31_DATA_SLOT_SIZE);
+			memcpy(meta + sl * WHIMORY_META_SIZE,
+			       csp->meta_raw[sl], WHIMORY_META_SIZE);
+		}
+
 		last = 0;
 		if (fpart_meta_special(meta, 0, NULL) ||
 		    fpart_meta_is_assign(meta, NULL))
@@ -2093,20 +2428,41 @@ static int fpart_scan_region(struct whimory *w, u16 type,
 {
 	u8 *page;
 	u8 meta[S5L8740_NAND_META_SIZE];
+	struct s5l8740_cs_page *csp;
 	u16 bank, nbanks = fpart_num_banks(w);
 	u32 b, p;
 	int ret, reads = 0, tag30 = 0, xrmw = 0, wrmx = 0, fail = 0;
 	unsigned int sample = 0;
 	u32 hist[256];
+	int sess;
 
 	page = kvmalloc(w->geom.page_size, GFP_KERNEL);
 	if (!page)
 		return -ENOMEM;
 
+	csp = kvmalloc(sizeof(*csp), GFP_KERNEL);
+	if (!csp) {
+		kvfree(page);
+		return -ENOMEM;
+	}
+
 	memset(hist, 0, sizeof(hist));
 
 	if (page_hi >= w->geom.pages_per_block)
 		page_hi = w->geom.pages_per_block - 1;
+
+	/*
+	 * Arm live CS for the sweep. -EBUSY means an outer session is already
+	 * open, which is fine -- it just means this one does not own the
+	 * teardown.
+	 */
+	sess = s5l8740_nand_dma_session_begin();
+	if (sess && sess != -EBUSY) {
+		dev_warn(w->dev, "FPART_SCAN no DMA session (%d)\n", sess);
+		kvfree(csp);
+		kvfree(page);
+		return sess;
+	}
 
 	s5l8740_nand_reset();
 
@@ -2122,7 +2478,7 @@ static int fpart_scan_region(struct whimory *w, u16 type,
 
 				cond_resched();
 				ret = fpart_fil_read_page(w, bank, blk, p,
-							  page, meta);
+							  csp, page, meta);
 				reads++;
 				if (ret) {
 					fail++;
@@ -2226,6 +2582,9 @@ static int fpart_scan_region(struct whimory *w, u16 type,
 		 wrmx, w->fpart_ctx.count, *matched,
 		 0xff, hist[0xff], 0x00, hist[0], 0x30, hist[0x30], 0x20,
 		 hist[0x20]);
+	if (!sess)
+		s5l8740_nand_dma_session_end();
+	kvfree(csp);
 	kvfree(page);
 	return 0;
 }
@@ -2286,11 +2645,13 @@ static int fpart_read_special_copy(struct whimory *w, u8 *dst, u32 dst_len,
 				   u16 entry_i, u32 *gen_out)
 {
 	struct fpart_special_entry *e;
+	struct s5l8740_cs_page *csp;
 	u8 *page;
 	u8 meta[S5L8740_NAND_META_SIZE];
 	u32 page_size, chunk_count = 1, copy_slots, chunk, slot;
 	u32 object_len = 0, copy_len = 0, generation = 0;
 	int ret = -ENOENT;
+	int sess;
 
 	if (entry_i >= w->fpart_ctx.count)
 		return -EINVAL;
@@ -2304,6 +2665,23 @@ static int fpart_read_special_copy(struct whimory *w, u8 *dst, u32 dst_len,
 	if (!page)
 		return -ENOMEM;
 
+	csp = kvmalloc(sizeof(*csp), GFP_KERNEL);
+	if (!csp) {
+		kvfree(page);
+		return -ENOMEM;
+	}
+
+	/* Same as the scan: cs_phys needs live CS armed, and -EBUSY only
+	 * means someone outside already armed it.
+	 */
+	sess = s5l8740_nand_dma_session_begin();
+	if (sess && sess != -EBUSY) {
+		dev_warn(w->dev, "FPART_COPY no DMA session (%d)\n", sess);
+		kvfree(csp);
+		kvfree(page);
+		return sess;
+	}
+
 	for (chunk = 0; chunk < chunk_count; chunk++) {
 		bool got = false;
 
@@ -2315,7 +2693,7 @@ static int fpart_read_special_copy(struct whimory *w, u8 *dst, u32 dst_len,
 				break;
 			cond_resched();
 			ret = fpart_fil_read_page(w, e->bank, e->block, pg,
-						  page, meta);
+						  csp, page, meta);
 			if (ret)
 				continue;
 			if (!fpart_meta_special(meta, chunk, &meta_type))
@@ -2382,6 +2760,9 @@ static int fpart_read_special_copy(struct whimory *w, u8 *dst, u32 dst_len,
 			 entry_i, dst);
 	ret = 0;
 out:
+	if (!sess)
+		s5l8740_nand_dma_session_end();
+	kvfree(csp);
 	kvfree(page);
 	return ret;
 }
@@ -3564,23 +3945,86 @@ static int whimory_ingest_btoc_page(struct whimory *w, unsigned int ce,
 	const char *verdict = "NONE";
 	int hit = 0;
 
-	if (whimory_page_blank(page, 64))
+	if (whimory_page_blank(page, 64)) {
+		w->sftl.btoc_blank++;
 		return 0;
+	}
 	if (whimory_btoc_looks_be_bte(page)) {
 		if (whimory_btoc_parse_be_bte(w, page, len, ce, cau, vblock)) {
 			verdict = "BE_BTE";
+			w->sftl.btoc_be_bte++;
 			hit = 1;
 		}
 	}
 	if (!hit && whimory_btoc_looks_be_lpn(page)) {
 		if (whimory_btoc_parse_be_lpn(w, page, len, ce, cau, vblock)) {
 			verdict = "BE_LPN_ARRAY";
+			w->sftl.btoc_be_lpn++;
 			hit = 1;
 		}
 	}
 	if (!hit && whimory_btoc_parse_bte(w, page, len, ce, cau, vblock)) {
 		verdict = "LE_BTE";
+		w->sftl.btoc_le_bte++;
 		hit = 1;
+	}
+
+	/*
+	 * Some BTOC pages carry an eight-byte header before the BTE array,
+	 * and 255 of the 563 closed superblocks on this device use it. Every
+	 * one of them was dropped -- 127 pages and about 2032 LBAs each --
+	 * which is what left directory sectors unreadable on a volume whose
+	 * FAT mounted fine.
+	 *
+	 * struct whimory_bte is {weave_seq_add, aux, lba, span}, so the
+	 * parser was reading the header's third and fourth words as lba and
+	 * span. The dumps make the misread obvious:
+	 *
+	 *   00000000 00000002 0000c30d 000004f2 | 000004f2 00000002 ...
+	 *   ^header........^ ^read as lba/span^ | ^the real first record^
+	 *
+	 * span came out as 1266 against a 508-VBA superblock, so the loop
+	 * broke on record zero and the page was declared unrecognised. Shift
+	 * eight bytes and the same parser reads lba=0x4f2 span=2, then 0x4f3,
+	 * then 0x4f4 -- ascending LBAs with uniform spans, exactly what a
+	 * BTOC is.
+	 *
+	 * Tried only after the unshifted parse yields nothing, and only when
+	 * the first word is zero as it is in every sample, so a page that
+	 * already parses cannot be re-read at the wrong offset.
+	 */
+	if (!hit && len > 8 && get_unaligned_le32(page) == 0 &&
+	    whimory_btoc_parse_bte(w, page + 8, len - 8, ce, cau, vblock)) {
+		verdict = "LE_BTE_HDR8";
+		w->sftl.btoc_le_bte_hdr8++;
+		hit = 1;
+	}
+
+	/*
+	 * A BTOC nobody claimed is a whole closed superblock missing from the
+	 * map -- 127 pages, about 2032 LBAs -- and 255 of 563 were going
+	 * unclaimed with no record of it beyond a count that did not
+	 * distinguish "erased" from "unrecognised".
+	 *
+	 * The read misses that follow look like this, and they are what stops
+	 * files opening on a volume whose FAT reads fine:
+	 *
+	 *   read miss fmss_lba=3723686 ret=-2
+	 *     neighbor 3723682..85 MAPPED blk=1714 pg=43 slot=0..3
+	 *     neighbor 3723686     UNMAPPED
+	 *   FAT-fs: Directory bread(block 3674407) failed
+	 *
+	 * So the unclaimed ones are dumped. Three parsers is three guesses at
+	 * a format, and the bytes say whether there is a fourth shape here or
+	 * whether one of the three is rejecting pages it should accept.
+	 */
+	if (!hit) {
+		w->sftl.btoc_unclaimed++;
+		if (w->sftl.btoc_unclaimed <= 8)
+			dev_info(w->dev,
+				 "BTOC_UNCLAIMED n=%u ce=%u cau=%u vblock=%u first64=%32ph %32ph\n",
+				 w->sftl.btoc_unclaimed, ce, cau, vblock,
+				 page, page + 32);
 	}
 	if (ftl_diag && w->sftl.btoc_pages_read <= 8)
 		dev_info(w->dev,
@@ -3602,6 +4046,7 @@ static int whimory_rebuild_open_sb(struct whimory *w, struct whimory_sb *sb)
 		ret = whimory_cs_read_page(w, sb->ce, sb->cau, sb->block, pg,
 					   data, S5L8740_NAND_PAGE_SIZE,
 					   spare, sizeof(spare));
+		w->sftl.open_pages_read++;
 		if (ret)
 			break;
 		if (whimory_page_blank(data, 64) &&
@@ -3841,7 +4286,7 @@ static int whimory_cxt_load_sb(struct whimory *w, u32 sb_idx)
 	for (ofs = 0; ofs < s->vbas_per_sb && !done; ofs += zone) {
 		n = min(zone, s->vbas_per_sb - ofs);
 		for (i = 0; i < n; i++) {
-			vba = s_g_addr_to_vba(w, sb_idx, ofs + i);
+			vba = whimory_sb_ofs_to_vba(w, sb_idx, ofs + i);
 			ret = whimory_unpack_vba(w, vba, &ce, &cau, &vblock,
 						 &page, &slot);
 			if (ret)
@@ -3999,7 +4444,7 @@ static int whimory_cxt_read_vba(struct whimory *w, u32 sb_idx, u32 ofs,
 {
 	struct whimory_sftl *s = &w->sftl;
 	u32 ce, cau, vblock, page, slot, pblock, key;
-	u32 vba = s_g_addr_to_vba(w, sb_idx, ofs);
+	u32 vba = whimory_sb_ofs_to_vba(w, sb_idx, ofs);
 	int ret;
 
 	ret = whimory_unpack_vba(w, vba, &ce, &cau, &vblock, &page, &slot);
@@ -4202,24 +4647,23 @@ MODULE_PARM_DESC(cxt_max_extents,
  * only contiguous in our space within one 4-slot group, because the next
  * group belongs to a different plane.
  */
+/*
+ * Now that the VBA space is the native one, a CXT VBA is already a VBA.
+ * All that is left is the range check the old translation did on the way
+ * through -- kept because an out-of-range CXT entry is real and must not
+ * be turned into a mapping onto some unrelated block.
+ */
 static int whimory_cxt_vba_translate(struct whimory *w, u32 cxt_vba, u32 *out)
 {
 	u32 planes = w->geom.num_ce * w->geom.num_cau;
-	u32 per_page, per_sb, vblock, rem, page, plane, slot;
+	u32 per_sb;
 
 	if (!planes || !w->sftl.vbas_per_page || !w->sftl.pages_per_sb)
 		return -EINVAL;
-	per_page = planes * w->sftl.vbas_per_page;
-	per_sb = w->sftl.pages_per_sb * per_page;
-	vblock = cxt_vba / per_sb;
-	rem = cxt_vba % per_sb;
-	page = rem / per_page;
-	plane = (rem % per_page) / w->sftl.vbas_per_page;
-	slot = rem % w->sftl.vbas_per_page;
-	if (vblock >= w->sftl.user_blocks || page >= w->sftl.pages_per_sb)
+	per_sb = w->sftl.pages_per_sb * planes * w->sftl.vbas_per_page;
+	if (cxt_vba / per_sb >= whimory_vba_blocks(w))
 		return -ERANGE;
-	*out = whimory_pack_vba(w, plane / w->geom.num_cau,
-				plane % w->geom.num_cau, vblock, page, slot);
+	*out = cxt_vba;
 	return 0;
 }
 
@@ -4241,6 +4685,34 @@ static int whimory_cxt_ext_add(struct whimory *w, u32 lba, u32 span, u32 vba)
 	e->span = span;
 	e->vba = vba;
 	return 0;
+}
+
+/*
+ * Spell a raw CXT VBA out in the terms it is built from.
+ *
+ * Every question about the CXT map so far -- are the holes real, is the
+ * translation ceiling right -- has been answered by arguing about
+ * arithmetic. A VBA printed as vblock/page/plane/slot settles them by
+ * inspection: a genuine hole sentinel is far outside the geometry, while an
+ * arithmetic fault lands just past a boundary.
+ */
+static void whimory_vba_describe(const struct whimory *w, u32 vba,
+				 char *buf, size_t len)
+{
+	u32 planes = w->geom.num_ce * w->geom.num_cau;
+	u32 per_page, per_sb, rem;
+
+	if (!planes || !w->sftl.vbas_per_page || !w->sftl.pages_per_sb) {
+		scnprintf(buf, len, "?");
+		return;
+	}
+	per_page = planes * w->sftl.vbas_per_page;
+	per_sb = w->sftl.pages_per_sb * per_page;
+	rem = vba % per_sb;
+	scnprintf(buf, len, "vblk=%u pg=%u plane=%u slot=%u",
+		  vba / per_sb, rem / per_page,
+		  (rem % per_page) / w->sftl.vbas_per_page,
+		  rem % w->sftl.vbas_per_page);
 }
 
 /*
@@ -4278,25 +4750,67 @@ static int whimory_cxt_parse_tree(struct whimory *w, const u8 *data,
 			break;
 		w->sftl.cxt_records_seen++;
 		if (vba >= WHIMORY_CXT_VBA_HOLE || vba >= w->l2v.invalid_vba) {
-			/* Hole: consumes logical space, maps nothing. */
+			/*
+			 * Hole: consumes logical space, maps nothing.
+			 *
+			 * Sampled, because "609 holes" on its own does not say
+			 * whether the checkpoint is describing unmapped space
+			 * or whether the ceiling is wrong. A sentinel sits far
+			 * outside the geometry; a ceiling fault sits just past
+			 * it. The covered LBA count tells them apart too -- a
+			 * volume a quarter full should have most of its
+			 * logical space in holes.
+			 */
 			w->sftl.cxt_hole_entries++;
+			w->sftl.cxt_hole_lbas += span;
+			if (w->sftl.cxt_hole_entries <= 12) {
+				char d[64];
+
+				whimory_vba_describe(w, vba, d, sizeof(d));
+				dev_info(w->dev,
+					 "CXT_HOLE n=%u vba=0x%08x (%s) lba=%u span=%u limit=0x%x\n",
+					 w->sftl.cxt_hole_entries, vba, d, lba,
+					 span, w->l2v.invalid_vba);
+			}
 			lba += span;
 			continue;
 		}
 		while (span) {
-			u32 chunk = w->sftl.vbas_per_page -
-				    (vba % w->sftl.vbas_per_page);
+			/*
+			 * Whole runs now. This used to break every extent at
+			 * the next 4-slot boundary because consecutive CXT
+			 * VBAs were not contiguous in the old bank-major
+			 * space. They are in the native one, so a run stays a
+			 * run and the range count drops by about four times.
+			 */
+			u32 chunk = span;
 			u32 tvba;
 			int ret;
-
-			if (chunk > span)
-				chunk = span;
 			if (!whimory_cxt_vba_translate(w, vba, &tvba)) {
 				ret = whimory_cxt_ext_add(w, lba, chunk, tvba);
-				if (ret)
+				if (ret) {
+					/* Loud: a full table is a short map,
+					 * and a short map is lost files.
+					 */
+					w->sftl.cxt_ext_nospc++;
+					dev_warn(w->dev,
+						 "CXT extent table full at %u -- map will be short\n",
+						 w->n_cxt_ext);
 					return ret;
+				}
 			} else {
 				w->sftl.cxt_xlate_fail++;
+				if (w->sftl.cxt_xlate_fail <= 12) {
+					char d[64];
+
+					whimory_vba_describe(w, vba, d,
+							     sizeof(d));
+					dev_info(w->dev,
+						 "CXT_XLATE_FAIL n=%u vba=0x%08x (%s) lba=%u span=%u vba_blocks=%u\n",
+						 w->sftl.cxt_xlate_fail, vba, d,
+						 lba, chunk,
+						 whimory_vba_blocks(w));
+				}
 			}
 			lba += chunk;
 			vba += chunk;
@@ -4315,7 +4829,7 @@ static int whimory_cxt_build_from_sb(struct whimory *w, u32 sb_idx)
 	u8 *data = s->gc_data;
 	u8 meta[WHIMORY_META_SIZE];
 	u8 spare[S5L8740_NAND_META_SIZE];
-	u32 ofs, last_key = ~0u, next_lba = 0;
+	u32 ofs, last_key = ~0u, next_lba = 0, n_l2v = 0;
 	bool lba_valid = false;
 	int ret;
 
@@ -4325,19 +4839,46 @@ static int whimory_cxt_build_from_sb(struct whimory *w, u32 sb_idx)
 	for (ofs = 0; ofs < s->vbas_per_sb; ofs++) {
 		ret = whimory_cxt_read_vba(w, sb_idx, ofs, data, meta, spare,
 					   &last_key);
-		if (ret)
+		if (ret) {
+			dev_warn(w->dev,
+				 "CXT sb=%u read failed at ofs=%u/%u (%d) -- rest of this checkpoint dropped\n",
+				 sb_idx, ofs, s->vbas_per_sb, ret);
 			return ret;
+		}
 		if (meta[0] != WHIMORY_META_TYPE_SFTL_CXT)
 			continue;
 		if (meta[1] == WHIMORY_CXT_TAG_CLEAN)
 			break;
 		if (meta[1] != WHIMORY_CXT_TAG_L2V)
 			continue;
+		n_l2v++;
 		ret = whimory_cxt_parse_tree(w, data, WHIMORY_LBA_SIZE,
 					     &next_lba, &lba_valid);
-		if (ret)
+		if (ret) {
+			/*
+			 * Stop this checkpoint, but say what stopping cost.
+			 *
+			 * Carrying on past a bad record is not an option: the
+			 * logical cursor is what places every record after it,
+			 * so a record parsed against a broken cursor lands at
+			 * the wrong LBA, and a mapping in the wrong place is
+			 * worse than a mapping missing. But the records after
+			 * it were silently lost before, and a checkpoint that
+			 * quietly stops halfway looks exactly like one that
+			 * finished.
+			 */
+			s->cxt_records_lost += s->vbas_per_sb - ofs;
+			dev_warn(w->dev,
+				 "CXT sb=%u parse stopped at record %u of %u (%d, %u L2V records read) -- up to %u records dropped\n",
+				 sb_idx, ofs, s->vbas_per_sb, ret, n_l2v,
+				 s->vbas_per_sb - ofs);
 			return ret;
+		}
 	}
+	if (!n_l2v)
+		dev_info(w->dev,
+			 "CXT sb=%u holds no L2V records (clean or superseded)\n",
+			 sb_idx);
 	return 0;
 }
 
@@ -4391,6 +4932,10 @@ static int whimory_cxt_build_candidate(struct whimory *w)
 	w->sftl.cxt_records_seen = 0;
 	w->sftl.cxt_hole_entries = 0;
 	w->sftl.cxt_xlate_fail = 0;
+	w->sftl.cxt_hole_lbas = 0;
+	w->sftl.cxt_ext_nospc = 0;
+	w->sftl.cxt_records_lost = 0;
+	w->sftl.cxt_sb_empty = 0;
 
 	sess = s5l8740_nand_dma_session_begin();
 	for (i = 0; i < n_all; i++) {
@@ -4403,8 +4948,20 @@ static int whimory_cxt_build_candidate(struct whimory *w)
 				 all[i].sb, ret);
 			continue;
 		}
-		if (w->n_cxt_ext == before)
+		if (w->n_cxt_ext == before) {
+			/*
+			 * Counted. sbs_used=2/4 read as "two checkpoints were
+			 * stale", and it may well be, but nothing here had
+			 * ever checked -- a superblock that parsed fine and
+			 * produced nothing left exactly the same trace as one
+			 * that was never looked at.
+			 */
+			w->sftl.cxt_sb_empty++;
+			dev_info(w->dev,
+				 "CXT_CAND_MAP sb=%u weave=%llu parsed but added no extents\n",
+				 all[i].sb, (unsigned long long)all[i].weave);
 			continue;
+		}
 		ok++;
 		if (all[i].weave > w->cxt_ext_weave) {
 			w->cxt_ext_weave = all[i].weave;
@@ -4434,6 +4991,18 @@ static int whimory_cxt_build_candidate(struct whimory *w)
 		 ok, n_all, w->n_cxt_ext, w->sftl.cxt_records_seen,
 		 w->sftl.cxt_hole_entries, w->sftl.cxt_xlate_fail, overlaps,
 		 (unsigned long long)w->cxt_ext_weave);
+	/*
+	 * The accounting the previous line was missing. hole_lbas is the one
+	 * that settles whether the holes are a fault: this volume maps about
+	 * 938k of 3.86M sectors, so if the holes cover roughly the other
+	 * three quarters they are describing unmapped space and are correct.
+	 * If they cover a little and there are hundreds of them, they are
+	 * not.
+	 */
+	dev_info(w->dev,
+		 "CXT_MAP hole_lbas=%u empty_sbs=%u records_lost=%u nospc=%u\n",
+		 w->sftl.cxt_hole_lbas, w->sftl.cxt_sb_empty,
+		 w->sftl.cxt_records_lost, w->sftl.cxt_ext_nospc);
 	return 0;
 }
 
@@ -4816,6 +5385,9 @@ static void whimory_print_recovery_stats(struct whimory *w)
 		 "  cxt_blocks_seen=%u cxt_records_seen=%u cxt_l2v_updates=%u\n"
 		 "  btoc_pages_read=%u btoc_pages_valid=%u btoc_entries_seen=%u btoc_l2v_updates=%u\n"
 		 "  btoc_meta_confirmed=%u btoc_meta_mismatch=%u btoc_skipped_zero=%u\n"
+		 "  btoc_blank=%u be_bte=%u be_lpn=%u le_bte=%u hdr8=%u unclaimed=%u\n"
+		 "  btoc_fallback sbs=%u pages=%u hits=%u (%u pages/sb)\n"
+		 "  unknown_fallback sbs=%u pages=%u hits=%u (%u pages/sb)\n"
 		 "  btoc_confirm_pages=%u btoc_confirm_capped=%u btoc_confirm_budget_stop=%u\n"
 		 "  btoc_unmap_entries=%u btoc_hole_entries=%u btoc_unknown_entries=%u\n"
 		 "  btoc_token_ffff0000=%u btoc_token_ffffff00=%u btoc_token_ffffffff=%u btoc_holelist_ffff0001=%u\n"
@@ -4836,6 +5408,12 @@ static void whimory_print_recovery_stats(struct whimory *w)
 		 s->btoc_l2v_updates,
 		 s->btoc_meta_confirmed, s->btoc_meta_mismatch,
 		 s->btoc_skipped_zero,
+		 s->btoc_blank, s->btoc_be_bte, s->btoc_be_lpn,
+		 s->btoc_le_bte, s->btoc_le_bte_hdr8, s->btoc_unclaimed,
+		 s->btoc_fb_sbs, s->btoc_fb_pages, s->btoc_fb_hits,
+		 s->btoc_fb_sbs ? s->btoc_fb_pages / s->btoc_fb_sbs : 0,
+		 s->unk_fb_sbs, s->unk_fb_pages, s->unk_fb_hits,
+		 s->unk_fb_sbs ? s->unk_fb_pages / s->unk_fb_sbs : 0,
 		 s->btoc_confirm_pages, s->btoc_confirm_capped,
 		 s->btoc_confirm_budget_stop,
 		 s->btoc_unmap_entries, s->btoc_hole_entries,
@@ -5034,6 +5612,8 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 	u8 meta0[S5L8740_NAND_META_SIZE];
 	u8 meta127[S5L8740_NAND_META_SIZE];
 	u8 *p127;
+	u32 *meta0_hist;
+	u32 *meta127_hist;
 	int ret;
 
 	nscan = scan_blocks ? scan_blocks : s->user_blocks;
@@ -5043,6 +5623,18 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 	p127 = s->btoc_page;
 	if (!p127)
 		return -ENOMEM;
+
+	/*
+	 * Histogram of the page 0 meta type byte over every block scanned.
+	 * When a class comes out at zero -- cxt=0, say -- the useful question
+	 * is whether the flash has no such block or whether the test for it
+	 * stopped matching, and the classify counters cannot tell those apart.
+	 * This can: WHIMORY_META_TYPE_SFTL_CXT is 0x1f, so a non-zero count at
+	 * 0x1f with cxt=0 means the recogniser is wrong, and a zero count means
+	 * the blocks really are not there.
+	 */
+	meta0_hist = kcalloc(256, sizeof(*meta0_hist), GFP_KERNEL);
+	meta127_hist = kcalloc(256, sizeof(*meta127_hist), GFP_KERNEL);
 	s->btoc_dumps_left = ftl_diag ? 5 : 0;
 	w->l2v_defer_pack = true;
 	s->btoc_verified = 0;
@@ -5071,6 +5663,7 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 				if (nsb >= s->num_sb)
 					goto classify_done;
 				if ((b & 0x1f) == 0 && ftl_progress_due(w))
+					ftl_progress_set(w, "classify", b, nscan),
 					dev_info(w->dev,
 						 "SFTL classify ce=%u cau=%u blk=%u/%u nsb=%u\n",
 						 ce, cau, b, nscan, nsb);
@@ -5079,37 +5672,174 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 					usleep_range(recover_yield_us,
 						     recover_yield_us + 500);
 				}
-				r0 = whimory_cs_read_page(w, ce, cau, b, 0,
+				/*
+				 * Page 127 is read lazily. It used to be fetched for
+				 * every block alongside page 0, but meta127 is only
+				 * ever consulted for the closed/BTOC test below -- so
+				 * on this device 5484 empty blocks and the 4 CXT
+				 * blocks paid for a full page read whose result was
+				 * discarded. That is roughly 70 percent of the page
+				 * 127 traffic and a third of all classify IO, against
+				 * a pass that takes about 57 seconds at 7.4 ms per
+				 * block.
+				 *
+				 * A blank page 0 with an erased meta is taken as an
+				 * empty block without confirming page 127. Blocks are
+				 * written from page 0 upwards, so blank-at-0 with data
+				 * at 127 does not occur in normal operation. If page 0
+				 * cannot be read at all the old both-failed rule still
+				 * applies and page 127 is consulted.
+				 */
+				/*
+				 * One short read answers both questions.
+				 *
+				 * Empty is the common answer -- about seven
+				 * blocks in ten on this volume -- and slot 0
+				 * settles it. But the same 4112 bytes also
+				 * carry the meta that classifies a non-empty
+				 * block, so there is no reason to throw them
+				 * away and read the page again: the block
+				 * either finishes here or escalates to the
+				 * full read, and nothing reads page 0 twice.
+				 */
+				r0 = -EAGAIN;
+				if (fast_empty_probe) {
+					const u8 *d0 = NULL;
+					u8 m0[WHIMORY_META_SIZE];
+
+					if (!whimory_cs_read_slot0(w, ce, cau,
+								   b, 0, &d0,
+								   m0)) {
+						if (whimory_page_blank(d0, 64) &&
+						    whimory_meta_erased(m0,
+							WHIMORY_META_SIZE)) {
+							s->empty_sbs++;
+							s->fast_empty_hits++;
+							continue;
+						}
+						if (whimory_meta0_is_conclusive(m0)) {
+							/*
+							 * Slots 1..3 stay 0xff
+							 * so an erased-meta
+							 * test on them tells
+							 * the truth rather
+							 * than repeating the
+							 * last page's bytes.
+							 */
+							memset(meta0, 0xff,
+							       sizeof(meta0));
+							memcpy(meta0, m0,
+							       WHIMORY_META_SIZE);
+							memcpy(w->sftl.data_page,
+							       d0,
+							       S5L8740_NAND_SLOT_DATA);
+							memset(w->sftl.data_page +
+							       S5L8740_NAND_SLOT_DATA,
+							       0xff,
+							       S5L8740_NAND_PAGE_SIZE -
+							       S5L8740_NAND_SLOT_DATA);
+							s->fast_slot0_hits++;
+							r0 = 0;
+						}
+					}
+				}
+
+				r127 = -EAGAIN;		/* not read yet */
+
+				if (r0)
+					r0 = whimory_cs_read_page(w, ce, cau, b, 0,
 							  w->sftl.data_page,
 							  S5L8740_NAND_PAGE_SIZE,
 							  meta0, sizeof(meta0));
-				r127 = whimory_cs_read_page(w, ce, cau, b,
-							    WHIMORY_BTOC_PAGE,
-							    p127,
-							    S5L8740_NAND_PAGE_SIZE,
-							    meta127,
-							    sizeof(meta127));
-				if (!r0)
+				if (!r0) {
 					whimory_note_meta0(w, ce, cau, b, 0,
 							   w->sftl.data_page,
 							   meta0);
-				if (r0 && r127)
-					continue;
-				if ((!r0 && whimory_page_blank(w->sftl.data_page, 64) &&
-				     whimory_meta_erased(meta0, 16)) &&
-				    (r127 || (whimory_page_blank(p127, 64) &&
-					      whimory_meta_erased(meta127, 16)))) {
+					if (meta0_hist)
+						meta0_hist[meta0[0]]++;
+				}
+
+				if (!btoc_page_lazy)
+					r127 = whimory_cs_read_page(w, ce, cau, b,
+								    WHIMORY_BTOC_PAGE,
+								    p127,
+								    S5L8740_NAND_PAGE_SIZE,
+								    meta127,
+								    sizeof(meta127));
+
+				/*
+				 * Only call a block empty when page 127 agrees, or
+				 * when we deliberately did not look. Checking page 0
+				 * alone is what the lazy path relies on.
+				 */
+				if (!r0 && whimory_page_blank(w->sftl.data_page, 64) &&
+				    whimory_meta_erased(meta0, 16) &&
+				    (btoc_page_lazy ||
+				     (!r127 && whimory_page_blank(p127, 64) &&
+				      whimory_meta_erased(meta127, 16)))) {
 					s->empty_sbs++;
 					continue;
+				}
+
+				/* CXT is decided from meta0 alone. */
+				if (r127 == -EAGAIN &&
+				    (r0 || !whimory_meta_slot0_or_any_cxt(meta0))) {
+					r127 = whimory_cs_read_page(w, ce, cau, b,
+								    WHIMORY_BTOC_PAGE,
+								    p127,
+								    S5L8740_NAND_PAGE_SIZE,
+								    meta127,
+								    sizeof(meta127));
+					if (r0 && r127)
+						continue;
+					if (r0 &&
+					    whimory_page_blank(p127, 64) &&
+					    whimory_meta_erased(meta127, 16)) {
+						s->empty_sbs++;
+						continue;
+					}
 				}
 				sb = &s->sbs[nsb];
 				sb->ce = ce;
 				sb->cau = cau;
 				sb->block = b;
+				/*
+				 * Two weaves, because they answer different
+				 * questions and only one of them is any use
+				 * for the CXT diff.
+				 *
+				 * sb->weave is page 0: the OLDEST content in
+				 * the superblock. A block is filled from page
+				 * 0 upwards, so page 0 was written when the
+				 * block was opened -- which may have been long
+				 * before the checkpoint even if the block was
+				 * still being appended to long after it.
+				 *
+				 * sb->weave_max is the newest weave we have
+				 * actually seen. For a closed superblock that
+				 * is page 127, written when the block was
+				 * sealed, so it is the real answer. For an
+				 * open one there is no page whose weave bounds
+				 * the block, which is why the replay below
+				 * refuses to skip open superblocks at all.
+				 */
 				sb->weave = 0;
+				sb->weave_max = 0;
+				sb->weave_max_p127 = 0;
 				if (!r0 && (whimory_meta_is_data_raw(meta0) ||
 					    meta0[0] == WHIMORY_META_TYPE_SFTL_CXT))
 					sb->weave = whimory_weave48(meta0);
+				if (!r127 && (whimory_meta_is_data_raw(meta127) ||
+					      whimory_meta_any_btoc(meta127))) {
+					sb->weave_max = whimory_weave48(meta127);
+					sb->weave_max_p127 = 1;
+				}
+				if (sb->weave_max < sb->weave) {
+					sb->weave_max = sb->weave;
+					sb->weave_max_p127 = 0;
+				}
+				if (meta127_hist && !r127)
+					meta127_hist[meta127[0]]++;
 				if (!r0 && whimory_meta_is_cxt_base(meta0, 0)) {
 					u32 vblock = whimory_vfl_virt(w, cau, b);
 					u32 sb_idx = whimory_sb_index(w, ce, cau,
@@ -5129,8 +5859,30 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 					sb->kind = WHIMORY_SB_OPEN;
 					s->open_sbs++;
 				} else {
+					/*
+					 * Nothing recognised this block, which
+					 * is not the same as it being empty --
+					 * the empty test ran earlier and said
+					 * no. 78 blocks land here on this
+					 * volume, meta type 00 on 76 of them
+					 * and 0x4b on two, and until now they
+					 * were counted and then dropped before
+					 * ever entering sbs[]. A block that
+					 * never enters sbs[] is never
+					 * replayed, so up to 2032 LBAs each
+					 * were unreachable with nothing in the
+					 * log to say so.
+					 *
+					 * They are kept now and rebuilt from
+					 * per-page meta in the replay, which
+					 * is the one method that needs no
+					 * recognised structure at all. Cost is
+					 * bounded the same way as the BTOC
+					 * fallback: a blank page 0 stops it
+					 * after one read.
+					 */
+					sb->kind = WHIMORY_SB_UNKNOWN;
 					s->unknown_sbs++;
-					continue;
 				}
 				nsb++;
 			}
@@ -5142,6 +5894,56 @@ classify_done:
 		 "SFTL classified nsb=%u closed=%u open=%u cxt=%u empty=%u unknown=%u\n",
 		 nsb, s->btoc_sbs, s->open_sbs, s->cxt_sbs, s->empty_sbs,
 		 s->unknown_sbs);
+	dev_info(w->dev, "SFTL fast-empty probe settled %u of %u blocks\n",
+		 s->fast_empty_hits, s->empty_sbs);
+	dev_info(w->dev, "SFTL slot0 read settled %u non-empty blocks\n",
+		 s->fast_slot0_hits);
+
+	if (meta0_hist) {
+		char hb[192];
+		unsigned int t, hn = 0;
+
+		for (t = 0; t < 256; t++) {
+			if (!meta0_hist[t] || hn + 16 >= sizeof(hb))
+				continue;
+			hn += scnprintf(hb + hn, sizeof(hb) - hn, "%02x:%u ",
+					t, meta0_hist[t]);
+		}
+		dev_info(w->dev,
+			 "SFTL meta0 types %s(cxt=0x%02x btoc=0x%02x data=0x%02x)\n",
+			 hb, WHIMORY_META_TYPE_SFTL_CXT, WHIMORY_META_TYPE_BTOC,
+			 WHIMORY_META_TYPE_DATA);
+		kfree(meta0_hist);
+		meta0_hist = NULL;
+	}
+
+	/*
+	 * What page 127 actually holds, and how the superblocks sit either
+	 * side of the checkpoint.
+	 *
+	 * Both were guesses until now. open=1619 against closed=563 is a
+	 * strange shape for a mostly-static volume and says either that a
+	 * great many blocks really are mid-write, or that page 127 is not
+	 * where this geometry keeps its BTOC -- the type histogram tells
+	 * those apart. The weave split says how much of the volume the
+	 * checkpoint genuinely covers, which is the number the diff replay
+	 * is supposed to act on.
+	 */
+	if (meta127_hist) {
+		char hb[192];
+		unsigned int t, hn = 0;
+
+		for (t = 0; t < 256; t++) {
+			if (!meta127_hist[t] || hn + 16 >= sizeof(hb))
+				continue;
+			hn += scnprintf(hb + hn, sizeof(hb) - hn, "%02x:%u ",
+					t, meta127_hist[t]);
+		}
+		dev_info(w->dev, "SFTL meta127 types %s(page %u)\n",
+			 hb, WHIMORY_BTOC_PAGE);
+		kfree(meta127_hist);
+		meta127_hist = NULL;
+	}
 
 	whimory_cxt_index_build(w, nsb);
 	/*
@@ -5177,11 +5979,62 @@ classify_done:
 
 		if (sb->kind == WHIMORY_SB_CXT)
 			continue;
-		if (use_cxt && s->cxt_loaded && sb->weave &&
-		    sb->weave < w->cxt_base_weave) {
+
+		/*
+		 * Skip what the checkpoint already covers -- but only when we
+		 * can prove it does.
+		 *
+		 * This used to test sb->weave, which is page 0: the oldest
+		 * page in the superblock. That is the wrong end. A block being
+		 * appended to right up to the moment of the crash still has an
+		 * old page 0, so every superblock on the volume tested older
+		 * than the checkpoint and the diff replay skipped all 2182 of
+		 * them -- sbs=0 replayed. The map then reflected the volume
+		 * exactly as of the last checkpoint and nothing written after
+		 * it, which is precisely the missing-recent-files symptom.
+		 *
+		 * The fix for that was to stop skipping open superblocks at
+		 * all, on the reasoning that an open block is still being
+		 * written and no page in it bounds the rest. On this hardware
+		 * that reasoning does not hold, and the measurement is
+		 * unambiguous:
+		 *
+		 *   SFTL meta127 types 00:76 01:1615 1c:563 ff:6
+		 *
+		 * 1615 of the 1619 "open" superblocks carry user data at page
+		 * 127. They are full blocks that were never sealed with a
+		 * BTOC, not blocks mid-write -- the rebuild proved it by
+		 * reading 126 pages per superblock before finding a blank one.
+		 * A full block has a real newest page, so page 127 bounds it
+		 * exactly as it bounds a closed one.
+		 *
+		 * Leaving them unskipped was not merely slow. It read 205194
+		 * pages in 411 seconds, had 98.6 percent of the slots rejected
+		 * as stale, and overrode 5726 CXT mappings with older data --
+		 * on a volume where not one superblock is newer than the
+		 * checkpoint (weave newer=0 older=2182). A map that had been
+		 * mounting stopped mounting.
+		 *
+		 * So the test is the bound, not the kind: skip only when the
+		 * weave came from page 127. A superblock whose page 127 gave
+		 * no usable weave has nothing but page 0 to offer, which is
+		 * the wrong end again, and is replayed.
+		 */
+		if (!sb->weave_max)
+			s->weave_none++;
+		else if (sb->weave_max >= w->cxt_base_weave)
+			s->weave_newer++;
+		else
+			s->weave_older++;
+
+		if (use_cxt && s->cxt_loaded && sb->weave_max_p127 &&
+		    sb->weave_max && sb->weave_max < w->cxt_base_weave) {
 			s->diff_skipped_sbs++;
 			continue;
 		}
+		if (use_cxt && s->cxt_loaded && !sb->weave_max_p127 &&
+		    sb->weave && sb->weave < w->cxt_base_weave)
+			s->diff_open_kept++;
 		s->diff_replayed_sbs++;
 		if (sb->kind == WHIMORY_SB_CLOSED) {
 			int ingested;
@@ -5213,9 +6066,55 @@ classify_done:
 							    S5L8740_NAND_PAGE_SIZE);
 			s->claim_weave = 0;
 			s->claim_source = 0;
-			if (ingested)
+			if (ingested) {
 				s->btoc_pages_valid++;
+			} else {
+				/*
+				 * No BTE array here -- rebuild the superblock
+				 * from per-page meta instead of writing it off.
+				 *
+				 * 70 of these remain after the header-8 parse
+				 * and they share one shape: header, aux=0x7fc,
+				 * then zeros where the first record would be.
+				 * The decomp of the writer (s_btoc sub_567E3C)
+				 * says that cannot be a record. It writes
+				 * v11[2]=lba and v11[3]=span with the caller
+				 * asserting span != 0, and it keeps
+				 * nextVbaOfs += span consistent with
+				 * s_g_addr_to_vba(sb, nextVbaOfs) afterwards --
+				 * a zero span would break that invariant. aux
+				 * is not a length either; at the call site it
+				 * is a per-write tag lifted from the stream
+				 * context, so 0x7fc there is not the array
+				 * declaring its own size. And 0x7fc is 2044,
+				 * which is a superblock's 2048 VBAs less one
+				 * 4-slot group.
+				 *
+				 * So these read as sealed-block trailers: a
+				 * fill count written when the block closed,
+				 * terminator after it, no BTE array at all.
+				 * That is not the same as an empty superblock,
+				 * and the difference is about 2032 LBAs each.
+				 *
+				 * Rather than decide which, measure. The
+				 * rebuild costs one read against an empty
+				 * block -- page 0 comes back blank and it
+				 * stops -- and about 127 against a full one.
+				 * The counters below say which happened.
+				 */
+				int fb;
+
+				s->btoc_fb_sbs++;
+				fb = s->open_pages_read;
+				ret = whimory_rebuild_open_sb(w, sb);
+				s->btoc_fb_pages += s->open_pages_read - fb;
+				if (ret > 0)
+					s->btoc_fb_hits += ret;
+				else if (ret < 0)
+					return ret;
+			}
 			if (ftl_progress_due(w))
+				ftl_progress_set(w, "replay", i, nsb),
 				dev_info(w->dev,
 					 "SFTL replay progress i=%u/%u closed_valid=%u "
 					 "open_updates=%u unmap_calls=%u stale_rej=%u "
@@ -5225,15 +6124,37 @@ classify_done:
 					 s->stale_mapping_rejected, s->mapped_lbas,
 					 s->range_nodes, s->btoc_confirm_pages,
 					 s->range_budget_stop);
+		} else if (sb->kind == WHIMORY_SB_UNKNOWN) {
+			/* Same rebuild, counted apart so the two unknowns --
+			 * BTOCs with no array, and blocks with no recognised
+			 * meta at all -- stay distinguishable.
+			 */
+			int fb = s->open_pages_read;
+
+			s->unk_fb_sbs++;
+			ret = whimory_rebuild_open_sb(w, sb);
+			s->unk_fb_pages += s->open_pages_read - fb;
+			if (ret > 0)
+				s->unk_fb_hits += ret;
+			else if (ret < 0)
+				return ret;
 		} else if (sb->kind == WHIMORY_SB_OPEN) {
-			if (max_open_sbs && open_done >= max_open_sbs)
+			if (max_open_sbs && open_done >= max_open_sbs) {
+				/* Counted, not silent: a cap that drops open
+				 * superblocks drops recent writes, and a map
+				 * that is quietly short is worse than a slow
+				 * one.
+				 */
+				s->open_truncated++;
 				continue;
+			}
 			ret = whimory_rebuild_open_sb(w, sb);
 			if (ret > 0)
 				open_done++;
 			else if (ret < 0)
 				return ret;
 			if (ftl_progress_due(w))
+				ftl_progress_set(w, "open", open_done, s->open_sbs),
 				dev_info(w->dev,
 					 "SFTL open progress done=%u/%u i=%u/%u "
 					 "open_updates=%u ranges=%u mapped=%u\n",
@@ -5244,8 +6165,31 @@ classify_done:
 	}
 
 	dev_info(w->dev,
-		 "SFTL diff replay sbs=%u skipped_by_cxt=%u cxt_seeded=%u\n",
-		 s->diff_replayed_sbs, s->diff_skipped_sbs, s->cxt_l2v_updates);
+		 "SFTL diff replay sbs=%u skipped_by_cxt=%u cxt_seeded=%u "
+		 "open_kept=%u open_truncated=%u\n",
+		 s->diff_replayed_sbs, s->diff_skipped_sbs, s->cxt_l2v_updates,
+		 s->diff_open_kept, s->open_truncated);
+	dev_info(w->dev,
+		 "SFTL weave vs cxt base=%llu: newer=%u older=%u none=%u\n",
+		 w->cxt_base_weave, s->weave_newer, s->weave_older,
+		 s->weave_none);
+	/*
+	 * How deep the open rebuilds went. A genuinely open superblock stops
+	 * at its first blank page, so pages/sb well under 127 says these
+	 * really are partly written; pages/sb at 127 says they are full
+	 * blocks that classify called open because page 127 held data rather
+	 * than a BTOC, and the fix belongs in the classification instead.
+	 */
+	if (open_done)
+		dev_info(w->dev,
+			 "SFTL open rebuild sbs=%u pages=%u (%u pages/sb)\n",
+			 open_done, s->open_pages_read,
+			 s->open_pages_read / open_done);
+	if (s->open_truncated)
+		dev_warn(w->dev,
+			 "SFTL %u open superblocks dropped by max_open_sbs=%u -- "
+			 "recent writes in them are NOT in the map\n",
+			 s->open_truncated, max_open_sbs);
 	w->l2v_defer_pack = false;
 	ret = whimory_l2v_build_from_ranges(w);
 	if (ret) {
@@ -5928,8 +6872,39 @@ static ssize_t whimory_status_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(whimory_status);
 
+/*
+ * One field per line, no prose, so a shell loop or a UI can read this
+ * without parsing the human log. percent is -1 rather than 0 while the
+ * total is unknown, so a bar can show indeterminate instead of snapping
+ * back to the left every time a phase begins.
+ */
+static ssize_t recover_progress_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	struct whimory *w = whimory_dev;
+	int pct = -1;
+
+	if (!w)
+		return sysfs_emit(buf, "state=absent\n");
+	if (w->prog_total)
+		/* 32-bit: cur is a block/SB index, so *100 cannot overflow, and
+		 * a u64 divide would need div_u64 on arm anyway. */
+		pct = min_t(unsigned int, 100,
+			    w->prog_cur / (w->prog_total / 100 + 1));
+	return sysfs_emit(buf,
+			  "state=%s\nphase=%s\ncur=%u\ntotal=%u\n"
+			  "percent=%d\nmapped_lbas=%u\ndisk=%s\n",
+			  whimory_recovery_state_name(),
+			  w->prog_phase ? w->prog_phase : "idle",
+			  w->prog_cur, w->prog_total, pct,
+			  w->sftl.mapped_lbas,
+			  w->disk ? "registered" : "none");
+}
+static DEVICE_ATTR_RO(recover_progress);
+
 static struct attribute *ftl_attrs[] = {
 	&dev_attr_whimory_status.attr,
+	&dev_attr_recover_progress.attr,
 	NULL,
 };
 static const struct attribute_group ftl_attr_group = {

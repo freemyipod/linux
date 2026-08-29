@@ -218,7 +218,9 @@ struct whimory_sb {
 	u16 cau;
 	u16 block;
 	u8 kind;
-	u64 weave;
+	u64 weave;	/* page 0 -- the OLDEST content in the superblock */
+	u64 weave_max;	/* newest content we have actually seen a weave for */
+	u8 weave_max_p127;	/* weave_max came from page 127, not page 0 */
 };
 
 /* Compact CXT superblock identity; see whimory_cxt_index_build(). */
@@ -247,6 +249,8 @@ struct whimory_sftl {
 	u32 btoc_sbs;
 	u32 open_sbs;
 	u32 empty_sbs;
+	u32 fast_empty_hits;	/* settled by the one-record probe */
+	u32 fast_slot0_hits;	/* non-empty blocks settled from slot 0 */
 	u32 cxt_sbs;
 	u32 btoc_recs;
 	u32 range_nodes;
@@ -269,6 +273,28 @@ struct whimory_sftl {
 	u32 cxt_xlate_fail;
 	u32 diff_replayed_sbs;
 	u32 diff_skipped_sbs;
+	u32 diff_open_kept;	/* open SBs the page-0 weave would have skipped */
+	u32 open_truncated;	/* open SBs dropped by max_open_sbs */
+	u32 weave_newer;	/* SBs at or after the checkpoint */
+	u32 weave_older;	/* SBs the checkpoint provably covers */
+	u32 weave_none;		/* SBs with no usable weave at all */
+	u32 open_pages_read;	/* pages read rebuilding open SBs */
+	u32 cxt_hole_lbas;	/* logical space the holes cover */
+	u32 cxt_ext_nospc;	/* extents dropped, table full */
+	u32 cxt_records_lost;	/* records after an aborted parse */
+	u32 cxt_sb_empty;	/* CXT SBs that yielded nothing */
+	u32 btoc_blank;		/* BTOC pages that were erased */
+	u32 btoc_be_bte;	/* claimed by the big-endian BTE parser */
+	u32 btoc_be_lpn;	/* claimed by the big-endian LPN parser */
+	u32 btoc_le_bte;	/* claimed by the little-endian BTE parser */
+	u32 btoc_le_bte_hdr8;	/* same, after an 8-byte page header */
+	u32 btoc_unclaimed;	/* no parser recognised the page */
+	u32 btoc_fb_sbs;	/* closed SBs rebuilt from per-page meta */
+	u32 btoc_fb_pages;	/* pages that cost */
+	u32 btoc_fb_hits;	/* mappings it recovered */
+	u32 unk_fb_sbs;		/* unclassified SBs rebuilt from meta */
+	u32 unk_fb_pages;
+	u32 unk_fb_hits;
 	u32 btoc_pages_read;
 	u32 btoc_pages_valid;
 	u32 btoc_entries_seen;
@@ -404,6 +430,14 @@ struct whimory {
 	bool oracle_used;
 	bool l2v_defer_pack;	/* pack once after replay, not per update */
 	unsigned long progress_jiffies;	/* rate-limits recover progress */
+	/*
+	 * Machine-readable mirror of the recover progress lines. The dev_info
+	 * output suits a human reading a console; a progress bar needs the
+	 * numbers without parsing prose, so the same call sites publish here.
+	 */
+	const char *prog_phase;
+	unsigned int prog_cur;
+	unsigned int prog_total;
 	/* L2V_Search sequential hint; see whimory_l2v_search(). */
 	u32 search_start;
 	u32 search_len;

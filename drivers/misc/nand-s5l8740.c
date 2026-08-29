@@ -6292,6 +6292,20 @@ static int fmss_probe(struct platform_device *pdev)
 	return 0;
 }
 
+/*
+ * The controller has its own DMA. Handing the machine over with a
+ * transfer in flight lets it complete into memory the next kernel owns,
+ * and on the write side it can leave a page half-programmed -- so this
+ * is the one shutdown here that protects the flash rather than just RAM.
+ */
+static void fmss_shutdown(struct platform_device *pdev)
+{
+	struct nand_s5l8740 *f = platform_get_drvdata(pdev);
+
+	if (f)
+		fmss_dma_teardown(f);
+}
+
 static void fmss_remove(struct platform_device *pdev)
 {
 	struct nand_s5l8740 *f = platform_get_drvdata(pdev);
@@ -6308,6 +6322,7 @@ static void fmss_remove(struct platform_device *pdev)
 static struct platform_driver nand_driver = {
 	.probe = fmss_probe,
 	.remove = fmss_remove,
+	.shutdown = fmss_shutdown,
 	.driver = {
 		.name = "s5l8740-nand",
 		.dev_groups = nand_groups,
@@ -6737,8 +6752,57 @@ EXPORT_SYMBOL_GPL(s5l8740_nand_meta_pick_lba);
  * FTL map CS physical read: always slot0/span4/rec4112.
  * Fills struct s5l8740_cs_page. No lba_map ingest.
  */
+/*
+ * Read only the first record of a page.
+ *
+ * A page is four 4096+16 records and the full read moves 16448 bytes.
+ * The FTL classify sweep looks at 64 bytes of slot-0 data and slot-0's
+ * 16-byte meta to decide "is this block empty", and seventy percent of
+ * the volume answers yes -- so most of that sweep was transferring 16 KB
+ * to read 80 bytes. Span 1 moves 4112 bytes instead.
+ *
+ * Only the empty test is safe on one record. Anything else classify asks
+ * -- CXT in particular -- inspects all four slots' meta, so the caller
+ * must fall back to the full read whenever the answer is not "empty".
+ * Slots 1..3 are left as 0xff here so a caller that ignores that rule
+ * sees erased meta rather than stale data from the previous page.
+ */
+int s5l8740_nand_cs_phys_read_slot0(u8 ce, u8 cau, u16 block, u8 page,
+				    struct s5l8740_cs_page *out)
+{
+	return s5l8740_nand_cs_phys_read_span(ce, cau, block, page, out, 1);
+}
+EXPORT_SYMBOL_GPL(s5l8740_nand_cs_phys_read_slot0);
+
 int s5l8740_nand_cs_phys_read(u8 ce, u8 cau, u16 block, u8 page,
 			      struct s5l8740_cs_page *out)
+{
+	return s5l8740_nand_cs_phys_read_span(ce, cau, block, page, out, 4);
+}
+
+int s5l8740_nand_cs_phys_read_span(u8 ce, u8 cau, u16 block, u8 page,
+				   struct s5l8740_cs_page *out, unsigned int span)
+{
+	return s5l8740_nand_cs_phys_read_slc(ce, cau, block, page, 0, out,
+					     span);
+}
+
+/*
+ * The same read, on a nominated SLC plane.
+ *
+ * Everything above reads slc=0 because that is where the user area lives.
+ * The FPart region at the tail of each CAU does not: it is SLC, and locating
+ * it means trying slc=1 before slc=0.
+ *
+ * That scan used to go through s5l8740_nand_page_read(), which refuses any
+ * request for meta unless meta_dma_read is set -- and it is deliberately not
+ * set, because a permanent live CS kick reboots the device. So every FPart
+ * read returned -EOPNOTSUPP before touching the NAND: 512 reads, 512
+ * failures, sixty milliseconds, and a "signature not found" verdict about a
+ * region nobody had actually looked at.
+ */
+int s5l8740_nand_cs_phys_read_slc(u8 ce, u8 cau, u16 block, u8 page, u8 slc,
+				  struct s5l8740_cs_page *out, unsigned int span)
 {
 	struct nand_s5l8740 *f = nand_dev;
 	u32 addr;
@@ -6760,7 +6824,7 @@ int s5l8740_nand_cs_phys_read(u8 ce, u8 cau, u16 block, u8 page,
 		return -EPERM;
 
 	memset(out, 0, sizeof(*out));
-	addr = fmss_ppn_addr(cau, block, page, 0);
+	addr = fmss_ppn_addr(cau, block, page, slc);
 
 	mutex_lock(&f->lock);
 	if (cs_reset_every && f->pages_since_reset >= cs_reset_every)
@@ -6770,7 +6834,7 @@ int s5l8740_nand_cs_phys_read(u8 ce, u8 cau, u16 block, u8 page,
 	dma_armed = true;
 	dma_skip_ingest = true;
 	t0 = ktime_get_ns();
-	ret = fmss_dma_page_read_records(f, ce, addr, 0, 4);
+	ret = fmss_dma_page_read_records(f, ce, addr, 0, span);
 	t1 = ktime_get_ns();
 	dma_skip_ingest = false;
 	if (!dma_one_shot)
@@ -6827,6 +6891,7 @@ int s5l8740_nand_cs_phys_read(u8 ce, u8 cau, u16 block, u8 page,
 	mutex_unlock(&f->lock);
 	return ret;
 }
+EXPORT_SYMBOL_GPL(s5l8740_nand_cs_phys_read_slc);
 EXPORT_SYMBOL_GPL(s5l8740_nand_cs_phys_read);
 
 /* Batch CS sessions for map build: keep armed across many phys reads. */
