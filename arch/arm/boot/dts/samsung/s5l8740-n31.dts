@@ -24,7 +24,7 @@
 
     chosen {
         /* U-Boot CONFIG_BOOTARGS overrides this. g_ether is built-in (0525:a4a2). */
-        bootargs = "console=tty0 fbcon=font:MINI4x6 earlyprintk nohlt panic=-1 clk_ignore_unused init=/init";
+        bootargs = "console=tty0 fbcon=font:MINI4x6 earlyprintk nohlt panic=0 clk_ignore_unused init=/init";
         stdout-path = "serial0";
         /*
          * U-Boot ft_board_setup adds apple,n31-isys-addr / apple,n31-isys-size
@@ -100,14 +100,25 @@
             #interrupt-cells = <1>;
         };
 
-        /* GPIO → EIC → VIC EXTn. EXT1 = Vol 40/41; EXT3 = PMIC GPIO86. */
+        /*
+         * GPIO -> EIC -> VIC. The two groups do not share a controller,
+         * which is why this needs interrupts-extended:
+         *
+         *   group 1 (GPIO 32-63, volume keys 40/41) -> VIC1 line 0
+         *   group 2 (GPIO 64-95, PMIC nIRQ 86)      -> VIC0 line 31
+         *
+         * Measured on the device by toggling each group's INTEN and
+         * watching which VIC RAWINTR bit followed. The previous entry
+         * put both on vic0 lines 1 and 3; neither line exists for the
+         * EIC, so no GPIO interrupt was ever delivered -- buttons and
+         * the touch nIRQ alike latched pending in the EIC forever.
+         */
         eic: interrupt-controller@39700000 {
             compatible = "apple,s5l8740-eic", "samsung,s5l8740-eic";
             reg = <0x39700000 0x1000>;
             interrupt-controller;
             #interrupt-cells = <2>;
-            interrupt-parent = <&vic0>;
-            interrupts = <1>, <3>;
+            interrupts-extended = <&vic1 0>, <&vic0 31>;
             apple,eic-groups = <1>, <2>;
             status = "okay";
         };
@@ -157,16 +168,53 @@
              * Companion GPIO/FM lives under apple,n31-bcm2078-companion. */
             bluetooth {
                 compatible = "brcm,bcm4329-bt", "brcm,bcm2078";
-                max-speed = <115200>;
                 /*
-                 * No control GPIOs here on purpose. 97/98/119 were
-                 * listed as shutdown/device-wakeup/host-wakeup, but
-                 * sub_15DD5C claims those three at function 2 when FM
-                 * powers on and releases them when it powers off --
-                 * they are the IIS2 PCM pads. Handing them to hci_bcm
-                 * made it drive the capture bus as GPIOs. The real BT
-                 * control pins are not identified yet.
+                 * sphwBluetooth_Init opens the port and immediately
+                 * sends 01 18 FC 06 00 00 00 9F 24 00 -- vendor command
+                 * 0xFC18, baud rate 0x00249F00 = 2400000. hci_bcm sends
+                 * the same command from this property, so leaving it at
+                 * 115200 would have run the link eight times slower than
+                 * stock once the controller started answering.
                  */
+                /*
+                 * A dependency, not a power role.
+                 *
+                 * The chip driver owns the sequence -- rails, REG_ON, the
+                 * wake pins -- but it can only run after gpio-d1830 loads,
+                 * at about t=7.4s. hci_bcm probes the serdev at t=4.8s and
+                 * sent 0xFC18 into a part that had no supply yet, timing
+                 * out before the chip driver ever got its turn.
+                 *
+                 * Naming the same rail here makes the bridge defer until
+                 * the provider exists, which is the only ordering hook a
+                 * serdev node has. Enabling an already-enabled regulator is
+                 * a refcount, so this does not take power management away
+                 * from the chip driver.
+                 */
+                vbat-supply = <&bt_rail>;
+                max-speed = <2400000>;
+                /*
+                 * 97/98/119 were once listed as shutdown/device-wakeup/
+                 * host-wakeup and must not go here: sub_15DD5C claims
+                 * those three at function 2 when FM powers on and
+                 * releases them when it powers off -- they are the IIS2
+                 * PCM pads, and handing them to hci_bcm made it drive
+                 * the capture bus as GPIOs.
+                 *
+                 * GPIO 70 is a different pin and is decomp-backed.
+                 * sphwBluetooth_Init (sub_570054, reached from
+                 * BluetoothOSBridgeInit) opens with
+                 *
+                 *     sub_43D38C(0x46u, 1, 1);
+                 *
+                 * pad 0x46 = 70, mode 1 = output, value 1 = high, before
+                 * any HCI traffic. That is the power-on control the
+                 * controller needs; without it hci0 binds and then
+                 * HCI_Reset (0x0c03) times out, which is exactly what we
+                 * were seeing. hci_bcm drives shutdown-gpios high on
+                 * power-on, which matches.
+                 */
+                shutdown-gpios = <&gpio 70 GPIO_ACTIVE_HIGH>;
                 firmware-name = "brcm/BCM2076B1.hcd";
                 status = "okay";
             };
@@ -270,7 +318,13 @@
             apple,skip-sec-pinmux;
             #gpio-cells = <2>;
             gpio-controller;
-            ngpios = <128>;
+            /*
+             * The block is mapped 0x400, which is 32 banks of 8, so 256
+             * pads exist. 128 was enough for BT host-wake at 119 but put
+             * pad 0xC8 = 200 out of reach, and sub_17D4DC drives that one
+             * as the Bluetooth power control on board variants 1 and 2.
+             */
+            ngpios = <256>;
             status = "okay";
         };
 
@@ -278,6 +332,13 @@
          * Does not own UART1 — that is bluetooth { } under uart1 → hci_bcm. */
         bcm2078_companion: bcm2078-companion {
             compatible = "apple,n31-bcm2078-companion";
+            /*
+             * The chip driver owns power. The UART-to-HCI bridge is a dumb
+             * transport and takes no supply: hci_bcm carries power handling
+             * upstream only because it doubles as the chip driver on most
+             * boards, which is not the case here.
+             */
+            bt-supply = <&bt_rail>;
             status = "okay";
         };
 
@@ -353,6 +414,22 @@
                 interrupt-parent = <&eic>;
                 interrupts = <86 IRQ_TYPE_LEVEL_LOW>;
                 monitored-battery = <&battery>;
+
+                /*
+                 * The Bluetooth rail, named so a consumer can reference it.
+                 *
+                 * bcm2078-bt is built into the kernel and probes long before
+                 * this driver, which is a module. Asking for power through a
+                 * direct hook in that window just fails. Asking for it as a
+                 * regulator makes the kernel defer the consumer's probe until
+                 * this node exists, which is the ordering guarantee that was
+                 * missing.
+                 */
+                regulators {
+                    bt_rail: bt {
+                        regulator-name = "bt";
+                    };
+                };
             };
         };
 
