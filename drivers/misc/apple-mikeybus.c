@@ -43,6 +43,7 @@
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
+#include <linux/input.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -100,6 +101,40 @@ static int poll_ms = 500;
 module_param(poll_ms, int, 0644);
 MODULE_PARM_DESC(poll_ms, "Model poll interval in milliseconds");
 
+/*
+ * Remote buttons.
+ *
+ * What the decomp proves: the event vocabulary, from the handler names --
+ * HandleMikeyCenter, HandleMikeyVolumeUp, HandleMikeyVolumeDown and
+ * HandleMikeyAllUp. That last one is the useful inference. An "all up"
+ * event only makes sense if the wire carries a bitmap of the buttons
+ * currently held rather than discrete press and release codes: with
+ * discrete codes each button would report its own release and a combined
+ * all-up event would be redundant. So this decodes a held-button bitmap and
+ * derives press/release by comparing against the previous value, with an
+ * all-zero byte meaning everything is released.
+ *
+ * What the decomp does NOT give is which bit is which button. The names
+ * prove the vocabulary, not the wire encoding, and nothing in the
+ * disassembly pins the bit order down. Guessing it in the source would bury
+ * an assumption somewhere it cannot be seen, so it lives here instead: one
+ * keycode per bit, changeable at runtime. Read remote_raw while pressing a
+ * known button, see which bit moves, and set the map accordingly -- that is
+ * one session with the hardware rather than an argument about byte order.
+ *
+ * The default below is a placeholder ordering, NOT an attested one.
+ */
+#define MIKEY_BUTTON_BITS	8
+
+static int button_map[MIKEY_BUTTON_BITS] = {
+	KEY_PLAYPAUSE, KEY_VOLUMEUP, KEY_VOLUMEDOWN, KEY_NEXTSONG,
+	KEY_PREVIOUSSONG, 0, 0, 0,
+};
+static int button_map_count = MIKEY_BUTTON_BITS;
+module_param_array(button_map, int, &button_map_count, 0644);
+MODULE_PARM_DESC(button_map,
+		 "keycode per remote bitmap bit 0..7, 0=unused; bit order is NOT attested, confirm with remote_raw");
+
 static int baud = 115200;
 module_param(baud, int, 0644);
 MODULE_PARM_DESC(baud, "MikeyBus UART baud rate");
@@ -149,6 +184,13 @@ struct apple_mikeybus {
 
 	struct apple_mikey_ring rx_raw;
 	struct apple_mikey_ring rx_task_stream;
+	struct apple_mikey_ring remote_raw;	/* channel 4 only */
+
+	struct input_dev *input;
+	u8 last_buttons;
+	u32 remote_bytes;
+	u32 button_events;
+	u32 all_up_events;
 
 	u32 rx_bytes;
 	u32 lower_packets;
@@ -333,6 +375,45 @@ static void mikey_rx_byte_locked(struct apple_mikeybus *m, u8 b)
 	m->rx_bytes++;
 }
 
+/*
+ * One byte of the channel 4 remote stream.
+ *
+ * Treated as a held-button bitmap: bits set now that were not set before are
+ * presses, bits that cleared are releases, and 0x00 releases everything --
+ * the AllUp case. Reporting is edge-driven, so a repeated identical byte
+ * costs nothing and a dropped byte self-corrects on the next one.
+ */
+static void mikey_remote_byte_locked(struct apple_mikeybus *m, u8 b)
+{
+	u8 changed;
+	unsigned int bit;
+
+	mikey_ring_put(&m->remote_raw, b);
+	m->remote_bytes++;
+
+	if (!m->input)
+		return;
+
+	changed = b ^ m->last_buttons;
+	if (!changed)
+		return;
+
+	for (bit = 0; bit < MIKEY_BUTTON_BITS; bit++) {
+		int code = button_map[bit];
+
+		if (!code || !(changed & BIT(bit)))
+			continue;
+		input_report_key(m->input, code, !!(b & BIT(bit)));
+		m->button_events++;
+	}
+	input_sync(m->input);
+
+	if (!b && m->last_buttons)
+		m->all_up_events++;
+
+	m->last_buttons = b;
+}
+
 static void mikey_report_state_locked(struct apple_mikeybus *m,
 				      const char *reason)
 {
@@ -422,8 +503,22 @@ static void mikey_handle_lower_packet_locked(struct apple_mikeybus *m,
 			return;
 
 		count = pkt[0] - 3;
-		for (i = 0; i < count; i++)
-			mikey_rx_byte_locked(m, pkt[3 + i]);
+
+		/*
+		 * pkt[2] is the channel and was being thrown away, so the
+		 * headset-model stream on channel 3 and the remote stream on
+		 * channel 4 were interleaved into one buffer. They are
+		 * different protocols; anything reading the mixed result is
+		 * parsing two things at once. Keep feeding both to the raw
+		 * ring for tracing, but route channel 4 to the remote decoder.
+		 */
+		for (i = 0; i < count; i++) {
+			u8 payload = pkt[3 + i];
+
+			mikey_rx_byte_locked(m, payload);
+			if (pkt[2] == MIKEY_CH_READ)
+				mikey_remote_byte_locked(m, payload);
+		}
 
 		m->lower_rx70_packets++;
 		break;
@@ -1021,6 +1116,47 @@ static ssize_t rx_status_shadow_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(rx_status_shadow);
 
+static ssize_t remote_raw_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct apple_mikeybus *m = dev_get_drvdata(dev);
+	size_t n;
+
+	mutex_lock(&m->lock);
+	n = mikey_ring_dump_hex(&m->remote_raw, buf, PAGE_SIZE);
+	mutex_unlock(&m->lock);
+	return n;
+}
+static DEVICE_ATTR_RO(remote_raw);
+
+/*
+ * Everything needed to pin down the bit order: the live bitmap, the map in
+ * force, and whether any of it is moving. Hold a button, read this.
+ */
+static ssize_t buttons_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	struct apple_mikeybus *m = dev_get_drvdata(dev);
+	unsigned int i;
+	size_t n = 0;
+
+	mutex_lock(&m->lock);
+	n += scnprintf(buf + n, PAGE_SIZE - n,
+		       "held=0x%02x remote_bytes=%u events=%u all_up=%u\n",
+		       m->last_buttons, m->remote_bytes, m->button_events,
+		       m->all_up_events);
+	for (i = 0; i < MIKEY_BUTTON_BITS; i++)
+		n += scnprintf(buf + n, PAGE_SIZE - n,
+			       "bit%u keycode=%d held=%d\n",
+			       i, button_map[i],
+			       !!(m->last_buttons & BIT(i)));
+	n += scnprintf(buf + n, PAGE_SIZE - n,
+		       "note: bit order is not attested by the decomp; confirm here\n");
+	mutex_unlock(&m->lock);
+	return n;
+}
+static DEVICE_ATTR_RO(buttons);
+
 static ssize_t rx_raw_show(struct device *dev, struct device_attribute *attr,
 			   char *buf)
 {
@@ -1133,6 +1269,8 @@ static struct attribute *mikey_attrs[] = {
 	&dev_attr_active_probe.attr,
 	&dev_attr_resistor_backend_ready.attr,
 	&dev_attr_decomp_channel_mask_shadow.attr,
+	&dev_attr_remote_raw.attr,
+	&dev_attr_buttons.attr,
 	&dev_attr_rx_status_shadow.attr,
 	&dev_attr_rx_raw.attr,
 	&dev_attr_rx_task_stream.attr,
@@ -1150,6 +1288,39 @@ static const struct attribute_group *mikey_groups[] = {
 	&mikey_attr_group,
 	NULL,
 };
+
+/*
+ * The remote is an input device, so publish it as one.
+ *
+ * Without this the driver decoded a button stream into nothing: no evdev
+ * node, so no key ever reached userspace no matter how well the packets
+ * parsed. devm-managed, so teardown follows the device.
+ */
+static int mikey_register_input(struct apple_mikeybus *m)
+{
+	struct input_dev *in;
+	unsigned int i;
+	int ret;
+
+	in = devm_input_allocate_device(m->dev);
+	if (!in)
+		return -ENOMEM;
+
+	in->name = "Apple MikeyBus Remote";
+	in->phys = "mikeybus/input0";
+	in->id.bustype = BUS_HOST;
+
+	for (i = 0; i < MIKEY_BUTTON_BITS; i++)
+		if (button_map[i])
+			input_set_capability(in, EV_KEY, button_map[i]);
+
+	ret = input_register_device(in);
+	if (ret)
+		return ret;
+
+	m->input = in;
+	return 0;
+}
 
 static int mikey_create_sysfs(struct apple_mikeybus *m)
 {
@@ -1209,6 +1380,14 @@ static int mikey_bind(struct device *dev, struct serdev_device *serdev)
 	}
 
 	mikey_pinmux_uart(m, true);
+
+	/*
+	 * Not fatal: the bus is still useful for headset detection and
+	 * tracing even if the input node cannot be created.
+	 */
+	ret = mikey_register_input(m);
+	if (ret)
+		dev_warn(m->dev, "no input device: %d\n", ret);
 
 	ret = mikey_create_sysfs(m);
 	if (ret) {

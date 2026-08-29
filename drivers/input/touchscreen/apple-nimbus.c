@@ -181,6 +181,25 @@ static int go_spi_setup;
 module_param(go_spi_setup, int, 0644);
 MODULE_PARM_DESC(go_spi_setup, "SPI2 SETUP override for 2D54C GO (0=11B70)");
 /* 0=8-bit PIO (RetailOS HBPP default), 1=u16 TXDATA pairs, 2=spi_sync */
+/*
+ * Read a report whenever ATTN is asserted, without requiring the ping
+ * to checksum first. Off restores the ping-gated behaviour.
+ */
+static bool attn_read = true;
+module_param(attn_read, bool, 0644);
+MODULE_PARM_DESC(attn_read,
+		 "Read a frame when ATTN asserts even if the ping fails");
+
+static bool post_poke_strict;
+module_param(post_poke_strict, bool, 0644);
+MODULE_PARM_DESC(post_poke_strict,
+		 "Require a known 2D5B0 status before EXEC");
+
+static bool park_power_down = true;
+module_param(park_power_down, bool, 0644);
+MODULE_PARM_DESC(park_power_down,
+		 "Cut the rail when parking (0 keeps it up for raw_xfer)");
+
 static int go_xfer;
 module_param(go_xfer, int, 0644);
 MODULE_PARM_DESC(go_xfer,
@@ -292,6 +311,9 @@ struct nimbus {
 	bool cal_uploaded;
 	bool requestcal_done;	/* 2D5B0 / 1F01 path done */
 	bool exec_sent;		/* 2D54C SPI xfer completed — not runtime */
+	u8 *raw_rx;		/* last raw_xfer response */
+	unsigned int raw_n;
+	unsigned int attn_fails;
 	bool runtime_ready;	/* valid 182590 ping checksum */
 	bool fw_loaded;		/* alias of runtime_ready for older call sites */
 	bool fw_tried;
@@ -307,6 +329,9 @@ struct nimbus {
 	int irq;
 	unsigned int ping_fails;
 	unsigned int recycle_count;
+	int spi_fam;		/* 0 auto, 1 ROS, 2 Classic */
+	unsigned int tx_timeouts;
+	unsigned int rx_timeouts;
 };
 
 /* From gpio-d1830.c — OSOS 20766 / 6644(4) / reg16 bit5 */
@@ -399,6 +424,98 @@ static void nimbus_power_down(struct nimbus *n)
 }
 
 /*
+ * CLKCON oracle replay.
+ *
+ * Deliberately not named after any peripheral. Nothing in the extracted
+ * Nimbus boot path -- sub_13A20, sub_1A5AC and the 2075A/20766/20690/
+ * 11B70/20848/20E94/20490 chain -- writes CLKCON or calls sub_41CBD8 at
+ * all, so there is no evidence naming any of these bits as a touch
+ * clock. What is established is narrower and still worth replaying:
+ * Linux is missing global CLKCON state that both the Apple bootloader
+ * and the running stock system have.
+ *
+ * The N31 bootloader sets, at 0x3C500000:
+ *
+ *   +0x08 = 0x2009200A   we inherit this unchanged
+ *   +0x0C = 0x80008000   we have 0x00000000
+ *   +0x10 = 0x00008000   we have 0x00000000
+ *   +0x14 = 0x80008000   we have 0x00002200
+ *   +0x18 = 0x20012001   we inherit this unchanged
+ *
+ * so something between DFU, u-boot and Linux clears two of them and
+ * rewrites a third, while leaving their neighbours alone.
+ *
+ * Polarity is inverted -- sub_41CBD8 clears a bit to enable and sets it
+ * to disable -- so our zeroes mean more clocks running than stock, not
+ * fewer. And the low nibble of +0x10 is a divider, not a flag: the rate
+ * decoder reads (MEMORY[0x3C500010] & 0xF) + 1. The stock live-touch
+ * 0x8000 -> 0x8004 delta is therefore a divider change, not an enable.
+ *
+ *   clkcon_oracle=1  replay stock's live-touch values
+ *   clkcon_oracle=2  replay the bootloader's post-init values
+ *
+ * Values are restored on unload so a failed experiment does not leave
+ * the clock tree in a state the rest of the kernel did not ask for.
+ */
+#define N31_CLKCON_PHYS		0x3c500000UL
+
+static int clkcon_oracle;
+module_param(clkcon_oracle, int, 0644);
+MODULE_PARM_DESC(clkcon_oracle,
+		 "Replay observed CLKCON state: 1=stock touch, 2=bootloader");
+
+static const unsigned int n31_clkcon_off[] = { 0x08, 0x0c, 0x10, 0x14 };
+static const u32 n31_clkcon_touch[] = {
+	0xa009200a, 0x80000001, 0x00008004, 0x80002200,
+};
+static const u32 n31_clkcon_boot[] = {
+	0x2009200a, 0x80008000, 0x00008000, 0x80008000,
+};
+static u32 n31_clkcon_saved[ARRAY_SIZE(n31_clkcon_off)];
+static bool n31_clkcon_applied;
+
+static void nimbus_clkcon_replay(struct nimbus *n)
+{
+	const u32 *want;
+	void __iomem *ck;
+	unsigned int i;
+
+	if (!clkcon_oracle || n31_clkcon_applied)
+		return;
+	want = (clkcon_oracle == 2) ? n31_clkcon_boot : n31_clkcon_touch;
+
+	ck = ioremap(N31_CLKCON_PHYS, 0x80);
+	if (!ck)
+		return;
+	for (i = 0; i < ARRAY_SIZE(n31_clkcon_off); i++) {
+		n31_clkcon_saved[i] = readl(ck + n31_clkcon_off[i]);
+		writel(want[i], ck + n31_clkcon_off[i]);
+		dev_info(&n->spi->dev,
+			 "ORACLE_REPLAY clkcon+0x%02x %08x -> %08x\n",
+			 n31_clkcon_off[i], n31_clkcon_saved[i],
+			 readl(ck + n31_clkcon_off[i]));
+	}
+	n31_clkcon_applied = true;
+	iounmap(ck);
+}
+
+static void nimbus_clkcon_restore(void)
+{
+	void __iomem *ck;
+	unsigned int i;
+
+	if (!n31_clkcon_applied)
+		return;
+	ck = ioremap(N31_CLKCON_PHYS, 0x80);
+	if (!ck)
+		return;
+	for (i = 0; i < ARRAY_SIZE(n31_clkcon_off); i++)
+		writel(n31_clkcon_saved[i], ck + n31_clkcon_off[i]);
+	n31_clkcon_applied = false;
+	iounmap(ck);
+}
+
+/*
  * sub_11B70(2, 0x1A, 0x2EE0, 1) after every 20690(1).
  * 1A5AC always re-inits SPI2 here. Skipping it after 1A878 remux
  * left an extra SCLK edge: 0x1f01/0x4879 came back as 0x0f80/0xa43c
@@ -465,11 +582,192 @@ static void nimbus_spi2_fifo_flush(struct nimbus *n)
 	writel(0xf, n->spi2 + SPI2_STATUS);
 }
 
+/*
+ * SPI2 status polling.
+ *
+ * Both transfer loops below used to do this:
+ *
+ *   guard = 100000;
+ *   do { st = readl(STATUS); } while (!(st & 0xf800) && --guard);
+ *   rx[i] = readl(RXDATA);
+ *
+ * The guard running out was not treated as a failure. RXDATA was read
+ * either way and the function returned 0, so when the ready bit never set,
+ * the FIFO's previous contents were handed back as if they were a reply.
+ * That does not look like noise because it is not noise: it is the same
+ * stale word every time, which is where the repeating 4f81 came from, and
+ * it is why the part appeared to answer while telling us nothing.
+ *
+ * Two changes. A timeout is now an error that propagates, so a dead bus
+ * reports as dead instead of inventing a reply. And because this engine has
+ * been seen reporting readiness in either of two encodings depending on the
+ * init path that ran, both are polled in one loop until one genuinely
+ * satisfies; that result is latched, logged once, and used exclusively
+ * afterwards. Latching matters: alternating between interpretations is how
+ * a transfer gets declared complete early.
+ */
+#define NIMBUS_SPI_GUARD	100000u
+
+#define NIMBUS_TXBUSY_ROS	0x7c0u
+#define NIMBUS_TXBUSY_RESIDUE	0x40u	/* stays set after 11B70 setup */
+#define NIMBUS_TXLVL_CLASSIC	0x1f0u
+#define NIMBUS_RXRDY_ROS	0xf800u
+#define NIMBUS_RXLVL_CLASSIC	0x3e00u
+
+static int nimbus_spi_family;
+module_param(nimbus_spi_family, int, 0644);
+MODULE_PARM_DESC(nimbus_spi_family,
+		 "SPI2 status encoding: 0=auto-latch, 1=ROS (0x7C0/0xF800), 2=Classic (0x1F0/0x3E00)");
+
+static bool nimbus_strict_rx;	/* opt-in until proven on glass */
+module_param(nimbus_strict_rx, bool, 0644);
+MODULE_PARM_DESC(nimbus_strict_rx,
+		 "1=receive timeout fails the transfer (default); 0=legacy, read the FIFO anyway");
+
+static void nimbus_latch_fam(struct nimbus *n, int fam, u32 st)
+{
+	if (n->spi_fam == fam)
+		return;
+	n->spi_fam = fam;
+	dev_info(&n->spi->dev,
+		 "SPI2 status encoding latched: %s (STATUS=0x%08x)\n",
+		 fam == 1 ? "ROS(0x7C0/0xF800)" : "Classic(0x1F0/0x3E00)", st);
+}
+
+/* Wait for the transmit side to accept another word. */
+static int nimbus_wait_tx(struct nimbus *n)
+{
+	unsigned int guard = NIMBUS_SPI_GUARD;
+	u32 st = 0;
+
+	while (guard--) {
+		st = readl(n->spi2 + SPI2_STATUS);
+
+		if (n->spi_fam != 2) {
+			u32 b = st & NIMBUS_TXBUSY_ROS;
+
+			if (b == 0 || b == NIMBUS_TXBUSY_RESIDUE) {
+				nimbus_latch_fam(n, 1, st);
+				return 0;
+			}
+		}
+		if (n->spi_fam != 1 && (st & NIMBUS_TXLVL_CLASSIC) == 0) {
+			nimbus_latch_fam(n, 2, st);
+			return 0;
+		}
+		cpu_relax();
+	}
+
+	if (!n->tx_timeouts++)
+		dev_warn(&n->spi->dev,
+			 "SPI2 transmit never went idle (STATUS=0x%08x)\n", st);
+	return -ETIMEDOUT;
+}
+
+/* Wait for a received word to actually be available. */
+static int nimbus_wait_rx(struct nimbus *n)
+{
+	unsigned int guard = NIMBUS_SPI_GUARD;
+	u32 st = 0;
+
+	while (guard--) {
+		st = readl(n->spi2 + SPI2_STATUS);
+
+		if (n->spi_fam != 2 && (st & NIMBUS_RXRDY_ROS)) {
+			nimbus_latch_fam(n, 1, st);
+			return 0;
+		}
+		if (n->spi_fam != 1 && (st & NIMBUS_RXLVL_CLASSIC)) {
+			nimbus_latch_fam(n, 2, st);
+			return 0;
+		}
+		cpu_relax();
+	}
+
+	if (!n->rx_timeouts++)
+		dev_warn(&n->spi->dev,
+			 "SPI2 receive never became ready (STATUS=0x%08x), refusing to report stale FIFO\n",
+			 st);
+	return -ETIMEDOUT;
+}
+
+/*
+ * Transfers go through the SPI core.
+ *
+ * This driver is bound as an spi_device yet drove the SPI2 registers itself:
+ * its own CS, its own FIFO reset, its own TXDATA/RXDATA polling. That meant
+ * none of the usual guarantees applied -- no bus locking against another
+ * client, no controller-side clock or mode setup, no error propagation --
+ * and it duplicated the controller driver's completion logic well enough to
+ * drift from it. Two copies of a tricky wait loop is one copy too many.
+ *
+ * The only thing the register path really offered was holding CS down across
+ * several calls, which the core expresses with cs_change on the final
+ * transfer of a message. The controller now honours that, so the whole thing
+ * is reachable through spi_sync().
+ *
+ * The legacy path is kept behind nimbus_use_spi=0 purely so the two can be
+ * compared on hardware; it is not the supported route.
+ */
+static bool nimbus_use_spi;	/* opt-in until proven on glass */
+module_param(nimbus_use_spi, bool, 0644);
+MODULE_PARM_DESC(nimbus_use_spi,
+		 "1=transfer via the SPI core (default); 0=legacy direct SPI2 register PIO");
+
+/*
+ * One HBPP burst as a single spi_message.
+ *
+ * @hold_cs: leave the part selected when the message ends, for a frame that
+ *           spans more than one call. Expressed as cs_change on the last
+ *           transfer, which is exactly what that flag means there.
+ *
+ * The controller skips reading RXDATA when rx is NULL, but the part clocks a
+ * reply out regardless; without draining it an 8 KiB chunk overruns the RX
+ * FIFO and quietly loses everything after the header. So a TX-only caller
+ * still gets a throwaway receive buffer.
+ */
+static int nimbus_spi_burst(struct nimbus *n, const u8 *tx, u8 *rx,
+			    unsigned int len, bool hold_cs)
+{
+	struct spi_transfer t = {
+		.tx_buf = tx,
+		.rx_buf = rx,
+		.len = len,
+		.cs_change = hold_cs,
+	};
+	struct spi_message m;
+	u8 *drain = NULL;
+	int ret;
+
+	if (!n->spi)
+		return -ENODEV;
+
+	if (!rx) {
+		drain = kzalloc(len, GFP_KERNEL);
+		if (!drain)
+			return -ENOMEM;
+		t.rx_buf = drain;
+	}
+
+	spi_message_init(&m);
+	spi_message_add_tail(&t, &m);
+	ret = spi_sync(n->spi, &m);
+	kfree(drain);
+
+	if (ret && !n->tx_timeouts++)
+		dev_warn(&n->spi->dev, "spi_sync failed: %d\n", ret);
+	return ret;
+}
+
 static int nimbus_burst_ex(struct nimbus *n, const u8 *tx, u8 *rx,
 			   unsigned int len, unsigned int cs_flags)
 {
-	unsigned int i, guard;
-	u32 st;
+	unsigned int i;
+	int ret = 0;
+
+	if (nimbus_use_spi)
+		return nimbus_spi_burst(n, tx, rx, len,
+					!(cs_flags & NIMBUS_CS_END));
 
 	if (!n->spi2)
 		return -ENODEV;
@@ -482,26 +780,31 @@ static int nimbus_burst_ex(struct nimbus *n, const u8 *tx, u8 *rx,
 	}
 	for (i = 0; i < len; i++) {
 		writel(1, n->spi2 + SPI2_RXLIMIT);
-		guard = 100000;
-		do {
-			st = readl(n->spi2 + SPI2_STATUS);
-		} while ((st & 0x7c0) != 0 && (st & 0x7c0) != 0x40 && --guard);
+
+		ret = nimbus_wait_tx(n);
+		if (ret)
+			goto out;
+
 		writel(tx[i], n->spi2 + SPI2_TXDATA);
 		writel(1, n->spi2 + SPI2_UNK4C);
-		guard = 100000;
-		do {
-			st = readl(n->spi2 + SPI2_STATUS);
-		} while (!(st & 0xf800) && --guard);
+
+		ret = nimbus_wait_rx(n);
+		if (ret && nimbus_strict_rx)
+			goto out;
+		ret = 0;
+
 		if (rx)
 			rx[i] = (u8)readl(n->spi2 + SPI2_RXDATA);
 		else
 			readl(n->spi2 + SPI2_RXDATA);
 	}
+
+out:
 	if (cs_flags & NIMBUS_CS_END) {
 		writel(readl(n->spi2 + SPI2_SETUP) & ~0x400001u, n->spi2 + SPI2_SETUP);
 		nimbus_spi2_cs(n, false);
 	}
-	return 0;
+	return ret;
 }
 
 static int nimbus_burst(struct nimbus *n, const u8 *tx, u8 *rx, unsigned int len)
@@ -519,13 +822,24 @@ static int nimbus_burst(struct nimbus *n, const u8 *tx, u8 *rx, unsigned int len
 static int nimbus_burst_u16_ex(struct nimbus *n, const u8 *tx, u8 *rx,
 			       unsigned int len, unsigned int cs_flags)
 {
-	unsigned int i, guard;
-	u32 st;
+	unsigned int i;
+	int ret = 0;
 
 	if (!n->spi2)
 		return -ENODEV;
 	if (len & 1)
 		return nimbus_burst_ex(n, tx, rx, len, cs_flags);
+
+	/*
+	 * The controller advertises SPI_BPW_MASK(8) and TXDATA is byte wide,
+	 * so a 16-bit write only ever put the low byte on the wire -- which is
+	 * why this path never got its 4BC1 ack and fell back. Through the core
+	 * the same buffer goes out as two bytes in the same order, which is
+	 * what the part was always receiving from the working path anyway.
+	 */
+	if (nimbus_use_spi)
+		return nimbus_spi_burst(n, tx, rx, len,
+					!(cs_flags & NIMBUS_CS_END));
 	if (cs_flags & NIMBUS_CS_BEGIN) {
 		nimbus_spi2_cs(n, true);
 		ndelay(2000);
@@ -538,27 +852,32 @@ static int nimbus_burst_u16_ex(struct nimbus *n, const u8 *tx, u8 *rx,
 		u16 r;
 
 		writel(1, n->spi2 + SPI2_RXLIMIT);
-		guard = 100000;
-		do {
-			st = readl(n->spi2 + SPI2_STATUS);
-		} while ((st & 0x7c0) != 0 && (st & 0x7c0) != 0x40 && --guard);
+
+		ret = nimbus_wait_tx(n);
+		if (ret)
+			goto out;
+
 		writel(w, n->spi2 + SPI2_TXDATA);
 		writel(1, n->spi2 + SPI2_UNK4C);
-		guard = 100000;
-		do {
-			st = readl(n->spi2 + SPI2_STATUS);
-		} while (!(st & 0xf800) && --guard);
+
+		ret = nimbus_wait_rx(n);
+		if (ret && nimbus_strict_rx)
+			goto out;
+		ret = 0;
+
 		r = (u16)readl(n->spi2 + SPI2_RXDATA);
 		if (rx) {
 			rx[i] = (u8)(r >> 8);
 			rx[i + 1] = (u8)r;
 		}
 	}
+
+out:
 	if (cs_flags & NIMBUS_CS_END) {
 		writel(readl(n->spi2 + SPI2_SETUP) & ~0x400001u, n->spi2 + SPI2_SETUP);
 		nimbus_spi2_cs(n, false);
 	}
-	return 0;
+	return ret;
 }
 
 static int nimbus_burst_u16(struct nimbus *n, const u8 *tx, u8 *rx,
@@ -613,7 +932,25 @@ static u32 nimbus_sum32(const u8 *p, unsigned int len);
 static bool nimbus_opcode_known(u16 w)
 {
 	return w == 0x18e1 || w == 0x1aa1 || w == 0x1f01 || w == 0x19c1 ||
-	       w == 0x4879 || w == 0x4bc1 || w == 0x4969 || w == 0x4ad1;
+	       w == 0x4879 || w == 0x4bc1 || w == 0x4969 || w == 0x4ad1 ||
+	       w == 0x4f81;
+}
+
+/*
+ * Words the bootloader answers with.
+ *
+ * This distinction is the useful part, and it is worth stating plainly
+ * because the log did not: seeing 0x4f81 come back is not a failed read
+ * and not a bus fault. The part is alive, it is answering, and it is
+ * answering as the bootloader -- which means the application it was
+ * asked to start is not running. A checksum failure on the runtime ping
+ * says only that the reply was not a runtime reply; this says what it
+ * was instead.
+ */
+static bool nimbus_status_is_bootloader(u16 w)
+{
+	return w == 0x4f81 || w == 0x4879 || w == 0x4bc1 ||
+	       w == 0x4ad1 || w == 0x4969;
 }
 
 /* sub_26494 — 16↔16 1A A1 + 18 E1 pad; two rev16 words must be known */
@@ -1356,6 +1693,44 @@ static int nimbus_acquire_fw(struct device *dev, const u8 **data,
 		return -ENOENT;
 	*data = (*fw_out)->data;
 	*size = (*fw_out)->size;
+
+	/*
+	 * The image declares its own length, and ours does not match the file.
+	 *
+	 * Layout starts with an ASCII revision string -- "87402.0" followed by
+	 * a revision byte -- and carries a little-endian u32 at +12. On the
+	 * Rockbox port's blob that u32 is 0xE960 = 59744, exactly the file
+	 * size, which is what identifies the field. The blob extracted here is
+	 * 61680 bytes while its own header says 59760, so 1920 bytes of
+	 * whatever follows the image were being uploaded as if they were part
+	 * of it.
+	 *
+	 * That is worth being strict about: the part checksums what it
+	 * receives, so trailing bytes do not produce a diagnostic, they produce
+	 * an image that fails to start while every transfer reports success --
+	 * which is exactly the state this driver has been stuck in, with the
+	 * bootloader still answering pings after EXEC.
+	 *
+	 * Trust the header when it is sane and smaller than the file. A header
+	 * larger than the file means the file is truncated and the declared
+	 * length is unusable, so keep the file size and say so.
+	 */
+	if (*size >= NIMBUS_FW_HDR_LEN) {
+		u32 declared = get_unaligned_le32(*data + 12);
+
+		if (declared && declared < *size) {
+			dev_info(dev,
+				 "fw '%c%c%c%c%c%c%c' rev %02x: file %zu, header says %u; uploading %u\n",
+				 (*data)[0], (*data)[1], (*data)[2], (*data)[3],
+				 (*data)[4], (*data)[5], (*data)[6], (*data)[7],
+				 *size, declared, declared);
+			*size = declared;
+		} else if (declared > *size) {
+			dev_warn(dev,
+				 "fw header declares %u but file is only %zu; using the file\n",
+				 declared, *size);
+		}
+	}
 	return 0;
 }
 
@@ -1690,21 +2065,77 @@ static int nimbus_post_download(struct nimbus *n)
 				 i, pokes[i].a1, rb, pokes[i].a2);
 	}
 
+	/*
+	 * Stock gates everything after this point on the reply:
+	 *
+	 *   if (!sub_40F770(&v8, 2, &v10, 2)) { sub_410522(65);
+	 *       if (!sub_3D5706(&v9, ...)) return 1; }
+	 *   return 0;
+	 *
+	 * We were throwing both answers away. nimbus_xfer returning 0
+	 * only says the SPI transfer completed, and nimbus_status_poll
+	 * below returns 0 for any status at all, so post_download always
+	 * reported success and we went on to EXEC no matter what the part
+	 * said. This is the last handshake before the application is
+	 * supposed to start, and its reply has never been looked at.
+	 */
 	put_unaligned_le16(NIMBUS_POST_POKE, tx);
 	ret = nimbus_xfer(n, tx, rx, 2);
 	if (ret)
 		return ret;
+	st = (u16)((rx[0] << 8) | rx[1]);
+	dev_info(&n->spi->dev,
+		 "011F reply %02x %02x (0x%04x)%s\n",
+		 rx[0], rx[1], st,
+		 nimbus_opcode_known(st) ? " known" : " UNKNOWN");
+	st = 0;
 	msleep(65);
 	/* 2D5B0: 3D5706 success only — does not require 0x4BC1 */
-	if (nimbus_status_poll(n, &st) == 0) {
-		nimbus_vinfo(n, "post-poke status 0x%04x\n", st);
-		n->requestcal_done = true;
-		return 0;
+	if (nimbus_status_poll(n, &st) != 0)
+		return -EIO;
+
+	dev_info(&n->spi->dev, "post-poke 1AA1 status 0x%04x%s\n",
+		 st, nimbus_opcode_known(st) ? " known" : " UNKNOWN");
+
+	/*
+	 * Refuse to EXEC on an unrecognised status when post_poke_strict
+	 * is set. Off by default so a run still reaches EXEC and we can
+	 * see both halves before deciding which status stock treats as a
+	 * pass.
+	 */
+	if (post_poke_strict && !nimbus_opcode_known(st)) {
+		dev_warn(&n->spi->dev,
+			 "post-poke status 0x%04x rejected; not running EXEC\n",
+			 st);
+		return -EIO;
 	}
-	return -EIO;
+	n->requestcal_done = true;
+	return 0;
 }
 
 /* sub_2D54C — 12↔12: 1D 53 + two LE u32 + sum16 */
+/*
+ * Neither implementation reconfigures SPI2 for EXEC -- go_spi_setup
+ * defaults to 0 here, and stock's sub_2D54C goes through sub_40F770
+ * like every other command, same channel-2 bracket and all. But the
+ * part stops driving MISO from EXEC onwards, so the question is
+ * whether the controller's own state moves underneath us. Measure it
+ * either side of the transfer rather than reasoning about it.
+ */
+static void nimbus_spi2_dump(struct nimbus *n, const char *when)
+{
+	if (!n->spi2)
+		return;
+	dev_info(&n->spi->dev,
+		 "SPI2 %-6s ctrl=%08x setup=%08x status=%08x pin=%08x clkdiv=%08x\n",
+		 when,
+		 readl(n->spi2 + SPI2_CTRL),
+		 readl(n->spi2 + SPI2_SETUP),
+		 readl(n->spi2 + SPI2_STATUS),
+		 readl(n->spi2 + SPI2_PIN),
+		 readl(n->spi2 + SPI2_CLKDIV));
+}
+
 static int nimbus_cmd_2d54c_raw(struct nimbus *n, u32 word0, u32 word1)
 {
 	u8 tx[12] = { 0x1d, 0x53 };
@@ -1727,14 +2158,18 @@ static int nimbus_cmd_2d54c_raw(struct nimbus *n, u32 word0, u32 word1)
 				 go_spi_setup, saved_setup);
 		}
 	}
+	nimbus_spi2_dump(n, "pre");
 	if (go_xfer == 2)
 		ret = nimbus_xfer(n, tx, rx, 12);
 	else if (go_xfer == 1)
 		ret = nimbus_burst_u16(n, tx, rx, 12);
 	else
 		ret = nimbus_burst(n, tx, rx, 12);
+	nimbus_spi2_dump(n, "post");
 	if (saved_setup)
 		writel(saved_setup, n->spi2 + SPI2_SETUP);
+	msleep(NIMBUS_EXEC_SETTLE_MS);
+	nimbus_spi2_dump(n, "settle");
 	nimbus_vinfo(n,
 		 "2D54C %08x %08x ret=%d xfer=%d rx %02x %02x %02x %02x %02x %02x\n",
 		 word0, word1, ret, go_xfer, rx[0], rx[1], rx[2], rx[3],
@@ -2377,6 +2812,14 @@ static int nimbus_ping(struct nimbus *n, u16 *status_out)
 				 rx[5], rx[6], rx[7], rx[8], rx[9],
 				 rx[10], rx[11], rx[12], rx[13],
 				 rx[14], rx[15]);
+		{
+			u16 w0 = get_unaligned_be16(rx);
+
+			if (nimbus_status_is_bootloader(w0))
+				dev_warn(&n->spi->dev,
+					 "bootloader status 0x%04x: the part is answering, its application is not running\n",
+					 w0);
+		}
 		if (tries == 5)
 			return -EIO;
 		msleep(1);
@@ -2551,6 +2994,8 @@ static void nimbus_gpio_bringup(struct nimbus *n)
 {
 	int rail;
 
+	nimbus_clkcon_replay(n);
+
 	/* GPIOCMD only — gpiod set_value fights polarity on RST. */
 	nimbus_gpiocmd_mode(n, NIMBUS_GPIO_RST, 1, 0);
 	msleep(5);
@@ -2656,7 +3101,17 @@ static void nimbus_park(struct nimbus *n, const char *why)
 	nimbus_verbose = false;
 	dev_warn(&n->spi->dev,
 		 "nimbus parked (%s) — rmmod/insmod to retry\n", why);
-	nimbus_power_down(n);
+	/*
+	 * Parking cuts the rail, which makes every post-mortem probe read
+	 * an undriven bus and look exactly like the failure being
+	 * investigated. touch_power_down only covers suspend, so there was
+	 * no way to examine a part that had reached EXEC and stayed up.
+	 */
+	if (park_power_down)
+		nimbus_power_down(n);
+	else
+		dev_warn(&n->spi->dev,
+			 "park_power_down=0: rail left on for probing\n");
 }
 
 /* ------------------------------------------------------------------ */
@@ -2822,6 +3277,31 @@ static void nimbus_service(struct nimbus *n)
 			nimbus_read_reports(n, st);
 		return;
 	}
+	/*
+	 * The ping is a bootloader-era transaction. Once the application
+	 * is running it answers with a repeating word instead, so a failed
+	 * ping stopped us from ever reading a report -- even though ATTN,
+	 * which the application drives low when a frame is waiting, was
+	 * asserted the whole time.
+	 *
+	 * Measured on a fresh boot: the pad idles high at 0x40 in bank 4
+	 * DIN, goes low during bring-up and stays low. That is the part
+	 * asking to be serviced. Honour it: if ATTN says there is data,
+	 * read regardless of what the ping thought.
+	 */
+	if (attn_read && n->attn && !gpiod_get_value_cansleep(n->attn)) {
+		int ret = nimbus_read_reports(n, 0);
+
+		if (!ret) {
+			n->spi_ok = true;
+			n->ping_fails = 0;
+			return;
+		}
+		if (n->attn_fails++ < 3)
+			dev_info(&n->spi->dev,
+				 "attn asserted but read failed (%d)\n",
+				 ret);
+	}
 	n->ping_fails++;
 	if (nimbus_verbose && (n->ping_fails <= 3 || n->ping_fails == 10))
 		nimbus_vinfo(n,
@@ -2960,6 +3440,209 @@ static void nimbus_isys_sysfs_remove(struct nimbus *n)
 	n->isys_sysfs = false;
 }
 
+/*
+ * Bring-up state. This driver carries two dozen module parameters and had
+ * no way to read back what any of them achieved, so a failed download and
+ * a controller that never booted looked identical from userspace.
+ *
+ * The flags are the download milestones in order, so the first one that
+ * reads 0 is where the sequence stopped.
+ */
+static ssize_t state_show(struct device *dev, struct device_attribute *a,
+			  char *buf)
+{
+	struct nimbus *n = spi_get_drvdata(to_spi_device(dev));
+
+	if (!n)
+		return -ENODEV;
+	return sysfs_emit(buf,
+			  "spi_ok=%d fw_tried=%d fw_uploaded=%d cal_uploaded=%d\n"
+			  "requestcal_done=%d exec_sent=%d runtime_ready=%d\n"
+			  "irq=%d suspended=%d\n",
+			  n->spi_ok, n->fw_tried, n->fw_uploaded,
+			  n->cal_uploaded, n->requestcal_done, n->exec_sent,
+			  n->runtime_ready, n->irq, nimbus_pm_suspended);
+}
+/*
+ * Raw transfer window.
+ *
+ * The application firmware answers the bootloader's ping with a
+ * repeating 16-bit word rather than a checksummed frame. A repeating
+ * word is not an idle bus -- the part is clocking something out -- so
+ * the remaining unknown is framing, not liveness. Guessing at that one
+ * hypothesis per rebuild is far too slow, so expose the transfer itself:
+ *
+ *   echo 'ea 01 01 00 ...' > raw_xfer   send these bytes
+ *   cat raw_xfer                        what came back
+ *   echo N > raw_len                    pad/clock out to N bytes
+ *   raw_mode=0  8-bit PIO   (bootloader width)
+ *   raw_mode=1  16-bit PIO  (application width)
+ *   raw_mode=2  SPI core
+ *
+ * Read-only against a part that is already running: it clocks bytes and
+ * reports what returns. It cannot wedge the SoC the way arming an
+ * unclaimed level interrupt can, which is the whole point of preferring
+ * it to another EIC experiment.
+ */
+static int raw_mode = 1;
+module_param(raw_mode, int, 0644);
+MODULE_PARM_DESC(raw_mode,
+		 "raw_xfer transport: 0=8-bit PIO 1=16-bit PIO 2=SPI core");
+
+static unsigned int raw_len;
+module_param(raw_len, uint, 0644);
+MODULE_PARM_DESC(raw_len,
+		 "Clock raw_xfer out to this many bytes (0 = as written)");
+
+static int nimbus_raw_do(struct nimbus *n, const u8 *tx, u8 *rx,
+			 unsigned int len)
+{
+	switch (raw_mode) {
+	case 0:
+		return nimbus_burst(n, tx, rx, len);
+	case 2:
+		return nimbus_xfer(n, tx, rx, len);
+	default:
+		return nimbus_burst_u16(n, tx, rx, len);
+	}
+}
+
+static ssize_t raw_xfer_show(struct device *dev,
+			     struct device_attribute *attr, char *buf)
+{
+	struct nimbus *n = dev_get_drvdata(dev);
+	unsigned int i;
+	int len = 0;
+
+	if (!n || !n->raw_rx || !n->raw_n)
+		return sysfs_emit(buf, "(no transfer yet)\n");
+
+	mutex_lock(&n->lock);
+	for (i = 0; i < n->raw_n && len < PAGE_SIZE - 4; i++)
+		len += scnprintf(buf + len, PAGE_SIZE - len, "%02x%c",
+				 n->raw_rx[i],
+				 ((i & 15) == 15 || i + 1 == n->raw_n) ?
+				 '\n' : ' ');
+	mutex_unlock(&n->lock);
+	return len;
+}
+
+static ssize_t raw_xfer_store(struct device *dev,
+			      struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct nimbus *n = dev_get_drvdata(dev);
+	unsigned int nb = 0, want;
+	const char *p = buf;
+	u8 *tx, *rx;
+	int ret;
+
+	if (!n)
+		return -ENODEV;
+
+	tx = kzalloc(NIMBUS_READ_MAX, GFP_KERNEL);
+	rx = kzalloc(NIMBUS_READ_MAX, GFP_KERNEL);
+	if (!tx || !rx) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	while (*p && nb < NIMBUS_READ_MAX) {
+		unsigned int v;
+
+		while (*p == ' ' || *p == ',' || *p == '\n' ||
+		       *p == '\t')
+			p++;
+		if (!*p)
+			break;
+		if (sscanf(p, "%2x", &v) != 1)
+			break;
+		tx[nb++] = (u8)v;
+		while (*p && *p != ' ' && *p != ',' && *p != '\n')
+			p++;
+	}
+
+	/* Clocking past the written bytes is how you see a reply that
+	 * arrives after the command, so honour raw_len when it is longer. */
+	want = raw_len ? raw_len : nb;
+	if (!want || want > NIMBUS_READ_MAX) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if ((raw_mode == 1) && (want & 1))
+		want++;
+
+	mutex_lock(&n->lock);
+	ret = nimbus_raw_do(n, tx, rx, want);
+	if (!ret) {
+		if (!n->raw_rx)
+			n->raw_rx = devm_kzalloc(&n->spi->dev,
+						 NIMBUS_READ_MAX, GFP_KERNEL);
+		if (n->raw_rx) {
+			memcpy(n->raw_rx, rx, want);
+			n->raw_n = want;
+		}
+	}
+	mutex_unlock(&n->lock);
+
+	dev_info(&n->spi->dev,
+		 "raw_xfer mode=%d len=%u ret=%d rx %02x %02x %02x %02x %02x %02x %02x %02x\n",
+		 raw_mode, want, ret, rx[0], rx[1], rx[2], rx[3],
+		 rx[4], rx[5], rx[6], rx[7]);
+out:
+	kfree(tx);
+	kfree(rx);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(raw_xfer);
+
+/*
+ * attn sysfs: the line the application drives when it has a report.
+ * Readable straight from DIN, which is why touch does not have to wait
+ * for the EIC to be understood.
+ */
+static ssize_t attn_show(struct device *dev,
+			 struct device_attribute *attr, char *buf)
+{
+	struct nimbus *n = dev_get_drvdata(dev);
+
+	if (!n || !n->attn)
+		return sysfs_emit(buf, "-1\n");
+	return sysfs_emit(buf, "%d\n",
+			  gpiod_get_value_cansleep(n->attn));
+}
+static DEVICE_ATTR_RO(attn);
+
+static DEVICE_ATTR_RO(state);
+
+/* Force a re-run of the bring-up without unbinding the driver. */
+static ssize_t redownload_store(struct device *dev,
+				struct device_attribute *a,
+				const char *buf, size_t count)
+{
+	struct nimbus *n = spi_get_drvdata(to_spi_device(dev));
+	int ret;
+
+	if (!n)
+		return -ENODEV;
+	if (buf[0] != '1')
+		return -EINVAL;
+	ret = n31_touch_suspend();
+	if (!ret)
+		ret = n31_touch_resume();
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(redownload);
+
+static struct attribute *nimbus_attrs[] = {
+	&dev_attr_raw_xfer.attr,
+	&dev_attr_attn.attr,
+	&dev_attr_state.attr,
+	&dev_attr_redownload.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(nimbus);
+
 static int nimbus_probe(struct spi_device *spi)
 {
 	struct nimbus *n;
@@ -2980,6 +3663,8 @@ static int nimbus_probe(struct spi_device *spi)
 	mutex_init(&n->lock);
 	spi_set_drvdata(spi, n);
 	nimbus_pm_dev = n;
+	if (sysfs_create_groups(&spi->dev.kobj, nimbus_groups))
+		dev_warn(&spi->dev, "sysfs groups failed\n");
 
 	n->gpio_base = devm_ioremap(&spi->dev, S5L8740_GPIO_PHYS, 0x400);
 	n->gpiocmd = devm_ioremap(&spi->dev, S5L8740_GPIOCMD_PHYS, 4);
@@ -3023,6 +3708,22 @@ static int nimbus_probe(struct spi_device *spi)
 		 * only after a failed 1A5AC, max 3. remove() already
 		 * 1A878s on reload.
 		 */
+		/*
+		 * sub_20E94 reads PMIC 0x51 here, between the 26494 probe and
+		 * the download loop, and discards the value. Do the same: the
+		 * read itself may be the point.
+		 */
+		{
+			int (*pmic_read)(void);
+
+			pmic_read = (int (*)(void))
+				__symbol_get("d1830_touch_bringup_read");
+			if (pmic_read) {
+				pmic_read();
+				__symbol_put("d1830_touch_bringup_read");
+			}
+		}
+
 		for (attempt = 0; attempt < 3; attempt++) {
 			if (attempt) {
 				nimbus_power_down(n);
@@ -3155,6 +3856,26 @@ static int nimbus_probe(struct spi_device *spi)
 	return 0;
 }
 
+/*
+ * OSOS sub_1A878 is the disable path -- 20490(0), RST asserted, 20690(0)
+ * to release the SPI2 pads, rail off, EN mode 1 -- and nimbus_power_down
+ * already implements it. It was only ever reached through remove(),
+ * which a shutdown or kexec does not call, so the part was left powered
+ * and holding the bus across the handover.
+ */
+static void nimbus_shutdown(struct spi_device *spi)
+{
+	struct nimbus *n = spi_get_drvdata(spi);
+
+	if (!n)
+		return;
+	n->stopped = true;
+	if (n->thread)
+		kthread_stop(n->thread);
+	n->thread = NULL;
+	nimbus_power_down(n);
+}
+
 static void nimbus_remove(struct spi_device *spi)
 {
 	nimbus_pm_dev = NULL;
@@ -3164,6 +3885,16 @@ static void nimbus_remove(struct spi_device *spi)
 	if (n->thread)
 		kthread_stop(n->thread);
 	nimbus_isys_sysfs_remove(n);
+	/*
+	 * probe creates these but nothing removed them, so the group
+	 * outlived the module. The next insmod then hit a duplicate
+	 * filename, and internal_create_group rolls the whole group back
+	 * on failure -- so a second load silently lost every attribute,
+	 * including state and redownload. It looked like the attributes
+	 * were never registered rather than registered twice.
+	 */
+	sysfs_remove_groups(&spi->dev.kobj, nimbus_groups);
+	nimbus_clkcon_restore();
 	nimbus_power_down(n);
 }
 
@@ -3180,6 +3911,7 @@ static struct spi_driver nimbus_driver = {
 	},
 	.probe = nimbus_probe,
 	.remove = nimbus_remove,
+	.shutdown = nimbus_shutdown,
 };
 module_spi_driver(nimbus_driver);
 
