@@ -20,6 +20,8 @@
  * A2DP does not appear here at all: it is host-encoded over UART1 HCI.
  */
 #include <linux/atomic.h>
+#include <linux/math64.h>
+#include <linux/swab.h>
 #include <linux/bitops.h>
 #include <linux/clk.h>
 #include <linux/delay.h>
@@ -46,7 +48,8 @@
 
 #include "n31-audio-rates.h"
 
-#define S5L8740_I2S_RATES	(SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000)
+/* Advertise every rate the divider table can actually clock. */
+#define S5L8740_I2S_RATES	N31_RATE_MASK
 #define S5L8740_I2S_FORMATS	(SNDRV_PCM_FMTBIT_S16_LE)
 #define I2SCLKCON	0x00
 #define I2STXCON	0x04
@@ -80,6 +83,25 @@ MODULE_PARM_DESC(txcon, "I2STXCON (default 0x03100099; NOT Rockbox 0x0B100019)")
  * D34C0 → 4F716(port, div). Table in n31-audio-rates.h.
  * 0 = 12 MHz / rate (272 @ 44.1 kHz RetailOS music).
  */
+/*
+ * DMA progress tracing.
+ *
+ * This ran unconditionally for 50 ticks at 100 ms on every stream start,
+ * so each playback put fifty KERN_INFO lines on the console -- including a
+ * long tail of STUCK reports after the transfer had already finished and
+ * en had gone to 0, which reads like a fault but is just the timer
+ * outliving the work. On a framebuffer console that much printk during
+ * boot is slow enough to matter on its own.
+ *
+ * It stays available because it is genuinely useful for watching the
+ * descriptor walk, but it is now something you ask for: set the number of
+ * 100 ms samples to take, 0 (default) for silence.
+ */
+static uint dma_watch_ticks;
+module_param(dma_watch_ticks, uint, 0644);
+MODULE_PARM_DESC(dma_watch_ticks,
+		 "log DMA progress for N samples of 100ms after each start; 0=off (default)");
+
 static uint clkdiv;
 module_param(clkdiv, uint, 0644);
 MODULE_PARM_DESC(clkdiv, "I2SCLKDIV override; 0 = OSOS table / 12000000/rate");
@@ -105,7 +127,45 @@ module_param(tone_rate, uint, 0644);
 MODULE_PARM_DESC(tone_rate, "dma_tone/pio_tone rate; 0 = OSOS 44100");
 
 /* Keep TX/codec up this long after START even if ALSA xruns. */
-static uint sustain_ms = 5000;
+/*
+ * Off, and the stop path it used to suppress is fixed.
+ *
+ * Ignoring ALSA's STOP for five seconds is a bring-up crutch and it makes
+ * the PCM layer and the hardware disagree about whether a stream is
+ * running. It should be 0. But setting it to 0 was the one behavioural
+ * change between a clean boot and a boot that hangs, and the reason is
+ * that the STOP path has never actually executed: with the crutch in
+ * place it was skipped every time.
+ *
+ * What it hits is s5l8740_i2s_cancel_asp() -> cs42l81_cancel_post_iis(),
+ * which is a cancel_delayed_work_sync() on a work item that takes
+ * c->lock. That blocks until the work completes, so if the work is
+ * waiting on that lock the stop never returns.
+ *
+ * That cancel is now the non-blocking form, so the stop path no longer
+ * waits on a work item that wants the codec lock. Dead code that has never
+ * run is not the same as code that works, which is the whole reason this
+ * surfaced the moment the crutch came off.
+ */
+/*
+ * Backtrace the first few hw_params calls, on by default until the thing
+ * that drives the boot-time open/start loop is identified.
+ */
+static bool hw_params_trace = true;
+module_param(hw_params_trace, bool, 0644);
+MODULE_PARM_DESC(hw_params_trace, "1=dump_stack() on the first few hw_params calls");
+static unsigned int hw_params_seen;
+
+/*
+ * Halt after this many hw_params calls, naming the caller. 0 disables.
+ * A normal boot opens the PCM a handful of times at most.
+ */
+static unsigned int hw_params_loop_panic;	/* off: the loop was tone-loop from net-up */
+module_param(hw_params_loop_panic, uint, 0644);
+MODULE_PARM_DESC(hw_params_loop_panic,
+		 "panic after N PCM opens to freeze the caller name on screen (0=off)");
+
+static uint sustain_ms;
 module_param(sustain_ms, uint, 0644);
 MODULE_PARM_DESC(sustain_ms, "ignore ALSA STOP for this many ms after START (default 5000)");
 
@@ -209,6 +269,76 @@ static u32 s5l8740_scale_lr(u32 sample)
 	return ((u32)(u16)r << 16) | (u16)l;
 }
 
+/* ------------------------------------------------------------------ */
+/* PCM inspection and sample-format probes                              */
+/*                                                                      */
+/* The jack carries a 1 kHz fundamental with 2k/3k/4k/5k harmonics at    */
+/* comparable amplitude, and a peak around 255 against a source that     */
+/* peaks near 23000. A gain error would keep the sine clean and only     */
+/* lower it; a mangled periodic waveform means the sample word is being  */
+/* interpreted wrongly somewhere between the ring buffer and the codec.  */
+/*                                                                      */
+/* pcm_dump prints what the driver is actually about to hand the DMA, so */
+/* the question "is the buffer already byte-scale?" is answered from the */
+/* kernel rather than inferred from the analog end.                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Off. pio_tone, dma_tone and walk_bit exist to poke tones and sweep TXCON
+ * bits by hand during bring-up. They drive the codec and the DMA engine
+ * directly, and walk_one re-enters codec prepare, so a stray write to any
+ * of them from a script or a stale test harness moves real hardware. They
+ * are not needed for normal operation; set debug_tone=1 when deliberately
+ * using them.
+ */
+static bool debug_tone;
+module_param(debug_tone, bool, 0644);
+MODULE_PARM_DESC(debug_tone,
+		 "1=enable the pio_tone/dma_tone/walk_bit debug pokes (default off)");
+
+static unsigned int walk_ms = 1000;
+module_param(walk_ms, uint, 0644);
+MODULE_PARM_DESC(walk_ms, "Milliseconds per walking-bit step");
+
+static unsigned int walk_gap_ms = 400;
+module_param(walk_gap_ms, uint, 0644);
+MODULE_PARM_DESC(walk_gap_ms, "Silence between walking-bit steps");
+
+static bool pcm_dump;
+module_param(pcm_dump, bool, 0644);
+MODULE_PARM_DESC(pcm_dump,
+		 "Log the first frames and their range at each stream start");
+
+/*
+ * Sample rewrites applied on the way to the FIFO. All default to off, so
+ * the transport is unchanged unless something is being tested.
+ */
+static int sample_shift;
+module_param(sample_shift, int, 0644);
+MODULE_PARM_DESC(sample_shift,
+		 "Arithmetic shift applied per sample, -16..16 (0 = none)");
+
+static bool sample_byteswap;
+module_param(sample_byteswap, bool, 0644);
+MODULE_PARM_DESC(sample_byteswap, "Swap the two bytes of each sample");
+
+static bool sample_swap_lr;
+module_param(sample_swap_lr, bool, 0644);
+MODULE_PARM_DESC(sample_swap_lr, "Swap left and right within each frame");
+
+static s16 s5l8740_sample_fix(s16 v)
+{
+	int x = v;
+
+	if (sample_shift > 0)
+		x <<= min(sample_shift, 16);
+	else if (sample_shift < 0)
+		x >>= min(-sample_shift, 16);
+	if (sample_byteswap)
+		x = (s16)__swab16((u16)x);
+	return (s16)x;
+}
+
 static int use_pio;
 module_param(use_pio, int, 0644);
 MODULE_PARM_DESC(use_pio, "1 = CPU FIFO PCM; 0 = PL080 M2P peri 10 from DT (default)");
@@ -279,10 +409,42 @@ struct s5l8740_i2s {
 	unsigned int pio_hw_ptr;
 	unsigned int rate;
 	struct delayed_work dma_watch;
+	bool programmed;
 	unsigned long play_jiffies;
 	u32 last_dma_src;
 	u8 watch_ticks;
 };
+
+/*
+ * Report the buffer as the hardware will see it: signed values, the range
+ * over a period, and the raw halfwords. A source that peaks in the low
+ * hundreds here is an application or format-negotiation fault and nothing
+ * downstream needs changing.
+ */
+static void s5l8740_pcm_dump(struct s5l8740_i2s *i2s, const s16 *buf,
+			     unsigned int frames, const char *tag)
+{
+	int lo = 32767, hi = -32768;
+	unsigned int i, n = min(frames, 512u);
+	long long acc = 0;
+
+	if (!pcm_dump || !buf || !n || !i2s->dev)
+		return;
+	for (i = 0; i < n * 2; i++) {
+		int v = buf[i];
+
+		lo = min(lo, v);
+		hi = max(hi, v);
+		acc += (long long)v * v;
+	}
+	dev_info(i2s->dev,
+		 "pcm %s: %u frames min=%d max=%d rms=%u\n",
+		 tag, n, lo, hi,
+		 (unsigned int)int_sqrt((unsigned long)div64_u64(acc, n * 2)));
+	dev_info(i2s->dev, "pcm %s: first 8 (L,R) %*ph\n",
+		 tag, 32, buf);
+}
+
 
 /*
  * SEC sub_2034 leftovers. OSOS 983430 never programs clock 9;
@@ -304,7 +466,41 @@ struct s5l8740_i2s {
 #define STOCK_CLKCON_18		0x20012001u
 #define STOCK_CLKCON_1C		0xD0052003u
 
-static bool force_stock_audio_parent = true;
+/*
+ * CLKCON+0x10 is the FM clock, and both paths write it.
+ *
+ * The decomp names it: sub_15DD5C powers FM through sub_41CBD8(v2, on)
+ * with v2 = sub_4E7B0() = 11, and case 11 of sub_41CBD8 clears bit 15
+ * of 0x3C500010 to enable and sets it to disable. That is exactly the
+ * CLKCON_FM_GATE_ON / _IDLE pair below, which had been derived from the
+ * oracle.
+ *
+ * s5l8740_i2s_ungate writes the whole music-playing CLKCON snapshot,
+ * and in that snapshot FM is off -- STOCK_CLKCON_10 is 0x8000, bit 15
+ * set, divider nibble zeroed. Playback starting while FM capture ran
+ * therefore gated off the capture's own clock and destroyed its
+ * divider. That is the same failure the +0x30 arbitration above already
+ * fixes in the other direction, so it gets the same treatment: while
+ * IIS2 holds the FM gate, playback leaves +0x10 alone.
+ */
+static bool s5l8740_fm_gate_held;
+
+/*
+ * OFF by default. This pushes a RetailOS music-playing snapshot into
+ * CLKCON +0x08..0x1C as whole-register writes, and those are SoC-wide
+ * clock gates, not audio-private ones. Blind full-register writes
+ * therefore discard whatever every other block had set. Observed: the
+ * device boots, FIL_Init reports the NAND fine, then the first audio
+ * start overwrites the clock tree and the FMSS controller loses its
+ * clock -- FMCTRL1 bit 30 never sets again, FMCTRL0 and NANDSTAT both
+ * read back the same stale word, and storage is gone until reboot.
+ *
+ * The conservative branch below is also the attested one: it only
+ * ungates what sub_41CBD8(9,1) actually specifies, read-modify-write,
+ * and leaves every other block's bits alone. Set this to 1 only to
+ * reproduce the snapshot experiment, and expect to lose storage.
+ */
+static bool force_stock_audio_parent;
 module_param(force_stock_audio_parent, bool, 0644);
 MODULE_PARM_DESC(force_stock_audio_parent,
 		 "1=force CLKCON+0x08..0x1C to RetailOS music-playing snapshot");
@@ -325,7 +521,8 @@ static void s5l8740_i2s_ungate(struct s5l8740_i2s *i2s)
 		 */
 		writel(STOCK_CLKCON_08, i2s->clkcon + 0x08);
 		writel(STOCK_CLKCON_0C, i2s->clkcon + 0x0c);
-		writel(STOCK_CLKCON_10, i2s->clkcon + 0x10);
+		if (!READ_ONCE(s5l8740_fm_gate_held))
+			writel(STOCK_CLKCON_10, i2s->clkcon + 0x10);
 		writel(STOCK_CLKCON_14, i2s->clkcon + 0x14);
 		writel(STOCK_CLKCON_18, i2s->clkcon + 0x18);
 		writel(STOCK_CLKCON_1C, i2s->clkcon + 0x1c);
@@ -699,16 +896,42 @@ static void s5l8740_i2s_status_w1c_tx(struct s5l8740_i2s *i2s)
 /* 26DDDE: 41CBD8(9,1), 5705DC RX, 414FAE (C09AC + BCB60), D34C0 CLKDIV. */
 static void s5l8740_i2s_program(struct s5l8740_i2s *i2s, unsigned int rate)
 {
-	const struct n31_rate_cfg *r = n31_find_rate(rate);
+	const struct n31_rate_cfg *r;
 	u32 div;
 	u32 rxcom;
+
+	/* Same resolver the codec uses, so the divider always matches. */
+	rate = n31_resolve_rate(rate);
+	r = n31_find_rate(rate);
+
+	/*
+	 * Do not re-do all of this for a rate we are already programmed for.
+	 *
+	 * Something opens the PCM during boot and prepare can fail, and when
+	 * it does the PCM layer retries at the next advertised rate. Every one
+	 * of those retries landed here and re-ran the pad mux, the TXCON and
+	 * RXCON writes and the clock programming from scratch. With two rates
+	 * advertised that was a couple of passes; advertising all nine the
+	 * hardware supports turned it into a visible storm of pinmux and reset
+	 * lines at boot, which is alarming to read and does real work for no
+	 * reason.
+	 *
+	 * Programming is idempotent, so the cheapest correct answer is not to
+	 * repeat it. This does not fix whatever opens the PCM or whatever makes
+	 * prepare fail -- both are still open -- it stops those from thrashing
+	 * the pads and the clock while they are unresolved.
+	 */
+	if (i2s->programmed && i2s->rate == rate && !clkdiv) {
+		dev_dbg(i2s->dev, "program: already at %u, skipping\n", rate);
+		return;
+	}
 
 	if (clkdiv)
 		div = clkdiv;
 	else if (r)
 		div = r->clkdiv;
 	else
-		div = MCLK_ASSUME_HZ / n31_pick_rate(rate);
+		div = MCLK_ASSUME_HZ / N31_RATE_DEFAULT;
 	if (div < 1)
 		div = 1;
 	s5l8740_i2s_ungate(i2s);
@@ -727,7 +950,8 @@ static void s5l8740_i2s_program(struct s5l8740_i2s *i2s, unsigned int rate)
 	writel(0x00010007u, i2s->base + I2SREG44);
 	/* Setup only — TXCOM stays 0 until .trigger START (OSOS B6620). */
 	writel(I2STXCOM_STOP, i2s->base + I2STXCOM);
-	i2s->rate = n31_pick_rate(rate);
+	i2s->rate = rate;
+	i2s->programmed = true;
 }
 
 /*
@@ -797,7 +1021,7 @@ static void s5l8740_i2s_dma_watch(struct work_struct *work)
 	u32 src = 0, dst = 0, en = 0, st, txcom;
 	int ret;
 
-	if (!i2s || !i2s->base)
+	if (!i2s || !i2s->base || !dma_watch_ticks)
 		return;
 	ret = s5l_pl080_peri_snapshot(10, &src, &dst, &en);
 	st = readl(i2s->base + I2SSTATUS);
@@ -819,7 +1043,7 @@ static void s5l8740_i2s_dma_watch(struct work_struct *work)
 	}
 	i2s->last_dma_src = src;
 	i2s->watch_ticks++;
-	if (i2s->watch_ticks < 50)
+	if (i2s->watch_ticks < dma_watch_ticks)
 		schedule_delayed_work(&i2s->dma_watch, msecs_to_jiffies(100));
 }
 
@@ -829,24 +1053,81 @@ static int s5l8740_i2s_hw_params(struct snd_pcm_substream *substream,
 {
 	struct s5l8740_i2s *i2s = dev_get_drvdata(dai->dev);
 	unsigned int rate = params_rate(params);
-	const struct n31_rate_cfg *r = n31_find_rate(rate);
+	unsigned int resolved = n31_resolve_rate(rate);
+	const struct n31_rate_cfg *r = n31_find_rate(resolved);
 	u32 div;
 	int ret;
 
 	if (!i2s || !i2s->base)
 		return -ENODEV;
-	if (!r && !clkdiv)
-		return -EINVAL;
+	/*
+	 * Do not refuse an out-of-table rate: resolve it to the nearest
+	 * supported one and let the codec SRC carry it. Refusing here while
+	 * the codec silently fell back to 44.1 was how the two ends ended up
+	 * disagreeing.
+	 */
+	if (resolved != rate)
+		dev_warn(dai->dev, "rate %u unsupported, using %u (SRC)\n",
+			 rate, resolved);
+	/*
+	 * Name whatever is driving the open/start cycle.
+	 *
+	 * The whole sequence -- hw_params, program, pinmux, DMA start, mute --
+	 * repeats endlessly at boot, and every fix so far has been to a step
+	 * inside it, which cannot stop something that keeps calling the cycle
+	 * again. Individual steps are not the problem; the caller is.
+	 *
+	 * hw_params is the top of that cycle, so print a backtrace for the
+	 * first few passes. Three is enough to see whether it arrives from a
+	 * syscall (a process opening the PCM), from a kernel worker, or from
+	 * the same place every time.
+	 */
+	/*
+	 * One line, every time, naming who asked.
+	 *
+	 * This was three dump_stack() calls, which is the wrong shape for a
+	 * device with no console: by the time anyone reads the screen the
+	 * loop has run hundreds of times and those three multi-line traces
+	 * are long gone off the top. current->comm and pid fit on one line
+	 * and answer the only question that matters -- whether this arrives
+	 * from a userspace process, and which, or from a kernel thread.
+	 */
+	if (hw_params_trace) {
+		hw_params_seen++;
+		dev_info(dai->dev, "hw_params #%u by %s[%d] rate=%u\n",
+			 hw_params_seen, current->comm, current->pid,
+			 params_rate(params));
+
+		/*
+		 * Stop the scroll and leave the answer on screen.
+		 *
+		 * This device has no console; the log is read off the display
+		 * by eye. A loop that reopens the PCM hundreds of times makes
+		 * every added line unreadable -- it scrolls past faster than
+		 * anyone can parse, so more logging cannot help. Halting can:
+		 * with panic=0 the machine stops with this as the last thing
+		 * printed, and it names exactly who kept asking.
+		 *
+		 * Only fires when the loop is real. A handful of opens during
+		 * a normal boot stays well under the limit.
+		 */
+		if (hw_params_loop_panic &&
+		    hw_params_seen >= hw_params_loop_panic)
+			panic("n31: PCM reopened %u times, last by %s[%d] rate=%u",
+			      hw_params_seen, current->comm, current->pid,
+			      params_rate(params));
+	}
+
 	ret = s5l8740_i2s_codec_prepare();
 	if (ret && i2s->dev)
 		dev_warn(i2s->dev, "codec prepare in hw_params: %d\n", ret);
-	s5l8740_i2s_program(i2s, rate);
+	s5l8740_i2s_program(i2s, resolved);
 	div = clkdiv ? clkdiv : (r ? r->clkdiv : 0);
 	s5l8740_i2s_log_clocks(i2s, "hw_params");
 	dev_info(dai->dev,
-		 "IIS hw_params rate=%u code=%u clkdiv=%u dma=%d pio=%d txcom=%08x\n",
-		 rate, r ? r->cs42_rate_code : 0, div, i2s->has_dma, use_pio,
-		 readl(i2s->base + I2STXCOM));
+		 "IIS hw_params rate=%u resolved=%u code=%u clkdiv=%u dma=%d pio=%d txcom=%08x\n",
+		 rate, resolved, r ? r->cs42_rate_code : 0, div, i2s->has_dma,
+		 use_pio, readl(i2s->base + I2STXCOM));
 	return 0;
 }
 
@@ -862,20 +1143,39 @@ static int s5l8740_i2s_trigger(struct snd_pcm_substream *substream, int cmd,
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		/*
+		 * Stage markers, printed before each step. The trigger has
+		 * hung here, and the DMA start log was the last thing on
+		 * screen -- which tells us only that it got that far, not
+		 * which of the following steps failed to return. Naming the
+		 * step before running it answers that directly, on a device
+		 * whose only diagnostic is what is left on the display.
+		 */
 		path_mode = s5l8740_i2s_audio_path_mode();
-		if (path_mode == 1)
+		dev_info(dai->dev, "trig: path_mode=%d\n", path_mode);
+		if (path_mode == 1) {
+			dev_info(dai->dev, "trig: codec_play_start(1)\n");
 			s5l8740_i2s_codec_play_start();
+		}
+		dev_info(dai->dev, "trig: tx_kick\n");
 		s5l8740_i2s_tx_kick(i2s, !use_pio);
-		if (path_mode == 2)
+		if (path_mode == 2) {
+			dev_info(dai->dev, "trig: codec_play_start(2)\n");
 			s5l8740_i2s_codec_play_start();
+		}
+		dev_info(dai->dev, "trig: log_clocks\n");
 		s5l8740_i2s_log_clocks(i2s, "trigger_start");
+		dev_info(dai->dev, "trig: schedule_asp\n");
 		s5l8740_i2s_schedule_asp();
+		dev_info(dai->dev, "trig: done\n");
 		i2s->pio_run = use_pio;
 		i2s->play_jiffies = jiffies;
 		i2s->watch_ticks = 0;
 		i2s->last_dma_src = 0;
-		mod_delayed_work(system_wq, &i2s->dma_watch, msecs_to_jiffies(100));
-		dev_info(dai->dev,
+		if (dma_watch_ticks)
+			mod_delayed_work(system_wq, &i2s->dma_watch,
+					 msecs_to_jiffies(100));
+		dev_info_ratelimited(dai->dev,
 			 "DAI trigger START path_mode=%d txcom=%08x sustain=%ums\n",
 			 path_mode, readl(i2s->base + I2STXCOM), sustain_ms);
 		return 0;
@@ -1197,6 +1497,11 @@ static ssize_t pio_tone_store(struct device *dev, struct device_attribute *attr,
 	unsigned int rate, frames, i;
 	s16 s;
 
+	if (!debug_tone) {
+		dev_info(dev, "debug tone disabled (set debug_tone=1)\n");
+		return -EPERM;
+	}
+
 	if (!i2s || !i2s->base)
 		return -ENODEV;
 	if (buf[0] != '1' && buf[0] != 'y' && buf[0] != 'Y')
@@ -1222,6 +1527,151 @@ static ssize_t pio_tone_store(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_WO(pio_tone);
 
+/*
+ * Walking-bit oracle.
+ *
+ * A sine cannot tell you which bit lanes survive the trip to the codec,
+ * because every wrong answer still looks like "quiet and dirty". This
+ * plays a square wave built from one bit at a time -- +BIT(n), -BIT(n),
+ * alternating -- so the analog result is a direct readout of that bit's
+ * significance.
+ *
+ * A correct 16-bit path doubles the output for each step of n. Reading
+ * the result:
+ *
+ *   only low bits audible    the codec is latching the wrong byte lane
+ *   only high bits audible   samples are landing too far down the slot
+ *   bit 15 not the loudest   sign or justification is wrong
+ *   flat across all n        the link is not carrying sample data at all
+ *
+ * Square edges are deliberate: they survive whatever the analog stage
+ * does far better than a low-amplitude sine, which matters when the
+ * quantity being measured may be 40 dB down.
+ *
+ *   echo 9 > walk_bit    play ~1 s of +/-BIT(9)
+ *   echo -1 > walk_bit   sweep 0..15, one second each, logging as it goes
+ */
+#define S5L8740_WALK_HZ		1000u
+
+static int s5l8740_walk_one(struct s5l8740_i2s *i2s, int bit,
+			    unsigned int ms)
+{
+	struct dma_async_tx_descriptor *desc;
+	struct dma_slave_config cfg = { };
+	struct dma_chan *chan;
+	dma_addr_t dma;
+	unsigned int rate, frames, half, i;
+	size_t bytes;
+	s16 *buf, hi, lo;
+	int ret;
+
+	if (bit < 0 || bit > 15)
+		return -EINVAL;
+
+	rate = i2s->rate ? i2s->rate : N31_RATE_DEFAULT;
+	half = max(1u, rate / (2 * S5L8740_WALK_HZ));
+	frames = half * 2;
+	bytes = frames * 2 * sizeof(s16);
+
+	/*
+	 * Bit 15 is the sign bit, so the pair is 0 and -32768 rather than
+	 * a symmetric swing; every other bit alternates about zero.
+	 */
+	hi = (bit == 15) ? 0 : (s16)(1 << bit);
+	lo = (bit == 15) ? (s16)-32768 : (s16)-(1 << bit);
+
+	mutex_lock(&i2s->dma_lock);
+	chan = s5l8740_i2s_tx_get(i2s);
+	if (IS_ERR_OR_NULL(chan)) {
+		mutex_unlock(&i2s->dma_lock);
+		return chan ? PTR_ERR(chan) : -ENODEV;
+	}
+	buf = dma_alloc_coherent(i2s->dev, bytes, &dma, GFP_KERNEL);
+	if (!buf) {
+		ret = -ENOMEM;
+		goto out_unlock;
+	}
+	for (i = 0; i < frames; i++) {
+		s16 v = (i < half) ? hi : lo;
+
+		buf[i * 2] = v;
+		buf[i * 2 + 1] = v;
+	}
+	s5l8740_pcm_dump(i2s, buf, frames, "walk");
+
+	cfg.direction = DMA_MEM_TO_DEV;
+	cfg.dst_addr = i2s->play_dma.addr;
+	cfg.dst_addr_width = (tone_width == 2) ?
+		DMA_SLAVE_BUSWIDTH_2_BYTES : DMA_SLAVE_BUSWIDTH_4_BYTES;
+	cfg.dst_maxburst = 1;
+	ret = dmaengine_slave_config(chan, &cfg);
+	if (ret)
+		goto out_buf;
+
+	s5l8740_i2s_codec_prepare();
+	s5l8740_i2s_program(i2s, rate);
+	desc = dmaengine_prep_dma_cyclic(chan, dma, bytes, bytes,
+					 DMA_MEM_TO_DEV, DMA_PREP_INTERRUPT);
+	if (!desc) {
+		ret = -ENOMEM;
+		goto out_buf;
+	}
+	if (dma_submit_error(dmaengine_submit(desc))) {
+		ret = -EIO;
+		goto out_buf;
+	}
+	dma_async_issue_pending(chan);
+	s5l8740_i2s_codec_play_start();
+	s5l8740_i2s_tx_kick(i2s, !use_pio);
+	s5l8740_i2s_schedule_asp();
+	dev_info(i2s->dev, "walk bit %d: +%d/%d for %u ms\n",
+		 bit, hi, lo, ms);
+	msleep(ms);
+	s5l8740_i2s_cancel_asp();
+	s5l8740_i2s_codec_play_stop();
+	dmaengine_terminate_sync(chan);
+	s5l8740_i2s_hw_stop(i2s, NULL);
+	ret = 0;
+out_buf:
+	dma_free_coherent(i2s->dev, bytes, buf, dma);
+out_unlock:
+	mutex_unlock(&i2s->dma_lock);
+	return ret;
+}
+
+static ssize_t walk_bit_store(struct device *dev,
+			      struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct s5l8740_i2s *i2s = dev_get_drvdata(dev);
+	int bit, ret;
+
+	if (!debug_tone) {
+		dev_info(dev, "debug tone disabled (set debug_tone=1)\n");
+		return -EPERM;
+	}
+
+	if (!i2s || !i2s->base)
+		return -ENODEV;
+	if (kstrtoint(buf, 0, &bit))
+		return -EINVAL;
+
+	if (bit >= 0) {
+		ret = s5l8740_walk_one(i2s, bit, walk_ms);
+		return ret ? ret : count;
+	}
+	for (bit = 0; bit < 16; bit++) {
+		ret = s5l8740_walk_one(i2s, bit, walk_ms);
+		if (ret) {
+			dev_err(dev, "walk bit %d: %d\n", bit, ret);
+			return ret;
+		}
+		msleep(walk_gap_ms);
+	}
+	return count;
+}
+static DEVICE_ATTR_WO(walk_bit);
+
 static ssize_t dma_tone_store(struct device *dev, struct device_attribute *attr,
 			      const char *buf, size_t count)
 {
@@ -1236,6 +1686,11 @@ static ssize_t dma_tone_store(struct device *dev, struct device_attribute *attr,
 	size_t bytes;
 	s16 s;
 	int ret;
+
+	if (!debug_tone) {
+		dev_info(dev, "debug tone disabled (set debug_tone=1)\n");
+		return -EPERM;
+	}
 
 	if (!i2s || !i2s->base)
 		return -ENODEV;
@@ -1261,10 +1716,11 @@ static ssize_t dma_tone_store(struct device *dev, struct device_attribute *attr,
 		goto out_unlock;
 	}
 	for (i = 0; i < frames; i++) {
-		s = s5l8740_scale_s16(n31_tone_s16(i, rate));
+		s = s5l8740_sample_fix(s5l8740_scale_s16(n31_tone_s16(i, rate)));
 		tone[i * 2] = s;
 		tone[i * 2 + 1] = s;
 	}
+	s5l8740_pcm_dump(i2s, tone, frames, "dma_tone");
 	dma_sync_single_for_device(dev, dma, bytes, DMA_TO_DEVICE);
 
 	cfg.direction = DMA_MEM_TO_DEV;
@@ -1409,6 +1865,9 @@ static int s5l8740_i2s_probe(struct platform_device *pdev)
 	ret = device_create_file(dev, &dev_attr_pio_tone);
 	if (ret)
 		dev_warn(dev, "pio_tone sysfs: %d\n", ret);
+	ret = device_create_file(dev, &dev_attr_walk_bit);
+	if (ret)
+		dev_warn(dev, "walk_bit sysfs: %d\n", ret);
 	ret = device_create_file(dev, &dev_attr_dma_tone);
 	if (ret)
 		dev_warn(dev, "dma_tone sysfs: %d\n", ret);
@@ -1445,6 +1904,23 @@ static void s5l8740_i2s_remove(struct platform_device *pdev)
 		clk_bulk_disable_unprepare(i2s->num_clks, i2s->clks);
 }
 
+/*
+ * IIS0 drives the codec through PL080. Left running across a kexec it
+ * keeps fetching from a buffer the next kernel has reused, so the
+ * handover is audible as well as unsafe. hw_stop is the same teardown
+ * the STOP path uses -- TXCOM stop, DMA terminated, pads released.
+ */
+static void s5l8740_i2s_shutdown_pdev(struct platform_device *pdev)
+{
+	struct s5l8740_i2s *i2s = platform_get_drvdata(pdev);
+
+	if (!i2s)
+		return;
+	i2s->pio_run = false;
+	s5l8740_i2s_hw_stop(i2s, NULL);
+	s5l8740_i2s_tx_put(i2s);
+}
+
 static const struct of_device_id s5l8740_i2s_of_match[] = {
 	{ .compatible = "apple,s5l8740-i2s" },
 	{ .compatible = "samsung,s5l8740-i2s" },
@@ -1455,6 +1931,7 @@ MODULE_DEVICE_TABLE(of, s5l8740_i2s_of_match);
 static struct platform_driver s5l8740_i2s_driver = {
 	.probe = s5l8740_i2s_probe,
 	.remove = s5l8740_i2s_remove,
+	.shutdown = s5l8740_i2s_shutdown_pdev,
 	.driver = {
 		.name = "s5l8740-i2s",
 		.of_match_table = s5l8740_i2s_of_match,
@@ -1545,12 +2022,14 @@ static void iis2_fm_gate(struct s5l8740_iis2 *iis2, bool on)
 			iis2->fm_gate_saved = cur;
 			iis2->fm_gate_held = true;
 		}
+		WRITE_ONCE(s5l8740_fm_gate_held, true);
 		writel(CLKCON_FM_GATE_ON, iis2->clkcon + CLKCON_FM_GATE);
 	} else if (iis2->fm_gate_held) {
 		writel(iis2->fm_gate_saved ? iis2->fm_gate_saved :
 					     CLKCON_FM_GATE_IDLE,
 		       iis2->clkcon + CLKCON_FM_GATE);
 		iis2->fm_gate_held = false;
+		WRITE_ONCE(s5l8740_fm_gate_held, false);
 	}
 }
 
@@ -1758,6 +2237,16 @@ static void s5l8740_iis2_remove(struct platform_device *pdev)
 		clk_bulk_disable_unprepare(iis2->num_clks, iis2->clks);
 }
 
+/*
+ * IIS2 captures FM over PL080 and holds the CLKCON+0x10 gate while it
+ * does. Stopping it here also puts that gate back, so the next kernel
+ * does not inherit a clock enabled by a driver that no longer exists.
+ */
+static void s5l8740_iis2_shutdown(struct platform_device *pdev)
+{
+	iis2_hw_stop(platform_get_drvdata(pdev));
+}
+
 static const struct of_device_id s5l8740_iis2_of_match[] = {
 	{ .compatible = "apple,s5l8740-bcm2078-pcm" },
 	{ .compatible = "apple,s5l8740-iis2" },
@@ -1767,6 +2256,7 @@ MODULE_DEVICE_TABLE(of, s5l8740_iis2_of_match);
 
 static struct platform_driver s5l8740_iis2_driver = {
 	.probe = s5l8740_iis2_probe,
+	.shutdown = s5l8740_iis2_shutdown,
 	.remove = s5l8740_iis2_remove,
 	.driver = {
 		.name = "s5l8740-iis2",

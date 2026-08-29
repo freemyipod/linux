@@ -49,6 +49,12 @@ static struct snd_soc_dai_link nano7_dais[] = {
 		.stream_name = "BCM2078 PCM Capture",
 		SND_SOC_DAILINK_REG(fm_capture),
 		.capture_only = 1,
+		/*
+		 * Same reason as the playback link: this DAI's trigger and
+		 * prepare reach the codec over SPI and take mutexes, so it
+		 * must not be called from atomic context.
+		 */
+		.nonatomic = 1,
 		.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
 			   SND_SOC_DAIFMT_CBS_CFS,
 	},

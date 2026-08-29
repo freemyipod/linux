@@ -12,6 +12,16 @@
 #include <linux/kernel.h>
 #include <linux/math64.h>
 #include <linux/types.h>
+#include <sound/pcm.h>
+
+/*
+ * Every rate the hardware actually has a divider for. Both the codec and
+ * the IIS DAI advertise exactly this set: they used to advertise only
+ * 44.1/48 while the table below carried nine entries, so 8/11.025/12/16/
+ * 22.05/24/32 kHz streams were refused by ALSA despite the silicon
+ * supporting them.
+ */
+#define N31_RATE_MASK	(SNDRV_PCM_RATE_8000_48000 | SNDRV_PCM_RATE_12000 | SNDRV_PCM_RATE_24000)
 
 #define N31_RATE_DEFAULT	44100u
 
@@ -49,6 +59,58 @@ static inline unsigned int n31_pick_rate(unsigned int rate)
 	if (rate && n31_find_rate(rate))
 		return rate;
 	return N31_RATE_DEFAULT;
+}
+
+/*
+ * One resolver, used by BOTH the codec and the IIS driver.
+ *
+ * They used to resolve independently: the codec fell back to
+ * N31_RATE_DEFAULT for anything it did not recognise while the IIS side
+ * refused the stream outright. For an out-of-table rate that meant the
+ * codec was programmed for 44.1 kHz while the clock divider was left on
+ * whatever the caller asked for -- the two halves of one link configured
+ * for different rates, which is silence or noise rather than an error.
+ *
+ * So: resolve once, here, and let both sides call this. An exact match
+ * wins; otherwise pick the nearest supported rate by relative distance,
+ * which keeps the substitution predictable (96000 -> 48000, 5512 ->
+ * 8000) instead of collapsing everything onto the default.
+ */
+static inline unsigned int n31_resolve_rate(unsigned int rate)
+{
+	unsigned int i, best = N31_RATE_DEFAULT;
+	u64 best_err = U64_MAX;
+
+	if (!rate)
+		return N31_RATE_DEFAULT;
+	if (n31_find_rate(rate))
+		return rate;
+
+	for (i = 0; i < ARRAY_SIZE(n31_rates); i++) {
+		unsigned int r = n31_rates[i].rate;
+		u64 err = (r > rate) ? (u64)(r - rate) : (u64)(rate - r);
+
+		/* Scale so the choice is proportional, not absolute. */
+		err = div64_u64(err * 100000ULL, r);
+		if (err < best_err) {
+			best_err = err;
+			best = r;
+		}
+	}
+	return best;
+}
+
+/*
+ * True when the codec must run its sample-rate converter rather than
+ * clocking the DAC straight off the ASP. OSOS takes the SRC arm for
+ * every rate except 48 kHz (rate code 12) -- see sub_183138, where the
+ * non-48 arm programs 0x121/0x122 and drops 0x10B/0x10C to 4/0x33.
+ */
+static inline bool n31_rate_uses_src(unsigned int rate)
+{
+	const struct n31_rate_cfg *r = n31_find_rate(n31_resolve_rate(rate));
+
+	return r && r->cs42_rate_code != 12;
 }
 
 /* Exact 1 kHz period group: rate / gcd(rate, 1000) frames. */

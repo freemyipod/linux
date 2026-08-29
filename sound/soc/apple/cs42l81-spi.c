@@ -158,7 +158,42 @@ static bool force_headset;
 module_param(force_headset, bool, 0644);
 MODULE_PARM_DESC(force_headset, "1=skip headset-ready gate (glass bring-up)");
 
-static unsigned int jack_poll_ms = 500;
+/*
+ * Grab volume keys system-wide.
+ *
+ * Off by default. A codec driver registering a global input handler means
+ * every KEY_VOLUMEUP on the machine moves the headphone gain, wherever it
+ * came from and whatever is in the foreground -- including the MikeyBus
+ * remote, which this handler attaches itself to as well. Changing output
+ * level is a decision an application makes on purpose, not something a
+ * driver should do behind its back, and it is a nuisance while the volume
+ * registers are still being characterised: the gain moves under a
+ * measurement for reasons unrelated to the measurement.
+ *
+ * The mixer control stays available either way; this only controls
+ * whether the driver also claims the keys for itself.
+ */
+static bool vol_keys;
+module_param(vol_keys, bool, 0644);
+MODULE_PARM_DESC(vol_keys,
+		 "1=grab KEY_VOLUMEUP/DOWN globally to set headphone gain; 0=leave keys alone (default)");
+
+/*
+ * Off. The poll existed to notice plug and unplug through MikeyBus and
+ * re-arm HSDET, and it re-entered the codec under c->lock every 500 ms
+ * forever for a result this board does not act on. Set non-zero only if
+ * jack detection is ever genuinely wanted here.
+ */
+/*
+ * Print the stack of the first codec prepare. On by default until the
+ * thing that opens the PCM at boot is identified; it is one backtrace.
+ */
+static bool prepare_caller_trace;	/* opt-in; set 1 to name the PCM opener */
+module_param(prepare_caller_trace, bool, 0644);
+MODULE_PARM_DESC(prepare_caller_trace,
+		 "1=dump_stack() on the first codec prepare to identify the caller");
+
+static unsigned int jack_poll_ms;
 module_param(jack_poll_ms, uint, 0644);
 MODULE_PARM_DESC(jack_poll_ms, "MikeyBus/HSDET poll period ms (0=off)");
 
@@ -173,7 +208,18 @@ module_param(audio_path_mode, int, 0644);
 MODULE_PARM_DESC(audio_path_mode, "0=legacy soup; 1=play before IIS; 2=play after IIS");
 
 /* 1 = redo D3280 prepare on every play_prepare (no stale brought_up). */
-static bool force_full_prepare = true;
+/*
+ * Off. This re-ran the entire codec init on every play_start, defeating
+ * both idempotence guards: prepare repeats, and an already-started stream
+ * gets a full play_stop and rebuild instead of returning early. Combined
+ * with anything that restarts the stream, that is a loop -- each pass
+ * tearing down and rebuilding a codec that was already correct, which is
+ * what "play start after play start" on the console actually was.
+ *
+ * It exists for glass bring-up where the codec state is unknown and
+ * starting from scratch is worth the cost. That is not the normal case.
+ */
+static bool force_full_prepare;
 module_param(force_full_prepare, bool, 0644);
 MODULE_PARM_DESC(force_full_prepare, "1=re-run codec prepare every session (default)");
 
@@ -247,6 +293,7 @@ struct cs42l81 {
 	struct input_handler input_handler;
 	struct work_struct vol_work;
 	struct delayed_work asp_post_work;
+	unsigned int prepared_rate;	/* 0 = not configured yet */
 	struct delayed_work jack_work;
 	atomic_t vol_steps;
 	bool jack_poll_active;
@@ -265,14 +312,20 @@ struct cs42_regval {
 
 static struct cs42l81 *cs42l81_dev;
 
+/*
+ * Resolve through n31_resolve_rate() so this agrees with the IIS side
+ * for every input. n31_pick_rate() collapsed anything out of the table
+ * onto 44.1 kHz while the IIS driver refused it, which configured the
+ * two ends of one link for different rates.
+ */
 static unsigned int cs42_pick_rate(struct cs42l81 *c, unsigned int rate)
 {
 	if (play_rate)
-		return n31_pick_rate(play_rate);
+		return n31_resolve_rate(play_rate);
 	if (rate)
-		return n31_pick_rate(rate);
+		return n31_resolve_rate(rate);
 	if (c && c->rate)
-		return n31_pick_rate(c->rate);
+		return n31_resolve_rate(c->rate);
 	return N31_RATE_DEFAULT;
 }
 
@@ -813,20 +866,43 @@ static int cs42_build_play_graph_static(struct cs42l81 *c)
 	if (ret)
 		return ret;
 
+	/*
+	 * Stage markers: this is where playback hangs, and the last line on
+	 * screen was graph_begin's domain-33 log, which only says it got
+	 * this far. Each step announces itself first so the final line names
+	 * the operation that did not return.
+	 */
+	dev_info(&c->spi->dev, "graph: write_table (%u regs)\n",
+		 (unsigned int)ARRAY_SIZE(cs42_static_5707d8));
 	ret = cs42_write_table(c, cs42_static_5707d8,
 			       ARRAY_SIZE(cs42_static_5707d8));
 	if (ret)
 		goto out;
 
+	/*
+	 * Split the settle from the write that follows it.
+	 *
+	 * The console stopped after "settle 100ms", which leaves two very
+	 * different possibilities: the sleep never returned, or it returned
+	 * and the 0x500 write wedged. A sleep that does not return means we
+	 * are in a context that cannot sleep, and the fix is the calling
+	 * path; a write that hangs means the codec stopped answering, and
+	 * the fix is the register. One line tells them apart.
+	 */
+	dev_info(&c->spi->dev, "graph: settle 100ms\n");
 	msleep(100); /* sub_43E006(100) → RTOS sleep */
+	dev_info(&c->spi->dev, "graph: settled ok\n");
+	dev_info(&c->spi->dev, "graph: write 0x500\n");
 	ret = cs42l81_write(c, 0x0500, 0x05);
 	if (ret)
 		goto out;
+	dev_info(&c->spi->dev, "graph: read 0x528\n");
 	cs42l81_read(c, 0x0528, &c->graph.status_528);
 	c->graph.mode = 0;
 	c->graph.tap_l = 0x09;
 	c->graph.tap_r = 0x08;
 
+	dev_info(&c->spi->dev, "graph: verify (22 reads)\n");
 	cs42_verify_5707d8(c);
 	cs42_log_graph_snapshot(c, "post_5707D8");
 
@@ -1048,12 +1124,25 @@ static int cs42_retailos_play_start(struct cs42l81 *c)
 {
 	int ret;
 
-	if (!cs42_headset_ready()) {
-		dev_warn(&c->spi->dev,
-			 "headset not ready (8925CF4) — RetailOS would 42D364(0)\n");
-		if (!force_headset)
-			return -ENODEV;
-	}
+	/*
+	 * A missing headset is not an error.
+	 *
+	 * This used to return -ENODEV, which is where the -19 in every boot
+	 * log came from. Failing the stream is the wrong response for two
+	 * reasons. It makes an absent jack -- or MikeyBus simply not having
+	 * probed yet, which at boot is a race we lose more often than not --
+	 * break the codec for everything, including routes that do not go to
+	 * the jack at all. And a caller that retries on failure will sit there
+	 * cycling PCM start/stop, which is what filled the boot log.
+	 *
+	 * What RetailOS does here is 42D364(0) -- it acts on the analog output and
+	 * carries on rather than refusing. We carry on too: the stream configures
+	 * and the DAC runs, and the analog mute is left to the normal play path
+	 * rather than being forced here, since forcing a mute on a detection
+	 * result we do not fully trust is its own way to produce silence. Set
+	 * There is no gate any more; this path never refuses on jack state.
+	 */
+	/* No jack gate on the play latch either -- see cs42_codec_prepare(). */
 
 	ret = cs42_f141c_play_unmute(c, true);
 	if (ret)
@@ -1069,7 +1158,7 @@ static int cs42_retailos_play_start(struct cs42l81 *c)
 		cs42_log_final_state(c, "play_start");
 	c->play_started = true;
 	c->route_playing = true;
-	dev_info(&c->spi->dev, "CS42 RetailOS play_start complete\n");
+	dev_info_ratelimited(&c->spi->dev, "CS42 RetailOS play_start complete\n");
 	return 0;
 }
 
@@ -1554,6 +1643,148 @@ static int cs42l81_set_rate(struct cs42l81 *c, unsigned int rate)
  * Codec prepare — rails, rate, D2D2C, D3280(4). No 42D364 play graph.
  * RetailOS play latch is cs42_retailos_play_start() at transport START.
  */
+/*
+ * Stage markers for codec prepare.
+ *
+ * This path can hang the kernel, and there was nothing between "no headset
+ * reported" and roughly fifty register writes to say how far it got. Each
+ * marker prints BEFORE its step, so the last line in the log names the
+ * operation that never returned rather than the last one that succeeded.
+ * That distinction is the point: a trailing "ok" tells you where you were
+ * still fine, which is not the question when the device is wedged.
+ *
+ * Unconditional on purpose. A debug flag you have to set in advance is no
+ * use for a hang you did not expect, and this is a few lines per stream.
+ */
+#define CS42_STAGE(c, st) dev_info(&(c)->spi->dev, "prepare stage: %s\n", (st))
+
+/*
+ * The 0x51E..0x525 mailbox reads stock performs and we did not.
+ *
+ * Every other register OSOS reads on the audio path was already read
+ * here -- 0x220, 0x2F, 0x74, 0x7B, 0x7C, 0x227, 0xC96F, 0x219, 0x528.
+ * These four were the whole remainder, and they were skipped because
+ * their results are discarded at the call sites, which is not a reason.
+ * A read is a bus transaction; clear-on-read status, level latching and
+ * FIFO advance are all things a codec does when a register is
+ * addressed, and none of them are visible in a decompiled expression
+ * whose value goes nowhere.
+ *
+ * Three distinct patterns in OSOS, reproduced in order:
+ *
+ *   sub_15A50C   0x51E bit0 = 1, read 0x51F, read 0x520, bit0 = 0.
+ *                The bit brackets the pair, so the levels are sampled
+ *                coherently rather than mid-update.
+ *   sub_1326D2   read 0x520 then 0x524, both discarded. A function
+ *                whose entire body is two reads is an acknowledge.
+ *   sub_154xxx   read 0x525 repeatedly. It is the read FIFO port, the
+ *                counterpart to 0x521 on the write side, so repeated
+ *                reads drain whatever is queued.
+ *
+ * The drain is bounded by the level 0x520 reports and a hard ceiling,
+ * because an unbounded drain against a part that always returns data
+ * is a hang, and this driver has produced enough of those tonight.
+ */
+#define CS42_MBOX_DRAIN_MAX	64
+
+static void cs42_mailbox_reads(struct cs42l81 *c)
+{
+	u8 lvl_51f = 0, lvl_520 = 0, v524 = 0, junk = 0;
+	unsigned int i, drain;
+
+	/* sub_15A50C: latch, sample both levels, release. */
+	cs42l81_rmw(c, 0x051e, 0x01, 0x01);
+	cs42l81_read(c, 0x051f, &lvl_51f);
+	cs42l81_read(c, 0x0520, &lvl_520);
+	cs42l81_rmw(c, 0x051e, 0x01, 0x00);
+
+	/* sub_1326D2: the read-and-discard acknowledge pair. */
+	cs42l81_read(c, 0x0520, &junk);
+	cs42l81_read(c, 0x0524, &v524);
+
+	/* 0x525 is the read FIFO port; drain what the level reports. */
+	drain = lvl_520;
+	if (drain > CS42_MBOX_DRAIN_MAX)
+		drain = CS42_MBOX_DRAIN_MAX;
+	for (i = 0; i < drain; i++)
+		if (cs42l81_read(c, 0x0525, &junk))
+			break;
+
+	dev_info(&c->spi->dev,
+		 "mailbox: 51f=%02x 520=%02x 524=%02x drained=%u\n",
+		 lvl_51f, lvl_520, v524, i);
+}
+
+/*
+ * Analog power-up, from the N31 bootloader (sub_1310 @ 0x1566).
+ *
+ * This is the sequence that makes the plop. On a hard reset into stock
+ * there is an audible transient in the headphones before the Apple
+ * logo, and another when the analog section drops at DFU. Booting Linux
+ * there is no plop at either end, which is not a subtle clue: a plop is
+ * an amplifier power transition, so no plop means the output stage was
+ * never powered in the first place. Every register we were arguing
+ * about downstream -- mute, gain, routing -- sits behind this.
+ *
+ * The bootloader runs it immediately after bringing SPI0 up, bracketed
+ * by the CLKCON+0x0C bit 15 ungate (sub_14FC), which is the same IIS0
+ * gate the IIS driver already handles:
+ *
+ *   0x227 mask 0x7F = 0x40      we only ever read this one
+ *   0x228 mask 0x7F = 0x40      never touched at all
+ *   0x225 mask 0xFF = 0x19      we write 0x00 here
+ *   0x226 mask 0xFF = 0x19      never touched at all
+ *   0x220 mask 0x78 = 0x50      we use mask 0x28
+ *   0x006 bit 0     = 1
+ *   poll 0x2F until bit 7 sets, 1 ms apart, at most 50 times
+ *   0x006 bit 6     = 1
+ *   wait 50 ms
+ *   0x007 bit 6     = 0
+ *
+ * The poll is the part that matters most and the part we never did.
+ * Bit 7 of 0x2F is the analog block reporting itself ready; everything
+ * after it is sequenced against that. Programming a codec that has not
+ * finished powering explains a register file that reads back perfectly
+ * and drives nothing.
+ *
+ * Bounds are the bootloader's own: 50 attempts, then continue anyway
+ * and say so. A poll that can spin forever is how this driver has hung
+ * the kernel before, and the stock code does not spin forever either.
+ */
+static int cs42_analog_power_up(struct cs42l81 *c)
+{
+	unsigned int i;
+	u8 v2f = 0;
+	bool ready = false;
+
+	cs42l81_rmw(c, 0x0227, 0x7f, 0x40);
+	cs42l81_rmw(c, 0x0228, 0x7f, 0x40);
+	cs42l81_rmw(c, 0x0225, 0xff, 0x19);
+	cs42l81_rmw(c, 0x0226, 0xff, 0x19);
+	cs42l81_rmw(c, 0x0220, 0x78, 0x50);
+	cs42l81_rmw(c, 0x0006, 0x01, 0x01);
+
+	for (i = 0; i < 50; i++) {
+		usleep_range(1000, 1500);
+		if (cs42l81_read(c, 0x002f, &v2f))
+			break;
+		if (v2f & 0x80) {
+			ready = true;
+			break;
+		}
+	}
+
+	dev_info(&c->spi->dev,
+		 "analog power-up: 0x2F=0x%02x ready=%d after %u polls\n",
+		 v2f, ready, i);
+
+	cs42l81_rmw(c, 0x0006, 0x40, 0x40);
+	msleep(50);
+	cs42l81_rmw(c, 0x0007, 0x40, 0x00);
+
+	return 0;
+}
+
 static int cs42_codec_prepare(struct cs42l81 *c, unsigned int rate)
 {
 	u8 st = 0, r219 = 0;
@@ -1561,13 +1792,25 @@ static int cs42_codec_prepare(struct cs42l81 *c, unsigned int rate)
 	int jack = -ENODEV;
 	int (*mikey_jack)(void);
 
-	if (!cs42_headset_ready()) {
-		dev_warn(&c->spi->dev,
-			 "headset not ready (8925CF4) — RetailOS gates 570620\n");
-		if (!force_headset)
-			return -ENODEV;
-	}
+	/*
+	 * Same rule as cs42_retailos_play_start(): an absent headset must not
+	 * fail the stream. This is the copy that actually matters, because
+	 * hw_params lands here, so -ENODEV came straight back out of
+	 * snd_soc_dai_hw_params and ASoC walked every advertised rate looking
+	 * for one that would take -- all the way down to 8 kHz, failing each.
+	 * That is the start/stop churn in the boot log.
+	 */
+	/*
+	 * No jack detection here. This board does not use the codec's jack
+	 * detect, and consulting it did nothing but harm: it gated the whole
+	 * bring-up on a MikeyBus answer that is absent whenever UART2 is not
+	 * up, returned -ENODEV out of hw_params, and left the PCM layer
+	 * retrying at every advertised rate -- which is where the boot-time
+	 * pinmux and reset storm came from. Whether something is plugged in
+	 * is not the codec driver's business and never gates configuration.
+	 */
 
+	CS42_STAGE(c, "d1830_audio_rails");
 	{
 		int (*rails)(void);
 
@@ -1586,6 +1829,7 @@ static int cs42_codec_prepare(struct cs42l81 *c, unsigned int rate)
 		}
 	}
 
+	CS42_STAGE(c, "mikeybus_jack_present");
 	mikey_jack = (int (*)(void))__symbol_get("apple_mikeybus_jack_present");
 	if (mikey_jack) {
 		jack = mikey_jack();
@@ -1620,14 +1864,51 @@ static int cs42_codec_prepare(struct cs42l81 *c, unsigned int rate)
 
 	if (!rate)
 		rate = cs42_pick_rate(c, 0);
+	/*
+	 * Configuration is idempotent, so do not repeat it.
+	 *
+	 * Something opens the PCM over and over during boot, and every
+	 * open re-ran this entire sequence: the analog power-up with its
+	 * readiness poll, the mailbox reads, the rate programming and the
+	 * whole output path. Dozens of times, at the same rate, for a
+	 * codec that was already configured exactly that way. That is
+	 * where the "48000 init" storm in the boot log comes from, and
+	 * running a power-up sequence repeatedly is not harmless.
+	 *
+	 * What is doing the opening is still unidentified -- nothing in
+	 * the init scripts touches audio -- so the first call also prints
+	 * its own stack, once, to name the caller instead of guessing at
+	 * it for another session.
+	 */
+	if (c->prepared_rate == rate) {
+		dev_dbg(&c->spi->dev, "prepare: already at %u, skipping\n",
+			rate);
+		return 0;
+	}
+
+	if (!c->prepared_rate && prepare_caller_trace) {
+		dev_info(&c->spi->dev,
+			 "first prepare (rate=%u); caller follows\n", rate);
+		dump_stack();
+	}
+
+	CS42_STAGE(c, "analog_power_up");
+	cs42_analog_power_up(c);
+
+	CS42_STAGE(c, "mailbox_reads");
+	cs42_mailbox_reads(c);
+
+	CS42_STAGE(c, "set_rate");
 	ret = cs42l81_set_rate(c, rate);
 	if (ret)
 		return ret;
 
+	CS42_STAGE(c, "output_path_enable");
 	ret = cs42l81_output_path_enable(c);
 	if (ret)
 		return ret;
 
+	CS42_STAGE(c, "state_4_output_on");
 	ret = cs42l81_state_4_output_on(c);
 	if (ret)
 		return ret;
@@ -1642,6 +1923,7 @@ static int cs42_codec_prepare(struct cs42l81 *c, unsigned int rate)
 	cs42l81_read(c, 0x0227, &st);
 	cs42l81_read(c, 0x0219, &r219);
 	cs42l81_apply_user_vol(c);
+	c->prepared_rate = rate;
 	cs42_log_graph_snapshot(c, "pre_play");
 	cs42l81_log_start_state(c, "codec_prepare");
 	dev_info(&c->spi->dev,
@@ -2121,8 +2403,22 @@ int cs42l81_play_start(void)
 
 	if (!c)
 		return -ENODEV;
+
+	/*
+	 * Markers either side of the lock. The trigger hangs somewhere in
+	 * here and the two possibilities need different fixes: if "taking
+	 * lock" is the last line then something else holds c->lock and this
+	 * is a deadlock; if "locked" appears then the lock was fine and the
+	 * hang is in the register sequence below. One line of output tells
+	 * those apart, which beats reasoning about it.
+	 */
+	dev_info(&c->spi->dev, "play_start: taking lock\n");
 	mutex_lock(&c->lock);
+	dev_info(&c->spi->dev, "play_start: locked (prepared=%d started=%d)\n",
+		 c->codec_prepared, c->play_started);
+
 	if (!c->codec_prepared) {
+		dev_info(&c->spi->dev, "play_start: prepare\n");
 		ret = cs42_codec_prepare(c, cs42_pick_rate(c, c->rate));
 		if (ret)
 			goto out;
@@ -2133,6 +2429,7 @@ int cs42l81_play_start(void)
 	}
 	if (force_full_prepare && c->play_started)
 		cs42_retailos_play_stop(c);
+	dev_info(&c->spi->dev, "play_start: retailos_play_start\n");
 	ret = cs42_retailos_play_start(c);
 out:
 	mutex_unlock(&c->lock);
@@ -2225,13 +2522,29 @@ void cs42l81_schedule_post_iis(void)
 }
 EXPORT_SYMBOL_GPL(cs42l81_schedule_post_iis);
 
+/*
+ * Called from the IIS stop path, so it must not block.
+ *
+ * This used to be cancel_delayed_work_sync(), which waits for the work to
+ * finish -- and the work is cs42l81_post_iis_start(), which takes c->lock.
+ * So stopping a stream blocked until a work item that wants the codec lock
+ * could get it, and anything already holding that lock deadlocked the
+ * stop. It went unnoticed because sustain_ms defaulted to 5000, meaning
+ * the stop path was skipped entirely and this line had never run.
+ *
+ * The asynchronous form is the correct one here: it dequeues the work if
+ * it has not started, and if it has, lets it finish on its own thread
+ * instead of dragging the stop path in behind it. The synchronous form is
+ * still right at remove/shutdown, where the work genuinely must be over
+ * before the device goes away, and it stays there.
+ */
 void cs42l81_cancel_post_iis(void)
 {
 	struct cs42l81 *c = cs42l81_dev;
 
 	if (!c)
 		return;
-	cancel_delayed_work_sync(&c->asp_post_work);
+	cancel_delayed_work(&c->asp_post_work);
 }
 EXPORT_SYMBOL_GPL(cs42l81_cancel_post_iis);
 
@@ -2318,14 +2631,22 @@ static int cs42l81_dai_hw_params(struct snd_pcm_substream *substream,
 {
 	struct cs42l81 *c = snd_soc_component_get_drvdata(dai->component);
 	unsigned int rate = params_rate(params);
+	unsigned int resolved;
 	int ret;
 
+	resolved = n31_resolve_rate(rate);
+	if (resolved != rate)
+		dev_warn(&c->spi->dev,
+			 "rate %u unsupported, running SRC at %u\n",
+			 rate, resolved);
+
 	mutex_lock(&c->lock);
-	c->rate = rate;
-	ret = cs42_codec_prepare(c, rate);
+	c->rate = resolved;
+	ret = cs42_codec_prepare(c, resolved);
 	mutex_unlock(&c->lock);
-	dev_info(&c->spi->dev, "DAI hw_params rate=%u ret=%d (prepare only)\n",
-		 rate, ret);
+	dev_info_ratelimited(&c->spi->dev,
+		 "DAI hw_params rate=%u resolved=%u src=%d ret=%d\n",
+		 rate, resolved, n31_rate_uses_src(resolved), ret);
 	return ret;
 }
 
@@ -2636,7 +2957,7 @@ static struct snd_soc_dai_driver cs42l81_dai = {
 		.stream_name = "Playback",
 		.channels_min = 2,
 		.channels_max = 2,
-		.rates = SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000,
+		.rates = N31_RATE_MASK,
 		.formats = SNDRV_PCM_FMTBIT_S16_LE,
 	},
 	.ops = &cs42l81_dai_ops,
@@ -2698,20 +3019,22 @@ static int cs42l81_probe(struct spi_device *spi)
 		return ret;
 	}
 
-	c->input_handler.event = cs42l81_input_event;
-	c->input_handler.connect = cs42l81_input_connect;
-	c->input_handler.disconnect = cs42l81_input_disconnect;
-	c->input_handler.name = "cs42l81-vol";
-	c->input_handler.id_table = cs42l81_input_ids;
-	ret = input_register_handler(&c->input_handler);
-	if (ret)
-		dev_warn(&spi->dev, "Vol± input handler: %d\n", ret);
-	else
-		c->input_handler_reg = true;
+	if (vol_keys) {
+		c->input_handler.event = cs42l81_input_event;
+		c->input_handler.connect = cs42l81_input_connect;
+		c->input_handler.disconnect = cs42l81_input_disconnect;
+		c->input_handler.name = "cs42l81-vol";
+		c->input_handler.id_table = cs42l81_input_ids;
+		ret = input_register_handler(&c->input_handler);
+		if (ret)
+			dev_warn(&spi->dev, "Vol± input handler: %d\n", ret);
+		else
+			c->input_handler_reg = true;
+	}
 
 	dev_info(&spi->dev,
-		 "CS42L81 SPI + ASoC DAI cs42l81-hifi (Vol±→Master step=%u)\n",
-		 CS42L81_VOL_STEP);
+		 "CS42L81 SPI + ASoC DAI cs42l81-hifi (vol keys %s, step=%u)\n",
+		 vol_keys ? "grabbed" : "not grabbed", CS42L81_VOL_STEP);
 	return 0;
 }
 
