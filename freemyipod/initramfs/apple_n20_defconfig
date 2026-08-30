@@ -1,5 +1,5 @@
 CONFIG_CROSS_COMPILER_PREFIX="arm-linux-gnueabihf-"
-CONFIG_EXTRA_CFLAGS="-mcpu=arm1176jzf-s -mfloat-abi=hard -mfpu=vfp"
+CONFIG_EXTRA_CFLAGS="-mcpu=arm1176jzf-s"
 CONFIG_STATIC=y
 CONFIG_STATIC_LIBGCC=y
 # tc needs kernel-specific headers not available in the cross toolchain sysroot
