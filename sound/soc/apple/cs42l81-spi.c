@@ -36,10 +36,9 @@
  *
  * Cirrus bring-up notes:
  *   Reset mutes outputs (0x527=0xFF); unmute 0x60 on play.
- *   0x2F bit6: glass shows 0x40 idle (no IIS), 0x00 while BCLK/LRCLK run.
- *   Treat bit6 as LOS / no-sync when asp_bit6_is_los=1 (default): asp_lock
- *   succeeds when bit6 is CLEAR. Legacy asp_bit6_is_los=0 waits for bit6 set.
- *   ASP lock after IIS clocks (414FAE), not before.
+ *   0x2F bit 7 is the analog-block readiness D3280(1) polls. Bit 6 moves
+ *   with the IIS clocks on glass but stock never reads it -- 0x2F is read
+ *   exactly once in the whole image. There is no ASP lock handshake.
  *   I2S slave NB_NF 16-bit; no DAPM graph — path is register audio_on().
  *
  * ARTP routes (CoreAudio debug: "BT-%s, HP-%s, USB-%s, MB-%s"):
@@ -153,11 +152,6 @@ static int audio_route;
 module_param(audio_route, int, 0644);
 MODULE_PARM_DESC(audio_route, "0=HP jack (default); USB/BT/MB unimplemented");
 
-/* 570620 gates on 0x8925CF4==1 (headset ready). */
-static bool force_headset;
-module_param(force_headset, bool, 0644);
-MODULE_PARM_DESC(force_headset, "1=skip headset-ready gate (glass bring-up)");
-
 /*
  * Grab volume keys system-wide.
  *
@@ -179,12 +173,6 @@ MODULE_PARM_DESC(vol_keys,
 		 "1=grab KEY_VOLUMEUP/DOWN globally to set headphone gain; 0=leave keys alone (default)");
 
 /*
- * Off. The poll existed to notice plug and unplug through MikeyBus and
- * re-arm HSDET, and it re-entered the codec under c->lock every 500 ms
- * forever for a result this board does not act on. Set non-zero only if
- * jack detection is ever genuinely wanted here.
- */
-/*
  * Print the stack of the first codec prepare. On by default until the
  * thing that opens the PCM at boot is identified; it is one backtrace.
  */
@@ -192,10 +180,6 @@ static bool prepare_caller_trace;	/* opt-in; set 1 to name the PCM opener */
 module_param(prepare_caller_trace, bool, 0644);
 MODULE_PARM_DESC(prepare_caller_trace,
 		 "1=dump_stack() on the first codec prepare to identify the caller");
-
-static unsigned int jack_poll_ms;
-module_param(jack_poll_ms, uint, 0644);
-MODULE_PARM_DESC(jack_poll_ms, "MikeyBus/HSDET poll period ms (0=off)");
 
 /*
  * audio_path_mode (i2s trigger also reads via cs42l81_get_audio_path_mode):
@@ -246,9 +230,6 @@ module_param(post_iis_401_rmw, bool, 0644);
 MODULE_PARM_DESC(post_iis_401_rmw, "1=post_iis 401&3=2 (default); 0=keep graph 0x12");
 
 /* D3280(4) RE writes C96F=0x0E. Glass sometimes needed 0x1E — A/B. */
-static int c96f_final = 0x0e;
-module_param(c96f_final, int, 0644);
-MODULE_PARM_DESC(c96f_final, "D3280(4) final 0xC96F (default 0x0E RE; try 0x1E)");
 
 /* Dynamic 570620: force 41F944 gate pass (route_present=1, busy=0). */
 static bool graph_force_gate = true;
@@ -294,12 +275,16 @@ struct cs42l81 {
 	struct work_struct vol_work;
 	struct delayed_work asp_post_work;
 	unsigned int prepared_rate;	/* 0 = not configured yet */
-	struct delayed_work jack_work;
 	atomic_t vol_steps;
-	bool jack_poll_active;
-	bool jack_last_present;
 	bool route_playing;	/* 892A058 mirror */
 	bool codec_prepared;
+	bool unlock_done;
+	bool graph_latched;
+	/*
+	 * RetailOS MEMORY[0x892A038]. Selects which of sub_D34C0's three
+	 * rate paths is live; written by D3280(3) and by sub_D2F64.
+	 */
+	u8 mode38;
 	bool play_started;
 	int graph_domain;	/* RetailOS SVC domain 33 held (not SPI page) */
 	struct cs42_graph_state graph;
@@ -330,36 +315,12 @@ static unsigned int cs42_pick_rate(struct cs42l81 *c, unsigned int rate)
 }
 
 /*
- * 0x2F bit6 polarity: glass idle (no IIS) reads 0x40; running IIS reads 0x00.
- * Default asp_bit6_is_los=1 → bit6 set = loss/no-sync, clear = ASP locked.
- */
-static bool asp_bit6_is_los = true;
-module_param(asp_bit6_is_los, bool, 0644);
-MODULE_PARM_DESC(asp_bit6_is_los,
-		 "1=bit6 is LOS flag (clear=synced); 0=legacy bit6-set=synced");
-
-/*
- * asp_gate_unmute=0 (default): post_iis always forces HP unmute; 0x2F is telemetry.
- * asp_gate_unmute=1: legacy — unmute only when asp probe reports synced.
- */
-static bool asp_gate_unmute;
-module_param(asp_gate_unmute, bool, 0644);
-MODULE_PARM_DESC(asp_gate_unmute, "1=gate unmute on 0x2F probe; 0=force unmute (default)");
-
-/*
  * of_asp_slave=1: clear 0x0F bit7 before IIS (CS42L73-family ASP slave test).
  * Default 0 keeps RetailOS D3280(3) pad-drive write.
  */
 static bool of_asp_slave;
 module_param(of_asp_slave, bool, 0644);
 MODULE_PARM_DESC(of_asp_slave, "1=force CS42 0x0F bit7=0 (ASP slave) before IIS");
-
-static bool cs42l81_asp_synced(u8 r2f)
-{
-	if (asp_bit6_is_los)
-		return !(r2f & 0x40);
-	return !!(r2f & 0x40);
-}
 
 int cs42l81_post_iis_start(void);
 int cs42l81_play_stop(void);
@@ -371,8 +332,96 @@ void cs42l81_schedule_post_iis(void);
 void cs42l81_cancel_post_iis(void);
 
 static int cs42l81_write(struct cs42l81 *c, u16 reg, u8 val);
+static void cs42_codec_clk(struct cs42l81 *c, bool on);
 static int cs42l81_apply_user_vol(struct cs42l81 *c);
+static int cs42l81_apply_mute(struct cs42l81 *c);
 static void cs42l81_log_start_state(struct cs42l81 *c, const char *tag);
+
+/*
+ * There are two write frames, and until now this driver only sent one.
+ *
+ * RetailOS has two register-write helpers and they put different things on
+ * the wire:
+ *
+ *   sub_43CDB4   6C  hi  lo          00  data          5 bytes
+ *   sub_3FA0E0   6C  hi  (lo|0x80)   01  data  data    6 bytes
+ *
+ * The five-byte form is what this driver has always sent, and it is correct
+ * -- it is what stock uses for the overwhelming majority of writes,
+ * including all 80 entries of the graph table.
+ *
+ * The six-byte form is used for exactly three registers, and stock never
+ * writes them any other way:
+ *
+ *   0x0225   0x0227   0x0229
+ *
+ * All three sit in the analog output block, all three are in the address
+ * space CS42L42 and CS43L36 both mark Reserved, and 0x0227 is the output
+ * gain. This driver has been writing all three with the short frame.
+ *
+ * That is consistent with everything observed: the register file accepts
+ * the short write and reads the value back perfectly -- which is how
+ * writes to 0x0227 have always verified -- while the analog side never
+ * takes it. Registers correct, clocks correct, ASP locked, jack silent.
+ *
+ * What the extra bytes mean is not documented anywhere available. Bit 7 of
+ * the low address byte and the 0x01 in the count position both look like
+ * flags, and the data byte appearing twice looks like a wider transfer than
+ * the register is. Rather than guess at semantics, the frame is reproduced
+ * exactly as stock emits it and the dispatch is by register number, which
+ * is the one thing the decomp states unambiguously.
+ *
+ * Dispatch happens inside cs42l81_write() so no call site can get it wrong,
+ * including the ones that route through cs42l81_rmw().
+ */
+/*
+ * On by default, but switchable, because it is new on the wire.
+ *
+ * The device wedged during the first playback test after this went in, and
+ * the six-byte frame is the newest variable in that path -- the codec
+ * shares SPI0 and a transfer the engine does not complete looks like a hang
+ * from the outside. That is a suspicion, not a finding: the same test also
+ * walked the codec through an 8 kHz open, which is its own hazard and is
+ * fixed separately. This exists so the two can be told apart from userspace
+ * on the next boot instead of by reflashing twice.
+ */
+static bool wide_write = true;
+module_param(wide_write, bool, 0644);
+MODULE_PARM_DESC(wide_write,
+		 "use the six-byte RetailOS frame for 0x225/0x227/0x229 (default Y)");
+
+static bool cs42l81_reg_wants_wide_write(u16 reg)
+{
+	if (!wide_write)
+		return false;
+
+	switch (reg) {
+	case 0x0225:
+	case 0x0227:
+	case 0x0229:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static int cs42l81_write_wide(struct cs42l81 *c, u16 reg, u8 val)
+{
+	u8 tx[6] = {
+		0x6c,
+		(reg >> 8) & 0xff,
+		(reg & 0xff) | 0x80,
+		0x01,
+		val,
+		val,
+	};
+	struct spi_transfer t = { .tx_buf = tx, .len = sizeof(tx) };
+	struct spi_message m;
+
+	spi_message_init(&m);
+	spi_message_add_tail(&t, &m);
+	return spi_sync(c->spi, &m);
+}
 
 static int cs42l81_write(struct cs42l81 *c, u16 reg, u8 val)
 {
@@ -383,8 +432,11 @@ static int cs42l81_write(struct cs42l81 *c, u16 reg, u8 val)
 		0x00,
 		val,
 	};
-	struct spi_transfer t = { .tx_buf = tx, .len = 5 };
+	struct spi_transfer t = { .tx_buf = tx, .len = sizeof(tx) };
 	struct spi_message m;
+
+	if (cs42l81_reg_wants_wide_write(reg))
+		return cs42l81_write_wide(c, reg, val);
 
 	spi_message_init(&m);
 	spi_message_add_tail(&t, &m);
@@ -437,10 +489,12 @@ static int cs42l81_bringup(struct cs42l81 *c)
 	if (ret)
 		return ret;
 
-	/* unlock-like */
-	cs42l81_write(c, 0x9901, 0xa5);
-	cs42l81_write(c, 0x9901, 0x00);
-
+	/*
+	 * The 0x9901 0xa5/0x00 unlock used to be here. Stock (sub_D2EFC) runs
+	 * it from inside state 3, once per boot, after the codec clock has
+	 * been re-enabled -- not at probe, where there is no clock at all yet.
+	 * It moved to cs42_d3280_state3_unfreeze().
+	 */
 	cs42l81_write(c, 0xc81f, 0xff);
 	cs42l81_write(c, 0xc85f, 0x0f);
 
@@ -543,6 +597,31 @@ static int cs42_graph_end(struct cs42l81 *c, int page)
 	return 0;
 }
 
+/*
+ * D3280(4) on the stop path. It is a genuine power-down -- it mutes to
+ * -76 dB, clears the analog enable and drops the 2v5 rail -- and for a
+ * long time this driver ran it as the last step of *prepare* under the
+ * name "state_4_output_on". Switchable while the play path is still being
+ * characterised.
+ */
+static bool state4_on_stop;
+module_param(state4_on_stop, bool, 0644);
+MODULE_PARM_DESC(state4_on_stop, "run D3280(4) standby on stop (default N)");
+
+static int cs42_d3280_state4_standby(struct cs42l81 *c);
+
+/*
+ * Which analog power-up to run at prepare: OSOS sub_D3280(1) or the
+ * bootloader's sub_1310. They differ in five registers and in the final
+ * state of 0x0007 bit 6; see cs42_d3280_state1_analog_on(). OSOS is the
+ * one that goes on to play music, so it is the default, and the bootloader
+ * path stays reachable for comparison.
+ */
+static bool osos_analog_on = true;
+module_param(osos_analog_on, bool, 0644);
+MODULE_PARM_DESC(osos_analog_on,
+		 "use OSOS D3280(1) rather than bootloader sub_1310 (default Y)");
+
 static int cs42_write_table(struct cs42l81 *c, const struct cs42_regval *t,
 			    unsigned int n)
 {
@@ -557,11 +636,53 @@ static int cs42_write_table(struct cs42l81 *c, const struct cs42_regval *t,
 	return 0;
 }
 
+/*
+ * Put 0x0006 bit 0 back after the graph table, and check that it took.
+ *
+ * This was argued both ways and the device settled it. The call graph says
+ * sub_5707D8 is reached only from sub_570620, which is reached only from
+ * sub_42D364(1) -- the play trigger -- so the graph is built after the
+ * power-up, and since nothing in the image re-sets bit 0 it looked as
+ * though stock simply plays with it clear.
+ *
+ * It does not. Measured on the device, across the 80 writes of the table:
+ *
+ *     prepare complete            0x002F = 0x80   ready=1
+ *     after the table             0x002F = 0x00   ready=0
+ *
+ * 0x002F bit 7 is the readiness D3280(1) polls for, and the table's
+ * {0x0006, 0x24} drops it. So bit 0 is a level after all, the analog block
+ * really does go down when the graph is programmed, and the inference from
+ * the call graph was wrong -- most likely because the vtable dispatch hides
+ * a D3280 transition that stock runs after the graph and we cannot see.
+ *
+ * Restore the bit and re-poll, exactly as the power-up does, so the log
+ * says whether the block came back rather than leaving it to be assumed.
+ */
+static void cs42_restore_analog_power(struct cs42l81 *c)
+{
+	unsigned int i;
+	u8 r06 = 0, r2f = 0;
+
+	cs42l81_rmw(c, 0x0006, 0x01, 0x01);
+	for (i = 0; i < 50; i++) {
+		if (cs42l81_read(c, 0x002f, &r2f))
+			break;
+		if (r2f & 0x80)
+			break;
+		usleep_range(1000, 1500);
+	}
+	cs42l81_read(c, 0x0006, &r06);
+	dev_info(&c->spi->dev,
+		 "graph: 0x006=0x%02x 0x02F=0x%02x ready=%d after %u polls\n",
+		 r06, r2f, !!(r2f & 0x80), i);
+}
+
 /* Read back last-write-wins expected values for 0x400..0x448 + key regs. */
 static void cs42_verify_5707d8(struct cs42l81 *c)
 {
 	static const struct cs42_regval expect[] = {
-		{ 0x0006, 0x24 },
+		{ 0x0006, 0x25 },
 		{ 0x0529, 0x2c }, { 0x052a, 0x2c },
 		{ 0x0533, 0x2c }, { 0x0534, 0x2c },
 		{ 0x0400, 0x04 }, { 0x0401, 0x12 },
@@ -878,6 +999,7 @@ static int cs42_build_play_graph_static(struct cs42l81 *c)
 			       ARRAY_SIZE(cs42_static_5707d8));
 	if (ret)
 		goto out;
+	cs42_restore_analog_power(c);
 
 	/*
 	 * Split the settle from the write that follows it.
@@ -1082,7 +1204,13 @@ static int cs42_play_unmute(struct cs42l81 *c)
 	if (ret)
 		return ret;
 	if (post_iis_401_rmw) {
-		ret = cs42l81_rmw(c, 0x0401, 0x03, 0x02);
+		/*
+		 * Bit 1 only. sub_570620 and sub_42D364 always drive bits 0
+		 * and 1 of 0x0401 in separate masked writes and never as a
+		 * pair; mask 0x03 cleared bit 0 as a side effect of setting
+		 * bit 1.
+		 */
+		ret = cs42l81_rmw(c, 0x0401, 0x02, 0x02);
 		if (ret)
 			return ret;
 	}
@@ -1115,8 +1243,6 @@ static int cs42_570620_play_graph(struct cs42l81 *c, int mode)
 	return 0;
 }
 
-static bool cs42_headset_ready(void);
-
 /*
  * Do not fold into codec prepare — this is the play lifecycle latch.
  */
@@ -1124,33 +1250,26 @@ static int cs42_retailos_play_start(struct cs42l81 *c)
 {
 	int ret;
 
-	/*
-	 * A missing headset is not an error.
-	 *
-	 * This used to return -ENODEV, which is where the -19 in every boot
-	 * log came from. Failing the stream is the wrong response for two
-	 * reasons. It makes an absent jack -- or MikeyBus simply not having
-	 * probed yet, which at boot is a race we lose more often than not --
-	 * break the codec for everything, including routes that do not go to
-	 * the jack at all. And a caller that retries on failure will sit there
-	 * cycling PCM start/stop, which is what filled the boot log.
-	 *
-	 * What RetailOS does here is 42D364(0) -- it acts on the analog output and
-	 * carries on rather than refusing. We carry on too: the stream configures
-	 * and the DAC runs, and the analog mute is left to the normal play path
-	 * rather than being forced here, since forcing a mute on a detection
-	 * result we do not fully trust is its own way to produce silence. Set
-	 * There is no gate any more; this path never refuses on jack state.
-	 */
-	/* No jack gate on the play latch either -- see cs42_codec_prepare(). */
-
 	ret = cs42_f141c_play_unmute(c, true);
 	if (ret)
 		return ret;
 
-	ret = cs42_570620_play_graph(c, 1);
-	if (ret)
-		return ret;
+	/*
+	 * The graph is built in cs42_codec_prepare(); see the note there.
+	 * Starting playback only re-arms it. The fallback covers a start
+	 * that somehow arrives without a prepare.
+	 */
+	if (!c->graph_latched) {
+		dev_warn(&c->spi->dev, "play_start: graph not built, building now\n");
+		ret = cs42_570620_play_graph(c, 1);
+		if (ret)
+			return ret;
+		c->graph_latched = true;
+	} else {
+		ret = cs42l81_rmw(c, 0x0401, 0x02, 0x02);
+		if (ret)
+			return ret;
+	}
 
 	cs42_log_graph_snapshot(c, "post_play_start");
 	cs42l81_log_start_state(c, "play_start");
@@ -1167,122 +1286,30 @@ static int cs42_retailos_play_stop(struct cs42l81 *c)
 	int ret;
 
 	ret = cs42_42d364_stop(c);
-	if (!ret)
-		cs42l81_log_start_state(c, "play_stop");
-	return ret;
-}
-
-static bool cs42_headset_ready(void)
-{
-	int (*ready)(void);
-	int r;
-
-	if (force_headset)
-		return true;
-	ready = (int (*)(void))__symbol_get("apple_mikeybus_headset_ready");
-	if (!ready) {
-		ready = (int (*)(void))__symbol_get("apple_mikeybus_jack_present");
-		if (!ready)
-			return true; /* no mikey module — analog HP path */
-		r = ready();
-		__symbol_put("apple_mikeybus_jack_present");
-		if (r < 0)
-			return true; /* loaded but unbound (uart2 disabled) */
-		return r > 0;
-	}
-	r = ready();
-	__symbol_put("apple_mikeybus_headset_ready");
+	if (ret)
+		return ret;
 	/*
-	 * -ENODEV: module loaded, serdev never probed (uart2 status=disabled).
-	 * That is not "open circuit". Blocking DAI here is the -19 bug.
-	 * 0: resistor task measured open circuit.
-	 * 1: identified accessory or force_plugged / unmeasured-ready.
+	 * D3280(4): mute to -76 dB, analog enable off, 2v5 rail down. This is
+	 * where stock runs it and where the register writes make sense.
 	 */
-	if (r < 0)
-		return true;
-	return r > 0;
-}
-
-/* RE D3280(3)/audio_on HSDET pulse — tip/ring sense + 0x0B type read. */
-static void cs42_hsdet_pulse(struct cs42l81 *c)
-{
-	u8 r220 = 0, r2f = 0, r0b = 0, r08 = 0, r09 = 0;
-	unsigned int j;
-
-	cs42l81_rmw(c, 0x0073, 0xc3, 0x00);
-	cs42l81_rmw(c, 0x0073, 0xc0, 0xc0);
-	cs42l81_rmw(c, 0x0079, 0x60, 0x00);
-	cs42l81_read(c, 0x0220, &r220);
-	cs42l81_rmw(c, 0x0220, 0x40, 0x40);
-	msleep(1);
-	cs42l81_rmw(c, 0x0009, 0xc0, 0xc0);
-	for (j = 0; j < 3; j++) {
-		msleep(1);
-		cs42l81_read(c, 0x002f, &r2f);
-		if (r2f & 0x40)
-			break;
+	/*
+	 * Off by default. A transport stop is sub_42D364(0) and nothing more.
+	 * D3280(4) is a full analog power-down -- 0x0006 bit 0 clear, rail to
+	 * 0x0E, 0x0225 to 0, gain to -76 dB -- and running it on every PCM
+	 * stop was unrecoverable, because cs42_codec_prepare() early-returns
+	 * when the rate has not changed and so never re-ran the power-up.
+	 * The first tone played and every one after it was silent.
+	 *
+	 * When it is enabled, drop prepared_rate so the next prepare really
+	 * does reconfigure.
+	 */
+	if (state4_on_stop) {
+		cs42_d3280_state4_standby(c);
+		c->prepared_rate = 0;
+		c->graph_latched = false;
 	}
-	cs42l81_read(c, 0x000b, &r0b);
-	cs42l81_rmw(c, 0x0009, 0xc0, 0x80);
-	cs42l81_rmw(c, 0x0220, 0x40, r220 & 0x40);
-	cs42l81_read(c, 0x0008, &r08);
-	cs42l81_read(c, 0x0009, &r09);
-	dev_info(&c->spi->dev,
-		 "HSDET 0x0B=0x%02x type=%u 0x2F=0x%02x 0x08=0x%02x 0x09=0x%02x\n",
-		 r0b, r0b & 3, r2f, r08, r09);
-}
-
-static void cs42_jack_poll_stop(struct cs42l81 *c)
-{
-	c->jack_poll_active = false;
-	cancel_delayed_work_sync(&c->jack_work);
-}
-
-static void cs42_jack_workfn(struct work_struct *work)
-{
-	struct cs42l81 *c = container_of(work, struct cs42l81, jack_work.work);
-	bool present;
-	int jack;
-
-	mutex_lock(&c->lock);
-	if (!c->jack_poll_active)
-		goto out_unlock;
-
-	jack = -ENODEV;
-	{
-		int (*jp)(void) = (int (*)(void))
-			__symbol_get("apple_mikeybus_jack_present");
-
-		if (jp) {
-			jack = jp();
-			__symbol_put("apple_mikeybus_jack_present");
-		}
-	}
-	present = force_headset || jack != 0;
-	if (jack == 0 && c->route_playing) {
-		dev_info(&c->spi->dev, "jack unplug -> 42D364(0)\n");
-		cs42_42d364_stop(c);
-		cs42_hsdet_pulse(c);
-	} else if (jack > 0 && !c->jack_last_present && !c->route_playing) {
-		dev_info(&c->spi->dev, "jack plug -> re-arm HSDET\n");
-		cs42_hsdet_pulse(c);
-	}
-	c->jack_last_present = present;
-	if (c->jack_poll_active && jack_poll_ms)
-		schedule_delayed_work(&c->jack_work,
-				      msecs_to_jiffies(jack_poll_ms));
-out_unlock:
-	mutex_unlock(&c->lock);
-}
-
-static void cs42_jack_poll_start(struct cs42l81 *c)
-{
-	if (!jack_poll_ms)
-		return;
-	c->jack_poll_active = true;
-	c->jack_last_present = cs42_headset_ready();
-	cancel_delayed_work(&c->jack_work);
-	schedule_delayed_work(&c->jack_work, msecs_to_jiffies(jack_poll_ms));
+	cs42l81_log_start_state(c, "play_stop");
+	return 0;
 }
 
 /*
@@ -1318,9 +1345,124 @@ static int cs42l81_db_to_code(int db)
  * writes `v4 & 0x7F`. Writing the sign-extended byte instead sets a bit 7
  * that is not part of the gain field.
  */
+/*
+ * 0x0227 is a signed gain in dB, not a magnitude.
+ *
+ * RetailOS sub_400330 opens with
+ *
+ *     if ( (a1 & 0x40) != 0 )  a1 |= 0x80u;
+ *
+ * which is a six-bit-to-eight-bit sign extension: 0x6c reads as -20 dB,
+ * which is exactly what this driver already prints for user volume 56. The
+ * mask-to-0x7f on the way out keeps the field width.
+ */
+static int cs42_gain_to_db(u8 raw)
+{
+	if (raw & 0x40)
+		raw |= 0x80;
+	return (int)(s8)raw;
+}
+
+/*
+ * Bring the 2.5 V analog backpower rail up.
+ *
+ * This is the piece that was missing. sub_400330 is not a volume setter --
+ * it is a volume setter wrapped around rail management, and the symbols in
+ * it say so outright:
+ *
+ *     "!gCS42L81_2v5Backpower_LastTimestamp"   "sphwDACCS42L81.c"
+ *
+ * The rail is gated on the gain crossing -8 dB. Coming up out of deep
+ * attenuation it runs the sequence below; going back down it starts a
+ * 601 ms timer and drops the rail afterwards. Everything else in the codec
+ * can be configured correctly -- ASP locked, clocks present, DAC clocked,
+ * mixer powered -- and the jack stays silent if this rail was never raised,
+ * which is the state this driver has been leaving it in: it wrote 0x0227
+ * and nothing else.
+ *
+ * The guard is stock's own: skip the work when 0xC96F already reads 30 and
+ * 0x0219 low three bits already read 1.
+ *
+ * sub_345D58 between the two 0xC96F writes is a thunk out to 0x2200104A,
+ * outside the extracted range. A settle delay is the only thing that fits
+ * between raising a rail and latching it, so it is one here, with the
+ * length exposed rather than guessed silently.
+ */
+static unsigned int backpower_settle_ms = 50;
+module_param(backpower_settle_ms, uint, 0644);
+MODULE_PARM_DESC(backpower_settle_ms,
+		 "settle inside the 2v5 backpower sequence (sub_345D58)");
+
+static int cs42_2v5_backpower_up(struct cs42l81 *c)
+{
+	u8 r_c96f = 0, r219 = 0;
+	int ret;
+
+	ret = cs42l81_read(c, 0xc96f, &r_c96f);
+	if (ret)
+		return ret;
+	ret = cs42l81_read(c, 0x0219, &r219);
+	if (ret)
+		return ret;
+
+	if (r_c96f == 0x1e && (r219 & 0x07) == 0x01) {
+		dev_dbg(&c->spi->dev, "2v5 backpower already up\n");
+		return 0;
+	}
+
+	dev_info(&c->spi->dev,
+		 "2v5 backpower up: C96F=%02x 219=%02x -> C96F=0e, 219 lo3=1, %ums, C96F=1e\n",
+		 r_c96f, r219, backpower_settle_ms);
+
+	ret = cs42l81_write(c, 0xc96f, 0x0e);
+	if (ret)
+		return ret;
+	ret = cs42l81_rmw(c, 0x0219, 0x07, 0x01);
+	if (ret)
+		return ret;
+	if (backpower_settle_ms)
+		msleep(backpower_settle_ms);
+	return cs42l81_write(c, 0xc96f, 0x1e);
+}
+
+/*
+ * Set the output gain, and manage the rail around it -- sub_400330.
+ *
+ * Deliberately the only place 0x0227 is written, so the threshold crossing
+ * cannot be bypassed by a caller that just wants a volume change.
+ */
 static int cs42l81_set_output_gain(struct cs42l81 *c, int code)
 {
-	return cs42l81_write(c, 0x0227, (u8)(code & 0x7f));
+	u8 raw = 0;
+	int old_db, new_db, ret;
+
+	new_db = cs42_gain_to_db((u8)(code & 0x7f));
+
+	ret = cs42l81_read(c, 0x0227, &raw);
+	old_db = ret ? -128 : cs42_gain_to_db(raw);
+
+	/* Coming up out of deep attenuation: the rail has to be there first. */
+	if (old_db < -8 && new_db >= -8) {
+		ret = cs42_2v5_backpower_up(c);
+		if (ret)
+			dev_warn(&c->spi->dev,
+				 "2v5 backpower failed (%d); gain applied anyway\n",
+				 ret);
+	}
+
+	ret = cs42l81_write(c, 0x0227, (u8)(code & 0x7f));
+
+	/*
+	 * Going the other way stock starts a 601 ms timer and drops the rail
+	 * when it expires. Not implemented: dropping a rail we have only just
+	 * learned to raise buys nothing here, and leaving it up costs idle
+	 * current on a device that is being debugged.
+	 */
+	if (!ret && old_db >= -8 && new_db < -8)
+		dev_dbg(&c->spi->dev,
+			"gain %d -> %d dB: stock would drop 2v5 after 601ms\n",
+			old_db, new_db);
+	return ret;
 }
 
 /*
@@ -1337,9 +1479,14 @@ static int cs42l81_apply_mode_271(struct cs42l81 *c)
 	ret = cs42l81_rmw(c, 0x0220, 0x28, 0x00);
 	if (ret)
 		return ret;
-	ret = cs42l81_rmw(c, 0x000d, 0x03, 0x00);
-	if (ret)
-		return ret;
+	c->mode38 = 0;		/* MEMORY[0x892A038] = v3 & 0x28, v3 == 0 here */
+	/*
+	 * 0x000D is deliberately absent. sub_D2F64 only writes it when its
+	 * v25 is non-zero, and v25 is set solely in the (a1 & 0xC08) == 0
+	 * branch -- which is mode 6, not mode 271. This driver wrote
+	 * 0x000D[1:0] = 0 in both, so the "output on" path was applying the
+	 * "output off" path's value and holding it there for all of playback.
+	 */
 	ret = cs42l81_rmw(c, 0x0206, 0x3f, 0x3d);
 	if (ret)
 		return ret;
@@ -1349,9 +1496,10 @@ static int cs42l81_apply_mode_271(struct cs42l81 *c)
 	ret = cs42l81_rmw(c, 0x0205, 0xff, 0x5a);
 	if (ret)
 		return ret;
-	ret = cs42l81_rmw(c, 0x0204, 0x03, 0x00);
-	if (ret)
-		return ret;
+	/*
+	 * 0x0204 is also absent: sub_42A5D6(516, v6, v32) with v6 == 0 is a
+	 * read-modify-write under an empty mask, i.e. nothing.
+	 */
 	ret = cs42l81_rmw(c, 0x0206, 0xc0, 0x00);
 	if (ret)
 		return ret;
@@ -1385,12 +1533,19 @@ static int cs42l81_apply_mode_6(struct cs42l81 *c)
 {
 	int ret;
 
-	ret = cs42l81_rmw(c, 0x0006, 0x04, 0x00);
+	/*
+	 * Set, not cleared. sub_D2F64 computes this value as v31, and v31
+	 * becomes 4 exactly when (a1 & 0x180) == 0 -- true for 6, false for
+	 * 271. The two modes drive this bit in opposite directions and this
+	 * driver had them driving it the same way.
+	 */
+	ret = cs42l81_rmw(c, 0x0006, 0x04, 0x04);
 	if (ret)
 		return ret;
 	ret = cs42l81_rmw(c, 0x0220, 0x28, 0x00);
 	if (ret)
 		return ret;
+	c->mode38 = 0;		/* MEMORY[0x892A038] = v3 & 0x28, v3 == 0 here */
 	ret = cs42l81_rmw(c, 0x000d, 0x03, 0x00);
 	if (ret)
 		return ret;
@@ -1435,6 +1590,7 @@ static int cs42l81_output_path_enable(struct cs42l81 *c)
 }
 
 /* OSOS sub_D2D2C(0). Kept for teardown; HP bring-up uses enable only. */
+
 static int __maybe_unused cs42l81_output_path_disable(struct cs42l81 *c)
 {
 	int ret;
@@ -1457,7 +1613,7 @@ static int __maybe_unused cs42l81_output_path_disable(struct cs42l81 *c)
  * Do not treat D3280(3) alone as playback-active.
  * Sequence includes sub_400330(64)/(65) before final 0x229=0x41.
  */
-static int cs42l81_state_4_output_on(struct cs42l81 *c)
+static int cs42_d3280_state4_standby(struct cs42l81 *c)
 {
 	int ret;
 
@@ -1470,6 +1626,7 @@ static int cs42l81_state_4_output_on(struct cs42l81 *c)
 	ret = cs42l81_write(c, 0x0229, 0x40);
 	if (ret)
 		return ret;
+	/* Analog enable off -- this is the standby transition. */
 	ret = cs42l81_rmw(c, 0x0006, 0x01, 0x00);
 	if (ret)
 		return ret;
@@ -1482,8 +1639,8 @@ static int cs42l81_state_4_output_on(struct cs42l81 *c)
 	ret = cs42l81_write(c, 0xc85f, 0x0f);
 	if (ret)
 		return ret;
-	/* RE state 4 base is 0x0E; glass A/B via c96f_final (try 0x1E). */
-	ret = cs42l81_write(c, 0xc96f, (u8)(c96f_final & 0xff));
+	/* Rail down. sub_D3280(4) writes 0x0E here, unconditionally. */
+	ret = cs42l81_write(c, 0xc96f, 0x0e);
 	if (ret)
 		return ret;
 	ret = cs42l81_write(c, 0x0223, 0x08);
@@ -1492,23 +1649,11 @@ static int cs42l81_state_4_output_on(struct cs42l81 *c)
 	ret = cs42l81_write(c, 0x0224, 0x09);
 	if (ret)
 		return ret;
+	/* State 1 puts 0x33 here; standby takes it to 0. */
 	ret = cs42l81_write(c, 0x0225, 0x00);
 	if (ret)
 		return ret;
-	/*
-	 * Exact D3280(4) RE: 400330(64)/400330(65) then 229=0x41.
-	 * Optional glass rail nudge (c96f_final=0x1e) keeps prior 219 lo3 dance.
-	 */
-	if ((c96f_final & 0xff) == 0x1e) {
-		ret = cs42l81_rmw(c, 0x0219, 0x07, 0x01);
-		if (ret)
-			return ret;
-		msleep(100);
-		ret = cs42l81_write(c, 0xc96f, 0x1e);
-		if (ret)
-			return ret;
-	}
-	/* D3280(4): 3FA0E0(553,64) before 400330 pair on 227. */
+	/* D3280(4): 3FA0E0(553,64) before the 400330 pair on 0x0227. */
 	ret = cs42l81_write(c, 0x0229, 0x40);
 	if (ret)
 		return ret;
@@ -1525,24 +1670,49 @@ static int cs42l81_state_4_output_on(struct cs42l81 *c)
 	if (ret)
 		return ret;
 
-	dev_info(&c->spi->dev, "D3280(4) / output_on complete\n");
+	dev_info(&c->spi->dev, "D3280(4) standby complete\n");
 	return 0;
 }
 
 /*
- * OSOS sub_D3280(a1==3) — headset detect / pre-output (not full play).
+ * OSOS sub_D3280(a1==3).
+ *
+ * Named for what it does rather than what it was once thought to be: it
+ * restores the codec clock and releases the freeze latch D3280(1) takes
+ * (0x0006 bit 6, 0x0007 bit 6, 0x0075 bit 7). The 0x007B/0x007C reads in
+ * the middle are stock and are left in place, but nothing here consults
+ * them or gates on them.
  */
-static int cs42l81_state_3_headset_detect(struct cs42l81 *c)
+static int cs42_d3280_state3_unfreeze(struct cs42l81 *c)
 {
 	u8 r74 = 0, r7b = 0, r7c = 0, r0f = 0, r2f = 0;
 	int ret;
 
+	/* sub_41CBD8(9, 1): clock back on before the latch is released. */
+	cs42_codec_clk(c, true);
+
+	/*
+	 * sub_D2EFC, guarded by MEMORY[0x892A028] so it runs exactly once.
+	 * Whatever 0x9901 gates, stock wants it opened here and not again.
+	 */
+	if (!c->unlock_done) {
+		cs42l81_write(c, 0x9901, 0xa5);
+		cs42l81_write(c, 0x9901, 0x00);
+		c->unlock_done = true;
+	}
+
 	ret = cs42l81_rmw(c, 0x0007, 0x40, 0x00);
 	if (ret)
 		return ret;
+	/* Release of the freeze latch state 1 sets. Not optional. */
 	ret = cs42l81_rmw(c, 0x0006, 0x40, 0x00);
 	if (ret)
 		return ret;
+	c->mode38 = 0x28;	/* MEMORY[0x892A038] = 40 */
+	/*
+	 * 0x220 bits 5 and 3. State 1 has already put mask 0x78 to 0x78,
+	 * which subsumes this; stock writes it anyway and so do we.
+	 */
 	ret = cs42l81_rmw(c, 0x0220, 0x28, 0x28);
 	if (ret)
 		return ret;
@@ -1567,16 +1737,156 @@ static int cs42l81_state_3_headset_detect(struct cs42l81 *c)
 	return 0;
 }
 
-/* OSOS sub_D34C0 / 183138 rate programming. */
-static int cs42l81_set_rate(struct cs42l81 *c, unsigned int rate)
+/*
+ * The sample-rate group, properly dispatched — RetailOS sub_D34C0.
+ *
+ * sub_D34C0 is not a sequence, it is a three-way branch on a mode word the
+ * rest of the driver maintains (MEMORY[0x892A038], modelled here as
+ * c->mode38):
+ *
+ *   mode38 & 0x08 and mode38 & 0x20  -> short path: 0x000F/0x012F only
+ *   mode38 & 0x08 and not 0x20       -> long path:  0x0121/0x0122/0x0130/
+ *                                       0x0131 and 0x0222/0x0223/0x0224
+ *   otherwise                        -> sub_183138(code, 1)
+ *
+ * This driver ran the 183138 body and then the long path's tail on top of
+ * it, unconditionally, as though D34C0 were one straight sequence. They are
+ * alternatives. The two use *different* register pairs for the same job --
+ * 183138 programs 0x010B/0x010C, the long path programs 0x0223/0x0224 --
+ * so running both wrote a rate into a block the current mode does not use,
+ * and, worse, the long path's closing `0x0220 mask 0x20 = 0x00` released a
+ * hold that 183138 had deliberately left set.
+ *
+ * Which branch is live follows from mode38, and mode38 follows from the
+ * sequence: D3280(3) sets it to 0x28, and sub_D2F64 recomputes it as
+ * `v3 & 0x28` -- zero for both mode 271 and mode 6. So after
+ * output_path_enable the third branch is the live one, which is why the
+ * 183138 body was the right code all along and the tail was not.
+ *
+ * mode38 is tracked rather than assumed so the branch keeps following the
+ * sequence if the sequence changes.
+ */
+
+/*
+ * 0 = call sub_183138 directly (default, and what prepare needs); 1 = go
+ * through sub_D34C0's dispatch on mode38. See cs42l81_set_rate().
+ */
+static int rate_path;
+module_param(rate_path, int, 0644);
+MODULE_PARM_DESC(rate_path, "0=183138 direct (default), 1=D34C0 dispatch");
+
+/* sub_D34C0 short path: rate code into 0x000F/0x012F, bracketed. */
+static int cs42_d34c0_short(struct cs42l81 *c, u8 code)
 {
-	const struct n31_rate_cfg *r = n31_find_rate(rate);
-	u8 code;
 	int ret;
 
-	if (!r)
-		return -EINVAL;
-	code = r->cs42_rate_code;
+	ret = cs42l81_rmw(c, 0x000e, 0xc0, 0xc0);
+	if (ret)
+		return ret;
+	ret = cs42l81_rmw(c, 0x000f, 0x0f, code);
+	if (ret)
+		return ret;
+	ret = cs42l81_write(c, 0x012f, (u8)(code | (code << 4)));
+	if (ret)
+		return ret;
+	return cs42l81_rmw(c, 0x000e, 0xc0, 0x40);
+}
+
+/*
+ * sub_D34C0 long path.
+ *
+ * Mutes to code 0x40 (-90 dB) and raises the 0x0220 bit-5 hold, programs
+ * the rate inside a 0x000E bracket, then drops the hold and restores the
+ * gain. Stock's SRC test is a pair of config-flag lookups
+ * (sub_149E98(126)/(127)) crossed with the rate; with no access to that
+ * config the native case is taken to be code 12 exactly, as elsewhere in
+ * this driver.
+ */
+static int cs42_d34c0_long(struct cs42l81 *c, u8 code)
+{
+	bool src = code != 12;
+	int ret;
+
+	ret = cs42l81_set_output_gain(c, 64);
+	if (ret)
+		return ret;
+	ret = cs42l81_rmw(c, 0x0220, 0x20, 0x20);
+	if (ret)
+		return ret;
+	usleep_range(1000, 1500);
+
+	ret = cs42l81_rmw(c, 0x000e, 0xc0, 0xc0);
+	if (ret)
+		return ret;
+	ret = cs42l81_rmw(c, 0x000f, 0x0f, code);
+	if (ret)
+		return ret;
+	ret = cs42l81_write(c, 0x012f, (u8)(code | (code << 4)));
+	if (ret)
+		return ret;
+
+	if (src) {
+		ret = cs42l81_write(c, 0x0121, 0x08);
+		if (ret)
+			return ret;
+		ret = cs42l81_write(c, 0x0122, 0x09);
+		if (ret)
+			return ret;
+		ret = cs42l81_rmw(c, 0x0130, 0x0f, code);
+		if (ret)
+			return ret;
+		ret = cs42l81_rmw(c, 0x0131, 0x01, 0x00);
+		if (ret)
+			return ret;
+		ret = cs42l81_write(c, 0x0223, 0x04);
+		if (ret)
+			return ret;
+		ret = cs42l81_write(c, 0x0224, 0x33);
+	} else {
+		ret = cs42l81_rmw(c, 0x0131, 0x01, 0x01);
+		if (ret)
+			return ret;
+		ret = cs42l81_write(c, 0x0223, 0x08);
+		if (ret)
+			return ret;
+		ret = cs42l81_write(c, 0x0224, 0x09);
+	}
+	if (ret)
+		return ret;
+
+	ret = cs42l81_write(c, 0x0222, src ? 12 : code);
+	if (ret)
+		return ret;
+
+	ret = cs42l81_rmw(c, 0x000e, 0xc0, 0x40);
+	if (ret)
+		return ret;
+	ret = cs42l81_rmw(c, 0x0220, 0x20, 0x00);
+	if (ret)
+		return ret;
+	usleep_range(1000, 1500);
+
+	/* Stock restores the cached volume here; this driver's cache is
+	 * user_vol, applied at the end of prepare.
+	 */
+	dev_info(&c->spi->dev, "D34C0 long: code=%u src=%d\n", code, src);
+	return 0;
+}
+
+/*
+ * sub_183138(code, 1).
+ *
+ * Ends muted at -90 dB with the 0x0220 bit-5 hold raised, and that is not
+ * an oversight in the transcription: sub_D2F64 clears 0x0220 mask 0x28 as
+ * its second write, so output_path_enable is what releases the hold. The
+ * gain comes back with cs42l81_apply_user_vol() at the end of prepare.
+ *
+ * This is why the order in cs42_codec_prepare has to be set_rate before
+ * output_path_enable and not the other way round.
+ */
+static int cs42_183138_set_rate(struct cs42l81 *c, u8 code)
+{
+	int ret;
 
 	ret = cs42l81_rmw(c, 0x000e, 0xc0, 0xc0);
 	if (ret)
@@ -1589,12 +1899,10 @@ static int cs42l81_set_rate(struct cs42l81 *c, unsigned int rate)
 		return ret;
 
 	/*
-	 * sub_183138 branches on rate code:
-	 *   code==12 (48 kHz): 0x10B=8, 0x10C=9, 0x131 bit0=1
-	 *   else (e.g. 10=44.1): 0x121=8, 0x122=9, 0x130 lo=code,
-	 *                        0x131 bit0=0, 0x10B=4, 0x10C=0x33
-	 * Linux previously always took the 48 kHz arm while IIS ran
-	 * 44.1 (CLKDIV 272) → ASP/SRC mismatch → pulsed noise.
+	 * code == 12 (48 kHz) runs native on 0x010B/0x010C; every other rate
+	 * goes through the SRC, which needs 0x0121/0x0122/0x0130 as well.
+	 * Linux previously always took the 48 kHz arm while IIS ran 44.1
+	 * (CLKDIV 272) -- an ASP/SRC mismatch, and the pulsed noise with it.
 	 */
 	if (code == 12) {
 		ret = cs42l81_write(c, 0x010b, 0x08);
@@ -1631,11 +1939,62 @@ static int cs42l81_set_rate(struct cs42l81 *c, unsigned int rate)
 	if (ret)
 		return ret;
 
+	/* Both of these were missing. See the comment above. */
+	ret = cs42l81_set_output_gain(c, 64);
+	if (ret)
+		return ret;
+	return cs42l81_rmw(c, 0x0220, 0x20, 0x20);
+}
+
+static int cs42l81_set_rate(struct cs42l81 *c, unsigned int rate)
+{
+	const struct n31_rate_cfg *r = n31_find_rate(rate);
+	u8 code;
+	int ret;
+
+	if (!r)
+		return -EINVAL;
+	code = r->cs42_rate_code;
+
+	/*
+	 * Prepare takes the 183138 branch, and does not consult mode38 to get
+	 * there.
+	 *
+	 * mode38 shadows 0x0220 bits 5 and 3 -- D3280(3) sets both and writes
+	 * 0x28 to the shadow in the same breath, sub_D2F64 clears both and
+	 * writes v3 & 0x28. Those two bits read as an idle/standby pair:
+	 * sub_D2F64 clears them for *both* mode 271 and mode 6, i.e. whenever
+	 * a route exists at all, and only a1 == 0 (no route) puts them back.
+	 *
+	 * At the point prepare programs the rate, D3280(3) has just set them,
+	 * so a faithful D34C0 dispatch would take the short branch -- which
+	 * writes 0x000F and 0x012F and nothing else. That cannot be right at
+	 * 44.1 kHz: the SRC lives in 0x0121/0x0122/0x0130/0x0131 and the short
+	 * branch never touches it.
+	 *
+	 * The reading that fits is that D34C0 is the steady-state entry point
+	 * (a track change, with a route already up) while initial route setup
+	 * calls sub_183138 directly -- consistent with 183138 having its own
+	 * a2 argument and its own 41F944 route gate. So prepare calls it
+	 * directly, and the D34C0 dispatch is available on rate_path=1 for a
+	 * device-side A/B rather than being settled here by assertion.
+	 */
+	if (rate_path == 0 || !(c->mode38 & 0x08))
+		ret = cs42_183138_set_rate(c, code);
+	else if (c->mode38 & 0x20)
+		ret = cs42_d34c0_short(c, code);
+	else
+		ret = cs42_d34c0_long(c, code);
+	if (ret)
+		return ret;
+
 	c->rate = rate;
 	dev_info(&c->spi->dev,
-		 "CS42 set_rate %u code=%u 10B=%02x 10C=%02x 131bit0=%d\n",
-		 rate, code, code == 12 ? 0x08 : 0x04,
-		 code == 12 ? 0x09 : 0x33, code == 12 ? 1 : 0);
+		 "CS42 set_rate %u code=%u mode38=0x%02x path=%s\n",
+		 rate, code, c->mode38,
+		 (rate_path && (c->mode38 & 0x08))
+			 ? ((c->mode38 & 0x20) ? "D34C0/short" : "D34C0/long")
+			 : "183138");
 	return 0;
 }
 
@@ -1646,8 +2005,8 @@ static int cs42l81_set_rate(struct cs42l81 *c, unsigned int rate)
 /*
  * Stage markers for codec prepare.
  *
- * This path can hang the kernel, and there was nothing between "no headset
- * reported" and roughly fifty register writes to say how far it got. Each
+ * This path can hang the kernel, and there was nothing between entry and
+ * roughly fifty register writes to say how far it got. Each
  * marker prints BEFORE its step, so the last line in the log names the
  * operation that never returned rather than the last one that succeeded.
  * That distinction is the point: a trailing "ok" tells you where you were
@@ -1713,6 +2072,150 @@ static void cs42_mailbox_reads(struct cs42l81 *c)
 	dev_info(&c->spi->dev,
 		 "mailbox: 51f=%02x 520=%02x 524=%02x drained=%u\n",
 		 lvl_51f, lvl_520, v524, i);
+}
+
+/*
+ * Keep the bootloader's analog power-up values through the play path.
+ *
+ * cs42_analog_power_up() sets 0x225=0x19, 0x220=0x50 within mask 0x78, and
+ * 0x006 bit 6, and it reports success: "analog power-up: 0x2F=0x80
+ * ready=1". Then the register dump taken after a playback reads 0x225=0x00
+ * and 0x220=0x78, and there is no sound at the jack.
+ *
+ * Two writes on the play path undo it. cs42l81_state_4_output_on() -- the
+ * function whose job is to turn the output on -- writes 0x225 = 0x00 as a
+ * whole byte, and the dump confirms it ran (223=08 224=09 225=00 is exactly
+ * its sequence). cs42_d3280_state3_unfreeze() clears 0x006 bit 6, which
+ * the power-up had just set and which the bootloader leaves set.
+ *
+ * The driver's own notes flag both as deviations: "0x225 mask 0xFF = 0x19
+ * we write 0x00 here" and "0x220 mask 0x78 = 0x50 we use mask 0x28".
+ *
+ * This is a switch rather than an edit because the two sequences come from
+ * different reverse-engineering: the bootloader's sub_1310 and OSOS's
+ * sub_D3280(4). Both could be right at their own moment. It defaults on
+ * because the current behaviour produces no sound at all, so there is
+ * nothing to lose by trying the bootloader's values and something to learn
+ * either way.
+ */
+
+/*
+ * RetailOS sub_41CBD8(sub_4F82F8(), on) — CLKCON+0x0C bit 15, active low.
+ * D3280(1) drops it, D3280(3) restores it, and the 0x0006/0x0007 bit-6
+ * freeze latch exists to hold the analog block across that gap. The gate
+ * itself lives in the IIS driver, which owns the CLKCON mapping.
+ */
+static bool codec_clk_gate = true;
+module_param(codec_clk_gate, bool, 0644);
+MODULE_PARM_DESC(codec_clk_gate,
+		 "cycle CLKCON+0x0C bit15 across D3280(1)/(3) as stock does");
+
+static void cs42_codec_clk(struct cs42l81 *c, bool on)
+{
+	void (*gate)(bool);
+
+	if (!codec_clk_gate)
+		return;
+	gate = (void (*)(bool))__symbol_get("s5l8740_codec_clk_gate");
+	if (!gate) {
+		dev_warn_once(&c->spi->dev,
+			      "s5l8740_codec_clk_gate absent — clock left running\n");
+		return;
+	}
+	gate(on);
+	__symbol_put("s5l8740_codec_clk_gate");
+}
+
+/*
+ * OSOS sub_D3280(a1 == 1) -- the analog power-up the shipping firmware
+ * actually runs.
+ *
+ * cs42_analog_power_up() below is the *bootloader's* version, sub_1310, and
+ * this driver has been running that at prepare time on the reasoning that
+ * it is the sequence which produces the audible plop. It is -- at boot.
+ * OSOS then runs its own, and the two are not the same sequence:
+ *
+ *              bootloader sub_1310      OSOS sub_D3280(1)
+ *   0x0227     rmw 0x7f = 0x40          wr = 0x40   (six-byte frame)
+ *   0x0225     rmw 0xff = 0x19          wr = 0x33   (six-byte frame)
+ *   0x0226     rmw 0xff = 0x19          not written
+ *   0x0228     rmw 0x7f = 0x40          not written
+ *   0x0229     not written              wr = 0x40   (six-byte frame)
+ *   0x0075     not touched              rmw 0x80 = 0x00
+ *   0x0220     rmw 0x78 = 0x50          rmw 0x78 = 0x78
+ *   0x0006 b0  set                      set
+ *   0x002F     poll bit 7               poll bit 7
+ *   0x0006 b6  set                      set
+ *   0x0007 b6  CLEARED                  SET
+ *
+ * The last row is the one that should not be shrugged at. The bootloader
+ * leaves 0x0007 bit 6 clear; OSOS leaves it set, and then clears it again
+ * in state 3. Running the bootloader's ending means state 3 clears a bit
+ * that was never set, and whatever that bit gates never went through its
+ * transition.
+ *
+ * 0x0229 and 0x0075 are simply absent from the bootloader path, and 0x0225
+ * and 0x0220 differ in value rather than in kind.
+ *
+ * The three six-byte writes come out of cs42l81_write() automatically --
+ * 0x0225, 0x0227 and 0x0229 are exactly the registers that dispatch to the
+ * wide frame, which is not a coincidence: they are the analog output
+ * registers, and this is the analog power-up.
+ *
+ * The poll stays bounded. Stock's is a bare do/while on 0x2F bit 7 with no
+ * escape, which is fine in an RTOS that owns the machine and is not fine
+ * here.
+ */
+static int cs42_d3280_state1_analog_on(struct cs42l81 *c)
+{
+	unsigned int i;
+	u8 v2f = 0;
+	bool ready = false;
+	int ret;
+
+	ret = cs42l81_write(c, 0x0227, 0x40);
+	if (ret)
+		return ret;
+	ret = cs42l81_write(c, 0x0225, 0x33);
+	if (ret)
+		return ret;
+	ret = cs42l81_write(c, 0x0229, 0x40);
+	if (ret)
+		return ret;
+	ret = cs42l81_rmw(c, 0x0075, 0x80, 0x00);
+	if (ret)
+		return ret;
+	ret = cs42l81_rmw(c, 0x0220, 0x78, 0x78);
+	if (ret)
+		return ret;
+	ret = cs42l81_rmw(c, 0x0006, 0x01, 0x01);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < 50; i++) {
+		usleep_range(1000, 1500);
+		if (cs42l81_read(c, 0x002f, &v2f))
+			break;
+		if (v2f & 0x80) {
+			ready = true;
+			break;
+		}
+	}
+
+	ret = cs42l81_rmw(c, 0x0006, 0x40, 0x40);
+	if (ret)
+		return ret;
+	ret = cs42l81_rmw(c, 0x0007, 0x40, 0x40);
+	if (ret)
+		return ret;
+
+	/* sub_41CBD8(9, 0): codec clock off, latch holds the analog block. */
+	cs42_codec_clk(c, false);
+
+	dev_info(&c->spi->dev,
+		 "D3280(1) analog on: 0x2F=0x%02x ready=%d after %u polls\n",
+		 v2f, ready, i);
+	return 0;
 }
 
 /*
@@ -1789,26 +2292,6 @@ static int cs42_codec_prepare(struct cs42l81 *c, unsigned int rate)
 {
 	u8 st = 0, r219 = 0;
 	int ret;
-	int jack = -ENODEV;
-	int (*mikey_jack)(void);
-
-	/*
-	 * Same rule as cs42_retailos_play_start(): an absent headset must not
-	 * fail the stream. This is the copy that actually matters, because
-	 * hw_params lands here, so -ENODEV came straight back out of
-	 * snd_soc_dai_hw_params and ASoC walked every advertised rate looking
-	 * for one that would take -- all the way down to 8 kHz, failing each.
-	 * That is the start/stop churn in the boot log.
-	 */
-	/*
-	 * No jack detection here. This board does not use the codec's jack
-	 * detect, and consulting it did nothing but harm: it gated the whole
-	 * bring-up on a MikeyBus answer that is absent whenever UART2 is not
-	 * up, returned -ENODEV out of hw_params, and left the PCM layer
-	 * retrying at every advertised rate -- which is where the boot-time
-	 * pinmux and reset storm came from. Whether something is plugged in
-	 * is not the codec driver's business and never gates configuration.
-	 */
 
 	CS42_STAGE(c, "d1830_audio_rails");
 	{
@@ -1829,21 +2312,6 @@ static int cs42_codec_prepare(struct cs42l81 *c, unsigned int rate)
 		}
 	}
 
-	CS42_STAGE(c, "mikeybus_jack_present");
-	mikey_jack = (int (*)(void))__symbol_get("apple_mikeybus_jack_present");
-	if (mikey_jack) {
-		jack = mikey_jack();
-		__symbol_put("apple_mikeybus_jack_present");
-	}
-	if (jack < 0)
-		dev_info(&c->spi->dev,
-			 "MikeyBus unbound (uart2 disabled) — analog HP not gated\n");
-	else if (jack == 0)
-		dev_warn(&c->spi->dev,
-			 "MikeyBus open circuit — force_headset=1 to override\n");
-	else
-		dev_info(&c->spi->dev, "MikeyBus jack present\n");
-
 	{
 		void (*ts_path)(struct device *);
 
@@ -1857,10 +2325,6 @@ static int cs42_codec_prepare(struct cs42l81 *c, unsigned int rate)
 				 "tristar unbound — 3.5mm path is CS42+Mikey, not Lightning Dx\n");
 		}
 	}
-
-	ret = cs42l81_state_3_headset_detect(c);
-	if (ret)
-		return ret;
 
 	if (!rate)
 		rate = cs42_pick_rate(c, 0);
@@ -1892,8 +2356,39 @@ static int cs42_codec_prepare(struct cs42l81 *c, unsigned int rate)
 		dump_stack();
 	}
 
+	c->graph_latched = false;
+
 	CS42_STAGE(c, "analog_power_up");
-	cs42_analog_power_up(c);
+	if (osos_analog_on)
+		cs42_d3280_state1_analog_on(c);
+	else
+		cs42_analog_power_up(c);
+
+	/*
+	 * State 3 goes *after* state 1, which is not where this call used to
+	 * sit.
+	 *
+	 * The two are a matched pair around the codec clock gate. State 1
+	 * ends by setting 0x0006 bit 6 and 0x0007 bit 6 and then dropping the
+	 * clock (sub_41CBD8(clk, 0)); state 3 restores the clock and clears
+	 * those same two bits. They are a freeze latch held across the gate
+	 * transition, and stock never runs one without the other.
+	 *
+	 * This driver called state 3 first, up before the rate check, so it
+	 * cleared a latch nothing had set and then state 1 set it -- with no
+	 * one left to clear it. The analog block spent the whole of playback
+	 * held. 0x0075 bit 7 inverted the same way: state 1 clears it, state 3
+	 * sets it, and in the old order we finished with it clear.
+	 *
+	 * With the bootloader power-up this was merely inert, because that
+	 * sequence ends with 0x0007 bit 6 *cleared*. Against OSOS state 1 it
+	 * is fatal, which is why the order matters now and did not appear to
+	 * before.
+	 */
+	CS42_STAGE(c, "state_3_unfreeze");
+	ret = cs42_d3280_state3_unfreeze(c);
+	if (ret)
+		return ret;
 
 	CS42_STAGE(c, "mailbox_reads");
 	cs42_mailbox_reads(c);
@@ -1908,17 +2403,82 @@ static int cs42_codec_prepare(struct cs42l81 *c, unsigned int rate)
 	if (ret)
 		return ret;
 
-	CS42_STAGE(c, "state_4_output_on");
-	ret = cs42l81_state_4_output_on(c);
+	/*
+	 * Build the play graph here, not in the trigger.
+	 *
+	 * It is 80 SPI writes and a 100 ms settle -- measured, 118 ms. Run
+	 * from the transport START callback that delay lands between the
+	 * application asking for playback and the DMA being kicked, and the
+	 * stream stops again about thirty milliseconds later. hw_params has
+	 * no such constraint.
+	 *
+	 * cs42_retailos_play_start() then has only to unmute and re-arm
+	 * 0x0401 bit 1, which is microseconds.
+	 */
+	CS42_STAGE(c, "play_graph");
+	ret = cs42_570620_play_graph(c, 1);
 	if (ret)
 		return ret;
+	c->graph_latched = true;
 
-	/* Play-object companions (40C028/54F/220) — safe before graph latch. */
-	cs42l81_rmw(c, 0x0075, 0x3f, 0x3c);
+	/*
+	 * D3280(4) used to be called here, as the last step of prepare, under
+	 * the name "state_4_output_on". It is a power-DOWN sequence and the
+	 * name was wrong.
+	 *
+	 * sub_3C6244 settles it. That function is a pure dB-code converter --
+	 * sign-extend the 6-bit code, then map: -64 becomes -90, and anything
+	 * below -50 becomes 2*code + 50. State 4 feeds it 64 and 65, i.e.
+	 * codes 0x40 and 0x41, i.e. **-90 dB and -76 dB**, and caches those as
+	 * the current left/right volume. Around that it clears 0x0006 bit 0
+	 * (the analog enable state 1 had just polled 0x002F for), drops the
+	 * 2v5 rail to 0x0E, and writes 0x0225 = 0x00 over state 1's 0x33.
+	 *
+	 * So every prepare finished by muting to -76 dB, switching the analog
+	 * block off and dropping the rail -- immediately after bringing all
+	 * three up.
+	 *
+	 * It also clobbered the sample rate. 0x0223 = 0x08 / 0x0224 = 0x09 is
+	 * the *native* pair out of sub_D34C0, the one used when no SRC is
+	 * needed. Running that after set_rate meant every 44.1 kHz stream had
+	 * its SRC pair (0x04/0x33) overwritten with the 48 kHz native values a
+	 * few microseconds after being programmed.
+	 *
+	 * It belongs on the standby transition, and that is where it now is:
+	 * cs42_d3280_state4_standby(), called from the stop path.
+	 */
+	/*
+	 * 0x054F mask 0xF0 = 0 is attested -- sub_42A5D6(1359, 240, 0). The
+	 * 0x0075 mask 0x3F = 0x3C that used to sit beside it is not: across
+	 * the whole image 0x0075 is only ever written under mask 0x40 or mask
+	 * 0x80, both of which D3280(1) and D3280(3) have already done by this
+	 * point. Nothing writes its low six bits. Removed.
+	 */
 	cs42l81_rmw(c, 0x054f, 0xf0, 0x00);
-	cs42l81_rmw(c, 0x0220, 0x28, 0x28);
+	/*
+	 * 0x0220 mask 0x28 = 0x28 used to be re-applied here. D2F64(271),
+	 * which runs a few lines earlier inside output_path_enable, clears
+	 * exactly those two bits as its second write, so this put them
+	 * straight back and left the register in a state no decoded sequence
+	 * produces. It was not transcribed from anything; it is gone.
+	 */
 
-	cs42_hsdet_pulse(c);
+	/*
+	 * cs42_hsdet_pulse() used to run here. Its comment credited it to
+	 * "RE D3280(3)/audio_on", and it is from neither: sub_D3280(3)
+	 * touches 0x000F, 0x0074, 0x0075, 0x007B, 0x007C, 0x0006, 0x0007 and
+	 * 0x0220, and none of the registers that function wrote. Searching
+	 * all 42,760 extracted functions, *nothing* in the image writes
+	 * 0x0073, 0x0079 or 0x0009. The sequence was invented.
+	 *
+	 * That would be tolerable if it were inert, and it was not: it left
+	 * 0x0009 -- MCLK control, on the CS42L42 map this part follows for
+	 * the low pages -- rewritten to 0x80 rather than restored, on a codec
+	 * whose clocking prepare has just finished setting up. And it sat
+	 * twenty lines below this function's own comment explaining that this
+	 * board does not use the codec's jack detect and that consulting it
+	 * did nothing but harm.
+	 */
 
 	cs42l81_read(c, 0x0227, &st);
 	cs42l81_read(c, 0x0219, &r219);
@@ -1930,7 +2490,6 @@ static int cs42_codec_prepare(struct cs42l81 *c, unsigned int rate)
 		 "codec_prepare 0x227=0x%02x 0x219=0x%02x rate=%u graph_mode=%d\n",
 		 st, r219, rate, graph_mode);
 	c->codec_prepared = true;
-	cs42_jack_poll_start(c);
 
 	/* audio_path_mode=0: legacy debug — graph folded into prepare. */
 	if (audio_path_mode == 0) {
@@ -1994,14 +2553,28 @@ static int __maybe_unused cs42l81_set_mute(struct cs42l81 *c, int mute)
  * software -- that only ever worked on the PIO path, and the codec gain
  * applies to both paths anyway.
  */
+/*
+ * Gain, and nothing else.
+ *
+ * This used to force the mute state as well, on every call. Stock's volume
+ * path is sub_D2C98 to work out the code and sub_400330 to write it, and
+ * sub_400330 touches 0x0227 and the 2v5 rail -- not 0x0527, and certainly
+ * not 0x0401. Ours reached 0x0401 through cs42_play_unmute(), so setting
+ * the volume latched the graph's commit bit, and the call at the end of
+ * prepare did that before the graph had been built at all.
+ *
+ * Mute state is cs42l81_apply_mute(), called from the paths whose job it
+ * actually is.
+ */
 static int cs42l81_apply_user_vol(struct cs42l81 *c)
 {
-	int ret;
-
-	ret = cs42l81_set_output_gain(c,
+	return cs42l81_set_output_gain(c,
 			cs42l81_db_to_code(cs42l81_vol_to_db(c->user_vol)));
-	if (ret)
-		return ret;
+}
+
+/* Apply c->dai_mute to the analog mute, and re-latch the graph if playing. */
+static int cs42l81_apply_mute(struct cs42l81 *c)
+{
 	if (c->dai_mute)
 		return cs42_f141c_play_unmute(c, false);
 	if (c->play_started)
@@ -2239,7 +2812,7 @@ static ssize_t mute_store(struct device *dev, struct device_attribute *attr,
 		return -EINVAL;
 	mutex_lock(&c->lock);
 	c->dai_mute = v ? 1 : 0;
-	ret = cs42l81_apply_user_vol(c);
+	ret = cs42l81_apply_mute(c);
 	mutex_unlock(&c->lock);
 	return ret ? ret : count;
 }
@@ -2281,98 +2854,67 @@ static ssize_t rreg_store(struct device *dev, struct device_attribute *attr,
 static DEVICE_ATTR_WO(rreg);
 
 /*
- * After IIS BCLK/LRCK run (RetailOS 26DDDE: 414FAE before sustained PCM).
- * Re-run 183138 clock regs and poll 0x2F bit6 for ASP sync (see asp_bit6_is_los).
- * LOS does not always self-recover — pulse 0x220 and retry clock prog.
+ * Read 0x002F and say what it holds. That is all.
+ *
+ * This used to be cs42l81_asp_lock(): five attempts, eighty polls each,
+ * waiting on 0x002F bit 6 for "ASP sync", re-running the rate programming
+ * between attempts, and returning -EAGAIN if the bit never moved.
+ *
+ * There is no such mechanism in the part. Across the entire OSOS image
+ * 0x002F is read exactly once -- the readiness poll inside sub_D3280(1),
+ * which tests bit 7 -- and bit 6 is never examined anywhere. The whole
+ * check was built on a bit stock never looks at, and the asp_bit6_is_los
+ * parameter existed because its polarity had never been established
+ * either: a guess with a switch on it.
+ *
+ * What stock does after the rate is programmed is start the I2S and play.
+ * There is no link-up handshake to wait for.
+ *
+ * The cost of the guess was not just wasted code. Worst case it spent
+ * ~2 seconds per playback start polling a meaningless bit, and once the
+ * retry path was corrected to re-program the rate properly it also ran
+ * four mute/unmute cycles on the way through.
+ *
+ * The read stays because it is one SPI transaction and the value is worth
+ * having in the log next to the clock registers.
  */
-static void cs42l81_asp_clock_pulse(struct cs42l81 *c)
+static int cs42_asp_status(struct cs42l81 *c)
 {
-	cs42l81_rmw(c, 0x0220, 0x20, 0x00);
-	udelay(50);
-	cs42l81_rmw(c, 0x0220, 0x20, 0x20);
-}
-
-/* Re-apply full 183138 during ASP lock (not just 0x0E/0x0F/0x12F). */
-static void cs42l81_asp_program_rate(struct cs42l81 *c)
-{
-	cs42l81_set_rate(c, cs42_pick_rate(c, c->rate));
-}
-
-int cs42l81_asp_hold_light(void);
-
-static int cs42l81_asp_lock(struct cs42l81 *c)
-{
-	unsigned int attempt, i;
 	u8 r2f = 0, r0e = 0, r0f = 0, r08 = 0, r09 = 0;
 
-	for (attempt = 0; attempt < 5; attempt++) {
-		if (attempt)
-			cs42l81_asp_clock_pulse(c);
-		cs42l81_asp_program_rate(c);
-		for (i = 0; i < 80; i++) {
-			cs42l81_read(c, 0x002f, &r2f);
-			if (cs42l81_asp_synced(r2f))
-				break;
-			usleep_range(500, 1000);
-		}
-		if (cs42l81_asp_synced(r2f))
-			break;
-	}
+	cs42l81_read(c, 0x002f, &r2f);
 	cs42l81_read(c, 0x0008, &r08);
 	cs42l81_read(c, 0x0009, &r09);
 	cs42l81_read(c, 0x000e, &r0e);
 	cs42l81_read(c, 0x000f, &r0f);
 	dev_info(&c->spi->dev,
-		 "asp_lock 0x2F=0x%02x los=%d synced=%d 0x0E=0x%02x 0x0F=0x%02x 0x08=0x%02x 0x09=0x%02x\n",
-		 r2f, asp_bit6_is_los, cs42l81_asp_synced(r2f), r0e, r0f, r08, r09);
-	return cs42l81_asp_synced(r2f) ? 0 : -EAGAIN;
+		 "asp status 0x2F=0x%02x 0x0E=0x%02x 0x0F=0x%02x 0x08=0x%02x 0x09=0x%02x\n",
+		 r2f, r0e, r0f, r08, r09);
+	return 0;
 }
 
 /*
  * Mid-stream LOS recovery: one 183138 pulse + short poll (~10 ms).
  * dma_tone calls this when 0x2F bit6 asserts LOS mid-tone.
  */
+/*
+ * Mid-stream "loss of signal" recovery. There is no loss-of-signal bit --
+ * see cs42_asp_status() -- so there is nothing to recover from and nothing
+ * to detect it with. Kept as an exported diagnostic so the tone generator's
+ * call site still links; it reads and logs and changes nothing.
+ */
+int cs42l81_asp_hold_light(void);
+
 int cs42l81_asp_hold_light(void)
 {
 	struct cs42l81 *c = cs42l81_dev;
-	unsigned int i;
-	u8 r2f = 0, before = 0;
-	int ret = -ENODEV;
 
 	if (!c)
 		return -ENODEV;
 	mutex_lock(&c->lock);
-	cs42l81_read(c, 0x002f, &before);
-	if (cs42l81_asp_synced(before)) {
-		ret = 0;
-		goto out;
-	}
-	cs42l81_asp_program_rate(c);
-	for (i = 0; i < 24; i++) {
-		cs42l81_read(c, 0x002f, &r2f);
-		if (cs42l81_asp_synced(r2f))
-			break;
-		usleep_range(400, 800);
-	}
-	if (cs42l81_asp_synced(r2f)) {
-		ret = 0;
-	} else {
-		cs42l81_asp_clock_pulse(c);
-		cs42l81_asp_program_rate(c);
-		for (i = 0; i < 16; i++) {
-			cs42l81_read(c, 0x002f, &r2f);
-			if (cs42l81_asp_synced(r2f))
-				break;
-			usleep_range(400, 800);
-		}
-		ret = cs42l81_asp_synced(r2f) ? 0 : -EAGAIN;
-	}
-	dev_info(&c->spi->dev,
-		 "asp_hold_light 0x2F 0x%02x->0x%02x ret=%d\n",
-		 before, r2f, ret);
-out:
+	cs42_asp_status(c);
 	mutex_unlock(&c->lock);
-	return ret;
+	return 0;
 }
 EXPORT_SYMBOL_GPL(cs42l81_asp_hold_light);
 
@@ -2479,12 +3021,11 @@ EXPORT_SYMBOL_GPL(cs42l81_pre_iis_start);
 int cs42l81_post_iis_start(void)
 {
 	struct cs42l81 *c = cs42l81_dev;
-	int probe;
 
 	if (!c)
 		return -ENODEV;
 	mutex_lock(&c->lock);
-	probe = cs42l81_asp_lock(c);
+	cs42_asp_status(c);
 	/*
 	 * Checkpoint-010 / handoff: do not gate HP unmute on dai_mute.
 	 * ALSA mute_stream(1) on a prior close left dai_mute stuck, so
@@ -2492,17 +3033,31 @@ int cs42l81_post_iis_start(void)
 	 * TXCOM=6 — silent jack with "perfect" digital telemetry.
 	 * asp_gate_unmute=0 (default): always force 0x527=0x60 / 0x401&3=2.
 	 */
-	if (!asp_gate_unmute || !probe) {
+	{
+		/*
+		 * Unmute and restore gain. Nothing else.
+		 *
+		 * This used to write 0x0229 = 0x41 and 0xC96F = 0x0E here,
+		 * both lifted from D3280(4) -- the standby sequence. 0x0229 is
+		 * written by sub_D3280 and by nothing else in the whole image,
+		 * only ever as 0x40 or 0x41, and 0x41 is the value standby
+		 * leaves; play was overwriting state 1's 0x40 with it. 0xC96F
+		 * is the 2v5 backpower rail, whose only legitimate writers are
+		 * sub_400330's -8 dB crossing logic and standby, and 0x0E is
+		 * the rail-DOWN value -- so starting playback dropped the rail
+		 * and bypassed the state machine that owns it.
+		 *
+		 * The gain does need restoring: sub_183138 ends the rate
+		 * programming muted at -90 dB by design.
+		 */
 		c->dai_mute = false;
-		cs42l81_write(c, 0x0229, 0x41);
-		cs42l81_write(c, 0xc96f, (u8)(c96f_final & 0xff));
 		cs42_play_unmute(c);
 		cs42l81_apply_user_vol(c);
 	}
 	cs42l81_log_start_state(c, "post_iis");
 	cs42_log_final_state(c, "post_iis");
 	mutex_unlock(&c->lock);
-	return asp_gate_unmute ? probe : 0;
+	return 0;
 }
 EXPORT_SYMBOL_GPL(cs42l81_post_iis_start);
 
@@ -2565,8 +3120,8 @@ static ssize_t probe_2f_store(struct device *dev, struct device_attribute *attr,
 	mutex_lock(&c->lock);
 	for (i = 0; i < n; i++) {
 		cs42l81_read(c, 0x002f, &r2f);
-		dev_info(&c->spi->dev, "probe_2f[%u]=0x%02x synced=%d\n",
-			 i, r2f, cs42l81_asp_synced(r2f));
+		dev_info(&c->spi->dev, "probe_2f[%u]=0x%02x ready=%d\n",
+			 i, r2f, !!(r2f & 0x80));
 	}
 	mutex_unlock(&c->lock);
 	return count;
@@ -2581,11 +3136,14 @@ static ssize_t force_play_store(struct device *dev, struct device_attribute *att
 	if (buf[0] != '1' && buf[0] != 'y' && buf[0] != 'Y')
 		return -EINVAL;
 	mutex_lock(&c->lock);
+	/*
+	 * Same rule as the real play path: unmute and set the gain. The
+	 * 0x0229 and 0xC96F writes that used to be here are standby values
+	 * out of D3280(4), and the raw 0x0527/0x0401 pair is what
+	 * cs42_play_unmute() already does properly.
+	 */
 	c->dai_mute = false;
-	cs42l81_write(c, 0x0229, 0x41);
-	cs42l81_write(c, 0xc96f, 0x1e);
-	cs42l81_write(c, 0x0527, 0x60);
-	cs42l81_rmw(c, 0x0401, 0x03, 0x02);
+	cs42_play_unmute(c);
 	cs42l81_apply_user_vol(c);
 	cs42l81_log_start_state(c, "force_play");
 	mutex_unlock(&c->lock);
@@ -2602,7 +3160,7 @@ static ssize_t asp_lock_store(struct device *dev, struct device_attribute *attr,
 	if (buf[0] != '1' && buf[0] != 'y' && buf[0] != 'Y')
 		return -EINVAL;
 	mutex_lock(&c->lock);
-	ret = cs42l81_asp_lock(c);
+	ret = cs42_asp_status(c);
 	mutex_unlock(&c->lock);
 	return ret ? ret : count;
 }
@@ -2691,8 +3249,10 @@ static int cs42l81_dai_mute_stream(struct snd_soc_dai *dai, int mute, int stream
 	/* Do not F141C-mute on ALSA mute(1). Short START/STOP bursts were
 	 * remuting HP 20-50ms after play_start. Real stop is 42D364 on IIS.
 	 */
-	if (!mute)
+	if (!mute) {
 		cs42l81_apply_user_vol(c);
+		cs42l81_apply_mute(c);
+	}
 	mutex_unlock(&c->lock);
 	dev_info_ratelimited(&c->spi->dev,
 			     "DAI mute=%d user_vol=%u%s\n", mute, c->user_vol,
@@ -2787,6 +3347,8 @@ static void cs42l81_vol_workfn(struct work_struct *work)
 	if (vol != prev || unmute) {
 		c->user_vol = vol;
 		cs42l81_apply_user_vol(c);
+		if (unmute)
+			cs42l81_apply_mute(c);
 	}
 	mutex_unlock(&c->lock);
 
@@ -2922,7 +3484,7 @@ static int cs42l81_sw_put(struct snd_kcontrol *kcontrol,
 	mutex_lock(&c->lock);
 	changed = mute != c->dai_mute;
 	c->dai_mute = mute;
-	cs42l81_apply_user_vol(c);
+	cs42l81_apply_mute(c);
 	mutex_unlock(&c->lock);
 	return changed;
 }
@@ -2994,7 +3556,6 @@ static int cs42l81_probe(struct spi_device *spi)
 	atomic_set(&c->vol_steps, 0);
 	INIT_WORK(&c->vol_work, cs42l81_vol_workfn);
 	INIT_DELAYED_WORK(&c->asp_post_work, cs42l81_asp_post_workfn);
-	INIT_DELAYED_WORK(&c->jack_work, cs42_jack_workfn);
 	spi_set_drvdata(spi, c);
 
 	mutex_lock(&c->lock);
@@ -3049,7 +3610,6 @@ static void cs42l81_remove(struct spi_device *spi)
 		}
 		cancel_work_sync(&c->vol_work);
 		cancel_delayed_work_sync(&c->asp_post_work);
-		cs42_jack_poll_stop(c);
 		c->component = NULL;
 	}
 	if (cs42l81_dev == c)

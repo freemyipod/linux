@@ -15,13 +15,30 @@
 #include <sound/pcm.h>
 
 /*
- * Every rate the hardware actually has a divider for. Both the codec and
- * the IIS DAI advertise exactly this set: they used to advertise only
- * 44.1/48 while the table below carried nine entries, so 8/11.025/12/16/
- * 22.05/24/32 kHz streams were refused by ALSA despite the silicon
- * supporting them.
+ * Advertise only the two rates RetailOS actually uses.
+ *
+ * The table below carries a divider for every rate the silicon can clock,
+ * and for a while all nine were advertised on the reasoning that refusing a
+ * stream the hardware could take was needlessly strict. The cost of that
+ * only became clear once the codec was being compared against stock: OSS
+ * opens /dev/dsp at 8 kHz by default, so every playback began by
+ * configuring the codec for 8 kHz -- rate code 1, CLKDIV 1500, and the SRC
+ * arm of sub_183138 -- before settling on the rate that was actually
+ * wanted. RetailOS never runs 8 kHz. Those probes were walking the part
+ * down a path stock has never taken, on every single open, while we were
+ * trying to work out why stock's path produced no sound.
+ *
+ * So the DAI advertises 44.1 and 48 kHz and nothing else, and anything
+ * lower is resampled up before it reaches the hardware. OSS emulation and
+ * plughw insert a rate plugin and do this transparently; an application
+ * opening hw: directly at a lower rate is now refused, which is the
+ * deliberate half of the trade.
+ *
+ * The full table stays: n31_resolve_rate() still uses it to pick the
+ * nearest supported rate, and the dividers are real. This changes only what
+ * ALSA is told the DAI will accept.
  */
-#define N31_RATE_MASK	(SNDRV_PCM_RATE_8000_48000 | SNDRV_PCM_RATE_12000 | SNDRV_PCM_RATE_24000)
+#define N31_RATE_MASK	(SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000)
 
 #define N31_RATE_DEFAULT	44100u
 
