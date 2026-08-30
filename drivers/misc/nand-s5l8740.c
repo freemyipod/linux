@@ -400,7 +400,18 @@ module_param(cs_reads_total, uint, 0444);
 /* Where CS read wall time actually goes; reported by the heartbeat. */
 static u64 cs_ns_kick, cs_ns_copy;
 
-static unsigned int cs_reset_every;
+/*
+ * On. The comment above explains exactly why this is needed and it then
+ * defaulted to 0, so the counter was incremented in five places and acted
+ * on in none. A recovery walks eight thousand pages of back-to-back live
+ * C00 kicks with nothing reasserting the sequencer across the whole run,
+ * which is the condition the comment describes.
+ *
+ * 4096 is two register writes and two 10 us delays roughly twice per
+ * recovery -- unmeasurable against the reads between them, and it bounds
+ * how far the sequencer can drift before something puts it back.
+ */
+static unsigned int cs_reset_every = 4096;
 module_param(cs_reset_every, uint, 0644);
 MODULE_PARM_DESC(cs_reset_every,
 		 "fmss_nand_reset after this many CS phys reads (0=off)");
@@ -6827,8 +6838,16 @@ int s5l8740_nand_cs_phys_read_slc(u8 ce, u8 cau, u16 block, u8 page, u8 slc,
 	addr = fmss_ppn_addr(cau, block, page, slc);
 
 	mutex_lock(&f->lock);
-	if (cs_reset_every && f->pages_since_reset >= cs_reset_every)
+	if (cs_reset_every && f->pages_since_reset >= cs_reset_every) {
+		/*
+		 * Clearing the counter is the half that was missing. Without
+		 * it the threshold latches and every read after the first
+		 * reset resets again, which turns a periodic safeguard into a
+		 * per-read cost.
+		 */
 		fmss_nand_reset(f);
+		f->pages_since_reset = 0;
+	}
 	saved_armed = dma_armed;
 	/* One-shot friendly: re-arm for this kick; disarm after if one_shot. */
 	dma_armed = true;

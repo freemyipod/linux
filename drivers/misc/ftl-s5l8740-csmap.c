@@ -199,6 +199,7 @@ static int n31_ftl_find_bpb(struct n31_ftl_cs *ftl);
 static int n31_ftl_select_bpb(struct n31_ftl_cs *ftl);
 static int n31_validate_fat_critical(struct n31_ftl_cs *ftl);
 static void n31_fat_semantic_validate(struct n31_ftl_cs *ftl);
+static bool n31_fat_first_sector_ok(struct n31_ftl_cs *ftl);
 static int n31_ftl_register_disk(struct n31_ftl_cs *ftl);
 static void n31_ftl_unregister_disk(struct n31_ftl_cs *ftl);
 static int n31_ftl_apply_bpb(struct n31_ftl_cs *ftl, u32 fmss_lba,
@@ -1183,7 +1184,7 @@ static int n31_ftl_select_bpb(struct n31_ftl_cs *ftl)
 	}
 
 	for (i = 0; i < ftl->bpb_ncand; i++) {
-		bool apple;
+		bool apple, fatsig;
 		int vret;
 
 		n31_ftl_apply_bpb(ftl, ftl->bpb_candidates[i],
@@ -1191,6 +1192,7 @@ static int n31_ftl_select_bpb(struct n31_ftl_cs *ftl)
 				  ftl->bpb_cand_sector[i]);
 		vret = n31_validate_fat_critical(ftl);
 		apple = !memcmp(ftl->bpb_cand_oem[i], "*UOKJIHC", 8);
+		fatsig = n31_fat_first_sector_ok(ftl);
 
 		dev_info(ftl->dev,
 			 "bpb_try fmss=%u weave=%012llx oem='%.8s' "
@@ -1199,6 +1201,18 @@ static int n31_ftl_select_bpb(struct n31_ftl_cs *ftl)
 			 (unsigned long long)ftl->bpb_cand_weave[i],
 			 ftl->bpb_cand_oem[i], ftl->fat_crit_ok_n,
 			 ftl->fat_crit_need_n, vret);
+
+		dev_info(ftl->dev, "bpb_try fmss=%u fatsig=%d\n",
+			 ftl->bpb_candidates[i], fatsig);
+
+		/*
+		 * A candidate whose first FAT sector is not a FAT is the wrong
+		 * volume base, however well its critical sectors read. That is
+		 * the entire failure this check exists for, so it gates both
+		 * the early-out below and the scoring after it.
+		 */
+		if (!fatsig)
+			continue;
 
 		/* Perfect critical set: newest weave wins immediately. */
 		if (!vret && ftl->fat_crit_ok_n == ftl->fat_crit_need_n &&
@@ -1275,6 +1289,59 @@ static int n31_read_disk_checked(struct n31_ftl_cs *ftl, u32 disk_lba,
  * Walk root cluster chain, count dir entries, search for known iPod names.
  * FAT1 starts at reserved + fat_size32 (e.g. 32+942=974), not disk_lba=33.
  */
+/*
+ * Does the first FAT sector actually look like the start of a FAT?
+ *
+ * n31_validate_fat_critical() only checks that its nine critical sectors
+ * *read*. It never looks at what came back, so a BPB whose volume base is
+ * wrong still scores a perfect 9/9 as long as the shifted sectors happen to
+ * be mapped -- which they were:
+ *
+ *   BPB_CAND #1 fmss_lba=49285 weave=..ad crit=9/9 selected
+ *   BPB_CAND #2 fmss_lba=49279 weave=..ac
+ *
+ * Six sectors apart, and the FAT belongs to the older one. Selecting #1 put
+ * the whole volume six sectors out: sector 0 still read as a valid BPB and
+ * sector 1 as a valid FSInfo, because those are static and were found by
+ * content, but the FAT region was offset. Reading it back showed a perfectly
+ * well-formed FAT32 chain stepping 0x400 per 4096-byte sector and starting
+ * six sectors early -- so vfat walked into the middle of the table and got
+ * "invalid cluster chain".
+ *
+ * Every FAT32 begins entry 0 with the media descriptor in the low byte and
+ * the FAT32 12-bit-wide EOC nibbles above it: F8 FF FF 0F. That single test
+ * separates the two candidates, and nothing that is genuinely the first FAT
+ * sector can fail it.
+ */
+static bool n31_fat_first_sector_ok(struct n31_ftl_cs *ftl)
+{
+	struct n31_fat_layout *L = &ftl->layout;
+	u8 *buf;
+	bool ok = false;
+
+	if (!ftl->fat_base_valid || !L->fat_start)
+		return false;
+	buf = kmalloc(N31_DATA_SLOT_SIZE, GFP_KERNEL);
+	if (!buf)
+		return false;
+	if (!n31_ftl_read_disk_lba(ftl, L->fat_start, buf)) {
+		u32 e0 = get_unaligned_le32(buf);
+		u32 e1 = get_unaligned_le32(buf + 4);
+
+		/*
+		 * Entry 0 low byte is the media descriptor and matches the
+		 * one in the BPB at offset 0x15; the rest of entry 0 and all
+		 * of entry 1 are set. Mask
+		 * to 28 bits -- FAT32 entries carry only the low 28.
+		 */
+		ok = (e0 & 0xff) == ftl->bpb_sector[0x15] &&
+		     (e0 & 0x0fffff00) == 0x0fffff00 &&
+		     (e1 & 0x0fffffff) == 0x0fffffff;
+	}
+	kfree(buf);
+	return ok;
+}
+
 static void n31_fat_semantic_validate(struct n31_ftl_cs *ftl)
 {
 	struct n31_fat_layout *L = &ftl->layout;

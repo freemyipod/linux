@@ -63,6 +63,112 @@ MODULE_PARM_DESC(import_l2v_oracle,
  * reads pages from page 0 until it finds a blank one, so a genuinely open
  * block stops early and a block that is actually full reads all 127.
  */
+/*
+ * Rebuild a closed superblock whose BTOC has no BTE array.
+ *
+ * Off, and the measurement that turned it off is worth keeping. Enabling it
+ * answered the question it was built for -- the 70 such superblocks report
+ * 127 pages/sb, so they are full sealed blocks and not empty ones, exactly
+ * as the decomp of sub_567E3C predicted. But the second number says the
+ * work is unnecessary and the third says it is harmful:
+ *
+ *   btoc_fallback sbs=70 pages=8890 hits=35560 (127 pages/sb)
+ *   mapped_lbas   949733 -> 949733
+ *
+ * 35560 mappings applied and not one new LBA. They did not add anything;
+ * they replaced existing mappings one for one with different VBAs. Reads
+ * then came back holding the wrong logical block:
+ *
+ *   sftl lba mismatch want=0x8042b meta=0x7fed0 type=01
+ *   sftl lba mismatch want=0x7483f meta=0x7482c type=01
+ *
+ * with scattered deltas, which is what overwriting a correct map with a
+ * differently-derived one looks like. The build immediately before this
+ * read every file on the volume with no error.
+ *
+ * The reason is the same one that made the uncapped open rebuild
+ * destructive: on this volume no superblock is newer than the checkpoint
+ * (weave newer=0 older=2182), so per-page meta has nothing to add over the
+ * CXT and every override is a regression. The CXT already maps everything
+ * those blocks hold, which is precisely why mapped_lbas did not move.
+ *
+ * Kept as a switch rather than deleted because the reasoning is
+ * volume-specific: a device whose checkpoint is genuinely behind its data
+ * would need this, and would show it by mapped_lbas rising when it runs.
+ */
+/*
+ * Dump the raw CXT tree records covering a window of logical space.
+ *
+ * The mismatch narrowed to the logical cursor in whimory_cxt_parse_tree:
+ * the runs land in the right VBAs and carry the wrong LBA labels. The
+ * cursor is checked against each record's declared start LBA and never
+ * disagreed, so whatever goes wrong is internal to a record and cancels out
+ * by the end of it -- which cannot be reasoned about from summary counters.
+ *
+ * cxt_dump_lba names the window, cxt_dump_len its size. Every pair whose
+ * logical extent touches it is printed with the cursor value it was given,
+ * so the pair whose span does not match the run it describes is visible
+ * directly.
+ */
+/*
+ * Trace the first records of every CXT superblock walk.
+ *
+ * Two readings are left for the two newest checkpoints, whose records are
+ * eight bytes of 0xff followed by file content, and they need opposite
+ * fixes:
+ *
+ *   the walk is landing on the wrong page  -> an addressing bug here
+ *   a record can be a header-only terminator followed by pre-erase
+ *   contents                               -> accept it and keep walking
+ *
+ * The discriminator is whether the meta and the data come from the same
+ * place. Printing each slot's own meta beside its own data head, with the
+ * page's four metas alongside, settles it: a page whose slots all carry
+ * SFTL_CXT meta while their data is XML is a page we should not be reading,
+ * whereas a CXT page whose later slots hold stale content is a terminator.
+ */
+/*
+ * Replay this virtual block even if the checkpoint says it is covered.
+ *
+ * The last hypothesis for the handful of files that will not read. Their
+ * mapping comes from the checkpoint, is structurally sound, and points at a
+ * page holding much older data -- so either the checkpoint entry is stale
+ * and the correction lives in per-page meta that the skip threw away, or it
+ * is not stale and the fault is elsewhere. Forcing one block through the
+ * replay separates those without changing the rule for anything else.
+ *
+ * 0 disables. This is a test instrument, not a fix: if it works the fix is
+ * to make the skip rule stop being wrong about blocks like it, not to keep
+ * a hardcoded exception.
+ */
+static unsigned int force_replay_vblock;
+module_param(force_replay_vblock, uint, 0644);
+MODULE_PARM_DESC(force_replay_vblock,
+		 "replay this vblock even when the CXT covers it (0 = off)");
+
+static unsigned int cxt_trace_sb;
+module_param(cxt_trace_sb, uint, 0644);
+MODULE_PARM_DESC(cxt_trace_sb, "trace this many leading records of each CXT superblock");
+
+static unsigned int cxt_dump_lba;
+module_param(cxt_dump_lba, uint, 0644);
+MODULE_PARM_DESC(cxt_dump_lba, "dump CXT tree pairs covering this LBA (0 = off)");
+
+static unsigned int cxt_dump_len = 16384;
+module_param(cxt_dump_len, uint, 0644);
+MODULE_PARM_DESC(cxt_dump_len, "size of the cxt_dump_lba window");
+
+static unsigned int cxt_dump_max = 96;
+module_param(cxt_dump_max, uint, 0644);
+MODULE_PARM_DESC(cxt_dump_max, "cap on dumped pairs");
+
+static bool btoc_meta_fallback;
+module_param(btoc_meta_fallback, bool, 0644);
+MODULE_PARM_DESC(btoc_meta_fallback,
+		 "Rebuild BTOC-less closed superblocks from per-page meta "
+		 "(default N; overrides the CXT and corrupts the map when "
+		 "the CXT is newer, which it is on N31)");
+
 static unsigned int max_open_sbs = 4096;
 module_param(max_open_sbs, uint, 0644);
 MODULE_PARM_DESC(max_open_sbs,
@@ -842,6 +948,17 @@ static u32 whimory_sb_ofs_to_vba(const struct whimory *w, u32 sb_idx, u32 ofs)
 				ofs % w->sftl.vbas_per_page);
 }
 
+/* The virtual block a bank-major superblock index names. */
+static u32 whimory_cxt_sb_vblock(const struct whimory *w, u32 sb_idx)
+{
+	u32 per_ce = w->geom.num_cau * w->sftl.user_blocks;
+
+	if (!per_ce || !w->sftl.user_blocks)
+		return 0;
+	return (sb_idx % per_ce) % w->sftl.user_blocks;
+}
+
+
 static int whimory_unpack_vba(const struct whimory *w, u32 vba,
 			      u32 *ce, u32 *cau, u32 *vblock,
 			      u32 *page, u32 *slot)
@@ -971,6 +1088,7 @@ static int whimory_range_split(struct whimory *w, struct whimory_range *r,
 	right->len = r->len - left_len;
 	right->vba = r->vba + left_len;
 	right->weave = r->weave;
+	right->src = r->src;
 	r->len = left_len;
 	whimory_range_link(&w->ranges, right);
 	w->sftl.range_nodes++;
@@ -1005,6 +1123,7 @@ static int whimory_range_insert_new(struct whimory *w, u32 start, u32 len,
 	n->len = len;
 	n->vba = vba;
 	n->weave = w->sftl.claim_weave;
+	n->src = w->sftl.claim_source;
 	whimory_range_link(&w->ranges, n);
 	w->sftl.range_nodes++;
 	w->sftl.map_gen++;
@@ -4389,11 +4508,21 @@ static unsigned int whimory_cxt_collect_sbs(struct whimory *w,
 			continue;
 		vblock = whimory_vfl_virt(w, sb->cau, sb->block);
 		idx = whimory_sb_index(w, sb->ce, sb->cau, vblock);
+		/*
+		 * One candidate per virtual block, not per plane. A CXT is a
+		 * single superblock striped across all four (ce, cau) planes;
+		 * counting each plane separately turned one checkpoint into
+		 * four candidates with four weaves, of which the two highest
+		 * appeared to contribute nothing.
+		 */
 		for (j = 0; j < n; j++)
-			if (out[j].sb == idx)
+			if (whimory_cxt_sb_vblock(w, out[j].sb) == vblock)
 				break;
-		if (j < n)
+		if (j < n) {
+			if (sb->weave > out[j].weave)
+				out[j].weave = sb->weave;
 			continue;
+		}
 		out[n].sb = idx;
 		out[n].weave = sb->weave;
 		n++;
@@ -4439,6 +4568,61 @@ static const char *whimory_cxt_tag_name(u8 tag)
  * the 16-byte record metadata in `meta`. Page reads are cached across the
  * four slots of a physical page by the caller.
  */
+/*
+ * Read one record of a checkpoint, by offset within the whole superblock.
+ *
+ * The offset is a native VBA offset, which means it walks all four planes
+ * in the order the FTL wrote them. That matters more than it looks.
+ *
+ * A CXT is one superblock striped across the four (ce, cau) planes, and its
+ * records run in VBA order: plane 0 slots 0..3 of page 0, then plane 1,
+ * plane 2, plane 3, then page 1 of plane 0. The weave in each record's meta
+ * says so directly -- 580d..5810 on plane 0, 5811..5814 on plane 1, then
+ * 5815, 5819, and 581d back on plane 0.
+ *
+ * This used to take a bank-major superblock index and walk one plane at a
+ * time, which visited the same records in the wrong order: every record of
+ * plane 0, then every record of plane 1, and so on. The L2V tree cannot
+ * survive that. Each record declares the LBA it continues from and the
+ * parse rejects a record whose declared start does not match the running
+ * cursor, so out-of-order records either abort the walk or, worse, attach a
+ * run to the wrong logical position.
+ *
+ * It also made one checkpoint look like four candidates with four different
+ * weaves, of which the two "newest" contributed nothing -- which read as a
+ * stale map when it was a misread one.
+ */
+static int whimory_cxt_read_ofs(struct whimory *w, u32 vblock, u32 ofs,
+				u8 *data, u8 *meta, u8 *spare, u32 *last_key)
+{
+	struct whimory_sftl *s = &w->sftl;
+	u32 ce, cau, vb, page, slot, pblock, key;
+	u32 planes = w->geom.num_ce * w->geom.num_cau;
+	u32 per_sb = s->pages_per_sb * planes * s->vbas_per_page;
+	u32 vba = vblock * per_sb + ofs;
+	int ret;
+
+	ret = whimory_unpack_vba(w, vba, &ce, &cau, &vb, &page, &slot);
+	if (ret)
+		return ret;
+	cau = whimory_vfl_bank(w, cau, vb);
+	pblock = whimory_vfl_phys(w, cau, vb);
+	key = ((ce & 0xf) << 28) | ((cau & 0xf) << 24) |
+	      ((pblock & 0xffff) << 8) | (page & 0xff);
+	if (key != *last_key) {
+		ret = whimory_cs_read_page(w, ce, cau, pblock, page,
+					   s->data_page,
+					   S5L8740_NAND_PAGE_SIZE,
+					   spare, S5L8740_NAND_META_SIZE);
+		if (ret)
+			return ret;
+		*last_key = key;
+	}
+	memcpy(data, s->data_page + slot * WHIMORY_LBA_SIZE, WHIMORY_LBA_SIZE);
+	memcpy(meta, spare + slot * WHIMORY_META_SIZE, WHIMORY_META_SIZE);
+	return 0;
+}
+
 static int whimory_cxt_read_vba(struct whimory *w, u32 sb_idx, u32 ofs,
 				u8 *data, u8 *meta, u8 *spare, u32 *last_key)
 {
@@ -4731,10 +4915,33 @@ static int whimory_cxt_parse_tree(struct whimory *w, const u8 *data,
 		return 0;
 	lba = get_unaligned_le32(data);
 	span = get_unaligned_le32(data + 4);
-	if (span == 0xffffffffu)
+	if (span == 0xffffffffu) {
+		/*
+		 * Header says nothing follows, and until now that was
+		 * indistinguishable from a record that parsed and contained
+		 * nothing. They are not the same: the two newest checkpoints
+		 * on this device contribute no extents while the map is built
+		 * from the two older ones, leaving it a generation behind the
+		 * volume -- which is what the bad reads are. If those
+		 * checkpoints are being turned away here, this says so and
+		 * shows the header that did it.
+		 */
+		w->sftl.cxt_hdr_skipped++;
+		if (w->sftl.cxt_hdr_skipped <= 6)
+			dev_info(w->dev,
+				 "CXT_HDR_SKIP n=%u lba=%u span=0x%08x first16=%16ph\n",
+				 w->sftl.cxt_hdr_skipped, lba, span, data);
 		return 0;
-	if (span != WHIMORY_CXT_CONTIG_SPAN)
+	}
+	if (span != WHIMORY_CXT_CONTIG_SPAN) {
+		w->sftl.cxt_hdr_bad++;
+		if (w->sftl.cxt_hdr_bad <= 6)
+			dev_info(w->dev,
+				 "CXT_HDR_BAD n=%u lba=%u span=0x%08x want=0x%08x first16=%16ph\n",
+				 w->sftl.cxt_hdr_bad, lba, span,
+				 (u32)WHIMORY_CXT_CONTIG_SPAN, data);
 		return -EINVAL;
+	}
 	if (*lba_valid && lba != *next_lba) {
 		dev_warn(w->dev,
 			 "CXT_TREE lba discontinuity want=%u got=%u\n",
@@ -4743,12 +4950,33 @@ static int whimory_cxt_parse_tree(struct whimory *w, const u8 *data,
 	}
 	*lba_valid = true;
 
+	if (cxt_dump_lba && lba < cxt_dump_lba + cxt_dump_len)
+		dev_info(w->dev,
+			 "CXT_REC header lba=%u contig=0x%x pairs<=%u\n",
+			 lba, span, n - 1);
+
 	for (i = 1; i < n; i++) {
 		vba = get_unaligned_le32(data + 8 * i);
 		span = get_unaligned_le32(data + 8 * i + 4);
 		if (vba == 0xffffffffu || !span)
 			break;
 		w->sftl.cxt_records_seen++;
+
+		if (cxt_dump_lba && w->sftl.cxt_dumped < cxt_dump_max &&
+		    lba + span > cxt_dump_lba &&
+		    lba < cxt_dump_lba + cxt_dump_len) {
+			bool hole = vba >= WHIMORY_CXT_VBA_HOLE ||
+				    vba >= w->l2v.invalid_vba;
+			char d[64];
+
+			w->sftl.cxt_dumped++;
+			whimory_vba_describe(w, vba, d, sizeof(d));
+			dev_info(w->dev,
+				 "CXT_PAIR[%u] lba=%u..%u vba=0x%08x span=%u %s%s\n",
+				 i, lba, lba + span - 1, vba, span,
+				 hole ? "HOLE" : d,
+				 hole ? "" : "");
+		}
 		if (vba >= WHIMORY_CXT_VBA_HOLE || vba >= w->l2v.invalid_vba) {
 			/*
 			 * Hole: consumes logical space, maps nothing.
@@ -4830,25 +5058,56 @@ static int whimory_cxt_build_from_sb(struct whimory *w, u32 sb_idx)
 	u8 meta[WHIMORY_META_SIZE];
 	u8 spare[S5L8740_NAND_META_SIZE];
 	u32 ofs, last_key = ~0u, next_lba = 0, n_l2v = 0;
+	u32 tag_hist[256] = { 0 };
+	u32 n_cxt_meta = 0, n_clean = 0;
+	u32 planes = w->geom.num_ce * w->geom.num_cau;
+	u32 per_sb = s->pages_per_sb * planes * s->vbas_per_page;
+	u32 vblock = whimory_cxt_sb_vblock(w, sb_idx);
 	bool lba_valid = false;
 	int ret;
 
-	if (!data || !s->data_page)
+	if (!data || !s->data_page || !per_sb)
 		return -ENOMEM;
 
-	for (ofs = 0; ofs < s->vbas_per_sb; ofs++) {
-		ret = whimory_cxt_read_vba(w, sb_idx, ofs, data, meta, spare,
+	/*
+	 * The whole superblock, all four planes, in the order the FTL wrote
+	 * it -- not one plane at a time. See whimory_cxt_read_ofs().
+	 */
+	for (ofs = 0; ofs < per_sb; ofs++) {
+		ret = whimory_cxt_read_ofs(w, vblock, ofs, data, meta, spare,
 					   &last_key);
+		if (!ret && cxt_trace_sb && ofs < cxt_trace_sb) {
+			u32 tv = vblock * per_sb + ofs;
+			unsigned int tce, tcau, tvb, tpg, tsl;
+			char d[64] = "?";
+
+			if (!whimory_unpack_vba(w, tv, &tce, &tcau, &tvb, &tpg,
+						&tsl))
+				scnprintf(d, sizeof(d),
+					  "ce%u/cau%u/vblk%u/pg%u/slot%u",
+					  tce, tcau, tvb, tpg, tsl);
+			dev_info(w->dev,
+				 "CXT_TRACE sb=%u ofs=%u vba=%u %s meta=%16ph data8=%8ph\n",
+				 sb_idx, ofs, tv, d, meta, data);
+			if (tsl == 0)
+				dev_info(w->dev,
+					 "CXT_TRACE   page metas s0=%16ph s1=%16ph\n",
+					 spare, spare + WHIMORY_META_SIZE);
+		}
 		if (ret) {
 			dev_warn(w->dev,
 				 "CXT sb=%u read failed at ofs=%u/%u (%d) -- rest of this checkpoint dropped\n",
-				 sb_idx, ofs, s->vbas_per_sb, ret);
+				 sb_idx, ofs, per_sb, ret);
 			return ret;
 		}
 		if (meta[0] != WHIMORY_META_TYPE_SFTL_CXT)
 			continue;
-		if (meta[1] == WHIMORY_CXT_TAG_CLEAN)
+		n_cxt_meta++;
+		tag_hist[meta[1]]++;
+		if (meta[1] == WHIMORY_CXT_TAG_CLEAN) {
+			n_clean++;
 			break;
+		}
 		if (meta[1] != WHIMORY_CXT_TAG_L2V)
 			continue;
 		n_l2v++;
@@ -4867,18 +5126,46 @@ static int whimory_cxt_build_from_sb(struct whimory *w, u32 sb_idx)
 			 * quietly stops halfway looks exactly like one that
 			 * finished.
 			 */
-			s->cxt_records_lost += s->vbas_per_sb - ofs;
+			s->cxt_records_lost += per_sb - ofs;
 			dev_warn(w->dev,
 				 "CXT sb=%u parse stopped at record %u of %u (%d, %u L2V records read) -- up to %u records dropped\n",
-				 sb_idx, ofs, s->vbas_per_sb, ret, n_l2v,
-				 s->vbas_per_sb - ofs);
+				 sb_idx, ofs, per_sb, ret, n_l2v,
+				 per_sb - ofs);
 			return ret;
 		}
 	}
-	if (!n_l2v)
+	if (!n_l2v) {
+		/*
+		 * A checkpoint that contributes nothing is not necessarily
+		 * stale, and on this device it is not: the two newest CXT
+		 * superblocks -- weave 2049391 and 2049387 -- both land here,
+		 * while the map is built from the two older ones at 2049383
+		 * and 2049379. That is a map one generation behind the
+		 * volume, which is exactly what the bad reads look like: the
+		 * checkpoint names a page whose contents were superseded, and
+		 * the page still holds what it held at weave 687252.
+		 *
+		 * So the tags actually present are worth having. The walk
+		 * only parses WHIMORY_CXT_TAG_L2V and stops at
+		 * WHIMORY_CXT_TAG_CLEAN; if the newest checkpoints carry the
+		 * tree under some other tag, or lead with a CLEAN record that
+		 * stops the walk before the tree, this says so instead of
+		 * leaving it as "superseded".
+		 */
+		char hb[160];
+		unsigned int t, hn = 0;
+
+		for (t = 0; t < 256; t++) {
+			if (!tag_hist[t] || hn + 14 >= sizeof(hb))
+				continue;
+			hn += scnprintf(hb + hn, sizeof(hb) - hn, "%02x:%u ",
+					t, tag_hist[t]);
+		}
 		dev_info(w->dev,
-			 "CXT sb=%u holds no L2V records (clean or superseded)\n",
-			 sb_idx);
+			 "CXT sb=%u no L2V records: cxt_meta=%u clean=%u tags=%s(l2v=0x%02x clean=0x%02x)\n",
+			 sb_idx, n_cxt_meta, n_clean, hb,
+			 WHIMORY_CXT_TAG_L2V, WHIMORY_CXT_TAG_CLEAN);
+	}
 	return 0;
 }
 
@@ -4893,6 +5180,73 @@ static int whimory_cxt_ext_cmp(const void *a, const void *b)
 	if (x->lba != y->lba)
 		return x->lba < y->lba ? -1 : 1;
 	return 0;
+}
+
+static int whimory_cxt_ext_vba_cmp(const void *a, const void *b)
+{
+	const struct whimory_cxt_extent *x = a, *y = b;
+
+	if (x->vba != y->vba)
+		return x->vba < y->vba ? -1 : 1;
+	return 0;
+}
+
+/*
+ * Do two extents claim the same physical VBA?
+ *
+ * The overlap check next to this one sorts by LBA and asks whether two
+ * extents claim the same logical block. That is the wrong axis for the
+ * failure that is left: a checkpoint mapping lba 555968 to a VBA whose page
+ * holds lba 564360, with both extents structurally sound. Two extents can
+ * name disjoint LBA ranges and still point at the same place, and nothing
+ * looked for it -- overlaps=0 was measuring the other axis and reading as
+ * "no collisions".
+ *
+ * If a VBA is claimed twice, the map keeps whichever extent the LBA sort
+ * happened to place last, not whichever the FTL wrote last. There is no
+ * weave arbitration in the seed, so the wrong one can win.
+ */
+static void whimory_cxt_check_vba_overlaps(struct whimory *w)
+{
+	struct whimory_cxt_extent *by_vba;
+	unsigned int i, n = w->n_cxt_ext, hits = 0, shown = 0;
+	size_t bytes;
+
+	if (n < 2)
+		return;
+	bytes = (size_t)n * sizeof(*by_vba);
+	by_vba = kvmalloc(bytes, GFP_KERNEL);
+	if (!by_vba) {
+		dev_info(w->dev, "CXT_VBA_OVERLAP skipped (no memory)\n");
+		return;
+	}
+	memcpy(by_vba, w->cxt_ext, bytes);
+	sort(by_vba, n, sizeof(*by_vba), whimory_cxt_ext_vba_cmp, NULL);
+
+	for (i = 1; i < n; i++) {
+		const struct whimory_cxt_extent *p = &by_vba[i - 1];
+		const struct whimory_cxt_extent *c = &by_vba[i];
+
+		if (c->vba >= p->vba + p->span)
+			continue;
+		hits++;
+		if (shown < 8) {
+			shown++;
+			dev_err(w->dev,
+				"CXT_VBA_OVERLAP lba=%u span=%u vba=%u overlaps lba=%u span=%u vba=%u by %u\n",
+				c->lba, c->span, c->vba,
+				p->lba, p->span, p->vba,
+				p->vba + p->span - c->vba);
+		}
+	}
+	if (hits)
+		dev_err(w->dev,
+			"CXT_VBA_OVERLAP %u extents claim a VBA another already holds\n",
+			hits);
+	else
+		dev_info(w->dev,
+			 "CXT_VBA_OVERLAP none -- every extent has its own VBAs\n");
+	kvfree(by_vba);
 }
 
 /*
@@ -5003,6 +5357,7 @@ static int whimory_cxt_build_candidate(struct whimory *w)
 		 "CXT_MAP hole_lbas=%u empty_sbs=%u records_lost=%u nospc=%u\n",
 		 w->sftl.cxt_hole_lbas, w->sftl.cxt_sb_empty,
 		 w->sftl.cxt_records_lost, w->sftl.cxt_ext_nospc);
+	whimory_cxt_check_vba_overlaps(w);
 	return 0;
 }
 
@@ -5499,6 +5854,22 @@ module_param(payload_string_scan, bool, 0644);
 MODULE_PARM_DESC(payload_string_scan,
 		 "Scan confirmed pages for iTunesDB/F00/mp3 strings (default N)");
 
+/*
+ * Seven strnstr() sweeps over 16 KiB, on the hottest path in the recover.
+ *
+ * This runs from whimory_btoc_confirm_page(), which on this volume is
+ * called 26653 times -- so it is 26653 passes over a 16 KiB buffer looking
+ * for "iTunesDB", "F00", "iPod_Control", "Music" and friends, inside the
+ * phase that already dominates the boot. It is pure diagnostics: nothing
+ * reads the counters except the RECOVERY_STATS line, and on this volume
+ * every one of them prints 0.
+ *
+ * payload_string_scan gates it and already defaults off, so this costs
+ * nothing today -- noted here only so nobody enables it during a boot-time
+ * measurement and wonders where the seconds went. It stays because it was
+ * useful once, for confirming that a rebuilt map really did point at a
+ * filesystem.
+ */
 static void whimory_note_payload_strings(struct whimory *w, const u8 *data,
 					 unsigned int len)
 {
@@ -6027,8 +6398,16 @@ classify_done:
 		else
 			s->weave_older++;
 
-		if (use_cxt && s->cxt_loaded && sb->weave_max_p127 &&
-		    sb->weave_max && sb->weave_max < w->cxt_base_weave) {
+		if (force_replay_vblock && vblock == force_replay_vblock) {
+			dev_info(w->dev,
+				 "SFTL forcing vblk=%u through replay (kind=%u weave=%llu max=%llu p127=%u base=%llu)\n",
+				 vblock, sb->kind,
+				 (unsigned long long)sb->weave,
+				 (unsigned long long)sb->weave_max,
+				 sb->weave_max_p127,
+				 (unsigned long long)w->cxt_base_weave);
+		} else if (use_cxt && s->cxt_loaded && sb->weave_max_p127 &&
+			   sb->weave_max && sb->weave_max < w->cxt_base_weave) {
 			s->diff_skipped_sbs++;
 			continue;
 		}
@@ -6105,6 +6484,8 @@ classify_done:
 				int fb;
 
 				s->btoc_fb_sbs++;
+				if (!btoc_meta_fallback)
+					goto btoc_done;
 				fb = s->open_pages_read;
 				ret = whimory_rebuild_open_sb(w, sb);
 				s->btoc_fb_pages += s->open_pages_read - fb;
@@ -6112,6 +6493,8 @@ classify_done:
 					s->btoc_fb_hits += ret;
 				else if (ret < 0)
 					return ret;
+btoc_done:
+				;
 			}
 			if (ftl_progress_due(w))
 				ftl_progress_set(w, "replay", i, nsb),
@@ -6534,6 +6917,169 @@ static int whimory_ftl_open(struct whimory *w)
 /* Read path */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Explain a bad read from the live map.
+ *
+ * The first attempt at this read the CXT extent table, which is freed after
+ * seeding -- it is about 12 MiB on a 55 MiB device -- so it printed nothing
+ * at all. The interval map holds the same information and is still there.
+ *
+ * The question is what kind of wrong the mapping is, and the deltas already
+ * hint at it. One of them is exactly -16:
+ *
+ *   want=0x89af4 meta=0x89ae4   delta -16
+ *
+ * 16 is one page of VBAs -- planes * vbas_per_page -- which is the quantum
+ * you get wrong if the two VBA spaces disagree about a superblock stride.
+ * Replay builds VBAs with whimory_pack_vba over pages_per_sb = 128, while
+ * CXT VBAs come from the FTL. If the FTL strides over the 127 data pages
+ * instead, the two differ by one page per superblock and pack/unpack cancel
+ * it everywhere except where a CXT mapping meets a replayed one.
+ *
+ * So: look the returned LBA up as well. delta_vba tells them apart.
+ *
+ *   delta_vba == delta_lba  -> the run is intact and sitting at the wrong
+ *                              place; a placement error
+ *   delta_vba == 0          -> two LBAs claim one VBA; the map is
+ *                              double-mapped and one writer overwrote the
+ *                              other
+ *   otherwise               -> the run itself is malformed
+ */
+static void whimory_explain_bad_map(struct whimory *w, u32 lba, u32 meta_lba,
+				    u32 vba, u32 span, const struct whimory_meta *m)
+{
+	unsigned int ce, cau, vblock, page, slot;
+	char dw[64];
+	u32 vba2 = 0, span2 = 0;
+	int r2;
+
+	if (w->sftl.bad_map_logged >= 8)
+		return;
+	w->sftl.bad_map_logged++;
+
+	whimory_vba_describe(w, vba, dw, sizeof(dw));
+	r2 = whimory_l2v_search(w, meta_lba, &vba2, &span2);
+
+	if (r2) {
+		dev_err(w->dev,
+			"  lba=%u -> vba=%u span=%u (%s); meta lba=%u is NOT mapped (%d), delta_lba=%d\n",
+			lba, vba, span, dw, meta_lba, r2,
+			(int)meta_lba - (int)lba);
+		return;
+	}
+
+	{
+		struct whimory_range *r = whimory_range_find(&w->ranges, lba);
+
+		dev_err(w->dev,
+			"  lba=%u -> vba=%u span=%u (%s) src=%s weave=%llu\n",
+			lba, vba, span, dw,
+			!r ? "?" :
+			r->src == 1 ? "BTOC" :
+			r->src == 2 ? "open" :
+			r->src == 3 ? "CXT" :
+			r->src == 4 ? "LIST" : "seed",
+			r ? (unsigned long long)r->weave : 0ULL);
+	}
+	whimory_vba_describe(w, vba2, dw, sizeof(dw));
+	dev_err(w->dev,
+		"  meta lba=%u -> vba=%u span=%u (%s) | delta_lba=%d delta_vba=%d%s\n",
+		meta_lba, vba2, span2, dw,
+		(int)meta_lba - (int)lba, (int)vba - (int)vba2,
+		((int)vba - (int)vba2) == 0 ? " DOUBLE-MAPPED" :
+		(((int)meta_lba - (int)lba) == ((int)vba - (int)vba2) ?
+			" run intact, misplaced" : " run malformed"));
+
+	if (!whimory_unpack_vba(w, vba, &ce, &cau, &vblock, &page, &slot))
+		dev_err(w->dev,
+			"  read from ce%u/cau%u/vblk%u/pg%u/slot%u\n",
+			ce, cau, vblock, page, slot);
+
+	/*
+	 * The one number that decides whether the skip rule is at fault.
+	 *
+	 * The mapping came from the CXT and the CXT was parsed correctly, so
+	 * the checkpoint is describing a page that now holds something else:
+	 * the FTL moved data there after the checkpoint was taken. That is
+	 * only possible if the block was not covered by the skip, and the
+	 * skip uses page 127 as the block's upper bound.
+	 *
+	 * If this page's weave is newer than cxt_base_weave, page 127 does
+	 * not bound this block -- the block was appended to after its BTOC
+	 * was written -- and the diff replay skipped a superblock it should
+	 * have replayed. If it is older, the checkpoint and the NAND
+	 * genuinely disagree and the fault is elsewhere.
+	 */
+	if (m) {
+		u64 pw = whimory_weave48((const u8 *)m);
+
+		dev_err(w->dev,
+			"  page weave=%llu vs cxt base=%llu -- %s\n",
+			(unsigned long long)pw,
+			(unsigned long long)w->cxt_base_weave,
+			pw > w->cxt_base_weave ?
+				"NEWER: page 127 does not bound this block, the skip was wrong" :
+				"older: written before the checkpoint");
+	}
+
+	/*
+	 * And what is actually at the VBA the map gave the returned LBA.
+	 *
+	 * The two extents in the failing case are exactly adjacent in VBA
+	 * space -- 737713 + 440 = 738153 -- and both sit in vblock 360, so
+	 * the runs are placed contiguously and only their LBA labels are in
+	 * question. One read settles which way round they belong: if the page
+	 * at vba2 holds the LBA we originally wanted, the two runs simply
+	 * have each other's labels, and the fault is in how parse_tree pairs
+	 * a run with its starting LBA rather than in the VBA arithmetic.
+	 *
+	 * It costs a NAND read on a path that has already failed.
+	 */
+	{
+		struct whimory_meta m2;
+		u8 *tmp = w->sftl.data_page;
+
+		if (tmp && w->vfl_ops && w->vfl_ops->read_vba &&
+		    !w->vfl_ops->read_vba(w, vba2, 1, tmp, &m2))
+			dev_err(w->dev,
+				"  vba=%u actually holds lba=%u type=%02x%s\n",
+				vba2, le32_to_cpu(m2.lba), m2.type,
+				le32_to_cpu(m2.lba) == lba ?
+					"  <-- the LBA we wanted: the two runs have swapped labels" : "");
+
+		/*
+		 * The same page on the other plane convention.
+		 *
+		 * A plane index packs a (ce, cau) pair, and with two of each
+		 * there are two ways round: ce * num_cau + cau, which is what
+		 * this driver uses, or cau * num_ce + ce. They agree on planes
+		 * 0 and 3 and swap 1 and 2 -- and both of the failing reads
+		 * land on plane 2 and plane 1 respectively, which is exactly
+		 * the half a wrong convention would break.
+		 *
+		 * Reading the same vblock/page/slot with ce and cau exchanged
+		 * settles it in one access: if that page holds the LBA we
+		 * asked for, the convention is backwards.
+		 */
+		if (tmp && w->vfl_ops && w->vfl_ops->read_vba &&
+		    !whimory_unpack_vba(w, vba, &ce, &cau, &vblock, &page,
+					&slot) &&
+		    w->geom.num_ce == w->geom.num_cau) {
+			u32 swapped = whimory_pack_vba(w, cau, ce, vblock,
+						       page, slot);
+
+			if (swapped != vba &&
+			    !w->vfl_ops->read_vba(w, swapped, 1, tmp, &m2))
+				dev_err(w->dev,
+					"  plane-swapped vba=%u (ce%u/cau%u) holds lba=%u type=%02x%s\n",
+					swapped, cau, ce,
+					le32_to_cpu(m2.lba), m2.type,
+					le32_to_cpu(m2.lba) == lba ?
+						"  <-- MATCH: the ce/cau plane order is reversed" : "");
+		}
+	}
+}
+
 static int whimory_validate_meta(struct whimory *w,
 				 const struct whimory_meta *m,
 				 u32 expected_lba)
@@ -6544,6 +7090,8 @@ static int whimory_validate_meta(struct whimory *w,
 		dev_err(w->dev,
 			"sftl non-data meta want=0x%x type=%02x flags=%02x lba=0x%x\n",
 			expected_lba, m->type, m->flags, meta_lba);
+		whimory_explain_bad_map(w, expected_lba, meta_lba,
+					w->bad_vba, w->bad_span, m);
 		return -EIO;
 	}
 
@@ -6551,6 +7099,8 @@ static int whimory_validate_meta(struct whimory *w,
 		dev_err(w->dev,
 			"sftl lba mismatch want=0x%x meta=0x%x type=%02x flags=%02x\n",
 			expected_lba, meta_lba, m->type, m->flags);
+		whimory_explain_bad_map(w, expected_lba, meta_lba,
+					w->bad_vba, w->bad_span, m);
 		return -EIO;
 	}
 
@@ -6609,6 +7159,9 @@ static int n31_sftl_read_lba(struct whimory *w, u32 lba, void *buf,
 	ret = w->vfl_ops->read_vba(w, vba, 1, buf, &meta);
 	if (ret)
 		return ret;
+	/* What the map actually answered, for the explainer below. */
+	w->bad_vba = vba;
+	w->bad_span = span;
 	ret = whimory_validate_meta(w, &meta, lba);
 	if (!ret)
 		dev_dbg(w->dev,

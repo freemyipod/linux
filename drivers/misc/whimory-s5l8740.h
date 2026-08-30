@@ -193,6 +193,14 @@ struct whimory_range {
 	u32 len;
 	u32 vba;
 	u64 weave;
+	/*
+	 * Which producer put this range here: 1 BTOC, 2 open rebuild,
+	 * 3 CXT seed, 4 list token. Diagnostic only, and the reason it
+	 * exists is that a wrong mapping looks identical whoever wrote
+	 * it -- the CXT record for the failing LBAs parses correctly,
+	 * so the question is who overwrote it afterwards.
+	 */
+	u8 src;
 };
 
 struct whimory_vfl {
@@ -295,6 +303,10 @@ struct whimory_sftl {
 	u32 unk_fb_sbs;		/* unclassified SBs rebuilt from meta */
 	u32 unk_fb_pages;
 	u32 unk_fb_hits;
+	u32 bad_map_logged;	/* bounded explanations for bad reads */
+	u32 cxt_dumped;		/* pairs printed by the record dump */
+	u32 cxt_hdr_skipped;	/* records whose header said nothing follows */
+	u32 cxt_hdr_bad;	/* records whose header was not a CONTIG marker */
 	u32 btoc_pages_read;
 	u32 btoc_pages_valid;
 	u32 btoc_entries_seen;
@@ -411,6 +423,8 @@ struct whimory {
 	struct gendisk *ipod_disk;
 	struct platform_device *pdev;
 	u32 lba0_vba;
+	u32 bad_vba;		/* what the map answered for a failing read */
+	u32 bad_span;
 	u64 cxt_base_weave;
 	struct whimory_cxt_extent *cxt_ext;	/* candidate map (Phase 3) */
 	u32 n_cxt_ext;
