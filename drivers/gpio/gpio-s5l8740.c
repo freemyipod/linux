@@ -41,6 +41,7 @@
 #include <linux/apple-n31.h>
 
 #define S5L8740_GPIO_BANK_STRIDE	32
+#define S5L8740_GPIO_PCON_OFF		0x00
 #define S5L8740_GPIO_DIN_OFF		0x04
 /* sub_428F70 target: input/pull enable, one bit per pad. */
 #define S5L8740_GPIO_INEN_OFF		0x0c
@@ -527,6 +528,49 @@ void s5l8740_iis0_pad6_enable(unsigned int mode)
 	s5l8740_gpiocmd_mode(sg, 6, m, 0);
 }
 EXPORT_SYMBOL_GPL(s5l8740_iis0_pad6_enable);
+
+/*
+ * Set one pad's function nibble and direction, and nothing else.
+ *
+ * Audio checkpoint-010 records the stock pad state while RetailOS plays:
+ * bank0 PCON 0x32112224 / DIR 0xFF and bank2 PCON 0x02230000 / DIR 0x70,
+ * which is GPIO6 func2, GPIO7 func3, GPIO20 func3, GPIO21 func2 and GPIO22
+ * func2, all outputs. Linux sets 7 and 20 and leaves 6, 21 and 22 alone.
+ *
+ * That matters because everything upstream now matches the oracle exactly
+ * -- TXCON, TXCOM, CLKDIV 272, CLKCON +0x18 and +0x1C, IIS STATUS, the
+ * PL080 channel -- and the jack is still silent. Clocks and status can all
+ * be right while the serialiser's data pin is not muxed out of the SoC.
+ *
+ * A whole-word PCON write would take pins 0..5 with it, which is why this
+ * is per-pad read-modify-write. The doc is explicit that GPIO6 must not go
+ * through GPIOCMD, so the nibble is written directly.
+ */
+int s5l8740_gpio_set_pad(unsigned int gpio, unsigned int func, bool out)
+{
+	struct s5l8740_gpio *sg = s5l8740_n31;
+	void __iomem *bank;
+	unsigned int pin = gpio & 7;
+	u32 v;
+
+	if (!sg || !sg->base || func > 15)
+		return -ENODEV;
+	bank = sg->base + (gpio >> 3) * S5L8740_GPIO_BANK_STRIDE;
+
+	v = readl(bank + S5L8740_GPIO_PCON_OFF);
+	v &= ~(0xfu << (pin * 4));
+	v |= (func & 0xf) << (pin * 4);
+	writel(v, bank + S5L8740_GPIO_PCON_OFF);
+
+	v = readl(bank + S5L8740_GPIO_DIR_OFF);
+	if (out)
+		v |= BIT(pin);
+	else
+		v &= ~BIT(pin);
+	writel(v, bank + S5L8740_GPIO_DIR_OFF);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(s5l8740_gpio_set_pad);
 
 void s5l8740_gpio_log_iis0_pads(const char *tag)
 {
