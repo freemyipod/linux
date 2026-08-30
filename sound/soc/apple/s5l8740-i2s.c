@@ -77,8 +77,7 @@
  * 0x24 (no external clock). Clearing it moves STATUS to 0x8020.
  * Override via txcon= for bring-up; default stays OSOS. */
 static uint txcon = I2STXCON_N31_16;
-module_param(txcon, uint, 0644);
-MODULE_PARM_DESC(txcon, "I2STXCON (default 0x03100099; NOT Rockbox 0x0B100019)");
+/* module_param moved below s5l8740_i2s_iis0; see txcon_set(). */
 /*
  * D34C0 → 4F716(port, div). Table in n31-audio-rates.h.
  * 0 = 12 MHz / rate (272 @ 44.1 kHz RetailOS music).
@@ -500,6 +499,29 @@ static bool s5l8740_fm_gate_held;
  * and leaves every other block's bits alone. Set this to 1 only to
  * reproduce the snapshot experiment, and expect to lose storage.
  */
+/*
+ * Write only CLKCON+0x1C, and nothing else.
+ *
+ * force_stock_audio_parent below is off because it pushes the whole
+ * music-playing snapshot into +0x08..0x1C, and those are SoC-wide gates:
+ * the first audio start took the FMSS clock with it and storage was gone
+ * until reboot. That is a good reason to distrust the snapshot, and a bad
+ * reason to leave the one register the oracle actually calls out.
+ *
+ * Checkpoint-010's truth table gives +0x1C = 0xD0052003 for RetailOS
+ * playing music. We run 0x10122003, the SEC bring-up value. The low half
+ * is identical -- 0x2003 either way -- so the difference is entirely in
+ * the upper 16 bits, which is where the audio parent selection lives.
+ *
+ * +0x08, +0x0C, +0x10 and +0x14 are the registers that killed the NAND and
+ * they are not touched. This writes one register that the oracle attests
+ * to, and the storage path is checked after every test.
+ */
+static bool stock_clkcon_1c = true;
+module_param(stock_clkcon_1c, bool, 0644);
+MODULE_PARM_DESC(stock_clkcon_1c,
+		 "write the RetailOS audio parent to CLKCON+0x1C only (default Y)");
+
 static bool force_stock_audio_parent;
 module_param(force_stock_audio_parent, bool, 0644);
 MODULE_PARM_DESC(force_stock_audio_parent,
@@ -529,8 +551,16 @@ static void s5l8740_i2s_ungate(struct s5l8740_i2s *i2s)
 	} else {
 		if (!r18)
 			writel(SEC_CLKCON_18, i2s->clkcon + 0x18);
-		if (!r1c)
+		if (stock_clkcon_1c) {
+			if (r1c != STOCK_CLKCON_1C) {
+				writel(STOCK_CLKCON_1C, i2s->clkcon + 0x1c);
+				dev_info(i2s->dev,
+					 "CLKCON+1C %08x -> %08x (stock audio parent)\n",
+					 r1c, STOCK_CLKCON_1C);
+			}
+		} else if (!r1c) {
 			writel(SEC_CLKCON_1C, i2s->clkcon + 0x1c);
+		}
 		v = readl(i2s->clkcon + 0x0c);
 		if (v & 0x8000u)
 			writel(v & ~0x8000u, i2s->clkcon + 0x0c);
@@ -547,12 +577,73 @@ static void s5l8740_i2s_ungate(struct s5l8740_i2s *i2s)
 static DEFINE_SPINLOCK(s5l8740_audio_clk_lock);
 static bool s5l8740_audio_clk_wanted[S5L8740_AUDIO_PORTS];
 
+/*
+ * Only touch the bits that are actually about audio.
+ *
+ * CLKCON_AUDIO_PLAY (0x32190) and CLKCON_AUDIO_IDLE (0x1c20) are whole-
+ * register snapshots taken from RetailOS at two moments, and this used to
+ * writel() one of them over CLKCON+0x30 in its entirety on every play and
+ * every stop. That imposes the entire captured clock state of the SoC,
+ * including whatever every other peripheral happened to be doing when the
+ * snapshot was taken -- and CLKCON+0x30 carries gates that are nothing to
+ * do with audio. The FMSS is one of them: after a few play/stop cycles the
+ * NAND controller reads back FMCTRL0=0 NANDSTAT=0, sub_10453C times out on
+ * FMCTRL1 bit 30, and Whimory open fails with -110. Storage is gone until
+ * the next boot.
+ *
+ * Stock never does this. sub_41CBD8 sets or clears exactly one bit:
+ *
+ *     v = MEMORY[0x3C500008] & 0x7FFFFFFF;   // or | 0x80000000
+ *
+ * and leaves the register otherwise untouched.
+ *
+ * The two snapshots differ in a fixed set of bits, and those are the ones
+ * that plausibly belong to audio. Everything outside that set is somebody
+ * else's and is now preserved from the live register.
+ */
+#define CLKCON_AUDIO_MASK	(CLKCON_AUDIO_PLAY ^ CLKCON_AUDIO_IDLE)
+
+
+/*
+ * Apply TXCON to the live register as soon as it is written.
+ *
+ * Sweeping TXCON used to mean setting clkdiv to defeat the "already
+ * programmed" check in s5l8740_i2s_program(), which re-ran the pad mux and
+ * the CLKCON writes on every play. That is how the NAND got clock-gated and
+ * how the device wedged mid-stream. This writes IIS0+0x04 and nothing else,
+ * so a sweep costs one register write and cannot disturb any clock.
+ */
+static struct s5l8740_i2s *s5l8740_i2s_iis0;
+
+static int txcon_set(const char *val, const struct kernel_param *kp)
+{
+	struct s5l8740_i2s *i2s = READ_ONCE(s5l8740_i2s_iis0);
+	int ret = param_set_uint(val, kp);
+
+	if (ret)
+		return ret;
+	if (i2s && i2s->base) {
+		writel(txcon, i2s->base + I2STXCON);
+		dev_info(i2s->dev, "txcon live -> 0x%08x (status=0x%08x)\n",
+			 txcon, readl(i2s->base + I2SSTATUS));
+	}
+	return 0;
+}
+
+static const struct kernel_param_ops txcon_ops = {
+	.set = txcon_set,
+	.get = param_get_uint,
+};
+module_param_cb(txcon, &txcon_ops, &txcon, 0644);
+MODULE_PARM_DESC(txcon, "I2STXCON; written live on set (default 0x03100099)");
+
 static void s5l8740_audio_clk_set(void __iomem *clkcon, unsigned int port,
 				  bool on)
 {
 	unsigned long flags;
 	unsigned int i;
 	bool any = false;
+	u32 want, cur, new;
 
 	if (!clkcon)
 		return;
@@ -560,10 +651,54 @@ static void s5l8740_audio_clk_set(void __iomem *clkcon, unsigned int port,
 	s5l8740_audio_clk_wanted[port] = on;
 	for (i = 0; i < S5L8740_AUDIO_PORTS; i++)
 		any |= s5l8740_audio_clk_wanted[i];
-	writel(any ? CLKCON_AUDIO_PLAY : CLKCON_AUDIO_IDLE,
-	       clkcon + CLKCON_AUDIO_OFF);
+	want = any ? CLKCON_AUDIO_PLAY : CLKCON_AUDIO_IDLE;
+	cur = readl(clkcon + CLKCON_AUDIO_OFF);
+	new = (cur & ~CLKCON_AUDIO_MASK) | (want & CLKCON_AUDIO_MASK);
+	if (new != cur)
+		writel(new, clkcon + CLKCON_AUDIO_OFF);
 	spin_unlock_irqrestore(&s5l8740_audio_clk_lock, flags);
 }
+
+
+/*
+ * The codec clock gate, RetailOS sub_41CBD8 with the id sub_4F82F8 returns.
+ *
+ * sub_4F82F8() returns 9, and case 9 of sub_41CBD8 is CLKCON+0x0C bit 15,
+ * active low:
+ *
+ *     if (on)  MEMORY[0x3C50000C] &= 0xFFFF7FFF;
+ *     else     MEMORY[0x3C50000C] |= 0x8000;
+ *
+ * D3280(1) ends by turning it OFF and D3280(3) begins by turning it back
+ * ON, which is what the 0x0006 / 0x0007 bit-6 freeze latch is bracketing:
+ * the codec is parked, its clock is stopped, and then the clock returns and
+ * the latch is released. This driver left the clock running the whole time,
+ * so that transition never happened.
+ *
+ * Exported because the CLKCON mapping lives here and the codec driver needs
+ * it. One bit, read-modify-write, nothing else touched -- the opposite of
+ * what s5l8740_audio_clk_set() used to do to CLKCON+0x30.
+ */
+void s5l8740_codec_clk_gate(bool on)
+{
+	struct s5l8740_i2s *i2s = READ_ONCE(s5l8740_i2s_iis0);
+	unsigned long flags;
+	u32 v;
+
+	if (!i2s || !i2s->clkcon)
+		return;
+	spin_lock_irqsave(&s5l8740_audio_clk_lock, flags);
+	v = readl(i2s->clkcon + 0x0c);
+	if (on)
+		v &= ~0x8000u;
+	else
+		v |= 0x8000u;
+	writel(v, i2s->clkcon + 0x0c);
+	spin_unlock_irqrestore(&s5l8740_audio_clk_lock, flags);
+	dev_info(i2s->dev, "codec clk gate %s (CLKCON+0x0C=0x%08x)\n",
+		 on ? "ON" : "OFF", v);
+}
+EXPORT_SYMBOL_GPL(s5l8740_codec_clk_gate);
 
 static void s5l8740_i2s_clkcon_audio(struct s5l8740_i2s *i2s, u32 val)
 {
@@ -665,10 +800,69 @@ static void s5l8740_i2s_log_iis_gpio(struct s5l8740_i2s *i2s, const char *tag)
  * touches GPIO at all. Claiming only GPIO 20 leaves the bus incomplete
  * and the jack silent. Optional (6,3) in pad_mode 1/4.
  */
+/*
+ * The stock pad set while RetailOS plays, from audio checkpoint-010:
+ * bank0 PCON 0x32112224 / DIR 0xFF, bank2 PCON 0x02230000 / DIR 0x70.
+ *
+ * We set 7 and 20 and have never touched 6, 21 or 22. That gap is worth
+ * closing now because everything else matches the oracle -- TXCON, TXCOM,
+ * CLKDIV 272, CLKCON +0x18 and +0x1C, IIS STATUS 0x424, PL080 channel 2 on
+ * peri 10 -- and the jack is still silent. Clocks and status can all read
+ * correct while the serialiser's data pin is not muxed out of the SoC,
+ * which is exactly the case the checkpoint's "wire/data" branch describes.
+ */
+static const struct { u8 gpio, func; } stock_audio_pads[] = {
+	{ 6, 2 }, { 7, 3 }, { 20, 3 }, { 21, 2 }, { 22, 2 },
+};
+
+/*
+ * Off: measured, and there is nothing to restore.
+ *
+ * devmem on the running device reads bank0 PCON 0x32222224 / DIR 0xFF and
+ * bank2 PCON 0x02230000 / DIR 0x70 against the oracle's 0x32112224 / 0xFF
+ * and 0x02230000 / 0x70. Every audio pad already matches -- GPIO6 f2,
+ * GPIO7 f3, GPIO20 f3, GPIO21 f2, GPIO22 f2, all outputs. The only bank0
+ * difference is pins 4 and 5, which belong to I2C0 and which the
+ * checkpoint explicitly says to leave alone.
+ *
+ * Kept because it costs nothing and pins the invariant, but it is not the
+ * silence and turning it on requires a kernel rebuild -- gpio-s5l8740 is
+ * built in, so the export it needs is not reachable from a module reload.
+ */
+static bool force_stock_audio_pads;
+module_param(force_stock_audio_pads, bool, 0644);
+MODULE_PARM_DESC(force_stock_audio_pads,
+		 "restore the stock GPIO6/7/20/21/22 audio pad nibbles (default Y)");
+
+static void s5l8740_i2s_stock_pads(struct s5l8740_i2s *i2s)
+{
+	int (*setpad)(unsigned int, unsigned int, bool);
+	unsigned int i;
+
+	setpad = (int (*)(unsigned int, unsigned int, bool))
+		 __symbol_get("s5l8740_gpio_set_pad");
+	if (!setpad) {
+		dev_warn(i2s->dev, "stock pads: gpio export missing\n");
+		return;
+	}
+	for (i = 0; i < ARRAY_SIZE(stock_audio_pads); i++)
+		setpad(stock_audio_pads[i].gpio, stock_audio_pads[i].func,
+		       true);
+	__symbol_put("s5l8740_gpio_set_pad");
+	dev_info(i2s->dev,
+		 "stock audio pads applied: 6=f2 7=f3 20=f3 21=f2 22=f2, all out\n");
+}
+
 static void s5l8740_i2s_pads(struct s5l8740_i2s *i2s)
 {
 	static const u8 sec_words[] = { 6, 7, 20 };
 	unsigned int i;
+
+	if (force_stock_audio_pads) {
+		s5l8740_i2s_stock_pads(i2s);
+		s5l8740_i2s_log_iis_gpio(i2s, "pads-stock");
+		return;
+	}
 
 	if (pad_mode == 2) {
 		void (*en)(unsigned int);
@@ -984,8 +1178,18 @@ static void s5l8740_i2s_tx_kick(struct s5l8740_i2s *i2s, bool dma)
 		writel((u32)txcom_exact, i2s->base + I2STXCOM);
 	} else if (dma) {
 		switch (txcom_mode) {
-		case 0: /* retail: OSOS B6620 TXCOM = 0x6 after DMA armed */
-			writel(I2STXCOM_DMA, i2s->base + I2STXCOM);
+		case 0:
+			/*
+			 * OSOS sub_B6620(port, 0) is
+			 *     *(base + 8) |= 6;
+			 * an OR, not an assignment. This wrote a bare 0x6 and
+			 * so cleared every other bit in TXCOM. It happens to
+			 * be equivalent while TXCOM reads 0 beforehand, which
+			 * is the case today, but the moment anything else
+			 * sets a bit here the plain write silently drops it.
+			 */
+			writel(readl(i2s->base + I2STXCOM) | I2STXCOM_DMA,
+			       i2s->base + I2STXCOM);
 			break;
 		case 1: /* pio-only kick (debug) */
 			writel(txcom_pio, i2s->base + I2STXCOM);
@@ -1832,6 +2036,7 @@ static int s5l8740_i2s_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, i2s);
 	dev_set_drvdata(dev, i2s);
+	WRITE_ONCE(s5l8740_i2s_iis0, i2s);
 	mutex_init(&i2s->dma_lock);
 	INIT_DELAYED_WORK(&i2s->dma_watch, s5l8740_i2s_dma_watch);
 
