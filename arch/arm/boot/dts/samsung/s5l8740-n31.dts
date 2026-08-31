@@ -146,7 +146,7 @@
             clock-names = "otg";
             g-rx-fifo-size = <256>;
             g-np-tx-fifo-size = <256>;
-            g-tx-fifo-size = <256 256 512 512 512 768 768>;
+            g-tx-fifo-size = <256 256 256 256 256 256>;
             status = "okay";
             dr_mode = "peripheral";
         };
