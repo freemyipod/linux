@@ -498,6 +498,25 @@ MODULE_PARM_DESC(use_cxt,
 		 "Load the SFTL CXT snapshot during recover (default Y)");
 
 /*
+ * The checkpoint is not an optimisation, it is the mount.
+ *
+ * Recovering from the checkpoint takes about eight seconds on this device;
+ * rebuilding the same map by replaying every superblock takes about eight
+ * minutes and reads roughly two hundred thousand pages to arrive at the
+ * same answer. The full replay exists as an oracle -- it is built from
+ * per-page metadata, so it is what a suspect checkpoint gets checked
+ * against -- and as the thing to reach for when the checkpoint decode is
+ * under suspicion. It is not a boot path.
+ *
+ * With this set, a checkpoint that will not load is an error and the
+ * recover stops there. Clearing it restores the old silent fallback.
+ */
+static bool require_cxt = true;
+module_param(require_cxt, bool, 0644);
+MODULE_PARM_DESC(require_cxt,
+		 "Fail the recover instead of full-replaying when the CXT will not load (default Y)");
+
+/*
  * A full rebuild used to be re-runnable at any time, so a stray write to
  * ftl_sftl_recover could tear down a live map underneath a mounted disk.
  */
@@ -4443,7 +4462,7 @@ static int n31_vfl_open(struct whimory *w)
 	struct s5l8740_cs_page *csp;
 	u8 *page;
 	u8 meta[S5L8740_NAND_META_SIZE];
-	unsigned int ce, cau, b, start, pg, ncau;
+	unsigned int ce, cau, b;
 	int hits = 0;
 	int sess;
 
@@ -4455,11 +4474,9 @@ static int n31_vfl_open(struct whimory *w)
 		kvfree(page);
 		return -ENOMEM;
 	}
-	ncau = w->geom.num_cau ? w->geom.num_cau : 1;
-	start = w->geom.blocks_per_cau - w->geom.vfl_tail;
 
 	/*
-	 * Arm live CS for the sweep, the same way FPART_SCAN does.
+	 * Arm live CS for the reads, the same way FPART_SCAN does.
 	 *
 	 * cs_phys_read_slc() needs the DMA session; without one it returns
 	 * -ENODEV before issuing anything, so the whole scan completed in
@@ -4478,50 +4495,72 @@ static int n31_vfl_open(struct whimory *w)
 		return sess;
 	}
 	s5l8740_nand_reset();
-	for (ce = 0; ce < w->geom.num_ce; ce++) {
-		for (cau = 0; cau < w->geom.num_cau; cau++) {
-			for (b = start; b < w->geom.blocks_per_cau; b++) {
-				for (pg = 0; pg < 8; pg++) {
-					int got;
 
-					cond_resched();
-					/*
-					 * fpart_fil_read_page(), not
-					 * s5l8740_nand_page_read(). This scan has never
-					 * read a page in its life: page_read refuses any
-					 * request carrying meta unless meta_dma_read is
-					 * set, and that is deliberately off because a
-					 * permanent live CS kick reboots the device. So
-					 * every one of these 512 reads returned
-					 * -EOPNOTSUPP before touching the NAND, and
-					 * VFL_Open reported ctx_hits=0 about a region
-					 * nobody had actually looked at.
-					 *
-					 * That is word for word the bug already found and
-					 * fixed on the FPart side -- see the comment above
-					 * s5l8740_nand_cs_phys_read_slc(). It was never
-					 * applied here, so the VFL context scan kept
-					 * failing silently and recovery kept falling back
-					 * to scanning the whole device.
-					 *
-					 * The shared helper also gets the plane right: the
-					 * tail of each CAU is SLC, so it tries slc=1
-					 * before slc=0. Reading it as MLC is what returns
-					 * a page of zeros that looks like a successful
-					 * read of an empty block.
-					 */
-					got = fpart_fil_read_page(w, (u16)(ce * ncau + cau),
-								  b, pg, csp, page, meta);
-					if (got)
-						continue;
-					if (n31_vfl_ingest_ctx(w, ce, cau, b,
-							       page,
-							       S5L8740_NAND_PAGE_SIZE,
-							       meta))
-						hits++;
-				}
-			}
-		}
+	/*
+	 * Read the copies the FPart directory names, and nothing else.
+	 *
+	 * This used to sweep the whole system area -- every block from
+	 * blocks_per_cau - vfl_tail up, eight pages each, on all four banks.
+	 * That is 4096 page reads, it took seventeen seconds of a
+	 * forty-second mount, and it found the context it wanted eight and a
+	 * half seconds before it stopped looking, because the loop had no
+	 * reason to end early.
+	 *
+	 * Stock does not do this. s_fpart keeps a table of special-object
+	 * copies -- six bytes of {bank, block, type} per entry, indexed by
+	 * type -- and sub_4F12DC walks only the copies of the one type it
+	 * was asked for, taking the highest generation. fpart_locate_special()
+	 * builds exactly that table and fpart_read_special_by_index() is a
+	 * transcription of that walk; the scan behind them has already run
+	 * for the signature by the time VFL_Open is called, so the lookup
+	 * here is a cache hit and costs nothing.
+	 *
+	 * On this unit the table holds five entries and two of them are the
+	 * 0xc104 context, so this is five page reads against 4096. The
+	 * objects live at page 0 of their block -- chunk 0, payload at
+	 * FPART_SPECIAL_HDR -- which is where the sweep found them too, and
+	 * n31_vfl_ingest_ctx() still does the parsing and the mirror
+	 * comparison exactly as before.
+	 */
+	{
+		u16 idx;
+
+		/*
+		 * Force the directory to exist. It normally already does --
+		 * n31_fpart_read_signature() ran first -- and this is then a
+		 * cache lookup. Its return value is not the point: a miss
+		 * here is reported by the loop below finding no context.
+		 */
+		fpart_locate_special(w, &idx, FPART_TYPE_VFL_CXT);
+	}
+
+	for (b = 0; b < w->fpart_ctx.count; b++) {
+		const struct fpart_special_entry *e = &w->fpart_ctx.table[b];
+		int got;
+
+		cond_resched();
+		fpart_bank_to_ce_cau(w, e->bank, &ce, &cau);
+		/*
+		 * fpart_fil_read_page(), not s5l8740_nand_page_read().
+		 * page_read refuses any request carrying meta unless
+		 * meta_dma_read is set, and that is deliberately off because
+		 * a permanent live CS kick reboots the device -- so every
+		 * read here used to return -EOPNOTSUPP before touching the
+		 * NAND, and VFL_Open reported ctx_hits=0 about a region
+		 * nobody had actually looked at.
+		 *
+		 * The shared helper also gets the plane right: the tail of
+		 * each CAU is SLC, so it tries slc=1 before slc=0. Reading it
+		 * as MLC returns a page of zeros that looks exactly like a
+		 * successful read of an empty block.
+		 */
+		got = fpart_fil_read_page(w, e->bank, e->block, 0, csp, page,
+					  meta);
+		if (got)
+			continue;
+		if (n31_vfl_ingest_ctx(w, ce, cau, e->block, page,
+				       S5L8740_NAND_PAGE_SIZE, meta))
+			hits++;
 	}
 	if (sess == 0)
 		s5l8740_nand_dma_session_end();
@@ -8413,14 +8452,40 @@ classify_done:
 	 * below then adopts only what is newer than its base weave.
 	 */
 	ret = use_cxt ? whimory_cxt_fast_load(w) : -ENOENT;
-	if (ret && use_cxt)
-		dev_info(w->dev,
-			 "CXT seed failed %d; falling back to full replay\n",
-			 ret);
+	if (ret && use_cxt) {
+		/*
+		 * Do not quietly become the full scan.
+		 *
+		 * When the checkpoint does not load, s->cxt_loaded stays
+		 * false, and every skip test in the replay below is guarded
+		 * on it -- so nothing is skipped and all 7623 superblocks are
+		 * replayed. That is the 500-second path, and it used to be
+		 * announced with a dev_info in the middle of a boot log
+		 * nobody reads at the time. The visible symptom was a device
+		 * that "sometimes takes eight minutes to mount", with the one
+		 * line explaining it eight thousand lines up.
+		 *
+		 * The fast path is the supported path. If it cannot run, say
+		 * so at error level and stop, so the failure is a failure
+		 * rather than a stall. require_cxt=0 restores the old
+		 * behaviour for a deliberate comparison against the
+		 * brute-force map, and use_cxt=0 still asks for that map
+		 * outright -- neither is something a boot should reach by
+		 * accident.
+		 */
+		if (require_cxt) {
+			dev_err(w->dev,
+				"CXT fast path failed (%d) and require_cxt is set: refusing to full-replay %u superblocks. Set require_cxt=0 (or use_cxt=0) to rebuild from media.\n",
+				ret, nsb);
+			whimory_set_status(w, "cxt load failed (%d)", ret);
+			w->l2v_defer_pack = false;
+			return ret;
+		}
+		dev_warn(w->dev,
+			 "CXT seed failed %d; falling back to full replay of %u superblocks -- this is the slow path\n",
+			 ret, nsb);
+	}
 	ret = 0;
-	if (ret)
-		dev_warn(w->dev, "s_cxt_load %d; continuing with BTOC replay\n",
-			 ret);
 	if (s->cxt_loaded)
 		dev_info(w->dev, "s_cxt_load OK bases=%u weave=%llu mapped=%u\n",
 			 w->n_cxt, w->cxt_base_weave, s->range_nodes);
