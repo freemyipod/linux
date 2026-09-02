@@ -601,10 +601,23 @@ module_param(vba_page_dump, bool, 0644);
 MODULE_PARM_DESC(vba_page_dump,
 		 "Emit VBA_DIAG sibling slot dump on critical reads (default N)");
 
-static unsigned int meta0_scan_sbs = 4;
+/*
+ * Off by default: 508 page reads that nothing acts on.
+ *
+ * This full-scans closed superblocks after the map is already built, page 0
+ * to 126, and hands every page to whimory_note_meta0() -- which increments
+ * meta0_hits and, unless diag is set, does nothing else. At four
+ * superblocks that is 4 x 127 reads and about 0.8 seconds added to every
+ * mount, to produce one number in RECOVERY_STATS.
+ *
+ * It was worth having while the question was "does anything on this volume
+ * carry meta lba 0", and it is worth having again the next time that comes
+ * up. It is not worth having on the boot path. Set it to 4 to get it back.
+ */
+static unsigned int meta0_scan_sbs;
 module_param(meta0_scan_sbs, uint, 0644);
 MODULE_PARM_DESC(meta0_scan_sbs,
-		 "Closed SBs to full-scan for META lba=0 after classify (0=skip extra)");
+		 "Closed SBs to full-scan for META lba=0 after recover (default 0 = off)");
 
 static bool allow_sigless_debug;
 module_param(allow_sigless_debug, bool, 0644);
@@ -3252,7 +3265,19 @@ static int fpart_scan_region(struct whimory *w, u16 type,
 					continue;
 				}
 				hist[meta[0]]++;
-				if (sample < 12) {
+				/*
+				 * Gated, because printing is not free here.
+				 *
+				 * Each of these is a 112-byte hex dump down a
+				 * slow console, and the timestamps put one at
+				 * 85 to 95 ms. Two dozen of them across the
+				 * scan is about two seconds added to every
+				 * mount, spent describing pages the scan
+				 * already summarises in FPART_SPECIAL_TYPE
+				 * and the meta histogram. diag=1 brings them
+				 * back.
+				 */
+				if (ftl_diag && sample < 12) {
 					fpart_bank_to_ce_cau(w, bank, &ce, &cau);
 					dev_info(w->dev,
 						 "FPART_META_SAMPLE n=%u bank=%u ce=%u cau=%u blk=%u pg=%u meta=%16ph data00=%32ph data80=%32ph\n",
@@ -3268,7 +3293,8 @@ static int fpart_scan_region(struct whimory *w, u16 type,
 						if (fpart_meta_interesting(meta +
 									    s * WHIMORY_META_SIZE))
 							interesting++;
-					if (interesting && w->fpart_ctx.slot_logs < 48) {
+					if (ftl_diag && interesting &&
+					    w->fpart_ctx.slot_logs < 48) {
 						fpart_bank_to_ce_cau(w, bank, &ce, &cau);
 						for (s = 0; s < 4; s++) {
 							const u8 *m = meta + s * WHIMORY_META_SIZE;
@@ -3300,15 +3326,18 @@ static int fpart_scan_region(struct whimory *w, u16 type,
 				if (!special)
 					continue;
 				tag30++;
-				fpart_bank_to_ce_cau(w, bank, &ce, &cau);
-				dev_info(w->dev,
-					 "FPART_ASSIGN_SCAN bank=%u ce=%u cau=%u block=%u page=%u slot=%d type_word=0x%04x blank=%d m0=%16ph m1=%16ph m2=%16ph m3=%16ph data00=%32ph data80=%32ph\n",
-					 bank, ce, cau, blk, p,
-					 fpart_meta_special_slot(meta, 0, NULL),
-					 type_word,
-					 whimory_page_blank(page, 256),
-					 meta, meta + 16, meta + 32, meta + 48,
-					 page, page + FPART_SPECIAL_HDR);
+				if (ftl_diag) {
+					fpart_bank_to_ce_cau(w, bank, &ce, &cau);
+					dev_info(w->dev,
+						 "FPART_ASSIGN_SCAN bank=%u ce=%u cau=%u block=%u page=%u slot=%d type_word=0x%04x blank=%d m0=%16ph m1=%16ph m2=%16ph m3=%16ph data00=%32ph data80=%32ph\n",
+						 bank, ce, cau, blk, p,
+						 fpart_meta_special_slot(meta, 0, NULL),
+						 type_word,
+						 whimory_page_blank(page, 256),
+						 meta, meta + 16, meta + 32,
+						 meta + 48,
+						 page, page + FPART_SPECIAL_HDR);
+				}
 				if (whimory_page_blank(page, 256)) {
 					dev_info(w->dev,
 						 "FPART_ASSIGN skip blank data type_word=0x%04x\n",
@@ -6491,7 +6520,13 @@ static int whimory_cxt_parse_tree(struct whimory *w, const u8 *data,
 			 */
 			w->sftl.cxt_hole_entries++;
 			w->sftl.cxt_hole_lbas += span;
-			if (w->sftl.cxt_hole_entries <= 12) {
+			/*
+			 * Gated: CXT_MAP already reports holes= and
+			 * hole_lbas=, which is what answers "are the holes
+			 * real". The per-hole lines answer "is the ceiling
+			 * wrong", which is a question you ask once.
+			 */
+			if (ftl_diag && w->sftl.cxt_hole_entries <= 12) {
 				char d[64];
 
 				whimory_vba_describe(w, vba, d, sizeof(d));
