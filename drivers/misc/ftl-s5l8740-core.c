@@ -3192,20 +3192,30 @@ static int fpart_scan_region(struct whimory *w, u16 type,
 	u32 b, p;
 	int ret, reads = 0, tag30 = 0, xrmw = 0, wrmx = 0, fail = 0;
 	unsigned int sample = 0;
-	u32 hist[256];
+	/*
+	 * Heap, not stack. 256 u32 is a kilobyte, and with the page buffer
+	 * pointers and the meta array around it this frame measured 1224
+	 * bytes -- past the 1024-byte warning and a quarter of an 8 KiB
+	 * kernel stack, on a function that also calls into the NAND driver.
+	 */
+	u32 *hist;
 	int sess;
 
 	page = kvmalloc(w->geom.page_size, GFP_KERNEL);
 	if (!page)
 		return -ENOMEM;
-
-	csp = kvmalloc(sizeof(*csp), GFP_KERNEL);
-	if (!csp) {
+	hist = kcalloc(256, sizeof(*hist), GFP_KERNEL);
+	if (!hist) {
 		kvfree(page);
 		return -ENOMEM;
 	}
 
-	memset(hist, 0, sizeof(hist));
+	csp = kvmalloc(sizeof(*csp), GFP_KERNEL);
+	if (!csp) {
+		kfree(hist);
+		kvfree(page);
+		return -ENOMEM;
+	}
 
 	/*
 	 * Clamp to the SLC page count, not the MLC one.
@@ -3239,6 +3249,7 @@ static int fpart_scan_region(struct whimory *w, u16 type,
 	sess = s5l8740_nand_dma_session_begin();
 	if (sess && sess != -EBUSY) {
 		dev_warn(w->dev, "FPART_SCAN no DMA session (%d)\n", sess);
+		kfree(hist);
 		kvfree(csp);
 		kvfree(page);
 		return sess;
@@ -3381,6 +3392,7 @@ static int fpart_scan_region(struct whimory *w, u16 type,
 	fpart_log_special_types(w);
 	if (!sess)
 		s5l8740_nand_dma_session_end();
+	kfree(hist);
 	kvfree(csp);
 	kvfree(page);
 	return 0;
@@ -5150,6 +5162,62 @@ static int whimory_btoc_confirm_page(struct whimory *w, unsigned int ce,
 	return hits;
 }
 
+/*
+ * Turn a BTOC offset into the page it names.
+ *
+ * The offsets a BTOC carries are whole-superblock VBA offsets -- s_btoc.c
+ * asserts vba == s_g_addr_to_vba(wr->sb, wr->nextVbaOfs) at line 230 -- so
+ * the bank comes out of the offset, not from whichever plane's page 127
+ * happened to carry the BTOC. The parsers used to divide by vbas_per_page
+ * and keep the caller's (ce, cau), which is the retired per-bank reading:
+ * it names a page nbanks times too early and always on one plane.
+ *
+ * That was never a mapping error, because none of these parsers maps
+ * anything -- the BTE only chooses which pages to visit, and
+ * whimory_btoc_confirm_page() then applies each slot from that slot's own
+ * metadata. It was a coverage error: the sweep re-read the first quarter of
+ * one plane instead of walking the superblock, and stopped at
+ * WHIMORY_DATA_VBAS_PER_SB, a quarter of the way in on four banks.
+ *
+ * Same arithmetic as everything else now: build the VBA and unpack it.
+ */
+static int whimory_btoc_ofs_to_page(const struct whimory *w, u32 vblock,
+				    u32 vba_ofs, unsigned int *ce,
+				    unsigned int *cau, unsigned int *page,
+				    unsigned int *slot)
+{
+	u32 vba = vblock * whimory_vbas_per_vblock(w) + vba_ofs;
+	u32 c, a, vb, pg, sl;
+
+	if (whimory_unpack_vba(w, vba, &c, &a, &vb, &pg, &sl))
+		return -ERANGE;
+	*ce = c;
+	*cau = a;
+	*page = pg;
+	*slot = sl;
+	return 0;
+}
+
+/* Addresses one superblock holds, and how many of them carry data. */
+static u32 whimory_sb_vbas(const struct whimory *w, u32 vblock)
+{
+	return whimory_sb_banks(w, vblock, NULL) * w->sftl.pages_per_sb *
+	       w->sftl.vbas_per_page;
+}
+
+static u32 whimory_sb_data_vbas(const struct whimory *w, u32 vblock)
+{
+	return whimory_sb_banks(w, vblock, NULL) *
+	       WHIMORY_DATA_PAGES_PER_SB * w->sftl.vbas_per_page;
+}
+
+/* One key per (bank, page), for the visit-each-page-once dedup. */
+static u32 whimory_btoc_page_key(unsigned int ce, unsigned int cau,
+				 unsigned int page)
+{
+	return ((u32)ce << 24) | ((u32)cau << 16) | (u32)page;
+}
+
 static bool whimory_btoc_parse_be_lpn(struct whimory *w, const u8 *page,
 				      unsigned int len, unsigned int ce,
 				      unsigned int cau, unsigned int vblock)
@@ -5157,7 +5225,11 @@ static bool whimory_btoc_parse_be_lpn(struct whimory *w, const u8 *page,
 	unsigned int i, n, hit = 0, valid = 0;
 	bool page_gran;
 
-	n = min_t(unsigned int, len / 4, WHIMORY_DATA_VBAS_PER_SB);
+	/*
+	 * Bound by this superblock's own data-address count, not the
+	 * per-bank one -- see whimory_btoc_ofs_to_page().
+	 */
+	n = min_t(unsigned int, len / 4, whimory_sb_data_vbas(w, vblock));
 	for (i = 0; i < n; i++) {
 		u32 lpn = get_unaligned_be32(page + i * 4);
 
@@ -5205,15 +5277,28 @@ static bool whimory_btoc_parse_be_lpn(struct whimory *w, const u8 *page,
 			continue;
 		}
 		if (page_gran) {
-			got = whimory_btoc_confirm_page(w, ce, cau, vblock, i,
-							lpn, true);
+			/*
+			 * One record per page, in the superblock's page
+			 * order: record i is page i of bank i % nbanks.
+			 */
+			unsigned int bce, bcau, bpg, bsl;
+
+			if (whimory_btoc_ofs_to_page(w, vblock,
+						     i * w->sftl.vbas_per_page,
+						     &bce, &bcau, &bpg, &bsl))
+				break;
+			got = whimory_btoc_confirm_page(w, bce, bcau, vblock,
+							bpg, lpn, true);
 		} else {
-			pg = i / w->sftl.vbas_per_page;
-			slot = i % w->sftl.vbas_per_page;
+			unsigned int bce, bcau;
+
+			if (whimory_btoc_ofs_to_page(w, vblock, i, &bce, &bcau,
+						     &pg, &slot))
+				break;
 			if (slot != 0)
 				continue;
-			got = whimory_btoc_confirm_page(w, ce, cau, vblock, pg,
-							lpn, false);
+			got = whimory_btoc_confirm_page(w, bce, bcau, vblock,
+							pg, lpn, false);
 		}
 		if (got < 0)
 			return hit > 0;
@@ -5223,36 +5308,19 @@ static bool whimory_btoc_parse_be_lpn(struct whimory *w, const u8 *page,
 	return hit > 0;
 }
 
-/*
- * A note on vba_ofs in the three BTOC parsers below, since the bank-count
- * fix raised the question and the answer is not what it looks like.
- *
- * The offsets a BTOC carries are whole-superblock VBA offsets --
- * s_btoc.c:230 asserts vba == s_g_addr_to_vba(wr->sb, wr->nextVbaOfs) --
- * so turning one into a page with ofs / vbas_per_page, as these do, is the
- * retired per-bank reading and names a page too early by a factor of
- * nbanks.
- *
- * It is not a mapping error, because none of these parsers maps anything.
- * The BTE is used only to decide which pages to visit;
- * whimory_btoc_confirm_page() then reads the page and applies each slot
- * from that slot's own metadata through whimory_pack_vba(), which is
- * bank-aware and authoritative. So the cost is coverage, not correctness:
- * the sweep visits more pages than it needs early in the block and stops at
- * WHIMORY_DATA_VBAS_PER_SB, which on a four-bank superblock is a quarter of
- * the way in.
- *
- * Left alone deliberately. Widening it changes which pages the brute-force
- * fallback reads, and that path is the oracle the CXT path is checked
- * against -- it should not be altered in the same change that alters what
- * it is checking.
- */
 static bool whimory_btoc_parse_be_bte(struct whimory *w, const u8 *page,
 				      unsigned int len, unsigned int ce,
 				      unsigned int cau, unsigned int vblock)
 {
 	unsigned int i, recs, vba_ofs = 0, hit = 0;
 	unsigned int last_pg = ~0u;
+	/*
+	 * Bounds from this superblock's own width. WHIMORY_VBAS_PER_SB and
+	 * WHIMORY_DATA_VBAS_PER_SB are the per-bank counts and stopped the
+	 * walk a quarter of the way into a four-bank superblock.
+	 */
+	u32 sb_vbas = whimory_sb_vbas(w, vblock);
+	u32 sb_data_vbas = whimory_sb_data_vbas(w, vblock);
 
 	recs = len / 16;
 	for (i = 0; i < recs; i++) {
@@ -5295,14 +5363,14 @@ static bool whimory_btoc_parse_be_bte(struct whimory *w, const u8 *page,
 				w->sftl.btoc_unknown_entries++;
 			}
 			w->sftl.token_hole++;
-			if (vba_ofs + span > WHIMORY_VBAS_PER_SB)
+			if (vba_ofs + span > sb_vbas)
 				break;
 			vba_ofs += span;
 			continue;
 		}
-		if (span > WHIMORY_DATA_VBAS_PER_SB || lba >= 0x01000000u)
+		if (span > sb_data_vbas || lba >= 0x01000000u)
 			break;
-		if (vba_ofs + span > WHIMORY_DATA_VBAS_PER_SB)
+		if (vba_ofs + span > sb_data_vbas)
 			break;
 		if (lba == 0) {
 			w->sftl.btoc_skipped_zero++;
@@ -5310,14 +5378,19 @@ static bool whimory_btoc_parse_be_bte(struct whimory *w, const u8 *page,
 			continue;
 		}
 		for (s = 0; s < span; s++) {
-			unsigned int pg = (vba_ofs + s) / w->sftl.vbas_per_page;
+			unsigned int bce, bcau, pg, sl;
+			u32 key;
 			int got;
 
-			if (pg == last_pg)
+			if (whimory_btoc_ofs_to_page(w, vblock, vba_ofs + s,
+						     &bce, &bcau, &pg, &sl))
+				break;
+			key = whimory_btoc_page_key(bce, bcau, pg);
+			if (key == last_pg)
 				continue;
-			last_pg = pg;
-			got = whimory_btoc_confirm_page(w, ce, cau, vblock, pg,
-							0xffffffffu, false);
+			last_pg = key;
+			got = whimory_btoc_confirm_page(w, bce, bcau, vblock,
+							pg, 0xffffffffu, false);
 			if (got < 0)
 				return hit > 0;
 			if (got > 0)
@@ -5334,6 +5407,13 @@ static bool whimory_btoc_parse_bte(struct whimory *w, const u8 *page,
 {
 	unsigned int i, recs, vba_ofs = 0, hit = 0;
 	unsigned int last_pg = ~0u;
+	/*
+	 * Bounds from this superblock's own width. WHIMORY_VBAS_PER_SB and
+	 * WHIMORY_DATA_VBAS_PER_SB are the per-bank counts and stopped the
+	 * walk a quarter of the way into a four-bank superblock.
+	 */
+	u32 sb_vbas = whimory_sb_vbas(w, vblock);
+	u32 sb_data_vbas = whimory_sb_data_vbas(w, vblock);
 
 	if (len < sizeof(struct whimory_bte) || whimory_page_blank(page, 64))
 		return false;
@@ -5382,14 +5462,14 @@ static bool whimory_btoc_parse_bte(struct whimory *w, const u8 *page,
 				w->sftl.btoc_unknown_entries++;
 			}
 			w->sftl.token_hole++;
-			if (vba_ofs + span > WHIMORY_VBAS_PER_SB)
+			if (vba_ofs + span > sb_vbas)
 				break;
 			vba_ofs += span;
 			continue;
 		}
-		if (span > WHIMORY_DATA_VBAS_PER_SB || lba >= 0x01000000u)
+		if (span > sb_data_vbas || lba >= 0x01000000u)
 			break;
-		if (vba_ofs + span > WHIMORY_DATA_VBAS_PER_SB)
+		if (vba_ofs + span > sb_data_vbas)
 			break;
 		if (lba == 0) {
 			w->sftl.btoc_skipped_zero++;
@@ -5397,14 +5477,19 @@ static bool whimory_btoc_parse_bte(struct whimory *w, const u8 *page,
 			continue;
 		}
 		for (s = 0; s < span; s++) {
-			unsigned int pg = (vba_ofs + s) / w->sftl.vbas_per_page;
+			unsigned int bce, bcau, pg, sl;
+			u32 key;
 			int got;
 
-			if (pg == last_pg)
+			if (whimory_btoc_ofs_to_page(w, vblock, vba_ofs + s,
+						     &bce, &bcau, &pg, &sl))
+				break;
+			key = whimory_btoc_page_key(bce, bcau, pg);
+			if (key == last_pg)
 				continue;
-			last_pg = pg;
-			got = whimory_btoc_confirm_page(w, ce, cau, vblock, pg,
-							0xffffffffu, false);
+			last_pg = key;
+			got = whimory_btoc_confirm_page(w, bce, bcau, vblock,
+							pg, 0xffffffffu, false);
 			if (got < 0)
 				return hit > 0;
 			if (got > 0)
@@ -6626,7 +6711,18 @@ static int whimory_cxt_build_from_sb(struct whimory *w, u32 sb_idx,
 	u8 meta[WHIMORY_META_SIZE];
 	u8 spare[S5L8740_NAND_META_SIZE];
 	u32 ofs, last_key = ~0u, next_lba = 0, n_l2v = 0;
-	u32 tag_hist[256] = { 0 };
+	/*
+	 * Eight entries, not 256.
+	 *
+	 * A full byte-indexed histogram is a kilobyte of stack, which put
+	 * this frame at 1368 bytes -- past the warning and a sixth of an
+	 * 8 KiB kernel stack, on a function that recurses into the NAND read
+	 * path. Every tag this walk can meet is 1..6 or CLEAN at 0xff, and
+	 * CLEAN is counted separately because it ends the walk; anything
+	 * else is by definition unrecognised and only needs a count.
+	 */
+	u32 tag_hist[8] = { 0 };
+	u32 tag_other = 0;
 	u32 n_cxt_meta = 0, n_clean = 0;
 	u32 vblock = whimory_cxt_sb_vblock(w, sb_idx);
 	/*
@@ -6686,7 +6782,10 @@ static int whimory_cxt_build_from_sb(struct whimory *w, u32 sb_idx,
 		if (meta[0] != WHIMORY_META_TYPE_SFTL_CXT)
 			continue;
 		n_cxt_meta++;
-		tag_hist[meta[1]]++;
+		if (meta[1] < ARRAY_SIZE(tag_hist))
+			tag_hist[meta[1]]++;
+		else
+			tag_other++;
 		if (meta[1] == WHIMORY_CXT_TAG_CLEAN) {
 			n_clean++;
 			break;
@@ -6751,12 +6850,15 @@ static int whimory_cxt_build_from_sb(struct whimory *w, u32 sb_idx,
 		char hb[160];
 		unsigned int t, hn = 0;
 
-		for (t = 0; t < 256; t++) {
+		for (t = 0; t < ARRAY_SIZE(tag_hist); t++) {
 			if (!tag_hist[t] || hn + 14 >= sizeof(hb))
 				continue;
 			hn += scnprintf(hb + hn, sizeof(hb) - hn, "%02x:%u ",
 					t, tag_hist[t]);
 		}
+		if (tag_other && hn + 16 < sizeof(hb))
+			scnprintf(hb + hn, sizeof(hb) - hn, "other:%u ",
+				  tag_other);
 		dev_info(w->dev,
 			 "CXT sb=%u no L2V records: cxt_meta=%u clean=%u tags=%s(l2v=0x%02x clean=0x%02x)\n",
 			 sb_idx, n_cxt_meta, n_clean, hb,
@@ -8421,6 +8523,69 @@ classify_done:
 			 "SFTL sb banks %s(known=%u partial=%u max=%u of %u vblocks)\n",
 			 hb, s->sb_bank_known, s->sb_bank_partial, maxb,
 			 s->sb_bank_blocks);
+	}
+	/*
+	 * Check the derived bank map against the VFL's own bad-block table.
+	 *
+	 * The bank map is built from which banks carry a record at page 0,
+	 * which is evidence but not authority. The authority for "this block
+	 * is unusable" is the 0xc104 object -- and it is worth being precise
+	 * about what that object is, because it was the obvious candidate
+	 * for a per-VBN bank table and it is not one.
+	 *
+	 * Dumped on this unit: object_len 0x800 at +0x24, generation 29 at
+	 * +0x28, payload at +0x80, and every payload row is 0xff except the
+	 * first two. Those two rows hold exactly 29 clear bits, which is the
+	 * 29 of "accepted: 29/2088 blocks bad" -- so it is one bit per
+	 * block over blocks_per_cau, padded, and nothing more. All 29 bad
+	 * blocks sit in blocks 0..31, while the narrow superblocks measured
+	 * here are vblocks 320, 1259, 1818 and 2048. The two describe
+	 * different things: a superblock can be narrower than four banks
+	 * without any of its blocks being factory-bad.
+	 *
+	 * So the FTL's per-VBN bank table (s_vfl.c sub_3D1438, one stride-
+	 * sized row per VBN) is not in this object and has not been located
+	 * on media.
+	 *
+	 * What is left to check is the object's scope, which was an
+	 * assumption and not a finding: the bitmap is taken to describe the
+	 * blocks of the bank it was found on, blk_status_bank. If that is
+	 * right, a block it calls bad must not have that bank as a member --
+	 * the superblock can still exist on the other three. So count both:
+	 * how many mapped vblocks it calls bad at all, and how many of those
+	 * still list that one bank.
+	 *
+	 * A zero in the second column supports the scope reading. A non-zero
+	 * one says the bitmap is not this bank's block list, and the next
+	 * person should not assume it is.
+	 */
+	if (w->vfl.bitmap_loaded && w->vfl.blk_status && s->sb_bank_mask) {
+		u32 v, flagged = 0, conflicts = 0, checked = 0;
+		u32 bank = w->vfl.blk_status_bank;
+
+		for (v = 0; v < s->sb_bank_blocks &&
+			    v < w->geom.blocks_per_cau; v++) {
+			bool bad = !(w->vfl.blk_status[v >> 3] &
+				     (1u << (v & 7)));
+
+			if (!s->sb_bank_mask[v])
+				continue;
+			checked++;
+			if (!bad)
+				continue;
+			flagged++;
+			if (bank < 8 && (s->sb_bank_mask[v] & (1u << bank)))
+				conflicts++;
+		}
+		s->sb_bank_conflicts = conflicts;
+		dev_info(w->dev,
+			 "SFTL sb banks vs VFL bitmap: checked=%u flagged_bad=%u still_list_bank%u=%u (%u bad recorded)\n",
+			 checked, flagged, bank, conflicts,
+			 w->vfl.blk_status_bad);
+		if (conflicts)
+			dev_info(w->dev,
+				 "SFTL the 0xc104 bitmap is not bank %u's block list -- do not read it as one\n",
+				 bank);
 	}
 	dev_info(w->dev, "SFTL fast-empty probe settled %u of %u blocks\n",
 		 s->fast_empty_hits, s->empty_sbs);

@@ -449,6 +449,7 @@ struct whimory_sftl {
 	u32 sb_bank_partial;	/* vblocks with fewer banks than the maximum */
 	u32 sb_bank_hist[S5L8740_NAND_MAX_CE * S5L8740_NAND_MAX_CAU + 1];
 	u32 sb_bank_overflow;	/* CXT offsets past the derived superblock end */
+	u32 sb_bank_conflicts;	/* members the VFL bad-block table calls bad */
 
 	struct whimory_sb *sbs;
 	u32 mapped_roots;

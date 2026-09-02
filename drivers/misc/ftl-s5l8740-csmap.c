@@ -39,6 +39,24 @@
 #define N31_FMSS_LBA_MAX		(N31_FAT_BASE_DEFAULT + \
 					 N31_FAT_TOTAL_DEFAULT + 65536u)
 #define N31_BPB_CANDIDATES_MAX		16
+/*
+ * Bounds for the partition-table probe; see n31_bpb_partition_lbas().
+ *
+ * RESERVED_PROBE has to span two things at once: a volume that starts at
+ * the partition sector, and one that starts a track in, at the classic
+ * CHS-aligned offset of 63. This unit is the second kind -- the partition
+ * begins at 49216 with an "MSDOS5.0" BPB whose hidden count is 0, and the
+ * volume the driver actually mounts is 63 sectors further on at 49279, its
+ * own BPB recording hidden=63 and its backup at +6. So the window is 63
+ * plus a full reserved area (this volume records reserved=32), rounded up.
+ *
+ * HIDDEN_MAX bounds the redirect a BPB's own hidden count can ask for, for
+ * the layouts where that field points forwards rather than back.
+ */
+#define N31_BPB_RESERVED_PROBE		96u
+#define N31_BPB_HIDDEN_MAX		4096u
+#define N31_BPB_LBA_SANE_MAX		0x10000000u
+#define N31_BPB_PROBE_MAX		(2 * 2 * N31_BPB_RESERVED_PROBE)
 #define N31_MAP_HASH_BITS		12
 #define N31_EXTENT_MAX			2048
 #define N31_PAGES_PER_BLOCK		128
@@ -231,6 +249,16 @@ static struct n31_ftl_cs *n31_ftl;
  * next failure a person triggers is always explained. Set the window to 0
  * for the old latching behaviour, or the max to 0 to describe every miss.
  */
+/*
+ * The exhaustive range walk is the fallback, not the plan. Clear this to
+ * force it -- useful when the partition table is suspect, or to confirm the
+ * two paths pick the same volume.
+ */
+static bool bpb_probe_partition = true;
+module_param(bpb_probe_partition, bool, 0644);
+MODULE_PARM_DESC(bpb_probe_partition,
+		 "Find the BPB from the MBR partition table before walking every range (default Y)");
+
 static unsigned int read_miss_diag_max = 3;
 module_param(read_miss_diag_max, uint, 0644);
 MODULE_PARM_DESC(read_miss_diag_max,
@@ -2689,6 +2717,83 @@ static int n31_bpb_walk_fn(u32 start, u32 len, u32 vba, u64 weave, void *opaque)
 	return 0;
 }
 
+/*
+ * Which LBAs are worth reading to find the volume, according to the media.
+ *
+ * The bind used to probe three hardcoded LBAs and then walk the interval
+ * map, reading up to max_try=512 mapped LBAs and asking each whether it
+ * looked like a BPB. That walk is 5.3 seconds of a 15-second mount, and on
+ * this unit it contributes nothing: the hardcoded probes have already found
+ * both candidates before it starts.
+ *
+ * The media states the answer outright. fmss_lba 0 is an MBR; measured
+ * here:
+ *
+ *   0x1BE: 80 10 0e 03 | 0c | 26 3d f3 | 40 c0 00 00 | 8a da 3a 00
+ *
+ * type 0x0c (FAT32 LBA), start LBA 0x0000c040 = 49216. That sector does
+ * hold a BPB -- "MSDOS5.0", jump eb 58 -- and its hidden-sector count at
+ * +0x1C is 63. 49216 + 63 = 49279, which is the volume this driver
+ * selects, whose own BPB puts its backup boot sector at +6 = 49285. Both
+ * candidates the walk was finding are reachable from the partition table in
+ * two steps.
+ *
+ * So: the partition start, whatever its hidden count redirects to, and the
+ * reserved area of each -- where FAT keeps its FSInfo and its backup boot
+ * sector, so a volume whose primary is damaged is still found. Around
+ * eighty LBAs instead of 512, and derived rather than assumed.
+ *
+ * Returns 0 when there is no usable partition table, and the caller then
+ * behaves exactly as it did before.
+ */
+static unsigned int n31_bpb_partition_lbas(struct n31_ftl_cs *ftl, u8 *buf,
+					   u32 *out, unsigned int max)
+{
+	static const u32 MBR_PART_OFF = 0x1be;
+	unsigned int n = 0, p, k, nbases = 0;
+	u32 bases[2];
+
+	if (!bpb_probe_partition || !ftl || !buf || !out)
+		return 0;
+	if (whimory_read_fmss_lba(0, buf))
+		return 0;
+	if (buf[0x1fe] != 0x55 || buf[0x1ff] != 0xaa)
+		return 0;
+
+	for (p = 0; p < 4 && nbases < ARRAY_SIZE(bases); p++) {
+		const u8 *e = buf + MBR_PART_OFF + p * 16;
+		u8 type = e[4];
+		u32 base = get_unaligned_le32(e + 8);
+
+		/* FAT12/16/32, CHS and LBA forms. */
+		if (type != 0x01 && type != 0x04 && type != 0x06 &&
+		    type != 0x0b && type != 0x0c && type != 0x0e)
+			continue;
+		if (!base || base >= N31_BPB_LBA_SANE_MAX)
+			continue;
+		bases[nbases++] = base;
+	}
+
+	for (p = 0; p < nbases; p++) {
+		u32 base = bases[p];
+		u32 hidden = 0;
+
+		/* Reading the base is what supplies the redirect. */
+		if (!whimory_read_fmss_lba(base, buf))
+			hidden = get_unaligned_le32(buf + 0x1c);
+		if (hidden >= N31_BPB_HIDDEN_MAX)
+			hidden = 0;
+
+		for (k = 0; k < N31_BPB_RESERVED_PROBE && n < max; k++)
+			out[n++] = base + k;
+		if (!hidden)
+			continue;
+		for (k = 0; k < N31_BPB_RESERVED_PROBE && n < max; k++)
+			out[n++] = base + hidden + k;
+	}
+	return n;
+}
+
 bool n31_ftl_cs_whimory_backed(void)
 {
 	return n31_ftl && n31_ftl->whimory_backed;
@@ -2748,11 +2853,59 @@ int n31_ftl_cs_bind_whimory(void)
 		mutex_unlock(&ftl->lock);
 	}
 
-	ctx.ftl = ftl;
-	ctx.buf = buf;
-	ctx.tried = 0;
-	ctx.max_try = 512;
-	whimory_range_walk(n31_bpb_walk_fn, &ctx);
+	/*
+	 * Then whatever the partition table names. The hardcoded probes
+	 * above are right for this unit and were arrived at by finding them
+	 * the slow way; these are derived from the media, so they keep
+	 * working on a volume laid out differently.
+	 */
+	{
+		u32 *plist = kmalloc_array(N31_BPB_PROBE_MAX, sizeof(*plist),
+					   GFP_KERNEL);
+		unsigned int np = 0;
+
+		if (plist) {
+			np = n31_bpb_partition_lbas(ftl, buf, plist,
+						    N31_BPB_PROBE_MAX);
+			for (i = 0; i < np; i++) {
+				if (whimory_read_fmss_lba(plist[i], buf))
+					continue;
+				if (!n31_bpb_looks_valid(buf, &total))
+					continue;
+				weave = 0;
+				whimory_l2v_search_phys(plist[i], &ce, &cau,
+							&blk, &page, &slot,
+							&weave);
+				mutex_lock(&ftl->lock);
+				n31_ftl_note_bpb_cand(ftl, plist[i], weave,
+						      buf, total);
+				mutex_unlock(&ftl->lock);
+			}
+			kfree(plist);
+		}
+		dev_info(ftl->dev,
+			 "bpb_probe partition lbas=%u candidates=%u\n",
+			 np, ftl->bpb_ncand);
+	}
+
+	/*
+	 * The walk is the fallback. It reads up to 512 mapped LBAs looking
+	 * for a boot sector, which is 5.3 seconds here, and it has nothing
+	 * to add once a candidate exists -- the selection rule below picks
+	 * among candidates, and a boot sector that neither the partition
+	 * table nor the known probes name is not one this volume boots from.
+	 */
+	if (!ftl->bpb_ncand || !bpb_probe_partition) {
+		ctx.ftl = ftl;
+		ctx.buf = buf;
+		ctx.tried = 0;
+		ctx.max_try = 512;
+		whimory_range_walk(n31_bpb_walk_fn, &ctx);
+	} else {
+		dev_info(ftl->dev,
+			 "bpb_probe skipping the range walk (%u candidate(s) already)\n",
+			 ftl->bpb_ncand);
+	}
 
 	mutex_lock(&ftl->lock);
 	if (!ftl->bpb_ncand) {
