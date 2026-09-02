@@ -972,6 +972,30 @@ static bool whimory_meta_is_data_raw(const u8 *m)
 	       m[0] == WHIMORY_META_TYPE_DATA2;
 }
 
+/*
+ * Does this metadata belong to a block that is part of a superblock?
+ *
+ * Membership from one record, for the blocks above user_blocks that the
+ * classify loop does not enumerate but that VBAs still name. Data, a BTOC
+ * and a checkpoint record all say the FTL allocated this block to a
+ * superblock; an erased record says it did not, and so does the all-zero
+ * type 00 shape that 76 blocks on this unit carry at both page 0 and page
+ * 127.
+ */
+static bool whimory_meta_is_member(const u8 *m)
+{
+	if (whimory_meta_erased(m, WHIMORY_META_SIZE))
+		return false;
+	/*
+	 * One 16-byte record, not a 64-byte page spare -- the batched plane
+	 * scan returns a single meta per (block, page), so the four-slot
+	 * helpers cannot be used here without reading past the end of it.
+	 */
+	return whimory_meta_is_data_raw(m) ||
+	       m[0] == WHIMORY_META_TYPE_BTOC ||
+	       m[0] == WHIMORY_META_TYPE_SFTL_CXT;
+}
+
 static bool whimory_special_lba(u32 lba)
 {
 	return (lba & 0xFFFF0000u) == WHIMORY_SPECIAL_LBA ||
@@ -997,7 +1021,21 @@ static u32 whimory_vfl_phys(struct whimory *w, u32 cau, u32 virt)
 	return w->vfl.remap[cau][virt];
 }
 
-/* Collect the CAU banks that participate in this virtual block. */
+/*
+ * Which CAUs carry this virtual block, for the CAU-substitution rule.
+ *
+ * This is not superblock bank membership, and reading it as if it were is
+ * what let the address decode assume four banks everywhere. Its domain is
+ * CAUs -- num_cau entries, no CE in it at all -- and it answers only "if
+ * this block failed on its own CAU, which CAU holds it now". vfl.bank_mask
+ * behind it is still a stub: allocated all-ones in n31_vfl_init() and never
+ * filled from flash, which makes whimory_vfl_bank() the identity and is why
+ * nothing has ever depended on it.
+ *
+ * The count that address arithmetic needs -- how many (ce, cau) banks a
+ * superblock spans -- is sftl.sb_bank_mask, built by classify. See
+ * whimory_sb_banks().
+ */
 static u32 whimory_vfl_banks_in_vbn(struct whimory *w, u32 vbn, u8 *out,
 				    u32 out_max)
 {
@@ -1082,7 +1120,7 @@ static u32 whimory_vfl_virt(struct whimory *w, u32 cau, u32 phys)
  * whimory_vfl_phys() translate the block number within that CAU.
  *
  * n31_vfl_read_vba() and whimory_l2v_search_phys() did both. The BTOC
- * confirm pass and whimory_cxt_read_vba() did only the second, with the
+ * confirm pass and the checkpoint walk did only the second, with the
  * unremapped CAU -- so if the bank bitmap were ever populated, the confirm
  * pass would key the L2V on metadata read from one plane while every later
  * read fetched another, a self-inflicted lba mismatch across the whole map.
@@ -1096,18 +1134,130 @@ static void whimory_vfl_resolve(struct whimory *w, u32 vblock, u32 *cau,
 	*pblock = whimory_vfl_phys(w, *cau, vblock);
 }
 
+/*
+ * The number of banks a superblock may have, and the VBA stride of one
+ * virtual block.
+ *
+ * The stride is the *maximum* -- max_banks * pages_per_sb * vbas_per_page,
+ * 2048 here -- not the number a given superblock uses. s_vfl.c builds an
+ * address as
+ *
+ *	(vbn * max_banks * pages_per_sb + page * nbanks + bank_ofs)
+ *		* vbas_per_page + slot
+ *
+ * (sub_4EAD34 forward, sub_4EAE40 back), so every virtual block owns the
+ * same 2048-address window and a short superblock simply leaves the tail of
+ * its window unused. Confirmed on this unit: CXT extents land exactly on
+ * vbn * 2048 boundaries -- vba 0xa0000 is vblock 320 page 0, 0x9d800 is
+ * vblock 315 page 0.
+ */
+static u32 whimory_max_banks(const struct whimory *w)
+{
+	u32 n = w->geom.num_ce * w->geom.num_cau;
+
+	return n ? n : 1;
+}
+
+static u32 whimory_vbas_per_vblock(const struct whimory *w)
+{
+	return whimory_max_banks(w) * w->sftl.pages_per_sb *
+	       w->sftl.vbas_per_page;
+}
+
+/*
+ * The banks this virtual block spans, and how many.
+ *
+ * An empty mask means classify never reached this block -- the region
+ * above user_blocks, or a run cut short by scan_blocks. Those fall back to
+ * every bank, which is what this driver assumed everywhere before the map
+ * existed, so an unscanned region behaves exactly as it used to.
+ */
+static u32 whimory_sb_banks(const struct whimory *w, u32 vblock, u8 *mask_out)
+{
+	u32 maxb = whimory_max_banks(w);
+	u8 mask = 0;
+
+	if (w->sftl.sb_bank_mask && vblock < w->sftl.sb_bank_blocks)
+		mask = w->sftl.sb_bank_mask[vblock];
+	if (!mask)
+		mask = (u8)((1u << maxb) - 1);
+	if (mask_out)
+		*mask_out = mask;
+	return hweight8(mask);
+}
+
+/* The bank sitting at position idx of a mask, counting from bit 0. */
+static u32 whimory_bank_at(u8 mask, u32 idx)
+{
+	u32 b;
+
+	for (b = 0; b < 8; b++) {
+		if (!(mask & (1u << b)))
+			continue;
+		if (!idx)
+			return b;
+		idx--;
+	}
+	return 0;
+}
+
+/*
+ * Record that (ce, cau) carries this virtual block.
+ *
+ * Called from classify for every block that came back as a real superblock
+ * member -- closed, open, or CXT. Empty blocks and blocks nothing could
+ * recognise deliberately do not call this: on this unit the 76 blocks whose
+ * page 0 and page 127 both read as type 00 are exactly the banks their
+ * superblocks do not span, and they are what the classify histogram has
+ * been reporting as "unknown" all along.
+ */
+static void whimory_sb_bank_note(struct whimory *w, u32 vblock, u32 ce,
+				 u32 cau)
+{
+	u32 bank = ce * w->geom.num_cau + cau;
+
+	if (!w->sftl.sb_bank_mask || vblock >= w->sftl.sb_bank_blocks ||
+	    bank >= 8)
+		return;
+	w->sftl.sb_bank_mask[vblock] |= (u8)(1u << bank);
+}
+
+/* Where a bank sits in a mask, or -1 when it is not a member. */
+static int whimory_bank_index(u8 mask, u32 bank)
+{
+	u32 b, n = 0;
+
+	for (b = 0; b < 8 && b < bank; b++)
+		if (mask & (1u << b))
+			n++;
+	if (bank >= 8 || !(mask & (1u << bank)))
+		return -1;
+	return (int)n;
+}
+
 static u32 s_g_vba_to_sb(const struct whimory *w, u32 vba)
 {
-	if (!w->sftl.vbas_per_sb)
+	u32 per_vb = whimory_vbas_per_vblock(w);
+
+	/*
+	 * Divide by the per-virtual-block stride, not by sftl.vbas_per_sb.
+	 * vbas_per_sb is 512, the per-plane count the BTOC parsers size
+	 * their arrays with; VBAs are packed over all four banks, so using
+	 * it here reported a superblock index four times too large in every
+	 * VBA_DIAG line.
+	 */
+	if (!per_vb)
 		return 0;
-	return vba / w->sftl.vbas_per_sb;
+	return vba / per_vb;
 }
 
 static u32 s_g_vba_to_ofs(const struct whimory *w, u32 vba)
 {
-	if (!w->sftl.vbas_per_sb)
+	u32 per_vb = whimory_vbas_per_vblock(w);
+
+	if (!per_vb)
 		return 0;
-	return vba % w->sftl.vbas_per_sb;
+	return vba % per_vb;
 }
 
 static u32 whimory_sb_index(const struct whimory *w, u32 ce, u32 cau,
@@ -1170,13 +1320,30 @@ static u32 whimory_vba_blocks(const struct whimory *w)
 static u32 whimory_pack_vba(const struct whimory *w, u32 ce, u32 cau,
 			    u32 vblock, u32 page, u32 slot)
 {
-	u32 planes = w->geom.num_ce * w->geom.num_cau;
-	u32 plane = ce * w->geom.num_cau + cau;
-	u32 per_page = planes * w->sftl.vbas_per_page;
-	u32 per_sb = w->sftl.pages_per_sb * per_page;
+	u32 bank = ce * w->geom.num_cau + cau;
+	u32 per_vb = whimory_vbas_per_vblock(w);
+	u8 mask;
+	u32 nbanks = whimory_sb_banks(w, vblock, &mask);
+	int ofs = whimory_bank_index(mask, bank);
 
-	return vblock * per_sb + page * per_page +
-	       plane * w->sftl.vbas_per_page + slot;
+	/*
+	 * A bank the map does not list as a member of this superblock.
+	 *
+	 * That is either a block classify could not read or a genuine
+	 * derivation error, and either way the honest answer is the layout
+	 * this driver used before the map existed: all banks, dense. It
+	 * keeps pack and unpack mutual inverses, which is what the replay
+	 * paths depend on -- they store an address and read it straight
+	 * back, so a wrong bank count cancels for them and only the
+	 * FTL-authored addresses (CXT extents, BTOC arrays) can go wrong.
+	 */
+	if (ofs < 0) {
+		nbanks = whimory_max_banks(w);
+		ofs = (int)bank;
+	}
+
+	return vblock * per_vb +
+	       (page * nbanks + (u32)ofs) * w->sftl.vbas_per_page + slot;
 }
 
 /*
@@ -1222,23 +1389,23 @@ static int whimory_unpack_vba(const struct whimory *w, u32 vba,
 		return -EINVAL;
 	/* Exact inverse of whimory_pack_vba(); see the layout there. */
 	{
-		u32 planes = w->geom.num_ce * w->geom.num_cau;
-		u32 per_page, per_sb, rem, plane;
+		u32 per_vb = whimory_vbas_per_vblock(w);
+		u32 rem, unit, nbanks, bank;
+		u8 mask;
 
-		if (!planes)
-			return -EINVAL;
-		per_page = planes * w->sftl.vbas_per_page;
-		per_sb = w->sftl.pages_per_sb * per_page;
-		if (!per_sb)
+		if (!per_vb)
 			return -EINVAL;
 
-		*vblock = vba / per_sb;
-		rem = vba % per_sb;
-		*page = rem / per_page;
-		plane = (rem % per_page) / w->sftl.vbas_per_page;
+		*vblock = vba / per_vb;
+		rem = vba % per_vb;
 		*slot = rem % w->sftl.vbas_per_page;
-		*ce = plane / w->geom.num_cau;
-		*cau = plane % w->geom.num_cau;
+		unit = rem / w->sftl.vbas_per_page;
+
+		nbanks = whimory_sb_banks(w, *vblock, &mask);
+		*page = unit / nbanks;
+		bank = whimory_bank_at(mask, unit % nbanks);
+		*ce = bank / w->geom.num_cau;
+		*cau = bank % w->geom.num_cau;
 	}
 
 	if (*ce >= w->geom.num_ce || *cau >= w->geom.num_cau)
@@ -4988,6 +5155,30 @@ static bool whimory_btoc_parse_be_lpn(struct whimory *w, const u8 *page,
 	return hit > 0;
 }
 
+/*
+ * A note on vba_ofs in the three BTOC parsers below, since the bank-count
+ * fix raised the question and the answer is not what it looks like.
+ *
+ * The offsets a BTOC carries are whole-superblock VBA offsets --
+ * s_btoc.c:230 asserts vba == s_g_addr_to_vba(wr->sb, wr->nextVbaOfs) --
+ * so turning one into a page with ofs / vbas_per_page, as these do, is the
+ * retired per-bank reading and names a page too early by a factor of
+ * nbanks.
+ *
+ * It is not a mapping error, because none of these parsers maps anything.
+ * The BTE is used only to decide which pages to visit;
+ * whimory_btoc_confirm_page() then reads the page and applies each slot
+ * from that slot's own metadata through whimory_pack_vba(), which is
+ * bank-aware and authoritative. So the cost is coverage, not correctness:
+ * the sweep visits more pages than it needs early in the block and stops at
+ * WHIMORY_DATA_VBAS_PER_SB, which on a four-bank superblock is a quarter of
+ * the way in.
+ *
+ * Left alone deliberately. Widening it changes which pages the brute-force
+ * fallback reads, and that path is the oracle the CXT path is checked
+ * against -- it should not be altered in the same change that alters what
+ * it is checking.
+ */
 static bool whimory_btoc_parse_be_bte(struct whimory *w, const u8 *page,
 				      unsigned int len, unsigned int ce,
 				      unsigned int cau, unsigned int vblock)
@@ -5631,7 +5822,16 @@ static int whimory_cxt_load_sb(struct whimory *w, u32 sb_idx)
 
 	w->cxt_lba_valid = false;
 	w->cxt_next_lba = 0;
-	/* Read the superblock in gc_zone_size chunks, as the FTL does. */
+	/*
+	 * Read the superblock in gc_zone_size chunks, as the FTL does.
+	 *
+	 * Unreferenced: this and whimory_cxt_load() are kept as the literal
+	 * transcription of s_cxt_load.c sub_5884D4, which is what
+	 * whimory_cxt_parse_tree() was checked against. The live path is
+	 * whimory_cxt_build_from_sb(). Note the bound below is the per-bank
+	 * count and the walk is bank-major -- both retired -- so this is
+	 * documentation, not something to call.
+	 */
 	for (ofs = 0; ofs < s->vbas_per_sb && !done; ofs += zone) {
 		n = min(zone, s->vbas_per_sb - ofs);
 		for (i = 0; i < n; i++) {
@@ -5826,9 +6026,13 @@ static int whimory_cxt_read_ofs(struct whimory *w, u32 vblock, u32 ofs,
 {
 	struct whimory_sftl *s = &w->sftl;
 	u32 ce, cau, vb, page, slot, pblock, key;
-	u32 planes = w->geom.num_ce * w->geom.num_cau;
-	u32 per_sb = s->pages_per_sb * planes * s->vbas_per_page;
-	u32 vba = vblock * per_sb + ofs;
+	/*
+	 * The offset is against the virtual block's full address stride --
+	 * every virtual block owns the same window whatever its bank count.
+	 * How far into that window a checkpoint runs is the caller's bound;
+	 * see whimory_cxt_build_from_sb().
+	 */
+	u32 vba = vblock * whimory_vbas_per_vblock(w) + ofs;
 	int ret;
 
 	ret = whimory_unpack_vba(w, vba, &ce, &cau, &vb, &page, &slot);
@@ -5851,33 +6055,14 @@ static int whimory_cxt_read_ofs(struct whimory *w, u32 vblock, u32 ofs,
 	return 0;
 }
 
-static int whimory_cxt_read_vba(struct whimory *w, u32 sb_idx, u32 ofs,
-				u8 *data, u8 *meta, u8 *spare, u32 *last_key)
-{
-	struct whimory_sftl *s = &w->sftl;
-	u32 ce, cau, vblock, page, slot, pblock, key;
-	u32 vba = whimory_sb_ofs_to_vba(w, sb_idx, ofs);
-	int ret;
-
-	ret = whimory_unpack_vba(w, vba, &ce, &cau, &vblock, &page, &slot);
-	if (ret)
-		return ret;
-	whimory_vfl_resolve(w, vblock, &cau, &pblock);
-	key = ((ce & 0xf) << 28) | ((cau & 0xf) << 24) |
-	      ((pblock & 0xffff) << 8) | (page & 0xff);
-	if (key != *last_key) {
-		ret = whimory_cs_read_page(w, ce, cau, pblock, page,
-					   s->data_page,
-					   S5L8740_NAND_PAGE_SIZE,
-					   spare, S5L8740_NAND_META_SIZE);
-		if (ret)
-			return ret;
-		*last_key = key;
-	}
-	memcpy(data, s->data_page + slot * WHIMORY_LBA_SIZE, WHIMORY_LBA_SIZE);
-	memcpy(meta, spare + slot * WHIMORY_META_SIZE, WHIMORY_META_SIZE);
-	return 0;
-}
+/*
+ * whimory_cxt_read_vba() lived here: the same read keyed by a bank-major
+ * superblock index and a per-bank offset. Its last caller was the dump, and
+ * the dump was the one place still walking a checkpoint in an order nothing
+ * else uses. Deleted rather than left for someone to reach for, because a
+ * second walker that disagrees with the loader is how the bank-count bug
+ * stayed hidden for as long as it did.
+ */
 
 /*
  * Walk one CXT superblock and report what is actually stored in it: the tag
@@ -5893,21 +6078,37 @@ static void whimory_cxt_dump_sb(struct whimory *w, u32 sb_idx, u64 weave,
 	u8 *data = s->gc_data;
 	u8 meta[WHIMORY_META_SIZE];
 	u8 spare[S5L8740_NAND_META_SIZE];
+	/*
+	 * Walk this the way the loader does.
+	 *
+	 * It used to call whimory_cxt_read_vba(), the bank-major walker,
+	 * while whimory_cxt_build_from_sb() uses whimory_cxt_read_ofs() --
+	 * so ftl_cxt_dump showed the records of one checkpoint in an order
+	 * no code path ever reads them in. It also clamped to vbas_per_sb,
+	 * the per-bank count, and so covered a quarter of the block. A
+	 * diagnostic that disagrees with the thing it is diagnosing is worse
+	 * than none, and this one was consulted while chasing exactly the
+	 * bug the disagreement was hiding.
+	 */
+	u32 vblock = whimory_cxt_sb_vblock(w, sb_idx);
+	u32 nbanks = whimory_sb_banks(w, vblock, NULL);
+	u32 sb_vbas = nbanks * s->pages_per_sb * s->vbas_per_page;
 
 	if (!data || !s->data_page) {
 		dev_err(w->dev, "CXT_DUMP sb=%u no scratch\n", sb_idx);
 		return;
 	}
-	if (!max_vbas || max_vbas > s->vbas_per_sb)
-		max_vbas = s->vbas_per_sb;
+	if (!max_vbas || max_vbas > sb_vbas)
+		max_vbas = sb_vbas;
 
-	dev_info(w->dev, "CXT_DUMP_BEGIN sb=%u weave=%llu vbas=%u\n",
-		 sb_idx, (unsigned long long)weave, max_vbas);
+	dev_info(w->dev,
+		 "CXT_DUMP_BEGIN sb=%u vblk=%u weave=%llu vbas=%u nbanks=%u\n",
+		 sb_idx, vblock, (unsigned long long)weave, max_vbas, nbanks);
 
 	for (ofs = 0; ofs < max_vbas; ofs++) {
 		u8 type, tag;
 
-		if (whimory_cxt_read_vba(w, sb_idx, ofs, data, meta, spare,
+		if (whimory_cxt_read_ofs(w, vblock, ofs, data, meta, spare,
 					 &last_key))
 			break;
 		type = meta[0];
@@ -5936,8 +6137,10 @@ static void whimory_cxt_dump_sb(struct whimory *w, u32 sb_idx, u64 weave,
 		 */
 		if (tag < ARRAY_SIZE(counts) && counts[tag] == 1)
 			dev_info(w->dev,
-				 "CXT_REC sb=%u ofs=%u pg=%u slot=%u type=%02x tag=%02x %s\n",
-				 sb_idx, ofs, ofs / s->vbas_per_page,
+				 "CXT_REC sb=%u ofs=%u pg=%u bank=%u slot=%u type=%02x tag=%02x %s\n",
+				 sb_idx, ofs,
+				 (ofs / s->vbas_per_page) / nbanks,
+				 (ofs / s->vbas_per_page) % nbanks,
 				 ofs % s->vbas_per_page, type, tag,
 				 whimory_cxt_tag_name(tag));
 
@@ -6115,20 +6318,28 @@ static int whimory_cxt_ext_add(struct whimory *w, u32 lba, u32 span, u32 vba,
 static void whimory_vba_describe(const struct whimory *w, u32 vba,
 				 char *buf, size_t len)
 {
-	u32 planes = w->geom.num_ce * w->geom.num_cau;
-	u32 per_page, per_sb, rem;
+	u32 per_vb = whimory_vbas_per_vblock(w);
+	u32 vblock, rem, unit, nbanks, bank;
+	u8 mask;
 
-	if (!planes || !w->sftl.vbas_per_page || !w->sftl.pages_per_sb) {
+	if (!per_vb || !w->sftl.vbas_per_page || !w->sftl.pages_per_sb) {
 		scnprintf(buf, len, "?");
 		return;
 	}
-	per_page = planes * w->sftl.vbas_per_page;
-	per_sb = w->sftl.pages_per_sb * per_page;
-	rem = vba % per_sb;
-	scnprintf(buf, len, "vblk=%u pg=%u plane=%u slot=%u",
-		  vba / per_sb, rem / per_page,
-		  (rem % per_page) / w->sftl.vbas_per_page,
-		  rem % w->sftl.vbas_per_page);
+	vblock = vba / per_vb;
+	rem = vba % per_vb;
+	unit = rem / w->sftl.vbas_per_page;
+	/*
+	 * nbanks is printed too. Reading a description without it is what
+	 * made this bug so hard to see: two superblocks with the same
+	 * vblk/pg/slot are different physical pages when their bank counts
+	 * differ, and nothing in the old line said so.
+	 */
+	nbanks = whimory_sb_banks(w, vblock, &mask);
+	bank = whimory_bank_at(mask, unit % nbanks);
+	scnprintf(buf, len, "vblk=%u pg=%u bank=%u slot=%u nbanks=%u",
+		  vblock, unit / nbanks, bank,
+		  rem % w->sftl.vbas_per_page, nbanks);
 }
 
 /*
@@ -6264,6 +6475,37 @@ static int whimory_cxt_parse_tree(struct whimory *w, const u8 *data,
 			u32 chunk = span;
 			u32 tvba;
 			int ret;
+
+			/*
+			 * A free consistency check on the bank map.
+			 *
+			 * A checkpoint never names an address past the end of
+			 * its superblock, so an offset at or beyond
+			 * nbanks * pages_per_sb * vbas_per_page says our bank
+			 * count for that virtual block is too small -- the
+			 * classify signal missed a member. Counted here
+			 * because it costs nothing and it is the one symptom
+			 * that distinguishes a bad derivation from a bad
+			 * checkpoint.
+			 */
+			{
+				u32 per_vb = whimory_vbas_per_vblock(w);
+				u32 vblk = per_vb ? vba / per_vb : 0;
+				u32 nb = whimory_sb_banks(w, vblk, NULL);
+				u32 end = nb * w->sftl.pages_per_sb *
+					  w->sftl.vbas_per_page;
+
+				if (per_vb && vba % per_vb >= end) {
+					w->sftl.sb_bank_overflow++;
+					if (w->sftl.sb_bank_overflow <= 8)
+						dev_warn(w->dev,
+							 "CXT_BANK_SHORT vba=0x%08x vblk=%u ofs=%u >= %u (nbanks=%u) lba=%u span=%u\n",
+							 vba, vblk,
+							 vba % per_vb, end, nb,
+							 lba, chunk);
+				}
+			}
+
 			if (!whimory_cxt_vba_translate(w, vba, &tvba)) {
 				ret = whimory_cxt_ext_add(w, lba, chunk, tvba,
 							  sb_weave);
@@ -6312,9 +6554,24 @@ static int whimory_cxt_build_from_sb(struct whimory *w, u32 sb_idx,
 	u32 ofs, last_key = ~0u, next_lba = 0, n_l2v = 0;
 	u32 tag_hist[256] = { 0 };
 	u32 n_cxt_meta = 0, n_clean = 0;
-	u32 planes = w->geom.num_ce * w->geom.num_cau;
-	u32 per_sb = s->pages_per_sb * planes * s->vbas_per_page;
 	u32 vblock = whimory_cxt_sb_vblock(w, sb_idx);
+	/*
+	 * How many addresses this checkpoint superblock actually holds.
+	 *
+	 * s_cxt_load.c walks a checkpoint from 0 to the value the VFL gives
+	 * for that superblock -- sub_4EFE0C, banks_in_vbn * pages_per_block *
+	 * vbas_per_page -- not to a fixed per-virtual-block stride. A
+	 * checkpoint on a short superblock has its records packed over the
+	 * banks it has; walking the full 2048 offsets would read them in the
+	 * wrong order, and the tree cannot survive that because each record
+	 * declares the LBA it continues from.
+	 *
+	 * This one happens to be a four-bank superblock on this unit, so the
+	 * two bounds agree today. They agree by luck.
+	 */
+	u32 nbanks = whimory_sb_banks(w, vblock, NULL);
+	u32 per_sb = nbanks * s->pages_per_sb * s->vbas_per_page;
+	u32 per_vb = whimory_vbas_per_vblock(w);
 	bool lba_valid = false;
 	int ret;
 
@@ -6322,14 +6579,14 @@ static int whimory_cxt_build_from_sb(struct whimory *w, u32 sb_idx,
 		return -ENOMEM;
 
 	/*
-	 * The whole superblock, all four planes, in the order the FTL wrote
-	 * it -- not one plane at a time. See whimory_cxt_read_ofs().
+	 * The whole superblock, every bank, in the order the FTL wrote it --
+	 * not one bank at a time. See whimory_cxt_read_ofs().
 	 */
 	for (ofs = 0; ofs < per_sb; ofs++) {
 		ret = whimory_cxt_read_ofs(w, vblock, ofs, data, meta, spare,
 					   &last_key);
 		if (!ret && cxt_trace_sb && ofs < cxt_trace_sb) {
-			u32 tv = vblock * per_sb + ofs;
+			u32 tv = vblock * per_vb + ofs;
 			unsigned int tce, tcau, tvb, tpg, tsl;
 			char d[64] = "?";
 
@@ -6359,6 +6616,19 @@ static int whimory_cxt_build_from_sb(struct whimory *w, u32 sb_idx,
 		if (meta[1] == WHIMORY_CXT_TAG_CLEAN) {
 			n_clean++;
 			break;
+		}
+		/*
+		 * The BASE payload is {count, sb, sb, ...} -- s_cxt_save.c
+		 * writes buf[0] = cxt->save.num_sb and then the list. That
+		 * count is what the weave fast-forward is scaled by, so it is
+		 * worth taking rather than guessing from how many checkpoint
+		 * superblocks classify happened to find.
+		 */
+		if (meta[1] == WHIMORY_CXT_TAG_BASE && !w->cxt_save_num_sb) {
+			u32 n = get_unaligned_le32(data);
+
+			if (n && n <= WHIMORY_CXT_MAX_SB)
+				w->cxt_save_num_sb = n;
 		}
 		if (meta[1] != WHIMORY_CXT_TAG_L2V)
 			continue;
@@ -7194,6 +7464,36 @@ static int whimory_cxt_fast_load(struct whimory *w)
 	if (ret)
 		return ret;
 	w->cxt_base_weave = w->cxt_ext_weave;
+	/*
+	 * The weave fast-forward, from s_cxt.c:81.
+	 *
+	 * Having loaded a checkpoint, stock sets the write cursor to
+	 *
+	 *	baseWeaveSeq + save.num_sb * s_g_vbas_per_sb + 1
+	 *
+	 * so that every subsequent write carries a weave at or above it. The
+	 * weaves in between belong to the checkpoint's own pages. This
+	 * driver has no write path and never needed the cursor, but it does
+	 * need the boundary: the diff skip below has to separate "predates
+	 * the checkpoint" from "written after it", and the base alone puts
+	 * the checkpoint's own write span on the wrong side of that line.
+	 *
+	 * num_sb comes from the BASE payload when it parsed, and otherwise
+	 * from the number of checkpoint superblocks classify found, which is
+	 * the same number on a healthy volume.
+	 */
+	{
+		u32 nsb = w->cxt_save_num_sb ? w->cxt_save_num_sb :
+			  (w->n_cxt ? w->n_cxt : 1);
+
+		w->cxt_top_weave = w->cxt_base_weave +
+				   (u64)nsb * whimory_vbas_per_vblock(w) + 1;
+		dev_info(w->dev,
+			 "CXT_WEAVE base=%llu top=%llu (num_sb=%u src=%s)\n",
+			 (unsigned long long)w->cxt_base_weave,
+			 (unsigned long long)w->cxt_top_weave, nsb,
+			 w->cxt_save_num_sb ? "BASE" : "classify");
+	}
 	w->sftl.cxt_loaded = true;
 	/*
 	 * The interval map now holds everything the extent table did, and the
@@ -7285,6 +7585,7 @@ static void whimory_print_recovery_stats(struct whimory *w)
 		 "  scan_blocks=%u (param) user_blocks=%u\n"
 		 "  fpart_sig=%u vfl_ctx_hits=%u vfl_cxt_loc=%u vfl_bitmap=%u\n"
 		 "  classified_empty=%u classified_closed=%u classified_open=%u classified_cxt=%u classified_unknown=%u\n"
+		 "  sb_banks known=%u partial=%u overflow=%u\n"
 		 "  cxt_blocks_seen=%u cxt_records_seen=%u cxt_l2v_updates=%u\n"
 		 "  cxt_meta_confirmed=%u cxt_meta_mismatch=%u cxt_confirm_pages=%u cxt_confirm_unreadable=%u\n"
 		 "  cxt_repair_pages=%u cxt_repair_slots=%u\n"
@@ -7308,6 +7609,7 @@ static void whimory_print_recovery_stats(struct whimory *w)
 		 w->vfl.bitmap_loaded,
 		 s->empty_sbs, s->btoc_sbs, s->open_sbs, s->cxt_sbs,
 		 s->unknown_sbs,
+		 s->sb_bank_known, s->sb_bank_partial, s->sb_bank_overflow,
 		 s->cxt_blocks_seen, s->cxt_records_seen, s->cxt_l2v_updates,
 		 s->cxt_meta_confirmed, s->cxt_meta_mismatch,
 		 s->cxt_confirm_pages, s->cxt_confirm_unreadable,
@@ -7603,7 +7905,7 @@ static int whimory_scan_plane_meta(struct whimory *w, unsigned int ce,
 static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 {
 	struct whimory_sftl *s = &w->sftl;
-	unsigned int ce, cau, b, nscan, nsb = 0, i, open_done = 0;
+	unsigned int ce, cau, b, nscan, nmap, nsb = 0, i, open_done = 0;
 	u8 meta0[S5L8740_NAND_META_SIZE];
 	u8 meta127[S5L8740_NAND_META_SIZE];
 	u8 *plane_m0 = NULL;
@@ -7616,6 +7918,27 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 	nscan = scan_blocks ? scan_blocks : s->user_blocks;
 	if (nscan > s->user_blocks)
 		nscan = s->user_blocks;
+
+	/*
+	 * The bank map has to cover every block a VBA may name, which is
+	 * blocks_per_cau -- 2088 -- and not the 1960 the classify loop
+	 * enumerates. The FTL does put user data above user_blocks: there
+	 * are checkpoint extents in virtual blocks 1987..1991 and 2048 on
+	 * this unit, and vblock 2048 is a three-bank superblock. Left out of
+	 * the map it decoded as four banks and read one page in twelve
+	 * wrong, which was the last mismatch standing after the rest of this
+	 * was fixed.
+	 *
+	 * It costs nothing: the batched pre-pass already sweeps a whole
+	 * plane in one series of kicks, so 128 more blocks per plane is
+	 * within the noise of a pass that takes about 1.2 seconds. The
+	 * classify loop itself still stops at nscan -- the tail is the VFL
+	 * and FPart region, and enumerating it as data superblocks would put
+	 * blocks into the replay that have no business there.
+	 */
+	nmap = whimory_vba_blocks(w);
+	if (nmap < nscan)
+		nmap = nscan;
 
 	p127 = s->btoc_page;
 	if (!p127)
@@ -7637,6 +7960,16 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 	s->btoc_verified = 0;
 	s->diff_replayed_sbs = 0;
 	s->diff_skipped_sbs = 0;
+	/*
+	 * Cleared per run: a re-recover reclassifies every block, and a mask
+	 * carried over from a previous scan would keep banks that this one
+	 * did not see.
+	 */
+	if (s->sb_bank_mask)
+		memset(s->sb_bank_mask, 0, s->sb_bank_blocks);
+	s->sb_bank_known = 0;
+	s->sb_bank_partial = 0;
+	s->sb_bank_overflow = 0;
 	s->confirm_start_jiffies = jiffies;
 	s->btoc_confirm_budget_stop = 0;
 	s->string_hit_itunesdb = 0;
@@ -7651,8 +7984,8 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 		 w->geom.num_ce, w->geom.num_cau, nscan,
 		 btoc_confirm_max, recover_budget_ms, audit_lba_winners);
 
-	plane_m0 = kvmalloc_array(nscan, WHIMORY_META_SIZE, GFP_KERNEL);
-	plane_mN = kvmalloc_array(nscan, WHIMORY_META_SIZE, GFP_KERNEL);
+	plane_m0 = kvmalloc_array(nmap, WHIMORY_META_SIZE, GFP_KERNEL);
+	plane_mN = kvmalloc_array(nmap, WHIMORY_META_SIZE, GFP_KERNEL);
 	if (!plane_m0 || !plane_mN) {
 		kvfree(plane_m0);
 		kvfree(plane_mN);
@@ -7666,9 +7999,30 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 
 			if (plane_m0 && plane_mN)
 				have_scan = !whimory_scan_plane_meta(w, ce, cau,
-								     nscan,
+								     nmap,
 								     plane_m0,
 								     plane_mN);
+			/*
+			 * Bank membership for the blocks past nscan, which
+			 * classify does not enumerate. Nothing else is
+			 * derived from them -- they do not enter sbs[] and
+			 * are never replayed -- but a VBA naming one has to
+			 * decode against the right bank count.
+			 */
+			if (have_scan) {
+				for (b = nscan; b < nmap; b++) {
+					const u8 *pm0 = plane_m0 +
+						(size_t)b * WHIMORY_META_SIZE;
+					const u8 *pmN = plane_mN +
+						(size_t)b * WHIMORY_META_SIZE;
+
+					if (whimory_meta_is_member(pm0) ||
+					    whimory_meta_is_member(pmN))
+						whimory_sb_bank_note(w,
+							whimory_vfl_virt(w, cau, b),
+							ce, cau);
+				}
+			}
 			for (b = 0; b < nscan; b++) {
 				struct whimory_sb *sb;
 				int r0, r127;
@@ -7930,6 +8284,21 @@ have_meta:
 					sb->kind = WHIMORY_SB_UNKNOWN;
 					s->unknown_sbs++;
 				}
+				/*
+				 * Bank membership, which is what every VBA in
+				 * this superblock is decoded against. Only a
+				 * recognised superblock counts as a member:
+				 * an unreadable or unrecognised block is
+				 * precisely the case the FTL left out of the
+				 * superblock, and including it would put the
+				 * whole block's addresses one bank wide.
+				 */
+				if (sb->kind == WHIMORY_SB_CLOSED ||
+				    sb->kind == WHIMORY_SB_OPEN ||
+				    sb->kind == WHIMORY_SB_CXT)
+					whimory_sb_bank_note(w,
+						whimory_vfl_virt(w, cau, b),
+						ce, cau);
 				nsb++;
 			}
 		}
@@ -7940,6 +8309,45 @@ classify_done:
 		 "SFTL classified nsb=%u closed=%u open=%u cxt=%u empty=%u unknown=%u\n",
 		 nsb, s->btoc_sbs, s->open_sbs, s->cxt_sbs, s->empty_sbs,
 		 s->unknown_sbs);
+	/*
+	 * How wide the superblocks actually are.
+	 *
+	 * This is the number every address on the volume is decoded against,
+	 * and until now it was assumed to be four everywhere. A histogram
+	 * with anything outside the maximum column is a volume where that
+	 * assumption was costing reads; a histogram that is entirely in the
+	 * maximum column says the assumption happened to hold.
+	 */
+	{
+		u32 maxb = whimory_max_banks(w);
+		char hb[128];
+		unsigned int t, hn = 0;
+
+		memset(s->sb_bank_hist, 0, sizeof(s->sb_bank_hist));
+		s->sb_bank_known = 0;
+		s->sb_bank_partial = 0;
+		for (i = 0; i < s->sb_bank_blocks; i++) {
+			u32 n = hweight8(s->sb_bank_mask[i]);
+
+			if (!n)
+				continue;
+			s->sb_bank_known++;
+			if (n < maxb)
+				s->sb_bank_partial++;
+			if (n < ARRAY_SIZE(s->sb_bank_hist))
+				s->sb_bank_hist[n]++;
+		}
+		for (t = 0; t < ARRAY_SIZE(s->sb_bank_hist); t++) {
+			if (!s->sb_bank_hist[t] || hn + 14 >= sizeof(hb))
+				continue;
+			hn += scnprintf(hb + hn, sizeof(hb) - hn, "%u:%u ",
+					t, s->sb_bank_hist[t]);
+		}
+		dev_info(w->dev,
+			 "SFTL sb banks %s(known=%u partial=%u max=%u of %u vblocks)\n",
+			 hb, s->sb_bank_known, s->sb_bank_partial, maxb,
+			 s->sb_bank_blocks);
+	}
 	dev_info(w->dev, "SFTL fast-empty probe settled %u of %u blocks\n",
 		 s->fast_empty_hits, s->empty_sbs);
 	dev_info(w->dev, "SFTL slot0 read settled %u non-empty blocks\n",
@@ -8075,7 +8483,7 @@ classify_done:
 		 */
 		if (!sb->weave_max)
 			s->weave_none++;
-		else if (sb->weave_max >= w->cxt_base_weave)
+		else if (sb->weave_max >= w->cxt_top_weave)
 			s->weave_newer++;
 		else
 			s->weave_older++;
@@ -8090,12 +8498,21 @@ classify_done:
 				 (unsigned long long)w->cxt_base_weave);
 		} else if (use_cxt && s->cxt_loaded && cxt_fast &&
 			   sb->weave_max &&
-			   sb->weave_max < w->cxt_base_weave) {
+			   sb->weave_max < w->cxt_top_weave) {
 			/*
-			 * Skip only what the checkpoint provably predates.
+			 * Skip only what the checkpoint provably covers.
 			 *
-			 * A superblock with no usable weave at all is not in
-			 * that set: nothing bounds it, so there is no
+			 * The line is cxt_top_weave, not the base. Weaves
+			 * between the two were consumed writing the
+			 * checkpoint itself, so a superblock bounded there is
+			 * still one the checkpoint describes; stock reserves
+			 * exactly that span before letting any user write
+			 * take a weave (s_cxt.c:81). Testing against the base
+			 * put those superblocks on the post-checkpoint side
+			 * and replayed them for nothing.
+			 *
+			 * A superblock with no usable weave at all is in
+			 * neither set: nothing bounds it, so there is no
 			 * evidence the checkpoint describes it. Those are
 			 * replayed. On this volume that is the 78 blocks
 			 * classify reports as unknown, which is cheap against
@@ -8104,12 +8521,12 @@ classify_done:
 			s->diff_skipped_sbs++;
 			continue;
 		} else if (use_cxt && s->cxt_loaded && sb->weave_max_p127 &&
-			   sb->weave_max && sb->weave_max < w->cxt_base_weave) {
+			   sb->weave_max && sb->weave_max < w->cxt_top_weave) {
 			s->diff_skipped_sbs++;
 			continue;
 		}
 		if (use_cxt && s->cxt_loaded && !sb->weave_max_p127 &&
-		    sb->weave && sb->weave < w->cxt_base_weave)
+		    sb->weave && sb->weave < w->cxt_top_weave)
 			s->diff_open_kept++;
 		s->diff_replayed_sbs++;
 		if (sb->kind == WHIMORY_SB_CLOSED) {
@@ -8250,9 +8667,9 @@ btoc_done:
 		 s->diff_replayed_sbs, s->diff_skipped_sbs, s->cxt_l2v_updates,
 		 s->diff_open_kept, s->open_truncated);
 	dev_info(w->dev,
-		 "SFTL weave vs cxt base=%llu: newer=%u older=%u none=%u\n",
-		 w->cxt_base_weave, s->weave_newer, s->weave_older,
-		 s->weave_none);
+		 "SFTL weave vs cxt base=%llu top=%llu: newer=%u older=%u none=%u\n",
+		 w->cxt_base_weave, w->cxt_top_weave, s->weave_newer,
+		 s->weave_older, s->weave_none);
 	/*
 	 * How deep the open rebuilds went. A genuinely open superblock stops
 	 * at its first blank page, so pages/sb well under 127 says these
@@ -8432,8 +8849,20 @@ static int whimory_sftl_alloc(struct whimory *w)
 	s->btoc_map = kvmalloc_array(WHIMORY_DATA_VBAS_PER_SB,
 				     sizeof(*s->btoc_map), GFP_KERNEL);
 	s->sbs = kvcalloc(nsb, sizeof(*s->sbs), GFP_KERNEL);
+	/*
+	 * Sized by blocks_per_cau, not user_blocks.
+	 *
+	 * A VBA may name any block the VFL can address, and CXT records
+	 * legitimately do -- there are extents in virtual blocks 1987..1991
+	 * on this unit, above user_blocks = 1960. Classify only reaches
+	 * user_blocks, so those entries stay zero and decode as all banks,
+	 * which is what this driver did everywhere before the map existed.
+	 */
+	s->sb_bank_blocks = whimory_vba_blocks(w);
+	s->sb_bank_mask = kvcalloc(s->sb_bank_blocks,
+				   sizeof(*s->sb_bank_mask), GFP_KERNEL);
 	if (!s->btoc_page || !s->data_page || !s->meta_page || !s->cs_page ||
-	    !s->sbs || !s->btoc_map)
+	    !s->sbs || !s->btoc_map || !s->sb_bank_mask)
 		return -ENOMEM;
 
 	/*
@@ -9462,6 +9891,9 @@ static void whimory_free(struct whimory *w)
 	kvfree(w->sftl.btoc_map);
 	kvfree(w->cxt_ext);
 	kvfree(w->sftl.sbs);
+	kvfree(w->sftl.sb_bank_mask);
+	w->sftl.sb_bank_mask = NULL;
+	w->sftl.sb_bank_blocks = 0;
 	kvfree(w->sftl.gc_data);
 	kvfree(w->sftl.gc_meta);
 	kvfree(w->vfl.bank_mask);
@@ -9792,6 +10224,8 @@ static int whimory_sftl_recover_cs_locked(void)
 		w->sftl.packed_ok = false;
 		w->n_cxt = 0;
 		w->cxt_base_weave = 0;
+		w->cxt_top_weave = 0;
+		w->cxt_save_num_sb = 0;
 		w->sftl.btoc_sbs = 0;
 		w->sftl.open_sbs = 0;
 		w->sftl.empty_sbs = 0;

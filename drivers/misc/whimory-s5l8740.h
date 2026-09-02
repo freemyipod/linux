@@ -420,6 +420,36 @@ struct whimory_sftl {
 	unsigned int rc_misses;
 	unsigned int rc_fails;
 	unsigned int scan_kicks;
+
+	/*
+	 * Which (ce, cau) banks each virtual block actually spans.
+	 *
+	 * A superblock is not always all four banks. The VFL keeps a bitmap
+	 * of the banks that carry a given VBN -- s_vfl.c sub_3D1438 counts
+	 * the set bits of one stride-sized row per VBN -- and every address
+	 * the FTL builds is dense over *those* banks:
+	 *
+	 *	vba = (vbn * max_banks * pages_per_sb
+	 *	       + page * nbanks + bank_ofs) * vbas_per_page + slot
+	 *
+	 * so a superblock holds nbanks * pages_per_sb * vbas_per_page
+	 * addresses (sub_4EFE0C), not the full four banks' worth. Decoding a
+	 * three-bank superblock as four puts the read on the wrong page of
+	 * the wrong bank, which is the "sftl lba mismatch" against a page
+	 * written long before the checkpoint.
+	 *
+	 * One byte per virtual block, bit b set for bank b = ce * num_cau +
+	 * cau. Built during classify from which banks carry a real record at
+	 * page 0; an all-zero entry means "not classified", and the decode
+	 * falls back to all banks so an unscanned region behaves as before.
+	 */
+	u8 *sb_bank_mask;
+	u32 sb_bank_blocks;	/* entries allocated */
+	u32 sb_bank_known;	/* vblocks with at least one bank */
+	u32 sb_bank_partial;	/* vblocks with fewer banks than the maximum */
+	u32 sb_bank_hist[S5L8740_NAND_MAX_CE * S5L8740_NAND_MAX_CAU + 1];
+	u32 sb_bank_overflow;	/* CXT offsets past the derived superblock end */
+
 	struct whimory_sb *sbs;
 	u32 mapped_roots;
 	u32 mapped_lbas;
@@ -618,6 +648,21 @@ struct whimory {
 	u32 bad_vba;		/* what the map answered for a failing read */
 	u32 bad_span;
 	u64 cxt_base_weave;
+	/*
+	 * The weave the checkpoint's own pages ran out to.
+	 *
+	 * s_cxt.c:81 sets sftl.write.weaveSeq to
+	 *
+	 *	cxt->load.baseWeaveSeq + cxt->save.num_sb * s_g_vbas_per_sb + 1
+	 *
+	 * before the diff runs, so every write after the checkpoint carries a
+	 * weave at or above this. Weaves between the base and here belong to
+	 * the checkpoint superblocks themselves, not to post-checkpoint user
+	 * data, and the skip rule has to draw its line here rather than at
+	 * the base.
+	 */
+	u64 cxt_top_weave;
+	u32 cxt_save_num_sb;	/* first word of the BASE record payload */
 	struct whimory_cxt_extent *cxt_ext;	/* candidate map (Phase 3) */
 	u32 n_cxt_ext;
 	u32 max_cxt_ext;
