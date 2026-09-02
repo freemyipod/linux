@@ -2,7 +2,7 @@
 /*
  * SPI controller for Samsung/Apple S5L8702 / S5L8740
  *
- * RetailOS PIO (sub_4043D0) is shared by SPI0/CS42 and SPI2/Nimbus:
+ * RetailOS PIO (sub_4043D0) is shared by SPI0/CS42 and SPI2/Grape:
  *   CS = SPIPIN bit1 (4045D4(n): assert=clear, idle=set)
  *   flush STATUS & 0x7C0 / 0xF800 == 0
  *   per-byte: wait !0x7C0, TXDATA, wait 0xF800, RXDATA
@@ -13,7 +13,7 @@
  *
  * "DMA" in 4043D0 is the SPI-controller block path (SETUP bit5 after
  * 11B70), not PL080. No SPI0/SPI2 PL080 peri IDs in OSOS. sub_3914
- * only does STATUS |= 0x40003F. Nimbus/CS42 stay on this PIO loop;
+ * only does STATUS |= 0x40003F. Grape/CS42 stay on this PIO loop;
  * do not invent peri IDs.
  */
 #include <linux/clk.h>
@@ -23,6 +23,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/spi/spi.h>
+#include <linux/unaligned.h>
 
 #define SPICTRL			0x00
 #define SPISETUP		0x04
@@ -73,8 +74,69 @@ MODULE_PARM_DESC(spi_family,
 		 "status encoding: 0=auto-latch per instance, 1=ROS (0x7C0/0xF800), 2=Classic (0x1F0/0x3E00)");
 
 #define SPISETUP_RXMODE		BIT(0)
-#define SPISETUP_RETAILOS	0x403c	/* 0x402C | 0x10 — SPI2 / 11B70(2,0x1A,…) */
+/*
+ * Bits 6:5 select which transfer engine the port is configured for.
+ *
+ * sub_4043D0 opens with v10 = (SPISETUP & 0x60) == 0 and runs its polled
+ * byte loop only when v10 is set, so PIO runs if and only if these bits are
+ * clear. Before transferring it makes the register agree with the engine it
+ * picked: from a bits-set state it writes SPISETUP &= ~0x60 and takes the
+ * PIO arm; from a bits-clear state it writes SPISETUP |= 0x20 and takes the
+ * interrupt arm (SPIRXLIMIT / +0x4c counts, event 68).
+ *
+ * sub_11B70 leaves bit 5 SET at init -- SPISETUP_SPI0_11B70 is 0x403e -- so
+ * a driver that then runs the polled loop is using stock's PIO code with
+ * the register configured for the other engine. That is a state stock never
+ * occupies: the bootloader, which is polled-only, uses 0x401e.
+ *
+ * We keep the 0x403e init, because that is what sub_11B70 writes, and clear
+ * the field in the transfer path, because that is what sub_4043D0 does when
+ * it selects PIO. Stock does not restore the bits afterwards (its epilogue
+ * is only SETUP &= ~0x400001), so neither do we.
+ */
+#define SPISETUP_ENGINE_MASK	0x60u
+/*
+ * SPISETUP_RETAILOS was 0x403c. That value is refuted: no path in either
+ * image produces it. Both sub_11B70 call sites pass mode 0x1A, which
+ * yields 0x403E, and the bootloader uses 0x401E on SPI0.
+ */
 #define SPISETUP_SPI0_11B70	0x403e	/* 11B70(0,0x1A,0x2EE0,8) → 0x402E|0x10 */
+
+/*
+ * Transfer word size. sub_11B70 always leaves this at 8-bit for both ports,
+ * so this field is ours to drive per transfer rather than something stock
+ * varies at setup time.
+ *
+ * Apple's own loaders do vary it mid-download: upstream apple_z2 sends the
+ * HBPP init payload with 8-bit words and every later firmware blob with
+ * 16-bit words. On a little-endian host a 16-bit word puts the high byte on
+ * the wire first, so the same byte array clocks out pair-swapped -- which is
+ * exactly the "pair-swapped payload bytes" signature our own HBPP14 notes
+ * record. That makes word width, not just baud rate, a candidate for a
+ * bootstrap/runtime mismatch.
+ */
+/*
+ * There is no runtime word-size control here.
+ *
+ * sub_11B70 builds SPISETUP from its mode argument and then ORs in the
+ * literal 0x4000 unconditionally at EA 0x08011C60, writes it at 0x08011C64,
+ * and ORs in 0x10 at 0x08011C78. Both of its call sites pass the SAME mode,
+ * 0x1A -- sub_11B70(2, 0x1A, 0x2EE0, 1) for SPI2 at EA 0x0801A600 and
+ * sub_11B70(0, 0x1A, 0x2EE0, 8) for SPI0 at EA 0x0807441A -- so both ports
+ * end up with the same SPISETUP. There are no other callers.
+ *
+ * Every other write to SPISETUP in either image preserves bits 13 and 14:
+ * the masks are ~0x60, ~0x1080, ~0x100, ~0x200000, ~1, 0xFFDFEE7F and
+ * 0xFFBFFFFE. Bit 13 is never set anywhere in either image.
+ *
+ * So this driver used to drive a field stock treats as a constant. The
+ * per-transfer word-size write is gone. Note also that 0x4000 under the
+ * bits-13:14 encoding this file used would decode as "32-bit", which
+ * contradicts the byte-at-a-time movement stock actually performs -- so
+ * either the field position was wrong or 0x4000 is not a word-size field at
+ * all. Which of those is true is NOT established from the image; what is
+ * established is that the bits never change.
+ */
 
 #define SPICTRL_RESET_FIFO	0xc
 #define SPICTRL_ENABLE		0x1
@@ -141,7 +203,7 @@ struct s5l8702_spi {
 	struct clk_bulk_data *clks;
 	int num_clks;
 	bool spi0;
-	bool spi2_nimbus;
+	bool spi2_grape;
 	bool prepared;
 	int last_err;
 	u32 last_status;
@@ -430,7 +492,7 @@ static void s5l8702_spi_hw_init(struct s5l8702_spi *sspi)
 	writel(SPI_CLKDIV_DEFAULT, sspi->base + SPICLKDIV);
 	/* idle: CS deasserted (bit1 set), match prior SPIPIN=6 */
 	writel(0x6, sspi->base + SPIPIN);
-	writel(SPISETUP_RETAILOS, sspi->base + SPISETUP);
+	writel(SPISETUP_SPI0_11B70, sspi->base + SPISETUP);
 	writel(readl(sspi->base + SPICTRL) | SPICTRL_RESET_FIFO,
 	       sspi->base + SPICTRL);
 	writel(SPICTRL_ENABLE, sspi->base + SPICTRL);
@@ -442,7 +504,7 @@ static void s5l8702_spi2_hw_init(struct s5l8702_spi *sspi)
 {
 	writel(4, sspi->base + SPICLKDIV);
 	writel(0x402c, sspi->base + SPISETUP);
-	writel(SPISETUP_RETAILOS, sspi->base + SPISETUP);
+	writel(SPISETUP_SPI0_11B70, sspi->base + SPISETUP);
 	writel(SPICTRL_ENABLE, sspi->base + SPICTRL);
 	sspi->prepared = true;
 }
@@ -531,6 +593,14 @@ static int s5l8702_spi_prepare_message(struct spi_controller *ctlr,
  * held-CS sequence through the SPI core at all and had to drive the
  * registers itself. Honouring cs_change is what makes spi_sync() usable.
  */
+/*
+ * Drive the SPISETUP word-size field for one transfer.
+ *
+ * Logged the first time each port changes width, because if a bootstrap ever
+ * starts working after a width change we want the boot log to say so rather
+ * than leaving it to be re-derived.
+ */
+
 static int s5l8702_spi_pio_one(struct s5l8702_spi *sspi,
 			       const u8 *tx, u8 *rx, unsigned int len,
 			       bool assert_cs, bool deassert_cs)
@@ -538,9 +608,31 @@ static int s5l8702_spi_pio_one(struct s5l8702_spi *sspi,
 	unsigned int i;
 	int ret;
 
+	/*
+	 * One byte per iteration, because that is what sub_4043D0 does.
+	 *
+	 * Its PIO arm reads the TX buffer with ldrb and writes SPITXDATA a
+	 * byte at a time, sets SPIRXLIMIT (+0x34) and SPIUNK4C (+0x4c) to 1
+	 * on every single byte, and takes RX back one byte at a time from
+	 * SPIRXDATA. Nothing in either image moves more than a byte per
+	 * FIFO slot.
+	 *
+	 * This used to take a bits-per-word argument and stride two bytes
+	 * at a time. The stride is gone rather than left unreachable.
+	 */
+
 	if (assert_cs)
 		s5l8702_spi_cs(sspi, true);
 	sspi->cs_held = true;
+
+	/*
+	 * Select PIO the way sub_4043D0 does: make SPISETUP agree with the
+	 * engine before any data moves. Without this we run the polled loop
+	 * against a port still configured for the interrupt engine.
+	 */
+	if (readl(sspi->base + SPISETUP) & SPISETUP_ENGINE_MASK)
+		writel(readl(sspi->base + SPISETUP) & ~SPISETUP_ENGINE_MASK,
+		       sspi->base + SPISETUP);
 
 	/* sub_4043D0 preamble */
 	writel(readl(sspi->base + SPICTRL) | SPICTRL_RESET_FIFO,
@@ -559,6 +651,7 @@ static int s5l8702_spi_pio_one(struct s5l8702_spi *sspi,
 	 * 4043D0: TX present → SETUP &= ~1, STATUS |= 0x400000.
 	 * RX-only (tx==NULL) → SETUP |= 1, STATUS |= 1 (auto-clock).
 	 */
+
 	if (tx) {
 		writel(readl(sspi->base + SPISETUP) & ~SPISETUP_RXMODE,
 		       sspi->base + SPISETUP);
@@ -583,7 +676,7 @@ static int s5l8702_spi_pio_one(struct s5l8702_spi *sspi,
 
 		if (tx) {
 			writel(tx[i], sspi->base + SPITXDATA);
-			/* 4043D0 PIO: * (base+0x4C) = 1 after each TX word */
+			/* 4043D0 PIO: *(base+0x4C) = 1 after each TX byte */
 			writel(1, sspi->base + SPIUNK4C);
 		}
 
@@ -601,7 +694,6 @@ static int s5l8702_spi_pio_one(struct s5l8702_spi *sspi,
 	/* sub_4043D0 epilogue: SETUP &= ~0x400001 */
 	writel(readl(sspi->base + SPISETUP) & ~0x400001u,
 	       sspi->base + SPISETUP);
-
 out_cs:
 	/*
 	 * Always drop CS on error: leaving it asserted after a timeout would
@@ -659,7 +751,8 @@ static int s5l8702_spi_transfer_one(struct spi_controller *ctlr,
 		deassert = xfer->cs_change;
 
 	return s5l8702_spi_pio_one(sspi, xfer->tx_buf, xfer->rx_buf,
-				   xfer->len, !sspi->cs_held, deassert);
+				   xfer->len,
+				   !sspi->cs_held, deassert);
 }
 
 static int s5l8702_spi_probe(struct platform_device *pdev)
@@ -681,7 +774,7 @@ static int s5l8702_spi_probe(struct platform_device *pdev)
 		return PTR_ERR(sspi->base);
 
 	sspi->spi0 = res && res->start == SPI0_BASE_PHYS;
-	sspi->spi2_nimbus = res && res->start == SPI2_BASE_PHYS;
+	sspi->spi2_grape = res && res->start == SPI2_BASE_PHYS;
 
 	/*
 	 * Start in AUTO unless told otherwise, so each instance reports the
@@ -733,7 +826,7 @@ static int s5l8702_spi_probe(struct platform_device *pdev)
 		s5l8702_spi0_11b70(sspi);
 		spi_vinfo(&pdev->dev, "SPI0 CS42 4043D0 CS=SPIPIN.1 PWRCON1=%08x\n",
 			 readl(sspi->pwrcon1));
-	} else if (sspi->spi2_nimbus) {
+	} else if (sspi->spi2_grape) {
 		void __iomem *pwrcon4;
 
 		sspi->pwrcon1 = devm_ioremap(&pdev->dev, S5L8702_PWRCON1_PHYS, 4);
@@ -755,7 +848,7 @@ static int s5l8702_spi_probe(struct platform_device *pdev)
 		s5l8702_spi2_11b70(sspi);
 		s5l8702_spi2_dev = sspi;
 		spi_vinfo(&pdev->dev,
-			 "SPI2 Nimbus 4043D0 PIO (SETUP=0x%x CLKDIV=2 CS=SPIPIN.1 11B70)\n",
+			 "SPI2 Grape 4043D0 PIO (SETUP=0x%x CLKDIV=2 CS=SPIPIN.1 11B70)\n",
 			 SPISETUP_SPI0_11B70);
 	}
 

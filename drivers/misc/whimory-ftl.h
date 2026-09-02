@@ -113,4 +113,5 @@ static inline u32 wmr_lpage_to_vpage(u32 lpage, u32 pages_per_block,
 	return (u32)vblock * pages_per_block + page;
 }
 
+
 #endif /* WHIMORY_FTL_H */

@@ -243,10 +243,32 @@ MODULE_PARM_DESC(verbose, "Verbose n31-pmic I2C/reg logging (default N; also gpi
  * supply actually comes from is still an open question, and neither
  * claim in this paragraph's history should be treated as settled.
  */
+/*
+ * On by default now. Stock's bootloader runs this sequence (sub_23EC) and
+ * our boot chain does not, so skipping it left the analog LDOs untrimmed --
+ * a divergence from stock, not a safe default. The white-screen hazard that
+ * originally forced it off was the reg-16 write clearing bits 6 and 7; that
+ * is now guarded twice in d1830_sec_trim_seq(), by n31_pmu_rail_held_mask()
+ * and by preserving the live 0xc0 bits unless apply_boot_rails is set.
+ */
+/*
+ * Default N, and it now gates only the sysfs audio_rails hook.
+ *
+ * This used to default Y while its own description said N, so anyone
+ * reading the description believed the sequence was dormant. It was not:
+ * it fired from d1830_audio_rails() on every codec prepare, which is how
+ * the 0x14-0x17 voltage write reached a live rail.
+ *
+ * Both automatic callers are gone now -- codec prepare and pm_resume --
+ * because sub_23EC lives only in the bootloader and stock has no OS path
+ * that replays it. What is left is a manual hook, and a manual hook that
+ * clears ACTIVE1 bits 6 and 7 with the panel live must be armed
+ * deliberately rather than by default.
+ */
 static bool allow_audio_rails;
 module_param(allow_audio_rails, bool, 0644);
 MODULE_PARM_DESC(allow_audio_rails,
-		 "Replay the whole board rail trim on codec prepare (default N; touches the display rail)");
+		 "Arm the sysfs audio_rails debug hook (default N; replays the bootloader trim and clears ACTIVE1 bits 6/7 with the panel live)");
 
 
 /* Off by default: false Sleep during NAND CS storms was cutting power. */
@@ -263,8 +285,11 @@ MODULE_PARM_DESC(sleep_poweroff,
  * into a poweroff mid-recover. Interrupt-driven by default.
  */
 /*
- * On by default: without it the nIRQ latch is never released. Left as a
- * knob only so the old behaviour can be reproduced when comparing.
+ * Off by default. An earlier version of this comment claimed "on by
+ * default", which the declaration below has never matched -- requesting the
+ * line arms a real EIC input whose level encoding is still unconfirmed, and
+ * getting that wrong wedges the system rather than merely failing. Polling
+ * covers the buttons meanwhile. Set pmic_irq=1 to arm it deliberately.
  */
 static bool pmic_irq;
 module_param(pmic_irq, bool, 0444);
@@ -485,59 +510,135 @@ static int d1830_gpio_parse_dt(struct d1830_gpio *gpio_dev)
 #define D1830_RTC_YEAR_BASE	100	/* tm_year for 2000 */
 
 /*
- * This uses MEMBYTE 124 to 127 rather than the hardware calendar, and the
- * reason is worth writing down because the obvious reading of the
- * register map does not survive contact with the part.
+ * The calendar registers are not a calendar. They are one binary counter,
+ * and it ticks.
  *
- * The map has calendar at 0x40 to 0x45 and a 32-bit upcount at 0x4c to
- * 0x4f, with MEMBYTE, general purpose non-volatile scratch, at 0x60 to
- * 0x87. So 124 to 127 is scratch, and OSOS sub_16517E reading exactly
- * those four LSB-first is OSOS keeping its own timestamp there by
- * convention rather than reading a clock.
+ * The previous reading of this block had 0x40 as seconds and 0x41 to 0x45 as
+ * minutes through year, concluded that "R65 to R68 accept nothing and do not
+ * advance", and fell back to keeping a timestamp in MEMBYTE scratch that
+ * cannot tick at all. Hence a clock that read 1970 in Linux and a wrong
+ * time in RetailOS.
  *
- * Measured on this unit:
+ * Measured on this unit over thirty seconds rather than three:
  *
- *   R64 ticks -- observed 0x23 to 0x26 across three seconds -- and
- *   accepts writes to its seconds field and to bit 6.
- *   R69 accepts a year write: 0xf7 became 0x1a for 2026.
- *   R65 to R68 accept nothing. They kept a2 26 00 00 through single
- *   writes and through a six-register block write, and they do not
- *   advance on their own -- R65 held a2 across several minutes, so it is
- *   not running minutes either.
- *   The upcount at 0x4c did not advance across three seconds.
+ *   0x40 0xf0 -> 0x0f     0x41 0xd4 -> 0xd5     0x42 0x28 unchanged
  *
- * Day and month therefore read zero, which is not a legal value, and
- * rtc_valid_tm rightly refuses it. A calendar whose middle four
- * registers cannot be set is not a clock this driver can offer, and
- * guessing at another address for them would be inventing hardware.
+ * Read little-endian across 0x40..0x42 that is 0x28d4f0 -> 0x28d50f, which
+ * is +31 in 30 s. It is a seconds upcounter, battery backed, currently
+ * around 31 days. 0x41 advances once every 256 seconds, not every 60, which
+ * is exactly why a three second sample saw it "not advancing" and read the
+ * block as a broken calendar.
  *
- * MEMBYTE does work, end to end and verified: writing 1787941200 read
- * back as 2026-08-28 18:20:00, and the raw registers held 50 d1 91 6a,
- * which is that value little-endian. It is battery-backed so it survives
- * a reboot, and it is what OSOS itself uses.
+ * So the part gives a monotonic seconds count with no epoch. Wall time needs
+ * an anchor, and MEMBYTE is where that belongs:
  *
- * The limitation is real and not hidden: scratch does not tick, so time
- * does not advance while the system is off. Userspace should write the
- * clock on shutdown, which is what CONFIG_RTC_SYSTOHC does. Fixing this
- * properly needs the addresses for minutes through month, which the
- * evidence here does not supply.
+ * Wall time needs an epoch, and RetailOS keeps one -- a single 32-bit
+ * offset, not a pair. From the decompiled OSOS:
+ *
+ *   sub_26764   read:  sub_1FFFE(pmic, 64, 4, &t);   t = tick at 0x40
+ *                      off = cached ? cached : sub_20718(pmic, &off);
+ *                      *out = t + off;
+ *
+ *   sub_11AA0   write: sub_422BE(pmic, &t);          t = tick at 0x40
+ *                      sub_141A2(pmic, wall - t);    store at 0x74
+ *
+ * where sub_422BE is sub_1FFFE(pmic, 64, 4, ...) and sub_141A2 is
+ * sub_19EE8(pmic, 116, 4, ...) -- a four-byte write at register 0x74.
+ *
+ *   wall = tick + offset,  offset = wall - tick
+ *
+ * This driver used to keep its own pair at 0x78 and 0x7c instead, chosen
+ * because 0x78..0x87 read zero on this unit and 0x68..0x77 was noted as
+ * holding live data. That note was right for the wrong reason: 0x74 is
+ * live precisely because it is this offset. The zero-reading range turned
+ * out not to survive a power cycle, so every boot found an empty anchor,
+ * fell back to the compiled-in seed, and came up roughly a day and a half
+ * behind whatever had last been set.
+ *
+ * Using stock's register also means RetailOS and Linux now agree about
+ * what time it is, since they read and write the same offset.
+ *
+ * sub_20718 substitutes 1 for a zero read, so zero means "never set".
  */
-#define D1830_RTC_MEM_BASE	0x7c	/* 124, inside MEMBYTE 0x60-0x87 */
-#define D1830_RTC_MEM_COUNT	4
+#define D1830_RTC_TICK_BASE	0x40	/* 32-bit LE seconds upcounter */
+#define D1830_RTC_TICK_COUNT	4
+#define D1830_RTC_OFFSET	0x74	/* wall = tick + this, 4 bytes LE (OSOS) */
+#define D1830_RTC_OFFSET_COUNT	4
+
+static int d1830_rtc_read_u32(struct i2c_client *client, u8 base, u32 *out)
+{
+	u32 v = 0;
+	int i, r;
+
+	for (i = 0; i < 4; i++) {
+		r = i2c_smbus_read_byte_data(client, base + i);
+		if (r < 0)
+			return r;
+		v |= (u32)(r & 0xff) << (8 * i);
+	}
+	*out = v;
+	return 0;
+}
+
+static int d1830_rtc_write_u32(struct i2c_client *client, u8 base, u32 val)
+{
+	int i, r;
+
+	for (i = 0; i < 4; i++) {
+		r = i2c_smbus_write_byte_data(client, base + i,
+					      (val >> (8 * i)) & 0xff);
+		if (r < 0)
+			return r;
+	}
+	return 0;
+}
+
+/*
+ * Seed for the first boot on a unit whose anchor has never been written.
+ *
+ * The counter at 0x40 is monotonic but has no epoch, so with an empty
+ * offset the only honest answer is zero -- which is what put "setting
+ * system clock to 1970-01-01" in the boot log. There is no other time
+ * source on this device: no calendar, no network that early in boot.
+ * Seeding once gives a sane starting date that then advances correctly,
+ * and any later set_time overwrites it.
+ *
+ * This is a fallback, not the mechanism. If it is being used on a unit
+ * that has had its time set, the offset is not persisting and that is the
+ * bug -- not the seed being stale.
+ */
+static uint rtc_seed = 1788000000;	/* 2026-08-29 */
+module_param(rtc_seed, uint, 0644);
+MODULE_PARM_DESC(rtc_seed,
+		 "wall seconds to anchor to when the RTC has never been set");
 
 static int d1830_rtc_read_time(struct device *dev, struct rtc_time *tm)
 {
 	struct i2c_client *client = to_i2c_client(dev);
-	u32 secs = 0;
-	int i, v;
+	u32 tick, offset;
+	int ret;
 
-	for (i = 0; i < D1830_RTC_MEM_COUNT; i++) {
-		v = i2c_smbus_read_byte_data(client, D1830_RTC_MEM_BASE + i);
-		if (v < 0)
-			return v;
-		secs |= (u32)(v & 0xff) << (8 * i);
+	ret = d1830_rtc_read_u32(client, D1830_RTC_TICK_BASE, &tick);
+	if (ret)
+		return ret;
+	ret = d1830_rtc_read_u32(client, D1830_RTC_OFFSET, &offset);
+	if (ret)
+		return ret;
+
+	/* Zero means never set, the same reading sub_20718 takes. */
+	if (!offset && rtc_seed) {
+		dev_info(dev, "RTC never set; seeding offset from %u\n",
+			 rtc_seed);
+		offset = rtc_seed - tick;
+		d1830_rtc_write_u32(client, D1830_RTC_OFFSET, offset);
 	}
-	rtc_time64_to_tm((time64_t)secs, tm);
+
+	/*
+	 * Deliberately u32 arithmetic: the offset is stored as the wrapped
+	 * difference, so the sum wraps back to the right answer and a tick
+	 * that has rolled over needs no special case.
+	 */
+	rtc_time64_to_tm((time64_t)(u32)(tick + offset), tm);
 	return 0;
 }
 
@@ -545,18 +646,18 @@ static int d1830_rtc_set_time(struct device *dev, struct rtc_time *tm)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	time64_t secs = rtc_tm_to_time64(tm);
-	int i, ret;
+	u32 tick;
+	int ret;
 
 	if (secs < 0 || secs > U32_MAX)
 		return -EINVAL;
 
-	for (i = 0; i < D1830_RTC_MEM_COUNT; i++) {
-		ret = i2c_smbus_write_byte_data(client, D1830_RTC_MEM_BASE + i,
-						(u8)(((u32)secs >> (8 * i)) & 0xff));
-		if (ret)
-			return ret;
-	}
-	return 0;
+	ret = d1830_rtc_read_u32(client, D1830_RTC_TICK_BASE, &tick);
+	if (ret)
+		return ret;
+	/* offset = wall - tick, exactly sub_11AA0. */
+	return d1830_rtc_write_u32(client, D1830_RTC_OFFSET,
+				   (u32)secs - tick);
 }
 
 static const struct rtc_class_ops d1830_rtc_ops = {
@@ -1548,7 +1649,7 @@ static const struct {
 	 */
 	{ 0x05, 4, "event latches (0x05 bit6 = VBUS present, bit2 = cable event)" },
 	{ 0x09, 4, "event masks" },
-	{ 0x0d, 5, "0x0d poweroff, 0x10-0x11 rail enables (0x10 bit5 = Nimbus, proven)" },
+	{ 0x0d, 5, "0x0d poweroff, 0x10-0x11 rail enables (0x10 bit5 = Grape, proven)" },
 	{ 0x14, 8, "bootloader LDO trims; 0x1a takes 0xb2, charge-adjacent" },
 	{ 0x23, 2, "touched by the bootloader trim sequence" },
 	{ 0x30, 4, "ADC config and result" },
@@ -1798,11 +1899,54 @@ MODULE_PARM_DESC(charger_hw_init,
  * would have sent the next person looking for a charger in the rail
  * block.
  */
-#define D1830_REG_LDO_1A	0x1a	/* 26 */
-#define D1830_LDO_1A_STOCK	0xb2	/* 3000 mV: 0xa0 | ((3000-1200)/100) */
-#define D1830_REG_ACTIVE_1	0x10	/* 16 */
-#define D1830_REG_ACTIVE_2	0x11	/* 17 */
-#define D1830_REG_CTRL_13	0x13	/* 19 */
+/*
+ * The byte stock writes to 0x1A. What its bits mean is NOT established.
+ * This was annotated "3000 mV: 0xa0 | ((3000-1200)/100)", assuming a
+ * 100 mV step from a 0xa0 base; under the Dialog LDO shape in the DA9053
+ * datasheet (bits 5:0 = voltage, 50 mV steps from 1.20 V, bit 6 = enable)
+ * the same byte reads as 3.70 V with the enable bit clear. We have no
+ * register map for the D1830 and the DA905x map is disproved for it, so
+ * neither reading is evidence. Written as an opaque unit.
+ * See docs-internal/n7g-audio/N31-PMIC-STATE-ANALYSIS.md.
+ */
+#define D1830_REG_LDO4		0x1a	/* 26 -- LDO4, not "LDO 1A" */
+#define D1830_LDO4_STOCK	0xb2
+/*
+ * Dialog D18x0 register names. Validated against the firmware's own
+ * behaviour, not assumed from a similar part -- see
+ * docs-internal/n7g-audio/N31-PMIC-STATE-ANALYSIS.md section 6.1. The
+ * decisive checks were that reg 0x60 is read as a 4-byte magic ('Sctr') and
+ * that regs 0x01-0x04 are copied into 0x7C-0x7F across hibernate, both of
+ * which only make sense if 0x60.. is the persistent scratch block and
+ * 0x01-0x04 are the EVENT registers.
+ *
+ * Do NOT substitute the DA9052/DA9053 map here. It collides on addresses
+ * (it defines nearly every address 1..127) but contradicts the firmware on
+ * four separate points.
+ */
+#define D1830_REG_EVENT_A	0x01	/* 1   EVENT_A..EVENT_D = 0x01..0x04 */
+#define D1830_REG_SYS_CONTROL	0x0d	/* 13  bit0 STANDBY, bit1 HIBERNATE */
+#define D1830_REG_ACTIVE_1	0x10	/* 16  ACTIVE1  -- rail enables */
+#define D1830_REG_ACTIVE_2	0x11	/* 17  ACTIVE2  -- rail enables */
+#define D1830_REG_HIBERNATE_1	0x13	/* 19  HIBERNATE1 */
+#define D1830_REG_BUCK1		0x14	/* 20 */
+#define D1830_REG_BUCK2		0x15	/* 21 */
+#define D1830_REG_SPECIAL	0x16	/* 22 */
+#define D1830_REG_LDO1		0x17	/* 23 */
+#define D1830_REG_BUCK_CONTROL	0x23	/* 35 */
+#define D1830_REG_MEMBYTE0	0x60	/* 96  persistent scratch, runs to 0x87 */
+
+/* SYS_CONTROL bits */
+#define D1830_SYS_STANDBY		BIT(0)
+#define D1830_SYS_HIBERNATE		BIT(1)
+#define D1830_SYS_BAT_PWR_SUSPEND	BIT(2)
+#define D1830_SYS_SWI_EN		BIT(4)
+#define D1830_SYS_PRO_FET_DIS		BIT(5)
+#define D1830_SYS_BUS_PWR_SUSPEND	BIT(6)
+
+/* The scratch bytes the bootloader saves EVENT_A..EVENT_D into. */
+#define D1830_REG_SAVED_EVENT_A	0x7c
+#define D1830_REG_SAVED_EVENT_D	0x7f
 
 /*
  * The charger-configuration half of sub_23EC, on its own: 0x1a takes
@@ -1824,12 +1968,12 @@ static int d1830_charger_config(struct i2c_client *client)
 {
 	int ret;
 
-	ret = i2c_smbus_write_byte_data(client, D1830_REG_LDO_1A,
-					D1830_LDO_1A_STOCK);
+	ret = i2c_smbus_write_byte_data(client, D1830_REG_LDO4,
+					D1830_LDO4_STOCK);
 	if (ret)
 		return ret;
-	return i2c_smbus_write_byte_data(client, D1830_REG_LDO_1A,
-					 D1830_LDO_1A_STOCK);
+	return i2c_smbus_write_byte_data(client, D1830_REG_LDO4,
+					 D1830_LDO4_STOCK);
 }
 
 static int d1830_charger_hw_init(struct i2c_client *client, bool cold_boot)
@@ -1863,10 +2007,10 @@ static int d1830_charger_hw_init(struct i2c_client *client, bool cold_boot)
 	if (ret)
 		return ret;
 
-	v = i2c_smbus_read_byte_data(client, D1830_REG_CTRL_13);
+	v = i2c_smbus_read_byte_data(client, D1830_REG_HIBERNATE_1);
 	if (v < 0)
 		return v;
-	return i2c_smbus_write_byte_data(client, D1830_REG_CTRL_13,
+	return i2c_smbus_write_byte_data(client, D1830_REG_HIBERNATE_1,
 					 (u8)(v | 0x02));
 }
 
@@ -2243,18 +2387,74 @@ struct n31_pmu_rail {
 };
 
 static const struct n31_pmu_rail n31_pmu_rails[] = {
-	{ "PMU_LDO_1",  0x17, 0x10, 0x08, 2500,  50 },
-	{ "PMU_LDO_2",  0x18, 0x10, 0x10, 1500,  50 },
-	{ "PMU_LDO_3",  0x19, 0x10, 0x20, 2500,  50 },
-	{ "PMU_LDO_4",  0x1a, 0x10, 0x40, 1800,  50 },
-	{ "PMU_LDO_5",  0x1b, 0x10, 0x80, 2500,  50 },
-	{ "PMU_LDO_6",  0x1c, 0x11, 0x01, 2500,  50 },
-	{ "PMU_LDO_7",  0x1d, 0x11, 0x02, 1500, 100 },
-	{ "PMU_LDO_8",  0x1e, 0x11, 0x04, 2000,  50 },
-	{ "PMU_LDO_9",  0x1f, 0x11, 0x80, 1200,  25 },
-	{ "PMU_LDO_10", 0x20, 0x11, 0x10, 1700,  50 },
-	{ "PMU_LDO_11", 0x21, 0x11, 0x20, 1700,  50 },
-	{ "PMU_WDIG",   N31_PMU_NO_VSEL, 0x11, 0x40, 0, 0 },
+	/*
+	 * base/step come from sub_2D404, the stock rail-voltage setter, which
+	 * maps a rail index 1..14 onto registers 20..33 and picks a base and
+	 * a step per rail:
+	 *
+	 *	idx 1-4   regs 20-23  BUCK1,BUCK2,SPECIAL,LDO1   725 + 25*n
+	 *	idx 5     reg  24     LDO2                      1200 + 50*n  (4-bit)
+	 *	idx 6     reg  25     LDO3                      2000 + 50*n
+	 *	idx 7     reg  26     LDO4                      1200 + 100*n, | 0xA0
+	 *	idx 8,9   regs 27,28  LDO5,LDO6                 1200 + 100*n
+	 *	idx 10    reg  29     LDO7                      1200 + 100*n, keeps bits 7:5
+	 *	idx 11    reg  30     LDO8                      2500 + 50*n,  keeps bits 7:5
+	 *	idx 12,13 regs 31,32  LDO9,LDO10                2000 + 50*n
+	 *	idx 14    reg  33     LDO11                     1650 + 5*n
+	 *
+	 * Every entry here was previously wrong, so every voltage this driver
+	 * reported was wrong. Two independent cross-checks pin the encodings:
+	 * LDO4 decodes 0xB2 -- the byte sub_23EC writes -- to exactly 3000 mV,
+	 * and LDO8 decodes to exactly the 3300 mV that sub_2A120(6, 3300) sets.
+	 *
+	 * This was a *reporting* bug only. The trim writes stock's literal
+	 * bytes, so the hardware always received stock's voltages.
+	 *
+	 * ACTIVE1/ACTIVE2 bit assignment comes from sub_7484, the stock rail
+	 * enable, which takes the SAME rail index as sub_2D404 above:
+	 *
+	 *	idx 0-4   ACTIVE1 bit 0   BUCK1,BUCK2,SPECIAL,LDO1 ganged
+	 *	idx 5-11  ACTIVE1 bits 1-7  LDO2..LDO8, one bit each
+	 *	idx 12-15 ACTIVE2 bits 0-3  LDO9..LDO12, one bit each
+	 *	idx 16-18 regs 40,46,47 bit 5
+	 *
+	 * That the two functions share an index space is not an assumption:
+	 * sub_2A120 maps a consumer id onto idx = id + 5 and hands it to
+	 * sub_2D404, and sub_6644 maps the same consumer id onto the same
+	 * idx = id + 5 and hands it to sub_7484. sub_2A120 also feeds that idx
+	 * to sub_2D30E, whose idx 10 -> reg 29 and idx 11 -> reg 30 match
+	 * sub_2D404's cases 10 and 11 exactly.
+	 *
+	 * The mapping here was previously an irregular guess (LDO9 on ACTIVE2
+	 * bit 7, LDO6 on ACTIVE2 bit 0) that had every rail on the wrong bit.
+	 * With the real mapping, the boot state ACTIVE1=0x7f ACTIVE2=0x17 reads
+	 * as LDO1..LDO7 and LDO9..LDO11 on, LDO8 and LDO12 off -- not the
+	 * "LDO5/LDO9/LDO11 off" the old table reported.
+	 *
+	 * Enable polarity: a SET bit in ACTIVE1/ACTIVE2 means the rail is ON --
+	 * sub_7484 does `v & ~mask` then `| (mask * (on != 0))`. Do NOT confuse
+	 * this with the per-rail gate in sub_2D30E (LDO7/LDO8 only), where
+	 * config-register bit 5 SET means OFF. The two are opposite.
+	 *
+	 * See docs-internal/n7g-audio/N31-POWER-RAILS.md.
+	 */
+	{ "PMU_LDO_1",  0x17, 0x10, 0x01,  725,  25 },
+	{ "PMU_LDO_2",  0x18, 0x10, 0x02, 1200,  50 },
+	{ "PMU_LDO_3",  0x19, 0x10, 0x04, 2000,  50 },
+	{ "PMU_LDO_4",  0x1a, 0x10, 0x08, 1200, 100 },
+	{ "PMU_LDO_5",  0x1b, 0x10, 0x10, 1200, 100 },
+	{ "PMU_LDO_6",  0x1c, 0x10, 0x20, 1200, 100 },
+	{ "PMU_LDO_7",  0x1d, 0x10, 0x40, 1200, 100 },
+	{ "PMU_LDO_8",  0x1e, 0x10, 0x80, 2500,  50 },
+	{ "PMU_LDO_9",  0x1f, 0x11, 0x01, 2000,  50 },
+	{ "PMU_LDO_10", 0x20, 0x11, 0x02, 2000,  50 },
+	{ "PMU_LDO_11", 0x21, 0x11, 0x04, 1650,   5 },
+	/*
+	 * sub_2D404 case 15: reg 34 (0x22), 1700 + 50*n. This rail was missing
+	 * from the table entirely, and the slot it now occupies used to hold a
+	 * "PMU_WDIG" entry with no vsel that no decomp evidence supports.
+	 */
+	{ "PMU_LDO_12", 0x22, 0x11, 0x08, 1700,  50 },
 };
 
 /* Registers worth watching across an audio or display state change. */
@@ -3236,7 +3436,7 @@ static void d1830_log_audio_regs(struct i2c_client *client, const char *tag)
 
 /*
  * OSOS sub_20766(1) → 439B00(1) → 6644(4) → 7484(pmic, 9, on):
- * RMW D1830 register 16 bit 5. Targeted Nimbus rail — not the SEC seq.
+ * RMW D1830 register 16 bit 5. Targeted Grape rail — not the SEC seq.
  */
 /*
  * Bluetooth companion rails.
@@ -3343,7 +3543,7 @@ int d1830_touch_bringup_read(void)
 }
 EXPORT_SYMBOL_GPL(d1830_touch_bringup_read);
 
-int d1830_nimbus_rail(bool on)
+int d1830_grape_rail(bool on)
 {
 	struct i2c_client *client = d1830_poweroff_client;
 	int before, ret;
@@ -3354,11 +3554,11 @@ int d1830_nimbus_rail(bool on)
 	if (before < 0)
 		return before;
 	ret = d1830_rmw(client, 16, BIT(5), on ? BIT(5) : 0);
-	d1830_vinfo(&client->dev, "nimbus rail reg16 0x%02x -> bit5=%d ret=%d\n",
+	d1830_vinfo(&client->dev, "grape rail reg16 0x%02x -> bit5=%d ret=%d\n",
 		    before, on, ret);
 	return ret;
 }
-EXPORT_SYMBOL_GPL(d1830_nimbus_rail);
+EXPORT_SYMBOL_GPL(d1830_grape_rail);
 
 /*
  * SEC sub_23EC trim — sibling LDOs used by analog HP.
@@ -3370,33 +3570,187 @@ EXPORT_SYMBOL_GPL(d1830_nimbus_rail);
  * the documented r16/r17/r19 RMWs. Skip r26=0xB2 (charge). Never
  * touch POWEROFF (reg 13).
  *
- * Cold-boot sub_23EC also sets r16 bit5 (same bit Nimbus uses). Keep
+ * Cold-boot sub_23EC also sets r16 bit5 (same bit Grape uses). Keep
  * that — OSOS 7484 will still toggle it for BT.
  */
+/*
+ * The step stock performs immediately before the rail trim:
+ *
+ *	sub_3F40(13, 1u, v133);  LOBYTE(v133[0]) &= 0x8Fu;  sub_3F60(13, 1u, v133);
+ *
+ * SYS_CONTROL bits 4, 5 and 6 are SWI_EN, PRO_FET_DIS and BUS_PWR_SUSPEND;
+ * clearing them is the state the trim expects to run against. Our boot chain
+ * never runs the stock bootloader, so this had never happened on this device.
+ */
+static int d1830_sys_control_pre_trim(struct i2c_client *client)
+{
+	int v = i2c_smbus_read_byte_data(client, D1830_REG_SYS_CONTROL);
+
+	if (v < 0)
+		return v;
+	return d1830_write8(client, D1830_REG_SYS_CONTROL,
+			    (u8)(v & ~(D1830_SYS_SWI_EN |
+				       D1830_SYS_PRO_FET_DIS |
+				       D1830_SYS_BUS_PWR_SUSPEND)));
+}
+
+/*
+ * sub_FDE: on a normal (non-hibernate) boot stock zeroes the four scratch
+ * bytes that sub_45C0 uses to carry EVENT_A..EVENT_D across hibernate. If
+ * they are left holding a previous session's events, anything that later
+ * reads them sees a stale wake reason.
+ *
+ * The hibernate counterpart (sub_45C0, which *saves* the events) belongs in
+ * a suspend path; see d1830_pm_suspend_stub().
+ */
+/*
+ * sub_FDE: zero the saved-EVENT scratch, regs 124-127.
+ *
+ * Deliberately has no caller. Stock runs it only on a cold boot, from the
+ * bootloader, before Linux exists -- see the note in d1830_gpio_probe().
+ * Kept as the transliteration so the sequence is not lost.
+ */
+static int __maybe_unused d1830_clear_saved_events(struct i2c_client *client)
+{
+	unsigned int reg;
+	int ret;
+
+	for (reg = D1830_REG_SAVED_EVENT_A; reg <= D1830_REG_SAVED_EVENT_D; reg++) {
+		ret = d1830_write8(client, reg, 0);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+/*
+ * The two board rail-trim tables sub_23EC reads, and the fuse word that
+ * indexes them.
+ *
+ * These were long recorded here as unrecoverable -- "populated from board
+ * data before sub_23EC runs", so the codes could not be known statically and
+ * the driver preserved whatever 5-bit field was already in the register. That
+ * was wrong, and the reason it was wrong is worth keeping: IDA loaded the
+ * bootloader at base 0, so VA 0x22004B70 fell outside its address space and
+ * rendered as MEMORY[0x22004B70] with nothing behind it. The bootloader is
+ * loaded flat at VA 0x22000000, so that address is simply file offset 0x4B70
+ * of N31.bootloader.dec.bin -- static data, present in the image all along.
+ *
+ * Four self-describing constants in the same block confirm the load base:
+ *
+ *	0x4B9C = 0x22000000	SRAM base
+ *	0x4BDC = 0x00030000	SRAM size
+ *	0x4BD8 = 0x08000000	the OS load base, known independently
+ *	0x4BB8 = 24000000	UART clock
+ *
+ * The tables, read straight out of the image:
+ *
+ *	0x4B70: E8 03 x4			1000, 1000, 1000, 1000 mV
+ *	0x4B80: B6 03  9D 03  84 03  6B 03	 950,  925,  900,  875 mV
+ *
+ * sub_23EC calls sub_6CC(mV - 725, 25) -- __udivsi3 -- and masks five bits,
+ * so the register code is (mV - 725) / 25. Every entry divides exactly on the
+ * 25 mV grid. sub_2D404 in the OS image independently gives base 725 step 25
+ * for registers 20-23, from a different image.
+ *
+ * Cross-check with no free parameters: index 0 yields 0x0B for register 20
+ * and 0x09 for 21-23, and the as-found dump on this unit reads
+ * 0x14=0x0b 0x15=0x09 0x16=0x09 0x17=0x09. Static derivation and measurement
+ * agree exactly, which is why this is now computed rather than preserved.
+ *
+ * Note stock writes these as bare bytes with bits 7:5 zero. It does not
+ * read-modify-write them, and it has no "leave it alone" fallback: on three
+ * consecutive I2C failures sub_23EC calls sub_128C, which does not return.
+ */
+static const u16 d1830_trim_code_a_mv[4] = { 1000, 1000, 1000, 1000 };
+static const u16 d1830_trim_code_b_mv[4] = {  950,  925,  900,  875 };
+
+/* sub_351E(0x3D100014): SoC ID/fuse word. Bit 30 says the index field is
+ * valid; bits 29:28 are the index. Not set means index 0. */
+#define D1830_TRIM_FUSE_PHYS	0x3d100014ul
+
+static u8 d1830_trim_index(struct i2c_client *client)
+{
+	void __iomem *p;
+	u32 w;
+	u8 idx = 0;
+
+	p = ioremap(D1830_TRIM_FUSE_PHYS, 4);
+	if (!p) {
+		dev_warn(&client->dev,
+			 "n31-pmic: trim fuse ioremap failed, using index 0\n");
+		return 0;
+	}
+	w = readl(p);
+	iounmap(p);
+
+	if (w & BIT(30))
+		idx = (u8)((w >> 28) & 3);
+
+	dev_info(&client->dev,
+		 "n31-pmic: trim fuse 0x%08x -> index %u (r20=0x%02x r21-23=0x%02x)\n",
+		 w, idx,
+		 (u8)(((d1830_trim_code_a_mv[idx] - 725) / 25) & 0x1f),
+		 (u8)(((d1830_trim_code_b_mv[idx] - 725) / 25) & 0x1f));
+	return idx;
+}
+
 static int d1830_sec_trim_seq(struct i2c_client *client, u8 boot_mode)
 {
-	int v20, v21, v35;
-	u8 fill, r16;
+	int v21, v35;
+	u8 fill, r16, idx;
 
 	d1830_vinfo(&client->dev,
 		 "n31-pmic: sub_23EC-equivalent begin boot_mode=0x%02x\n",
 		 boot_mode);
 
+	/*
+	 * Stock order is r20 first, then r35.
+	 *
+	 * sub_23EC writes r20 = codeA & 0x1F and r21..r23 = codeB & 0x1F,
+	 * both computed from the board tables above and the fuse index. It
+	 * does not read these registers first, so neither do we: writing a
+	 * bare byte is what the sequence does.
+	 *
+	 * Two earlier versions of this write are worth remembering, because
+	 * both looked reasonable in the file and both were wrong.
+	 *
+	 * It first ORed 0x10 into all four registers -- already admitted in
+	 * this file as "this driver's own invention, not stock". Bit 4 is the
+	 * top bit of the 5-bit voltage code, so that added 16 steps, 400 mV,
+	 * to each. Measured: reg 0x17 (LDO1) read 0x09 = 950 mV at probe and
+	 * 0x19 = 1350 mV after playback had run this sequence.
+	 *
+	 * It then preserved the live 5-bit field, on the belief that stock's
+	 * codes were unrecoverable. They are not; see the tables above. The
+	 * preserved value happened to equal the computed one on this unit,
+	 * which is exactly why the belief survived so long.
+	 */
+	idx = d1830_trim_index(client);
+	d1830_write8(client, 20,
+		     (u8)(((d1830_trim_code_a_mv[idx] - 725) / 25) & 0x1f));
+
 	v35 = i2c_smbus_read_byte_data(client, 35);
 	if (v35 >= 0)
 		d1830_write8(client, 35, (u8)(v35 & 0xFC));
 
-	v20 = i2c_smbus_read_byte_data(client, 20);
-	v21 = i2c_smbus_read_byte_data(client, 21);
-	if (v20 < 0 || v21 < 0)
-		return v20 < 0 ? v20 : v21;
-
-	/* Keep r20 extras (live 0x1a). 21–23 share one 5-bit field + bit4. */
-	d1830_write8(client, 20, (u8)(v20 | 0x10));
-	fill = (u8)((v21 & 0x1f) | 0x10);
+	fill = (u8)(((d1830_trim_code_b_mv[idx] - 725) / 25) & 0x1f);
 	d1830_write8(client, 21, fill);
 	d1830_write8(client, 22, fill);
 	d1830_write8(client, 23, fill);
+
+	/*
+	 * Step 6 of sub_23EC: r26 (0x1A) = 0xB2, issued twice. The firmware
+	 * reuses the same stack byte, so the repeat is reproduced rather
+	 * than tidied away.
+	 *
+	 * This lived in d1830_charger_config() behind charger_hw_init and
+	 * ldo_1a_write, both of which default to false -- so on our device
+	 * this step of the sequence never executed at all. sub_23EC is one
+	 * sequence in stock and belongs in one function here.
+	 */
+	d1830_write8(client, 26, D1830_LDO4_STOCK);
+	d1830_write8(client, 26, D1830_LDO4_STOCK);
 
 	v21 = i2c_smbus_read_byte_data(client, 16);
 	if (v21 < 0)
@@ -3424,8 +3778,9 @@ static int d1830_sec_trim_seq(struct i2c_client *client, u8 boot_mode)
 		r16 |= (u8)(v21 & 0xc0);
 	d1830_write8(client, 16, r16);
 
-	d1830_rmw(client, 17, 0, 0x07);
-	d1830_rmw(client, 19, 0, 0x02);
+	d1830_rmw(client, D1830_REG_ACTIVE_2, 0, 0x07);
+
+	d1830_rmw(client, D1830_REG_HIBERNATE_1, 0, 0x02);
 
 	d1830_vinfo(&client->dev, "n31-pmic: sub_23EC-equivalent complete\n");
 	return 0;
@@ -3476,6 +3831,13 @@ int d1830_audio_rails(void)
 	r02 = i2c_smbus_read_byte_data(client, 2);
 	if (r02 < 0)
 		return r02;
+
+	/* Stock's order: SYS_CONTROL is cleaned up first, then the trim. */
+	ret = d1830_sys_control_pre_trim(client);
+	if (ret)
+		dev_warn(&client->dev,
+			 "n31-pmic: SYS_CONTROL pre-trim failed: %d\n", ret);
+
 	ret = d1830_sec_trim_seq(client, (r02 & 0x80) ? 0x11 : 0x00);
 	/* sub_27F4 analog-adjacent: r14 fixed 0x20. Not POWEROFF. */
 	if (!ret)
@@ -3522,6 +3884,17 @@ static int d1830_sec_rail_seq(struct i2c_client *client)
 		/* Do not write reg 0x49/0x60/0x01/0x0d or call sub_1130. */
 	}
 
+	/*
+	 * EA 0x29BA: RD 0x0D, clear bits 4/5/6, WR 0x0D -- unconditional, and
+	 * immediately before the BL to sub_23EC at 0x29DC. This sequence went
+	 * straight from the reg 1 read into the trim without it.
+	 *
+	 * The mask cannot reach bit 0 or bit 1, so it cannot request standby
+	 * or hibernate.
+	 */
+	if (d1830_sys_control_pre_trim(client))
+		dev_warn(dev, "n31-pmic: SYS_CONTROL pre-trim failed\n");
+
 	d1830_sec_trim_seq(client, boot_mode);
 
 	/* sub_27F4 post-trim, non-fatal. NEVER POWEROFF (reg 13). */
@@ -3535,8 +3908,178 @@ static int d1830_sec_rail_seq(struct i2c_client *client)
 	d1830_write8(client, 14, 0x20);
 	d1830_rmw(client, 38, 0x01, 0);
 
+	/*
+	 * EA 0x2B2A, cold boot only: derive the charge current from the fuel
+	 * gauge and program it.
+	 *
+	 *	RD 0x6F -> v
+	 *	if (v & 0x80) { v &= 0x7F; if (v > 100) v = 40; } else v = 40;
+	 *	code = sub_B88(v)
+	 *	WR 0x24 = code >> 1
+	 *	WR 0x25 = (code & 1) << 2
+	 *
+	 * sub_B88(pct) = pct > 40 ? 475 - (91 * (100 - pct)) / 60
+	 *			 : (284 * pct) / 40 + 100
+	 */
+	if (boot_mode != 0x11) {
+		int r6f = i2c_smbus_read_byte_data(client, 0x6f);
+		unsigned int pct = 40, code;
+
+		if (r6f >= 0 && (r6f & 0x80)) {
+			pct = (unsigned int)(r6f & 0x7f);
+			if (pct > 100)
+				pct = 40;
+		}
+		code = (pct > 40) ? (475u - (91u * (100u - pct)) / 60u)
+				  : ((284u * pct) / 40u + 100u);
+		d1830_write8(client, 36, (u8)(code >> 1));
+		d1830_write8(client, 37, (u8)((code & 1u) << 2));
+		d1830_vinfo(dev,
+			    "n31-pmic: charge pct=%u code=%u r24=%02x r25=%02x\n",
+			    pct, code, (u8)(code >> 1), (u8)((code & 1u) << 2));
+	}
+
+	/*
+	 * EA 0x2BC6: RD 0x0D, clear bits 2 and 3, WR 0x0D -- the last thing
+	 * sub_27F4 does on every boot. The mask cannot reach bit 0 or bit 1.
+	 */
+	d1830_rmw(client, D1830_REG_SYS_CONTROL, 0x0C, 0);
+
+	/*
+	 * Deliberately NOT transliterated, because every one of them ends in a
+	 * non-returning spin after cutting power:
+	 *
+	 *	EA 0x28D4  hibernate-to-standby, WR 0x0D = 0x01
+	 *	EA 0x297C  reg 0x03/0x6E/0x07 branch, WR 0x0D |= 1 or 2
+	 *	EA 0x12EC  sub_128C panic handler, WR 0x0D |= 1
+	 *
+	 * Writing reg 13 bit 0 has already cut power to this device once.
+	 * There is no non-terminal bit 0 or bit 1 write anywhere in either
+	 * image, so a Linux driver has nothing to gain by reproducing them.
+	 */
+
 	d1830_vinfo(dev, "n31-pmic: sub_27F4-equivalent complete (POWEROFF skipped)\n");
 	return 0;
+}
+
+/*
+ * Log every rail and every enable bit exactly as found, before this driver
+ * changes anything.
+ *
+ * The point is a baseline: the trim, the codec prepare and the BT/Grape rail
+ * helpers all move bits in ACTIVE1/ACTIVE2, so anything sampled later cannot
+ * be attributed. Called first thing in probe.
+ *
+ * Voltages are decoded with the encodings from stock's sub_2D404 (see
+ * docs-internal/n7g-audio/N31-POWER-RAILS.md). Enable polarity in
+ * ACTIVE1/ACTIVE2 is set = ON -- note this is the opposite of the per-rail
+ * gate in sub_2D30E, where config bit 5 set means OFF.
+ */
+static void d1830_dump_rails(struct i2c_client *client, const char *tag)
+{
+	static const u8 sysregs[] = { 0x0d, 0x10, 0x11, 0x12, 0x13 };
+	static const char *const sysnames[] = {
+		"SYS_CONTROL", "ACTIVE1", "ACTIVE2", "STANDBY1", "HIBERNATE1"
+	};
+	unsigned int i;
+	int act1, act2;
+
+	for (i = 0; i < ARRAY_SIZE(sysregs); i++) {
+		int v = i2c_smbus_read_byte_data(client, sysregs[i]);
+
+		dev_info(&client->dev, "pmu %s: 0x%02x %-11s = 0x%02x\n",
+			 tag, sysregs[i], sysnames[i], v < 0 ? 0 : v);
+	}
+
+	act1 = i2c_smbus_read_byte_data(client, 0x10);
+	act2 = i2c_smbus_read_byte_data(client, 0x11);
+
+	/*
+	 * ACTIVE2 reads 0x17 as found -- bits 0, 1, 2 and 4. sub_7484 sends
+	 * rail indices 12-15 to register 17 (0x11) and uses only bits 0-3
+	 * there, so bit 4 belongs to no rail in the stock setter and this
+	 * driver must not relabel it as one. It arrives already set from the
+	 * bootloader handoff. Named here so it stops being a silent unknown.
+	 */
+	if (act2 >= 0 && (act2 & 0x10))
+		dev_info(&client->dev,
+			 "pmu %s: ACTIVE2 bit4 set (0x%02x) -- no rail index in sub_7484, unidentified\n",
+			 tag, act2);
+
+	/*
+	 * sub_2D404 cases 16-18 and sub_7484 cases 16-18: three more supplies
+	 * outside the 0x17..0x22 LDO block, at regs 0x28, 0x2E and 0x2F. All
+	 * three decode 5000 + 50*n and are enabled by bit 5 of their own
+	 * register rather than by ACTIVE1/ACTIVE2. This driver has never read
+	 * or written them, so log them rather than leave a blind spot.
+	 */
+	{
+		static const u8 hv[] = { 0x28, 0x2e, 0x2f };
+		unsigned int k;
+
+		for (k = 0; k < ARRAY_SIZE(hv); k++) {
+			int raw = i2c_smbus_read_byte_data(client, hv[k]);
+
+			dev_info(&client->dev,
+				 "pmu %s: PMU_HV_%u     vsel 0x%02x=0x%02x -> %5d mV  en(own bit5)=%d\n",
+				 tag, k, hv[k], raw < 0 ? 0 : raw,
+				 raw < 0 ? -1 : 5000 + (raw & 0x1f) * 50,
+				 raw < 0 ? -1 : !!(raw & 0x20));
+		}
+	}
+
+	for (i = 0; i < ARRAY_SIZE(n31_pmu_rails); i++) {
+		const struct n31_pmu_rail *r = &n31_pmu_rails[i];
+		int raw, act, on, mv = -1;
+
+		if (r->vsel == N31_PMU_NO_VSEL) {
+			raw = -1;
+		} else {
+			raw = i2c_smbus_read_byte_data(client, r->vsel);
+			if (raw >= 0)
+				mv = r->base_mv +
+					     (raw & (r->vsel == 0x18 ? 0x0f : 0x1f)) *
+					     r->step_mv;
+		}
+
+		act = (r->active_reg == 0x10) ? act1 : act2;
+		on = (act < 0) ? -1 : !!(act & r->active_mask);
+
+		/*
+		 * LDO7 and LDO8 have a second gate, and it runs the other way.
+		 *
+		 * sub_2D30E takes rail index 10 -> register 29 (0x1D) and index 11
+		 * -> register 30 (0x1E) -- the same bytes this table calls the
+		 * LDO7/LDO8 vsel -- and does
+		 *
+		 *      v = (v & 0xDF) | (32 * (a3 != 0))
+		 *
+		 * Its caller picks a3 from the requested voltage: the "off"
+		 * sentinel 0x80000000 passes a3 = 1, and any real voltage passes
+		 * a3 = 0 and then programs the level via sub_2D404. So for these
+		 * two rails bit 5 SET means OFF -- the opposite of the
+		 * ACTIVE1/ACTIVE2 convention, where a set bit is on.
+		 *
+		 * A rail is only actually on when its ACTIVE bit is set AND, for
+		 * these two, bit 5 of its own register is clear. Reporting the
+		 * ACTIVE bit alone gives the right answer while both config bits
+		 * read clear, which is what this unit does -- so this was
+		 * invisible rather than harmless.
+		 */
+		if ((r->vsel == 0x1d || r->vsel == 0x1e) && on > 0 && raw >= 0)
+			on = !(raw & 0x20);
+
+		dev_info(&client->dev,
+			 "pmu %s: %-11s vsel 0x%02x=0x%02x -> %5d mV  en(%s bit%d)=%d%s\n",
+			 tag, r->name, r->vsel,
+			 raw < 0 ? 0 : raw, mv,
+			 r->active_reg == 0x10 ? "ACTIVE1" : "ACTIVE2",
+			 __ffs(r->active_mask), on,
+			 (r->vsel == 0x1d || r->vsel == 0x1e)
+				 ? (raw >= 0 && (raw & 0x20) ? "  cfg-bit5=1 FORCED-OFF"
+							    : "  cfg-bit5=0")
+				 : "");
+	}
 }
 
 static int d1830_gpio_probe(struct i2c_client *client)
@@ -3562,6 +4105,10 @@ static int d1830_gpio_probe(struct i2c_client *client)
 		return ret;
 
 	d1830_poweroff_client = client;
+
+	/* Baseline, before this driver changes a single bit. */
+	d1830_dump_rails(client, "as-found");
+
 	/* bcm2078-bt is built in; hand it our rail control now that we have
 	 * a client to talk to. */
 	bcm2078_register_bt_rails(d1830_bt_rails);
@@ -3572,7 +4119,7 @@ static int d1830_gpio_probe(struct i2c_client *client)
 	if (of_property_read_bool(dev->of_node, "dlg,apply-sec-rails"))
 		d1830_sec_rail_seq(client);
 	else
-		d1830_vinfo(dev, "d1830 gpio-only (rail seq off; CS42 calls d1830_audio_rails)\n");
+		d1830_vinfo(dev, "d1830 gpio-only (rail seq off; the bootloader already ran it)\n");
 
 	d1830_log_audio_regs(client, "probe");
 
@@ -3642,6 +4189,30 @@ static int d1830_gpio_probe(struct i2c_client *client)
 		if (cret)
 			dev_warn(dev, "0x1a rail write: %d\n", cret);
 	}
+	/*
+	 * The saved-EVENT scratch is deliberately left alone.
+	 *
+	 * This used to run the sub_FDE half unconditionally at probe, zeroing
+	 * regs 124-127. Stock only does that on a cold boot. On a hibernate
+	 * wake it does the OPPOSITE: sub_45C0 copies regs 1-4 INTO 124-127.
+	 * The bootloader has already run whichever half applies before Linux
+	 * gets control -- EA 0x29B0, boot_mode == 0x11 ? sub_45C0 : sub_FDE,
+	 * immediately before the trim.
+	 *
+	 * We cannot tell the two apart. boot_mode comes from reg 2 bit 7 and
+	 * the bootloader consumes and clears that latch at EA 0x2822-0x282E,
+	 * so by the time this driver probes it always reads 0.
+	 *
+	 * Guessing cold boot is not safe. On a cold boot the bootloader has
+	 * already zeroed these registers and our write is redundant; on a
+	 * hibernate wake it destroys what the bootloader just saved.
+	 * Redundant in one case and destructive in the other leaves no case
+	 * where the write is required, so it is gone.
+	 *
+	 * d1830_clear_saved_events() is kept below with no caller, as the
+	 * sub_FDE transliteration.
+	 */
+
 	d1830_charger_update(client);
 	d1830_charger_register(dev);
 	if (d1830_rtc_register(client))
@@ -3683,8 +4254,19 @@ static int d1830_gpio_probe(struct i2c_client *client)
 			d1830_vinfo(dev,
 				 "PMIC nIRQ virq=%d hwirq=%lu LEVEL_LOW (OSOS 40641C type=1, EFBB4 DIN=0)\n",
 				 client->irq, d ? d->hwirq : 0);
+	} else if (client->irq <= 0) {
+		dev_warn(dev,
+			 "no PMIC nIRQ: of_irq did not map GPIO 86 -- polling\n");
 	} else {
-		dev_err(dev, "no PMIC nIRQ in DT (of_irq did not map GPIO 86)\n");
+		/*
+		 * The line mapped fine. It is simply not requested, because
+		 * pmic_irq defaults off. Saying "did not map GPIO 86" here
+		 * blamed the device tree for a deliberate choice and sent at
+		 * least one person looking for a DT bug that does not exist.
+		 */
+		dev_info(dev,
+			 "PMIC nIRQ virq=%d mapped but not requested (pmic_irq=0, polling)\n",
+			 client->irq);
 	}
 	d1830_dump_irq_chain(client, "irq-on");
 
@@ -3823,10 +4405,85 @@ static const struct i2c_device_id d1830_gpio_id[] = {
 };
 MODULE_DEVICE_TABLE(i2c, d1830_gpio_id);
 
+/*
+ * Suspend / resume.
+ *
+ * Stock does not do this in the OS at all -- on S3 the *bootloader* re-runs
+ * the rail trim (sub_23EC, unconditionally) and the codec analog power-up
+ * (sub_1314, on the hibernate arm) when it comes back up. Our boot chain
+ * never executes the stock bootloader, so on resume nothing would restore
+ * either. These callbacks stand in for the bootloader.
+ *
+ * INCOMPLETE -- see the placeholders below. Landing the structure now so the
+ * gap is visible in code rather than only in a document.
+ */
+static int d1830_pm_suspend(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	unsigned int i;
+	int v;
+
+	/* sub_45C0: carry EVENT_A..EVENT_D across the sleep in scratch. */
+	for (i = 0; i < 4; i++) {
+		v = i2c_smbus_read_byte_data(client, D1830_REG_EVENT_A + i);
+		if (v < 0)
+			return v;
+		d1830_write8(client, D1830_REG_SAVED_EVENT_A + i, (u8)v);
+	}
+
+	/*
+	 * PLACEHOLDER: stock also writes a 4-byte 'Sctr' magic to MEMBYTE0
+	 * so the bootloader recognises the resume. We deliberately do NOT
+	 * write it: it would send the *stock* bootloader down its
+	 * hibernate arm, and our boot chain does not run that bootloader at
+	 * all. Revisit only if we ever boot through it.
+	 */
+	return 0;
+}
+
+static int d1830_pm_resume(struct device *dev)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	int ret;
+
+	/* What the bootloader would have done for us. */
+	ret = d1830_sys_control_pre_trim(client);
+	if (ret)
+		dev_warn(dev, "n31-pmic: resume SYS_CONTROL: %d\n", ret);
+
+	/*
+	 * No rail trim on resume.
+	 *
+	 * This ran the full sub_23EC-equivalent on every resume, which
+	 * clears ACTIVE1 bits 6 and 7 with the panel live. Stock has no
+	 * OS-side path that re-runs it: sub_23EC exists only in the
+	 * bootloader and is reached only through the reset vector, so a
+	 * stock hibernate wake gets it by re-entering the bootloader, never
+	 * from a resume callback.
+	 *
+	 * Whether our S3 resume re-enters the bootloader is not established.
+	 * Until it is, doing nothing here is the position with a stock
+	 * analogue; running the trim is not.
+	 */
+
+	/*
+	 * PLACEHOLDER: the codec also needs its analog block brought back --
+	 * stock gets that from sub_1314 in the bootloader on resume. That is
+	 * cs42l81's job, not this driver's: it must re-run from the 0x9901
+	 * key onward, in order. cs42l81-spi.c has no PM callbacks yet, so
+	 * that half does not exist. Do not paper over it here by poking the
+	 * codec from the PMIC driver.
+	 */
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(d1830_pm_ops, d1830_pm_suspend, d1830_pm_resume);
+
 static struct i2c_driver d1830_gpio_driver = {
 	.driver = {
 		.name = "gpio-d1830",
 		.of_match_table = d1830_gpio_of_match,
+		.pm = pm_sleep_ptr(&d1830_pm_ops),
 	},
 	.probe = d1830_gpio_probe,
 	.remove = d1830_gpio_remove,

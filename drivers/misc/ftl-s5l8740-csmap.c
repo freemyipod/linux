@@ -19,6 +19,7 @@
 #include <linux/bio.h>
 #include <linux/blkdev.h>
 #include <linux/hashtable.h>
+#include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/overflow.h>
@@ -111,6 +112,7 @@ struct n31_ftl_cs {
 	unsigned int map_updates;
 	unsigned int map_skips;
 	unsigned int map_collisions;
+	unsigned int map_capped;
 	unsigned int map_pages;
 	unsigned int map_data_recs;
 	unsigned int newer_replacements;
@@ -170,12 +172,15 @@ struct n31_ftl_cs {
 	unsigned int range_miss;
 	unsigned int demand_scans;
 	unsigned int read_miss_count;
+	/* Rolling budget for read-miss descriptions; see n31_log_read_miss(). */
+	unsigned long miss_window_start;
+	unsigned int miss_window_shown;
+	unsigned int miss_window_suppressed;
 
 	bool disk0_ok;
 	bool fat_critical_ok;
 	bool enable_gate_ok;
 	bool block_enable;
-	bool dma_session_held;
 	bool whimory_backed; /* L2V_Search via Whimory recover */
 
 	/* FAT semantic validation (beyond crit sector reads). */
@@ -210,18 +215,46 @@ static struct n31_ftl_cs *n31_ftl;
 
 /*
  * A read miss costs nine L2V probes plus ten console lines. VFAT retries a
- * failing directory cluster, so an unmapped chain used to bury the log and
- * slow the mount. Describe the first few, then count silently.
+ * failing directory cluster, so an unmapped chain can bury the log and slow
+ * the mount. Describe a few, then go quiet -- but go quiet for a while, not
+ * for the rest of the uptime.
+ *
+ * This was a budget against a counter that was never reset: not per bio, not
+ * per mount, not per open. Three misses at any point in the module's life
+ * and every read failure after it was silent, forever. On a device that had
+ * been up eight hours that meant `cp` failing with EIO and ten
+ * "FAT read failed" lines from vfat with nothing at all from the driver that
+ * produced them -- which is most of why the underlying map bug took so long
+ * to see.
+ *
+ * The budget refills on a window now, so a burst is still bounded but the
+ * next failure a person triggers is always explained. Set the window to 0
+ * for the old latching behaviour, or the max to 0 to describe every miss.
  */
 static unsigned int read_miss_diag_max = 3;
 module_param(read_miss_diag_max, uint, 0644);
 MODULE_PARM_DESC(read_miss_diag_max,
-		 "Read misses to describe in full before going quiet (0=all)");
+		 "Read misses to describe in full per window (0=all)");
+
+static unsigned int read_miss_diag_window_ms = 5000;
+module_param(read_miss_diag_window_ms, uint, 0644);
+MODULE_PARM_DESC(read_miss_diag_window_ms,
+		 "Refill the read-miss description budget after this long (0=never)");
 
 static bool ftl_block_enable = true;
 module_param(ftl_block_enable, bool, 0644);
 MODULE_PARM_DESC(ftl_block_enable,
 		 "Register RO ipod/firmware disks after FAT-critical gates (default Y)");
+
+/*
+ * Ceiling on the sparse hash, which block I/O feeds. About 40 bytes an
+ * entry, so 65536 is roughly 2.6 MB on a 55 MB device. 0 = unbounded,
+ * which is only safe when nothing is reading the volume.
+ */
+static unsigned int map_max_entries = 65536;
+module_param(map_max_entries, uint, 0644);
+MODULE_PARM_DESC(map_max_entries,
+		 "Ceiling on sparse-map entries ingested from reads (0=unbounded)");
 
 static bool ftl_demand_scan;
 module_param(ftl_demand_scan, bool, 0644);
@@ -579,7 +612,27 @@ static void n31_map_ingest(struct n31_ftl_cs *ftl, u8 ce, u8 cau,
 
 	n = n31_map_find(ftl, m->lba);
 	if (!n) {
-		n = kzalloc(sizeof(*n), GFP_KERNEL);
+		/*
+		 * Bounded, because this is now reachable from block I/O.
+		 *
+		 * Every fallback read ingests the page it just fetched, which
+		 * is what makes the neighbour probe work on the next miss.
+		 * It also means the table grows with the volume as it is
+		 * read: this device has 3.8M sectors and each entry is about
+		 * forty bytes, so an unbounded table is 150 MB on a machine
+		 * with 55. The path was dead until CS was armed for it, so
+		 * this never mattered before and would have become an OOM
+		 * during a long copy.
+		 *
+		 * Refusing new entries past the cap costs only the probe
+		 * hint; every read still resolves through Whimory L2V or
+		 * through its own CS read.
+		 */
+		if (map_max_entries && ftl->map_entries >= map_max_entries) {
+			ftl->map_capped++;
+			return;
+		}
+		n = kzalloc(sizeof(*n), GFP_NOIO);
 		if (!n) {
 			ftl->map_skips++;
 			return;
@@ -616,7 +669,19 @@ static int n31_scan_page(struct n31_ftl_cs *ftl, u8 ce, u8 cau,
 	struct s5l8740_cs_page *pg;
 	int ret, s;
 
-	pg = kzalloc(sizeof(*pg), GFP_KERNEL);
+	/*
+	 * GFP_NOIO, and no zeroing.
+	 *
+	 * struct s5l8740_cs_page is about 16 KiB, so this is an order-2
+	 * allocation on a path the block layer can enter during writeback --
+	 * GFP_KERNEL there lets reclaim recurse back into the filesystem
+	 * that is waiting on this read. It mattered less when the fallback
+	 * path was dead; it is live now.
+	 *
+	 * The zeroing was redundant either way: s5l8740_nand_cs_phys_read_slc()
+	 * memsets the whole struct before it fills it.
+	 */
+	pg = kmalloc(sizeof(*pg), GFP_NOIO);
 	if (!pg)
 		return -ENOMEM;
 	ret = s5l8740_nand_cs_phys_read(ce, cau, block, page, pg);
@@ -797,7 +862,7 @@ static int n31_demand_scan_for(struct n31_ftl_cs *ftl, u32 fmss_lba)
 	u8 ce = 0, cau = 0;
 	u16 blk = 63;
 	u8 page = 88, slot;
-	int ret;
+	int ret, sess;
 	u16 lo, hi;
 
 	ftl->demand_scans++;
@@ -818,11 +883,14 @@ static int n31_demand_scan_for(struct n31_ftl_cs *ftl, u32 fmss_lba)
 	lo = blk;
 	hi = blk;
 
+	/* Arm CS for the scan; nests if a caller already holds a session. */
+	sess = s5l8740_nand_dma_session_begin();
+
 	/* Home bank first, then the other CE/CAU at the same block. */
 	ret = n31_scan_block_window(ftl, ce, cau, lo, hi, false, false);
 	if (n31_map_find(ftl, fmss_lba) ||
 	    !n31_extent_lookup(ftl, fmss_lba, &hint))
-		return 0;
+		goto found;
 	{
 		u8 tce, tcau;
 
@@ -834,11 +902,17 @@ static int n31_demand_scan_for(struct n31_ftl_cs *ftl, u32 fmss_lba)
 						      false, false);
 				if (n31_map_find(ftl, fmss_lba) ||
 				    !n31_extent_lookup(ftl, fmss_lba, &hint))
-					return 0;
+					goto found;
 			}
 		}
 	}
+	if (sess == 0)
+		s5l8740_nand_dma_session_end();
 	return ret ? ret : -ENOENT;
+found:
+	if (sess == 0)
+		s5l8740_nand_dma_session_end();
+	return 0;
 }
 
 static void n31_map_ingest_page(struct n31_ftl_cs *ftl, u8 ce, u8 cau,
@@ -864,7 +938,7 @@ static int n31_neighbor_probe(struct n31_ftl_cs *ftl, u32 fmss_lba,
 	unsigned int ntry = 0, i, j;
 	u8 ce, cau, pg, sl;
 	u16 blk;
-	int slot, ret;
+	int slot, ret, sess;
 
 	if (fmss_lba > 0 &&
 	    !n31_map_lookup_hint(ftl, fmss_lba - 1, &hint)) {
@@ -878,9 +952,24 @@ static int n31_neighbor_probe(struct n31_ftl_cs *ftl, u32 fmss_lba,
 	if (!ntry)
 		return -ENOENT;
 
-	page = kzalloc(sizeof(*page), GFP_KERNEL);
+	/*
+	 * GFP_NOIO, and no zeroing.
+	 *
+	 * struct s5l8740_cs_page is about 16 KiB, so this is an order-2
+	 * allocation on a path the block layer can enter during writeback --
+	 * GFP_KERNEL there lets reclaim recurse back into the filesystem
+	 * that is waiting on this read. It mattered less when the fallback
+	 * path was dead; it is live now.
+	 *
+	 * The zeroing was redundant either way: s5l8740_nand_cs_phys_read_slc()
+	 * memsets the whole struct before it fills it.
+	 */
+	page = kmalloc(sizeof(*page), GFP_NOIO);
 	if (!page)
 		return -ENOMEM;
+
+	/* Arm CS for the probe reads; nests if a caller already holds one. */
+	sess = s5l8740_nand_dma_session_begin();
 
 	for (i = 0; i < ntry; i++) {
 		if (try_key[i] == N31_PHYS_KEY_INVALID)
@@ -907,12 +996,16 @@ static int n31_neighbor_probe(struct n31_ftl_cs *ftl, u32 fmss_lba,
 		n31_map_ingest_page(ftl, ce, cau, blk, pg, page);
 		slot = s5l8740_nand_meta_pick_lba(page, fmss_lba);
 		if (slot >= 0) {
+			if (sess == 0)
+				s5l8740_nand_dma_session_end();
 			kfree(page);
 			return n31_map_lookup_hint(ftl, fmss_lba, out);
 		}
 next:
 		;
 	}
+	if (sess == 0)
+		s5l8740_nand_dma_session_end();
 	kfree(page);
 	return -ENOENT;
 }
@@ -923,7 +1016,7 @@ static int n31_ftl_read_fmss_lba_flags(struct n31_ftl_cs *ftl, u32 fmss_lba,
 	struct n31_map_entry e;
 	struct n31_lba_map_entry leg;
 	struct s5l8740_cs_page *page;
-	int slot, ret;
+	int slot, ret, sess;
 	u8 ce, cau, pg, sl;
 	u16 blk;
 	u32 p_ord;
@@ -952,7 +1045,22 @@ static int n31_ftl_read_fmss_lba_flags(struct n31_ftl_cs *ftl, u32 fmss_lba,
 					    0, 0x01);
 			have_hint = true;
 		} else if (ret == -EUCLEAN) {
-			return -EUCLEAN;
+			/*
+			 * L2V and V2L disagree about this LBA. That is a
+			 * reason to distrust the vecmap, not a reason to
+			 * abandon the read: the hash map, the neighbour probe
+			 * and the demand scan below are independent of it and
+			 * may well know the answer.
+			 *
+			 * Returning -EUCLEAN here skipped all three. And the
+			 * disagreement is expected by construction --
+			 * n31_esc_add() de-duplicates escapes by key with
+			 * last-writer-wins, so two LBAs claiming one physical
+			 * ordinal genuinely cannot agree on both axes.
+			 */
+			dev_dbg(ftl->dev,
+				"vecmap cross-check failed for fmss_lba=%u; falling through\n",
+				fmss_lba);
 		}
 	}
 
@@ -975,12 +1083,42 @@ static int n31_ftl_read_fmss_lba_flags(struct n31_ftl_cs *ftl, u32 fmss_lba,
 	blk = leg.block;
 	pg = leg.page;
 
-	page = kzalloc(sizeof(*page), GFP_KERNEL);
+	/*
+	 * GFP_NOIO, and no zeroing.
+	 *
+	 * struct s5l8740_cs_page is about 16 KiB, so this is an order-2
+	 * allocation on a path the block layer can enter during writeback --
+	 * GFP_KERNEL there lets reclaim recurse back into the filesystem
+	 * that is waiting on this read. It mattered less when the fallback
+	 * path was dead; it is live now.
+	 *
+	 * The zeroing was redundant either way: s5l8740_nand_cs_phys_read_slc()
+	 * memsets the whole struct before it fills it.
+	 */
+	page = kmalloc(sizeof(*page), GFP_NOIO);
 	if (!page)
 		return -ENOMEM;
 
+	/*
+	 * Arm CS for this read.
+	 *
+	 * Nothing did, and the disk-lifetime session that was supposed to
+	 * cover it never actually existed -- so every read that got this far
+	 * came back -EAGAIN from the dma_dry test inside
+	 * s5l8740_nand_cs_phys_read(), before f->lock, in microseconds. That
+	 * is the whole hash/vec fallback path, and it failed silently.
+	 *
+	 * Sessions nest, so this costs nothing when a caller above already
+	 * holds one.
+	 */
+	sess = s5l8740_nand_dma_session_begin();
 	ret = s5l8740_nand_cs_phys_read(ce, cau, blk, pg, page);
+	if (sess == 0)
+		s5l8740_nand_dma_session_end();
 	if (ret) {
+		dev_err_ratelimited(ftl->dev,
+				    "CS read failed fmss_lba=%u ce=%u cau=%u blk=%u pg=%u: %d\n",
+				    fmss_lba, ce, cau, blk, pg, ret);
 		ret = -EIO;
 		goto out;
 	}
@@ -1149,9 +1287,19 @@ static int n31_ftl_select_bpb(struct n31_ftl_cs *ftl)
 	unsigned int best_ok = 0;
 	bool best_apple = false;
 	u64 best_weave = 0;
+	u8 *sector;
 
 	if (!ftl->bpb_ncand)
 		return -ENOENT;
+
+	/*
+	 * One 4 KiB swap buffer for the sort below, on the heap. It used to
+	 * be a local inside the loop, which put a 4160-byte frame on a
+	 * kernel stack that has nothing like that to spare.
+	 */
+	sector = kmalloc(N31_DATA_SLOT_SIZE, GFP_KERNEL);
+	if (!sector)
+		return -ENOMEM;
 
 	/* Insertion-sort candidates by weave descending (n is tiny). */
 	for (i = 1; i < ftl->bpb_ncand; i++) {
@@ -1159,7 +1307,6 @@ static int n31_ftl_select_bpb(struct n31_ftl_cs *ftl)
 		u64 weave = ftl->bpb_cand_weave[i];
 		u32 total = ftl->bpb_cand_total[i];
 		char oem[9];
-		u8 sector[N31_DATA_SLOT_SIZE];
 
 		memcpy(oem, ftl->bpb_cand_oem[i], 9);
 		memcpy(sector, ftl->bpb_cand_sector[i], N31_DATA_SLOT_SIZE);
@@ -1234,8 +1381,31 @@ static int n31_ftl_select_bpb(struct n31_ftl_cs *ftl)
 		}
 	}
 
-	if (best < 0)
-		best = 0;
+	/*
+	 * No candidate survived the gates, and index 0 is not a safe guess.
+	 *
+	 * Candidates are sorted newest weave first, so falling back to 0
+	 * selected exactly the candidate n31_fat_first_sector_ok() had just
+	 * rejected -- on this unit fmss 49285, whose FAT is not a FAT and
+	 * whose selection puts the whole volume six sectors out. That is not
+	 * a degraded mount, it is a wrong one: every FAT read lands in the
+	 * middle of the table and the disk looks corrupt.
+	 *
+	 * A disk that does not appear is something a person can diagnose.
+	 */
+	if (best < 0) {
+		dev_err(ftl->dev,
+			"bpb: no candidate passed the FAT signature check (%u tried) -- refusing to guess\n",
+			ftl->bpb_ncand);
+		ftl->fat_base_valid = false;
+		ftl->fat_critical_ok = false;
+		ftl->enable_gate_ok = false;
+		scnprintf(ftl->bpb_log, sizeof(ftl->bpb_log),
+			  "bpb: no valid candidate of %u; volume base unknown\n",
+			  ftl->bpb_ncand);
+		kfree(sector);
+		return -ENOENT;
+	}
 
 	n31_ftl_apply_bpb(ftl, ftl->bpb_candidates[best],
 			  ftl->bpb_cand_total[best],
@@ -1266,6 +1436,7 @@ static int n31_ftl_select_bpb(struct n31_ftl_cs *ftl)
 			 i == (unsigned int)best ? "yes" : "no",
 			 i == (unsigned int)best ?
 				"newest_valid_high_crit" : "not_selected");
+	kfree(sector);
 	return ftl->fat_critical_ok ? 0 : -EAGAIN;
 }
 
@@ -1784,8 +1955,31 @@ static void n31_log_read_miss(struct n31_ftl_cs *ftl, struct n31_ftl_slice *sl,
 	int phys_ret;
 
 	ftl->read_miss_count++;
-	if (read_miss_diag_max && ftl->read_miss_count > read_miss_diag_max)
+
+	/*
+	 * Refill the description budget once the window has passed, and say
+	 * how many misses went by unexplained while it was empty. A count
+	 * that only appears in sysfs is a count nobody reads.
+	 */
+	if (read_miss_diag_window_ms &&
+	    (!ftl->miss_window_start ||
+	     time_after(jiffies, ftl->miss_window_start +
+			msecs_to_jiffies(read_miss_diag_window_ms)))) {
+		if (ftl->miss_window_suppressed)
+			dev_err(ftl->dev,
+				"read miss: %u further misses not described (%u since load)\n",
+				ftl->miss_window_suppressed,
+				ftl->read_miss_count);
+		ftl->miss_window_start = jiffies;
+		ftl->miss_window_shown = 0;
+		ftl->miss_window_suppressed = 0;
+	}
+
+	if (read_miss_diag_max && ftl->miss_window_shown >= read_miss_diag_max) {
+		ftl->miss_window_suppressed++;
 		return;
+	}
+	ftl->miss_window_shown++;
 	if (L->valid && L->sectors_per_cluster &&
 	    disk_lba >= L->data_start) {
 		cluster = ((disk_lba - L->data_start) /
@@ -1840,40 +2034,65 @@ static void n31_ftl_submit_bio(struct bio *bio)
 	struct bvec_iter iter;
 	struct bio_vec bvec;
 	sector_t sector = bio->bi_iter.bi_sector;
+	u64 pos = (u64)sector << 9;
 	int ret = 0;
 
 	if (!sl || !sl->ftl || !sl->nsectors) {
+		pr_err_ratelimited("s5l8740-ftl: bio on an unbound slice\n");
 		bio_io_error(bio);
 		return;
 	}
 	ftl = sl->ftl;
 	if (sl->kind != N31_SLICE_FIRMWARE && !ftl->enable_gate_ok) {
+		dev_err_ratelimited(ftl->dev,
+				    "bio refused: FAT-critical gate is not open\n");
 		bio_io_error(bio);
 		return;
 	}
 	if (op_is_write(bio_op(bio)) || bio_op(bio) == REQ_OP_DISCARD ||
 	    bio_op(bio) == REQ_OP_WRITE_ZEROES) {
+		/* Read-only by construction; not worth a log line per write. */
 		bio->bi_status = BLK_STS_IOERR;
 		bio_endio(bio);
 		return;
 	}
 	if ((sector & 7) != 0) {
+		dev_err_ratelimited(ftl->dev,
+				    "bio refused: sector %llu is not 4 KiB aligned\n",
+				    (unsigned long long)sector);
 		bio_io_error(bio);
 		return;
 	}
 
+	/*
+	 * Track the position in bytes, not in 512-byte sectors.
+	 *
+	 * The copy used to come from the head of the bounce buffer
+	 * unconditionally, and the position advanced by n/512 -- so a bvec
+	 * that was not a whole number of 4 KiB sectors left the LBA
+	 * arithmetic truncating back onto the sector just read, copying its
+	 * first bytes a second time. That is silent corruption rather than an
+	 * error, and n/512 could also round to zero and stall. Bytes cannot
+	 * do either, and the intra-sector offset falls out of the same
+	 * variable. The Whimory front-end has always done it this way.
+	 */
 	bio_for_each_segment(bvec, bio, iter) {
 		u8 *dst = kmap_local_page(bvec.bv_page) + bvec.bv_offset;
 		unsigned int done = 0;
 
 		while (done < bvec.bv_len) {
-			u32 off = (u32)(sector >> 3);
+			u32 off = (u32)(pos >> 12);
+			unsigned int soff = (unsigned int)(pos & (N31_DATA_SLOT_SIZE - 1));
 			u32 fmss_lba;
 			unsigned int n = min_t(unsigned int,
 					       bvec.bv_len - done,
-					       N31_DATA_SLOT_SIZE);
+					       N31_DATA_SLOT_SIZE - soff);
 
 			if (off >= sl->nsectors) {
+				dev_err_ratelimited(ftl->dev,
+						    "bio past end: sector %u of %u on %s\n",
+						    off, sl->nsectors,
+						    sl->gd ? sl->gd->disk_name : "?");
 				ret = -ERANGE;
 				kunmap_local(dst);
 				goto done;
@@ -1883,7 +2102,7 @@ static void n31_ftl_submit_bio(struct bio *bio)
 			ret = n31_ftl_read_fmss_lba_flags(ftl, fmss_lba,
 							  ftl->bounce, false);
 			if (!ret)
-				memcpy(dst + done, ftl->bounce, n);
+				memcpy(dst + done, ftl->bounce + soff, n);
 			else
 				n31_log_read_miss(ftl, sl, fmss_lba, off, ret);
 			mutex_unlock(&ftl->lock);
@@ -1892,7 +2111,7 @@ static void n31_ftl_submit_bio(struct bio *bio)
 				goto done;
 			}
 			done += n;
-			sector += n / 512;
+			pos += n;
 		}
 		kunmap_local(dst);
 	}
@@ -1976,13 +2195,19 @@ static int n31_ftl_register_disk(struct n31_ftl_cs *ftl)
 	if (ftl->ipod.gd)
 		return 0;
 
-	if (!ftl->dma_session_held) {
-		ret = s5l8740_nand_dma_session_begin();
-		if (ret && ret != -EBUSY)
-			return ret;
-		ftl->dma_session_held = (ret == 0);
-	}
-
+	/*
+	 * No session is taken here any more.
+	 *
+	 * This used to open one and hold it for the lifetime of the gendisk,
+	 * which -- now that sessions nest properly -- would mean dma_dry=0
+	 * and dma_armed=1 permanently. That is exactly the standing live C00
+	 * kick the NAND driver documents as rebooting the device, and it was
+	 * only ever harmless because the acquisition silently failed with
+	 * -EBUSY when called from inside n31_ftl_cs_bind_whimory().
+	 *
+	 * Reads arm CS for the duration of the read instead; see
+	 * n31_ftl_read_fmss_lba_flags().
+	 */
 	ftl->ipod.ftl = ftl;
 	ftl->ftl_alias.ftl = ftl;
 	ftl->firmware.ftl = ftl;
@@ -2023,10 +2248,6 @@ static void n31_ftl_unregister_disk(struct n31_ftl_cs *ftl)
 	n31_slice_unregister(&ftl->firmware);
 	n31_slice_unregister(&ftl->ftl_alias);
 	n31_slice_unregister(&ftl->ipod);
-	if (ftl->dma_session_held) {
-		s5l8740_nand_dma_session_end();
-		ftl->dma_session_held = false;
-	}
 }
 
 /* -------------------- sysfs -------------------- */
@@ -2042,14 +2263,15 @@ static ssize_t ftl_map_stats_show(struct device *dev,
 			  "built=%d entries=%u pages=%u valid_records=%u "
 			  "lba_min=%u lba_max=%u extents=%u largest=%u "
 			  "duplicates=%u newer=%u has_49279=%d "
-			  "demand_scans=%u\n%s",
+			  "demand_scans=%u read_misses=%u capped=%u skips=%u\n%s",
 			  ftl->map_built, ftl->map_entries, ftl->map_pages,
 			  ftl->map_data_recs,
 			  ftl->lba_min == ~0u ? 0 : ftl->lba_min, ftl->lba_max,
 			  ftl->extent_count, ftl->extent_largest,
 			  ftl->map_collisions, ftl->newer_replacements,
 			  n31_map_find(ftl, N31_FAT_BASE_DEFAULT) ? 1 : 0,
-			  ftl->demand_scans, ftl->last_log);
+			  ftl->demand_scans, ftl->read_miss_count,
+			  ftl->map_capped, ftl->map_skips, ftl->last_log);
 }
 static DEVICE_ATTR_RO(ftl_map_stats);
 
@@ -2790,7 +3012,42 @@ static ssize_t ftl_string_scan_log_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(ftl_string_scan_log);
 
+/*
+ * The FPart system objects, and the device identity inside one of them.
+ * Read-only: this is what the flash says about itself.
+ */
+static ssize_t fpart_objects_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	return whimory_fpart_objects_show(buf, PAGE_SIZE);
+}
+static DEVICE_ATTR_RO(fpart_objects);
+
+static ssize_t device_id_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	return whimory_syscfg_show(buf, PAGE_SIZE);
+}
+static DEVICE_ATTR_RO(device_id);
+
+/*
+ * Hexdump of the same bytes the touch_cal binary attribute serves.
+ *
+ * Kept for reading by eye; it is bounded by PAGE_SIZE and so stops short
+ * of a full N31_TOUCH_CAL_LEN container. Anything that needs the whole
+ * blob should read the binary attribute instead.
+ */
+static ssize_t touch_cal_hex_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	return whimory_touch_cal_show(buf, PAGE_SIZE);
+}
+static DEVICE_ATTR_RO(touch_cal_hex);
+
 static struct attribute *n31_ftl_finish_attrs[] = {
+	&dev_attr_touch_cal_hex.attr,
+	&dev_attr_fpart_objects.attr,
+	&dev_attr_device_id.attr,
 	&dev_attr_ftl_sftl_recover.attr,
 	&dev_attr_ftl_cxt_dump.attr,
 	&dev_attr_ftl_cxt_candidate.attr,

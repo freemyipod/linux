@@ -92,15 +92,41 @@ EXPORT_SYMBOL_GPL(bcm2078_register_bt_rails);
  */
 static struct regulator *bcm_bt_vreg;
 
+/*
+ * Whether WE hold an enable on bcm_bt_vreg.
+ *
+ * regulator_enable/disable are refcounted per consumer handle, and calling
+ * disable without a matching enable is not merely ignored: _regulator_disable
+ * WARNs with a full backtrace and returns -EIO. That is exactly what an
+ * unbind produced --
+ *
+ *	_regulator_disable from regulator_disable
+ *	regulator_disable from bcm_power_off
+ *	bcm2078-bt: bt rail disable failed: -5
+ *
+ * -- because the enable had gone down the legacy-hook path (the regulator
+ * was not acquired yet at the time) while the disable found the pointer set
+ * and went to the regulator. Track it here rather than inferring it, so the
+ * two paths cannot disagree.
+ */
+static bool bcm_bt_vreg_on;
+
 static int bcm_bt_rails(bool on)
 {
 	if (bcm_bt_vreg) {
-		int ret = on ? regulator_enable(bcm_bt_vreg)
-			     : regulator_disable(bcm_bt_vreg);
+		int ret;
+
+		if (on == bcm_bt_vreg_on)
+			return 0;
+
+		ret = on ? regulator_enable(bcm_bt_vreg)
+			 : regulator_disable(bcm_bt_vreg);
 
 		if (ret)
 			pr_warn("bcm2078-bt: bt rail %s failed: %d\n",
 				on ? "enable" : "disable", ret);
+		else
+			bcm_bt_vreg_on = on;
 		return ret;
 	}
 
@@ -135,6 +161,7 @@ static int bcm_bt_rails(bool on)
  */
 #define BCM_GPIO_NOP		0xC8
 #define BCM_GPIO_PWR		0x46	/* 70 — power control, all variants */
+#define BCM_GPIO_UART		0x50	/* 80 — function 2 while the part is on */
 #define BCM_GPIO_PWR_ALT	0xC8	/* 200 — variants 1 and 2 */
 #define BCM_MODE_POWER		2
 #define BCM_MODE_CLEAR		0xFFFE
@@ -331,17 +358,25 @@ static void bcm_43D38C(struct bcm2078_bt *bt, unsigned int gpio, u16 mode, int v
 		return;
 	bank = bt->gpio + 32 * (gpio >> 3);
 	pin = gpio & 7;
-	if (mode == 1) {
+	if (mode == 1)
 		cmd = val ? 15 : 14;
-	} else if (mode == BCM_MODE_CLEAR) {
-		dir = readl(bank + 0x14);
-		writel(dir & ~BIT(pin), bank + 0x14);
+	else if (mode == BCM_MODE_CLEAR)
 		cmd = 0;
-	} else {
+	else
 		cmd = (u8)mode;
-		dir = readl(bank + 0x14);
-		writel(dir | BIT(pin), bank + 0x14);
-	}
+
+	/*
+	 * sub_43D38C sets DIR for every mode but 0xFFFE, mode 1 included:
+	 * the a2 == 1 arm picks command 14 or 15 and falls through to the
+	 * shared "DIR |= bit". Skipping it here left pad 70 an input, so
+	 * the level never reached the pin.
+	 */
+	dir = readl(bank + 0x14);
+	if (mode == BCM_MODE_CLEAR)
+		dir &= ~BIT(pin);
+	else
+		dir |= BIT(pin);
+	writel(dir, bank + 0x14);
 	writel(((gpio >> 3) << 16) | (pin << 8) | cmd, bt->gpiocmd);
 }
 
@@ -777,6 +812,72 @@ static int bcm_fm_seek(struct bcm2078_bt *bt, int up, u8 rssi)
 	dev_info(bt->dev, "FM seek %s rssi=%u%s\n",
 		 up ? "up" : "down", rssi ? rssi : 33, ret ? " FAIL" : "");
 	return ret;
+}
+
+/*
+ * The power-on stock actually performs, in stock's order.
+ *
+ * sub_57045C(1) is Bluetooth power on and is exactly three pad writes:
+ *
+ *     sub_17D0(1)             -> sub_43D38C(0x50, 2, 0)   pad 80 function 2
+ *     sub_43D38C(0x46, 1, 1)                              pad 70 output high
+ *     sub_428F70(0x46, 1)                                 pad 70 +0x0C
+ *
+ * and sub_570054 only then opens the port and speaks at 115200. Power off
+ * is the same three with the argument inverted, which is what says pad 70
+ * high means on.
+ *
+ * Deliberately NOT the mode-2 trio 97/98/119 that bcm_power_pins_on()
+ * drives. Those are claimed by sub_15DD5C at function 2 when FM powers up
+ * -- they are the IIS2 PCM pads -- and driving them here once put the
+ * device back into RetailOS. They are not part of sub_57045C.
+ *
+ * This has to run before hci_bcm opens the port, so it is called from
+ * probe rather than from the FM tuning path, which was the only caller
+ * bcm_power_on() ever had.
+ */
+/*
+ * WARNING: this is almost certainly NOT the power-on sequence.
+ *
+ * It transliterates sub_57045C, and sub_57045C is not what this file has
+ * been assuming. Its two callers name it, in stock's own log strings:
+ *
+ *	sub_58B8F4: "Allow BT Chip to enter low power mode."   -> sub_57045C(0)
+ *	sub_58B930: "Prevent BT Chip from entering low power mode." -> sub_57045C(1)
+ *
+ * So sub_57045C is the low-power-mode inhibit -- the BT_WAKE line -- and
+ * not a supply or reset at all. The body agrees: sub_17D0(1) is
+ * sub_43D38C(0x50, 2, 0) and the rest is sub_43D38C(0x46, 1, 1) plus its
+ * gate. Two pins, toggled, nothing else. Our transliteration of it is
+ * faithful; what it was labelled is wrong.
+ *
+ * Which fits what the hardware says. Measured with this running: the UART
+ * transmits cleanly (UTRSTAT 0x06, tx and shift register both empty, zero
+ * errors), the rx FIFO stays empty, and UMSTAT reads 0x00 -- CTS never
+ * asserts. hci_bcm gets -110 on 0xfc18. That is a part which is not
+ * executing, and asserting its wake pin would not change that.
+ *
+ * The real power-on has not been found yet. The trail runs from
+ * "BTLocalDeviceSetModulePower" through sub_429538(handle, 3, -1, ...),
+ * which is a BT stack call several layers above any GPIO.
+ *
+ * Left in place because it is a correct transliteration of a real stock
+ * function and removing it would lose that, and because it is harmless.
+ * It is just not the thing that turns the chip on.
+ */
+static void bcm_bt_power_up(struct bcm2078_bt *bt)
+{
+	bcm_43D38C(bt, BCM_GPIO_UART, BCM_MODE_POWER, 0);
+	bcm_43D38C(bt, BCM_GPIO_PWR, 1, 1);
+	bcm_428F70(bt, BCM_GPIO_PWR, 1);
+	/*
+	 * The part needs to come out of reset before it will answer. Stock
+	 * waits here through a thunk into 0x2200xxxx, which is not in the
+	 * image, so the length is not recoverable; this is the same
+	 * conservative stand-in bcm_power_on() already uses.
+	 */
+	msleep(150);
+	dev_info(bt->dev, "BT power-on: pad 80 fn2, pad 70 high + gate\n");
 }
 
 static int bcm_power_on(struct bcm2078_bt *bt)
@@ -1412,9 +1513,21 @@ static int bcm2078_probe(struct platform_device *pdev)
 			 ret);
 
 	/*
-	 * Do NOT poke GPIOs or touch UART at probe — early mode-2 correlated
-	 * with reset to RetailOS. Use power_on / n31-bt-up after init is up.
+	 * Power the controller up here, before hci_bcm opens the port.
+	 *
+	 * Nothing used to do this at probe: bcm_power_on() hangs off the V4L2
+	 * FM tuning path and is never reached on a plain boot, so hci_bcm bound
+	 * to a part that had never been powered and every command timed out.
+	 *
+	 * The older note here said not to touch GPIOs at probe because early
+	 * mode-2 correlated with a reset back to RetailOS. That observation
+	 * stands and is why bcm_bt_power_up() deliberately leaves 97/98/119
+	 * alone -- those are the IIS2 PCM pads, claimed by sub_15DD5C when FM
+	 * powers on, and driving them is what reproduces the reset. They are
+	 * not part of sub_57045C. What is left is pad 80 to function 2 and
+	 * pad 70 high, which is the whole of stock Bluetooth power-on.
 	 */
+	bcm_bt_power_up(bt);
 	dev_info(dev,
 		 "BCM2078 companion (GPIO+FM+V4L2) — UART1 owned by hci_bcm\n");
 	return 0;
@@ -1452,6 +1565,16 @@ static void bcm2078_remove(struct platform_device *pdev)
 		bcm_fm_power_off(bt);
 	if (gpio_poke)
 		bcm_power_off(bt);
+
+	/*
+	 * bcm_bt_vreg is a file-scope pointer to a devm_regulator_get_optional()
+	 * handle, so devm frees it the moment this returns. Leaving the pointer
+	 * set means the next bcm_bt_rails() -- from a rebind, or from the FM
+	 * side, which shares these statics -- dereferences freed memory. Drop
+	 * it here, along with the enable state it tracks.
+	 */
+	bcm_bt_vreg = NULL;
+	bcm_bt_vreg_on = false;
 }
 
 static const struct of_device_id bcm2078_of_match[] = {

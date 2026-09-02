@@ -40,6 +40,11 @@ bool n31_ftl_cs_whimory_backed(void);
 /* Implemented in ftl-s5l8740-core.c (same module). */
 int whimory_sftl_recover_cs(void);
 int whimory_cxt_dump(unsigned int max_vbas);
+/* The FPart system objects, and the SysCfg identity inside one. */
+int whimory_fpart_objects_show(char *buf, size_t len);
+int whimory_syscfg_show(char *buf, size_t len);
+int whimory_touch_cal_show(char *buf, size_t len);
+size_t whimory_syscfg_touch_cal(const u8 **out);
 int whimory_cxt_candidate(u32 fat_base);
 bool whimory_l2v_ready(void);
 int whimory_read_fmss_lba(u32 lba, void *buf);

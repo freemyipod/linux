@@ -258,11 +258,39 @@ MODULE_PARM_DESC(btoc_meta_confirm,
  */
 static bool fast_empty_probe = true;
 module_param(fast_empty_probe, bool, 0644);
+
+static bool batch_classify = true;
+module_param(batch_classify, bool, 0644);
+MODULE_PARM_DESC(batch_classify,
+		 "classify page-0 scan reads 16 blocks per sequencer kick (default on)");
 MODULE_PARM_DESC(fast_empty_probe,
 		 "1=one-record empty probe before the full page read (default)");
 
 static bool btoc_page_lazy = true;
 module_param(btoc_page_lazy, bool, 0644);
+
+static unsigned int read_prefetch_pages = WHIMORY_RC_SLOTS;
+module_param(read_prefetch_pages, uint, 0644);
+MODULE_PARM_DESC(read_prefetch_pages,
+		 "physical pages held in the sequential read-ahead window, 0 to disable (default 8)");
+
+/*
+ * How far ahead to walk the VBAs when filling the window. 32 VBAs is one
+ * 128 KiB readahead request, which at four LBAs per page is the eight pages
+ * the window holds.
+ */
+static unsigned int read_prefetch_vbas = 32;
+module_param(read_prefetch_vbas, uint, 0644);
+
+/* Window behaviour, read-only. Guessing at this cost a 4x regression once. */
+static unsigned int rc_fills, rc_hits, rc_misses, rc_fails, rc_pages;
+module_param(rc_fills, uint, 0444);
+module_param(rc_hits, uint, 0444);
+module_param(rc_misses, uint, 0444);
+module_param(rc_fails, uint, 0444);
+module_param(rc_pages, uint, 0444);
+MODULE_PARM_DESC(read_prefetch_vbas,
+		 "VBAs to look ahead when filling the read-ahead window (default 32)");
 MODULE_PARM_DESC(btoc_page_lazy,
 		 "1=read page 127 only when page 0 is inconclusive (default); 0=always read it");
 
@@ -280,7 +308,13 @@ MODULE_PARM_DESC(recover_budget_ms,
 		 "Stop BTOC confirms after this many ms (0=off)");
 
 /* Keep RNDIS/USB alive during long recover (default 2ms every 4 blocks). */
-static unsigned int recover_yield_us = 2000;
+/*
+ * No sleep by default. This existed to keep RNDIS and the watchdog alive
+ * during a long scan, but cond_resched() alone does that under
+ * CONFIG_PREEMPT, and at 2 ms every fourth block the sleeps alone cost
+ * several seconds of a mount that should take a few.
+ */
+static unsigned int recover_yield_us;
 module_param(recover_yield_us, uint, 0644);
 MODULE_PARM_DESC(recover_yield_us,
 		 "usleep between classify blocks to keep USB alive (0=off; default 2000)");
@@ -381,6 +415,15 @@ MODULE_PARM_DESC(progress_ms, "Minimum ms between progress updates");
 /* Rate-limit: emit at most this many of a repeating diagnostic. */
 static unsigned int diag_max_lines = 3;
 module_param(diag_max_lines, uint, 0644);
+
+/*
+ * Log the parts of each FPart system object that carry something.
+ * Off: this is for reverse engineering the objects, not for boots.
+ */
+static bool fpart_dump;
+module_param(fpart_dump, bool, 0644);
+MODULE_PARM_DESC(fpart_dump,
+		 "Dump non-fill rows of the FPart system objects (default N)");
 MODULE_PARM_DESC(diag_max_lines, "Cap on repeated read-miss/winner lines");
 
 /* True once per progress_ms window; keeps hot loops from flooding. */
@@ -412,6 +455,45 @@ MODULE_PARM_DESC(range_coalesce,
 
 static bool use_cxt = true;
 module_param(use_cxt, bool, 0644);
+
+/*
+ * Mount from the checkpoint alone, as RetailOS does.
+ *
+ * s_cxt_load.c inserts every (vba, span) pair the context carries unless
+ * the pair's superblock is set in diff->sbFilter:
+ *
+ *	sb = vba_to_sb(vba);
+ *	if (vba >= invalid_vba || !sbFilter_test(sb))
+ *		l2v_insert(lba, span, vba);
+ *
+ * and s_cxt_diff.c:405 allocates that filter with numRecords = 0 at init.
+ * Nothing populates the record array during a load -- the diff machinery
+ * belongs to the running FTL, where it tracks superblocks dirtied since the
+ * last checkpoint so the next one can be incremental. At mount the filter
+ * is empty, every pair is inserted, and no superblock is replayed.
+ *
+ * This driver keeps one safety net stock does not need: a superblock whose
+ * newest page is at or after the checkpoint weave was written after the
+ * checkpoint, so the checkpoint cannot describe it and it is replayed.
+ * On a cleanly unmounted volume that set is empty and the whole replay
+ * disappears.
+ *
+ * Clearing this restores the per-superblock weave test, which replays
+ * anything whose bound did not come from page 127.
+ */
+/*
+ * Scan superblock meta the way RetailOS does: first and last page queued
+ * together, 256 records per sequencer kick, page data discarded.
+ */
+static bool stock_scan = true;
+module_param(stock_scan, bool, 0644);
+MODULE_PARM_DESC(stock_scan,
+		 "classify reads first+last page meta in 256-record batches (default Y)");
+
+static bool cxt_fast = true;
+module_param(cxt_fast, bool, 0644);
+MODULE_PARM_DESC(cxt_fast,
+		 "mount from the checkpoint and replay only superblocks newer than it (default Y)");
 MODULE_PARM_DESC(use_cxt,
 		 "Load the SFTL CXT snapshot during recover (default Y)");
 
@@ -434,11 +516,32 @@ module_param(recover_force, bool, 0644);
 MODULE_PARM_DESC(recover_force,
 		 "Allow rebuild when a map is already valid/bound (default N)");
 
+/*
+ * Check each CXT extent against the page it points at before seeding it.
+ * Off is faster and reproduces the old behaviour, at the cost of
+ * trusting a snapshot that may predate the writes which moved its data.
+ */
+/*
+ * Re-reading each extent's page meta to confirm the checkpoint is not
+ * something RetailOS does: s_cxt_load.c inserts what the context says and
+ * moves on. It costs one page read per extent -- 6276 on this volume --
+ * and is kept only as a diagnostic.
+ */
+static bool cxt_meta_confirm;
+module_param(cxt_meta_confirm, bool, 0644);
+MODULE_PARM_DESC(cxt_meta_confirm,
+		 "Confirm CXT extents against page metadata before seeding (default Y)");
+
+static unsigned int cxt_confirm_max;
+module_param(cxt_confirm_max, uint, 0644);
+MODULE_PARM_DESC(cxt_confirm_max,
+		 "Cap on CXT confirmation page reads (0 = no cap)");
+
 /* Changing any of these is a different map, so a repeat is not a no-op. */
 static u32 whimory_recover_key(void)
 {
 	return scan_blocks * 1000003u + max_open_sbs * 10007u +
-	       btoc_confirm_max * 101u + (use_cxt ? 2u : 0u) +
+	       btoc_confirm_max * 101u + (use_cxt ? 2u : 0u) + (cxt_meta_confirm ? 4u : 0u) +
 	       (range_coalesce ? 1u : 0u) + max_range_nodes;
 }
 
@@ -685,6 +788,140 @@ static int whimory_cs_read_slot0(struct whimory *w, unsigned int ce,
 }
 
 /*
+ * Batched page-0 prefetch for the classify scan.
+ *
+ * Classify reads page 0 of every block on the volume -- about 7840 of them
+ * -- and does nothing between one read and the next that depends on the
+ * previous answer. That makes it the one pass where the per-kick cost is
+ * pure waste: measured on the device at kick_us=1536 against a NAND tR of
+ * 60-80 us, roughly 1.45 ms of every 1.54 ms read is the sequencer being
+ * set up and torn down for a single page.
+ *
+ * So set it up once for sixteen. The window slides forward through the
+ * block range and every read the loop asks for is served from it, including
+ * the full 4 KiB slot the escalation path wants -- there is no point
+ * batching the blank test and then reading the page again for the blocks
+ * that are not blank.
+ *
+ * Refill failure is not fatal. batch_valid goes false and the caller falls
+ * back to the single-page path for that window, which is what the scan did
+ * before any of this existed.
+ */
+static void whimory_prefetch_reset(struct whimory *w)
+{
+	w->sftl.pf_valid = false;
+	w->sftl.pf_count = 0;
+}
+
+static int whimory_prefetch_slot0(struct whimory *w, unsigned int ce,
+				  unsigned int cau, unsigned int block,
+				  unsigned int nscan, const u8 **data,
+				  u8 *meta0)
+{
+	struct whimory_sftl *s = &w->sftl;
+	u16 blocks[WHIMORY_PF_SLOTS];
+	unsigned int i, n, idx;
+	int ret;
+
+	if (!batch_classify || !s->pf_data)
+		goto fallback;
+
+	if (!(s->pf_valid && ce == s->pf_ce && cau == s->pf_cau &&
+	      block >= s->pf_first && block < s->pf_first + s->pf_count)) {
+		n = nscan - block;
+		if (n > WHIMORY_PF_SLOTS)
+			n = WHIMORY_PF_SLOTS;
+		if (n < 1)
+			goto fallback;
+		for (i = 0; i < n; i++)
+			blocks[i] = (u16)(block + i);
+		ret = s5l8740_nand_cs_read_meta_batch((u8)ce, (u8)cau, blocks,
+						      0, n, s->pf_meta,
+						      s->pf_data,
+						      S5L8740_NAND_SLOT_DATA);
+		if (ret) {
+			/*
+			 * Say so once per mount rather than per window. A
+			 * batch that cannot run is a speed regression, not a
+			 * correctness one, and the fallback below is the
+			 * path the scan used before batching existed.
+			 */
+			if (!s->pf_failed) {
+				s->pf_failed = true;
+				dev_warn(w->dev,
+					 "SFTL batch prefetch failed (%d), classify falls back to single-page reads\n",
+					 ret);
+			}
+			whimory_prefetch_reset(w);
+			goto fallback;
+		}
+		s->pf_ce = ce;
+		s->pf_cau = cau;
+		s->pf_first = block;
+		s->pf_count = n;
+		s->pf_valid = true;
+		s->pf_kicks++;
+
+	/*
+	 * Prove the descriptor walk once, on the first window of the mount.
+	 *
+	 * The list format is read out of the 4EDDDC decomp, and the one thing
+	 * the decomp does not answer is whether the CS microcode blob we load
+	 * walks a multi-descriptor list or executes the first pair and stops
+	 * at the terminator. If it stops, every entry past index 0 is stale
+	 * buffer rather than the block that was asked for -- and a classify
+	 * pass that believes it would mismarks most of the volume.
+	 *
+	 * So the second entry gets read again the slow way and compared. One
+	 * extra page read per mount buys the right to default this on; a
+	 * mismatch turns batching off for the rest of the mount and the scan
+	 * carries on down the path it used before.
+	 */
+	if (!s->pf_checked && n >= 2) {
+		const u8 *vd = NULL;
+		u8 vm[WHIMORY_META_SIZE];
+
+		s->pf_checked = true;
+		/*
+		 * Only a read that succeeds and disagrees is evidence. A
+		 * verification read that fails outright says nothing about
+		 * the batch -- dma_one_shot disarms CS after a single read,
+		 * so a bare -EPERM here is routine and it comes back as an
+		 * all-zero meta, which is indistinguishable from a real
+		 * disagreement if you only compare bytes. Treating that as a
+		 * mismatch would switch batching off on every mount.
+		 */
+		if (!whimory_cs_read_slot0(w, ce, cau, block + 1, 0, &vd, vm) &&
+		    (memcmp(vm, s->pf_meta + S5L8740_NAND_BATCH_META_SIZE,
+			    WHIMORY_META_SIZE) ||
+		     memcmp(vd, s->pf_data + S5L8740_NAND_SLOT_DATA, 64))) {
+			dev_warn(w->dev,
+				 "SFTL batch prefetch does not match single-page reads at blk=%u -- the CS blob is not walking the descriptor list; batching off\n",
+				 block + 1);
+			batch_classify = false;
+			whimory_prefetch_reset(w);
+			goto fallback;
+		}
+		dev_info(w->dev,
+			 "SFTL batch prefetch verified against single-page reads, %u blocks per kick\n",
+			 n);
+	}
+
+	}
+
+	idx = block - s->pf_first;
+	memcpy(meta0, s->pf_meta + idx * S5L8740_NAND_BATCH_META_SIZE,
+	       WHIMORY_META_SIZE);
+	*data = s->pf_data + (size_t)idx * S5L8740_NAND_SLOT_DATA;
+	s->pf_hits++;
+	return 0;
+
+fallback:
+	return whimory_cs_read_slot0(w, ce, cau, block, 0, data, meta0);
+}
+
+
+/*
  * Can slot 0 alone classify this block?
  *
  * The only thing classify needs the other three slots for is
@@ -727,11 +964,6 @@ static bool whimory_meta_is_cxt_base(const u8 *m, u32 vba_ofs)
 	return m[0] == WHIMORY_META_TYPE_SFTL_CXT &&
 	       m[1] == WHIMORY_CXT_TAG_BASE &&
 	       vba_ofs == 0;
-}
-
-static bool whimory_meta_is_btoc(const u8 *m)
-{
-	return m[0] == WHIMORY_META_TYPE_BTOC;
 }
 
 static bool whimory_meta_is_data_raw(const u8 *m)
@@ -841,6 +1073,28 @@ static u32 whimory_vfl_virt(struct whimory *w, u32 cau, u32 phys)
  * a bank-major superblock index any more. whimory_sb_ofs_to_vba() is the
  * replacement and converts at the boundary instead.
  */
+
+/*
+ * Resolve a (ce, cau, vblock) triple to the hardware that holds it.
+ *
+ * Two steps, and they have to happen in this order: whimory_vfl_bank()
+ * answers which CAU actually carries this virtual block, and only then does
+ * whimory_vfl_phys() translate the block number within that CAU.
+ *
+ * n31_vfl_read_vba() and whimory_l2v_search_phys() did both. The BTOC
+ * confirm pass and whimory_cxt_read_vba() did only the second, with the
+ * unremapped CAU -- so if the bank bitmap were ever populated, the confirm
+ * pass would key the L2V on metadata read from one plane while every later
+ * read fetched another, a self-inflicted lba mismatch across the whole map.
+ * Both helpers are the identity while vfl_remap_mode=off, which is why it
+ * has never bitten; one helper means it cannot start.
+ */
+static void whimory_vfl_resolve(struct whimory *w, u32 vblock, u32 *cau,
+				u32 *pblock)
+{
+	*cau = whimory_vfl_bank(w, *cau, vblock);
+	*pblock = whimory_vfl_phys(w, *cau, vblock);
+}
 
 static u32 s_g_vba_to_sb(const struct whimory *w, u32 vba)
 {
@@ -1112,9 +1366,16 @@ static int whimory_range_insert_new(struct whimory *w, u32 start, u32 len,
 
 	if (!len)
 		return 0;
+	/*
+	 * Backstop. whimory_range_update() checks the budget before it
+	 * splits or erases anything, so reaching here means a caller went
+	 * around it. Returning 0 -- success, having inserted nothing -- is
+	 * what turned working mappings into holes; say -ENOSPC instead so a
+	 * new caller fails loudly rather than silently truncating the map.
+	 */
 	if (max_range_nodes && w->sftl.range_nodes >= max_range_nodes) {
 		w->sftl.range_budget_stop++;
-		return 0;
+		return -ENOSPC;
 	}
 	n = kzalloc(sizeof(*n), GFP_KERNEL);
 	if (!n)
@@ -1170,34 +1431,103 @@ static void whimory_range_coalesce_at(struct whimory *w, u32 start)
 	}
 }
 
-static int whimory_range_update(struct whimory *w, u32 lba, u32 span, u32 vba)
+/*
+ * Apply as much of [lba, lba+span) as this claim is entitled to.
+ *
+ * Returns the number of LBAs consumed -- always at least one, so the caller
+ * cannot spin -- or a negative errno. *applied says whether that run was
+ * written to the map or passed over.
+ *
+ * TWO THINGS THIS USED TO GET WRONG
+ *
+ * It rejected the whole span the moment any part of it was covered by a
+ * newer weave: "return 1" from inside the scan, with the comment "stale --
+ * do not touch packed L2V". A BTOC or CXT run of 256 LBAs where one LBA had
+ * been superseded therefore lost all 256, and the 255 with no competing
+ * claim kept whatever was there before, which was frequently nothing. The
+ * run is now split at the newer range instead: the part in front of it is
+ * applied, the overlap is skipped, and the caller comes back for the rest.
+ *
+ * And it erased before it knew whether it could insert. The split and erase
+ * ran first, then whimory_range_insert_new() returned 0 -- success --
+ * without inserting anything once max_range_nodes was reached. Past the
+ * ceiling every update turned a working mapping into a hole and reported
+ * success while doing it. The budget is checked up front now, before
+ * anything is destroyed, and a claim that cannot be recorded is passed over
+ * intact rather than half-applied.
+ */
+static int whimory_range_update(struct whimory *w, u32 lba, u32 span, u32 vba,
+				bool *applied)
 {
-	u32 end = lba + span;
+	bool is_unmap = vba >= w->l2v.invalid_vba;
+	struct whimory_range *blocker = NULL;
 	struct whimory_range *hit;
 	struct rb_node *node, *next;
+	u32 run, end;
 	int ret;
 
-	if (!span || whimory_special_lba(lba))
+	*applied = false;
+	if (!span)
 		return 0;
+	if (whimory_special_lba(lba))
+		return span;
 
+	/* First range in the way that a newer writer already owns. */
 	{
 		struct whimory_range *first = whimory_range_lower(&w->ranges,
-								 lba);
-		struct rb_node *node = first ? &first->rb : NULL;
+								  lba);
+		struct rb_node *n = first ? &first->rb : NULL;
 
-		while (node) {
-			struct whimory_range *r = rb_entry(node,
-							  struct whimory_range,
-							  rb);
+		while (n) {
+			struct whimory_range *r = rb_entry(n,
+							   struct whimory_range,
+							   rb);
 
-			if (r->start >= end)
+			if (r->start >= lba + span)
 				break;
 			if (r->weave > w->sftl.claim_weave) {
-				w->sftl.stale_mapping_rejected++;
-				return 1; /* stale — do not touch packed L2V */
+				blocker = r;
+				break;
 			}
-			node = rb_next(node);
+			n = rb_next(n);
 		}
+	}
+
+	if (blocker && blocker->start <= lba) {
+		/*
+		 * The head of the run is owned by something newer. Skip
+		 * exactly the overlap and let the caller retry past it --
+		 * the tail may be entirely unclaimed.
+		 */
+		u32 blocker_end = blocker->start + blocker->len;
+
+		w->sftl.stale_mapping_rejected++;
+		run = min(lba + span, blocker_end) - lba;
+		return (int)run;
+	}
+
+	run = blocker ? blocker->start - lba : span;
+	end = lba + run;
+	if (WARN_ON_ONCE(end < lba))		/* would wrap; cannot with a
+						 * non-special lba and
+						 * run <= WHIMORY_L2V_ROOT_SPAN */
+		return (int)run;
+
+	/*
+	 * Budget first, and only for claims that add a node. An unmap only
+	 * erases, so it is net-negative on the node count and is always
+	 * allowed through -- refusing it would strand a stale mapping.
+	 *
+	 * The two splits below each allocate, and they run before the
+	 * insert. Checking for bare equality would let a claim past the gate
+	 * with one node of headroom, split twice, and then fail the insert
+	 * having already erased -- which is the exact hole this check exists
+	 * to prevent, just moved to the boundary. Reserve the splits.
+	 */
+	if (!is_unmap && max_range_nodes &&
+	    w->sftl.range_nodes + 2 >= max_range_nodes) {
+		w->sftl.range_budget_stop++;
+		return (int)run;
 	}
 
 	hit = whimory_range_find(&w->ranges, lba);
@@ -1206,13 +1536,11 @@ static int whimory_range_update(struct whimory *w, u32 lba, u32 span, u32 vba)
 		if (ret)
 			return ret;
 	}
-	if (end) {
-		hit = whimory_range_find(&w->ranges, end - 1);
-		if (hit && hit->start < end) {
-			ret = whimory_range_split(w, hit, end);
-			if (ret)
-				return ret;
-		}
+	hit = whimory_range_find(&w->ranges, end - 1);
+	if (hit && hit->start < end) {
+		ret = whimory_range_split(w, hit, end);
+		if (ret)
+			return ret;
 	}
 
 	hit = whimory_range_lower(&w->ranges, lba);
@@ -1231,16 +1559,18 @@ static int whimory_range_update(struct whimory *w, u32 lba, u32 span, u32 vba)
 	}
 
 	/* True unmap: erase only; do not insert invalid_vba placeholders. */
-	if (vba >= w->l2v.invalid_vba) {
+	if (is_unmap) {
 		whimory_range_coalesce_at(w, lba);
-		return 0;
+		*applied = true;
+		return (int)run;
 	}
 
-	ret = whimory_range_insert_new(w, lba, span, vba);
+	ret = whimory_range_insert_new(w, lba, run, vba);
 	if (ret)
 		return ret;
 	whimory_range_coalesce_at(w, lba);
-	return 0;
+	*applied = true;
+	return (int)run;
 }
 
 /*
@@ -1255,21 +1585,40 @@ static int whimory_l2v_update(struct whimory *w, u32 lba, u32 span, u32 vba)
 	while (span) {
 		u32 chunk = WHIMORY_L2V_ROOT_SPAN -
 			    (lba & (WHIMORY_L2V_ROOT_SPAN - 1));
+		bool applied;
+		u32 done;
 		int ret;
 
 		if (chunk > span)
 			chunk = span;
-		ret = whimory_range_update(w, lba, chunk, vba);
+		/*
+		 * range_update consumes as much of the chunk as this claim
+		 * is entitled to, which may be less than all of it when a
+		 * newer weave owns part of the range. It always consumes at
+		 * least one LBA, so this loop always advances.
+		 */
+		ret = whimory_range_update(w, lba, chunk, vba, &applied);
 		if (ret < 0)
 			return ret;
-		if (ret > 0) {
-			/* Stale reject: leave packed L2V alone for this chunk. */
-			span -= chunk;
-			lba += chunk;
-			if (vba < w->l2v.invalid_vba)
-				vba += chunk;
+		done = (u32)ret;
+		if (WARN_ON_ONCE(!done || done > chunk))
+			return -EINVAL;
+		/*
+		 * A chunk can now take several passes -- one per newer range
+		 * standing in the way -- so this loop is no longer bounded by
+		 * a couple of iterations. Up to WHIMORY_L2V_ROOT_SPAN of
+		 * them, if the tree happens to alternate.
+		 */
+		cond_resched();
+		if (!applied) {
+			/* Skipped: leave the packed L2V alone for this run. */
+			span -= done;
+			lba += done;
+			if (!is_unmap)
+				vba += done;
 			continue;
 		}
+		chunk = done;
 
 		w->sftl.l2v_update_calls++;
 		if (is_unmap)
@@ -2169,9 +2518,9 @@ static void whimory_log_sig_fields(struct whimory *w, const u8 *s,
 	u32 cfg = whimory_sig32(s, 0xb8);
 
 	dev_info(w->dev,
-		 "WHIMORY_SIG %s magic=%08x ver=%u ftl=%u.%u vfl=%u.%u fpart=%u.%u geom=%u fil101=%u vfl_arg=%u fpart_arg=%u extra=%u cfg_b8=%u first32=%32ph\n",
+		 "WHIMORY_SIG %s magic=%08x ver=%u ftl=%u.%u vfl=%u.%u fpart=%u.%u geom=%u num_ce=%u vfl_arg=%u fpart_arg=%u extra=%u cfg_b8=%u first32=%32ph\n",
 		 why, magic, ver, ftl_m, ftl_n, vfl_m, vfl_n, fpt_m, fpt_n,
-		 geom, w->geom.dev_id, vfl_arg, fpt_a, extra, cfg, s);
+		 geom, w->geom.num_ce, vfl_arg, fpt_a, extra, cfg, s);
 }
 
 /* OSOSchecks — not the old ver>=1 / major<=16 heuristic. */
@@ -2193,14 +2542,49 @@ static int whimory_validate_signature(struct whimory *w, const u8 *sig)
 			 "FPART_SIG_READ reject: version=%u > 6\n", ver);
 		return -EINVAL;
 	}
-	if (geom != w->geom.dev_id) {
+	/*
+	 * The +0x34 field is a device count, not a block count.
+	 *
+	 * This compared it against FIL GetInfo(101) and rejected the
+	 * signature on every boot of this unit: geom=2 against
+	 * GetInfo(101)=2088. Those are not a mismatched pair of the same
+	 * quantity, they are two different quantities -- GetInfo(101)
+	 * returns blocks_per_cau, and the signature field holds 2, which is
+	 * num_ce.
+	 *
+	 * OSOS settles it. The validator reads, with the signature buffer at
+	 * 0x8D0C220:
+	 *
+	 *   if (MEMORY[0x8D0C220] != 0x776D7278)  "invalid magic"
+	 *   if (MEMORY[0x8D0C244] != a1)          "FPart major ver"
+	 *   if (MEMORY[0x8D0C254] != MEMORY[0x8D0CE20]) "Geometry does not match"
+	 *   if (MEMORY[0x8D0C228] > 6)            "Device version unsupported"
+	 *
+	 * so +0x34 is compared against MEMORY[0x8D0CE20]. Earlier in the
+	 * same function that word is the one tested as
+	 *
+	 *   if (!MEMORY[0x8D0CE20]) "[NAND] No NAND device found"
+	 *
+	 * which is a count of NAND devices. It cannot be a block count: a
+	 * zero block count is not how firmware says no chip responded.
+	 *
+	 * Rejecting the signature is not a harmless miss. It is what left
+	 * fpart_sig=0 vfl_ctx_hits=0 vfl_cxt_loc=0 on every boot, and
+	 * without the FPart signature there is no VFL context, so recovery
+	 * fell back to scanning all 1960 user blocks three times and
+	 * inferring by weave what the context would have stated.
+	 */
+	if (geom != w->geom.num_ce) {
 		dev_info(w->dev,
-			 "FPART_SIG_READ reject: geom=%u != FIL GetInfo(101)=%u\n",
-			 geom, w->geom.dev_id);
+			 "FPART_SIG_READ reject: geom=%u != num_ce=%u\n",
+			 geom, w->geom.num_ce);
 		return -EINVAL;
 	}
 	return 0;
 }
+
+static void whimory_dump_sparse(struct whimory *w, const char *tag,
+				const u8 *p, unsigned int len);
 
 static int whimory_parse_signature(struct whimory *w, const u8 *s)
 {
@@ -2222,6 +2606,7 @@ static int whimory_parse_signature(struct whimory *w, const u8 *s)
 	w->sig.fpart_arg = whimory_sig32(s, 0x2c);
 	w->sig.extra_arg = whimory_sig32(s, 0x30);
 	w->sig_ok = true;
+	whimory_dump_sparse(w, "SIG", s, WHIMORY_SIG_SIZE);
 	dev_info(w->dev,
 		 "Whimory sig OK ver=%u fpart=%u.%u vfl=%u.%u ftl=%u.%u geom=%u vfl_arg=%u fpart_arg=%u extra=%u\n",
 		 w->sig.version, w->sig.fpart_major, w->sig.fpart_minor,
@@ -2528,6 +2913,62 @@ static bool fpart_find_in_cache(struct whimory *w, u16 *index, u16 type)
 	return false;
 }
 
+/*
+ * Say out loud every distinct FPART special type the scan actually found.
+ *
+ * We only act on three: 0xc101 SIGNATURE, 0xc104 VFL_CXT, 0xc105 CONFIG (which
+ * carries SysCfg). Anything else is cached and then silently ignored, so a
+ * type that exists on the medium has never been visible in a boot log.
+ *
+ * That matters right now because the Grape touch firmware has a second source.
+ * sub_1A640 falls back to sub_201FC(0x67706677, ...) -- 'gpfw' big-endian --
+ * when MEMORY[0x8A8FAA4] is zero, and that lookup goes through sub_683E0 ->
+ * sub_26794 -> sub_261A4, a keyed record lookup whose sub_26794 carries the
+ * string "APPLE_MDFW". Which medium backs it is NOT established from the
+ * decomp yet; a NAND special area analogous to SysCfg is the working
+ * hypothesis and this log is how the device answers it.
+ *
+ * Printed once per scan, unconditionally, because the whole point is to turn a
+ * cold boot into evidence.
+ */
+static void fpart_log_special_types(struct whimory *w)
+{
+	u16 seen[16];
+	unsigned int nseen = 0;
+	u16 i, j;
+
+	for (i = 0; i < w->fpart_ctx.count; i++) {
+		u16 t = w->fpart_ctx.table[i].type_word;
+
+		for (j = 0; j < nseen; j++)
+			if (seen[j] == t)
+				break;
+		if (j < nseen)
+			continue;
+		if (nseen < ARRAY_SIZE(seen))
+			seen[nseen++] = t;
+	}
+
+	for (j = 0; j < nseen; j++) {
+		const char *known =
+			seen[j] == FPART_TYPE_SIGNATURE ? " SIGNATURE" :
+			seen[j] == FPART_TYPE_VFL_CXT   ? " VFL_CXT" :
+			seen[j] == FPART_TYPE_CONFIG    ? " CONFIG/SysCfg" :
+							  " UNCLAIMED";
+		u16 n = 0;
+
+		for (i = 0; i < w->fpart_ctx.count; i++)
+			if (w->fpart_ctx.table[i].type_word == seen[j])
+				n++;
+
+		dev_info(w->dev,
+			 "FPART_SPECIAL_TYPE 0x%04x copies=%u%s\n",
+			 seen[j], n, known);
+	}
+	dev_info(w->dev, "FPART_SPECIAL_TYPES distinct=%u of %u copies\n",
+		 nseen, w->fpart_ctx.count);
+}
+
 static u16 fpart_count_special_copies(struct whimory *w, u16 type_word)
 {
 	u8 low = type_word & 0xff;
@@ -2567,13 +3008,34 @@ static int fpart_scan_region(struct whimory *w, u16 type,
 
 	memset(hist, 0, sizeof(hist));
 
-	if (page_hi >= w->geom.pages_per_block)
+	/*
+	 * Clamp to the SLC page count, not the MLC one.
+	 *
+	 * This region is SLC and an SLC block holds geom_105 pages, 16 on
+	 * this part, against 128 in MLC. Sweeping to pages_per_block asks
+	 * for pages 16..127, which do not exist there -- and the failures
+	 * do not stay local: measured over blk[1960,2088), pages[0,127]
+	 * gave 65536 reads, fail=0 and tag30=0, with 97 per cent of pages
+	 * reading back as meta 0x00. Every object in the region vanished,
+	 * including the five on page 0 that the same code finds every
+	 * time when it stops at page 0. The same sweep bounded to
+	 * pages[0,15] gives 8192 reads, fail=0, tag30=80 and entries=5:
+	 * the five objects, each occupying all 16 SLC pages of its block.
+	 *
+	 * So an out-of-range SLC page does not merely fail, it takes the
+	 * reads after it with it, and the result looks like a clean scan
+	 * of an empty region rather than like an error.
+	 */
+	if (w->geom.geom_105 && page_hi >= w->geom.geom_105)
+		page_hi = w->geom.geom_105 - 1;
+	else if (page_hi >= w->geom.pages_per_block)
 		page_hi = w->geom.pages_per_block - 1;
 
 	/*
-	 * Arm live CS for the sweep. -EBUSY means an outer session is already
-	 * open, which is fine -- it just means this one does not own the
-	 * teardown.
+	 * Arm live CS for the sweep. Sessions nest and begin() always
+	 * succeeds, so this one owns exactly its own end; an outer session
+	 * simply keeps CS armed past it. The failure check below is kept for
+	 * a future begin() that can fail.
 	 */
 	sess = s5l8740_nand_dma_session_begin();
 	if (sess && sess != -EBUSY) {
@@ -2701,6 +3163,7 @@ static int fpart_scan_region(struct whimory *w, u16 type,
 		 wrmx, w->fpart_ctx.count, *matched,
 		 0xff, hist[0xff], 0x00, hist[0], 0x30, hist[0x30], 0x20,
 		 hist[0x20]);
+	fpart_log_special_types(w);
 	if (!sess)
 		s5l8740_nand_dma_session_end();
 	kvfree(csp);
@@ -3071,7 +3534,27 @@ static int whimory_payload_scan_range(struct whimory *w, void *page,
 	u16 bank, nbanks = fpart_num_banks(w);
 	u32 b, p;
 
-	if (page_hi >= w->geom.pages_per_block)
+	/*
+	 * Clamp to the SLC page count, not the MLC one.
+	 *
+	 * This region is SLC and an SLC block holds geom_105 pages, 16 on
+	 * this part, against 128 in MLC. Sweeping to pages_per_block asks
+	 * for pages 16..127, which do not exist there -- and the failures
+	 * do not stay local: measured over blk[1960,2088), pages[0,127]
+	 * gave 65536 reads, fail=0 and tag30=0, with 97 per cent of pages
+	 * reading back as meta 0x00. Every object in the region vanished,
+	 * including the five on page 0 that the same code finds every
+	 * time when it stops at page 0. The same sweep bounded to
+	 * pages[0,15] gives 8192 reads, fail=0, tag30=80 and entries=5:
+	 * the five objects, each occupying all 16 SLC pages of its block.
+	 *
+	 * So an out-of-range SLC page does not merely fail, it takes the
+	 * reads after it with it, and the result looks like a clean scan
+	 * of an empty region rather than like an error.
+	 */
+	if (w->geom.geom_105 && page_hi >= w->geom.geom_105)
+		page_hi = w->geom.geom_105 - 1;
+	else if (page_hi >= w->geom.pages_per_block)
 		page_hi = w->geom.pages_per_block - 1;
 	if (block_hi > w->geom.blocks_per_cau)
 		block_hi = w->geom.blocks_per_cau;
@@ -3219,151 +3702,649 @@ static int n31_vfl_init(struct whimory *w)
 	return 0;
 }
 
+/*
+ * Ingest the VFL context object.
+ *
+ * What this device keeps in its system area, enumerated completely --
+ * 128 blocks, all 16 SLC pages, 4 banks, 8192 reads, no failures --
+ * and dumped past each header:
+ *
+ *   0xc101  bank 1 blk 2085  signature: magic, versions, geometry
+ *   0xc104  bank 1 blk 2084  block status bitmap, mirror on bank 2
+ *   0xc105  bank 0 blk 2085  device identity, mirror on bank 3
+ *
+ * 0xc104 is the bitmap and nothing else: everything past the 261 bytes
+ * it needs for 2088 blocks is 0xff, and all 16 pages of the block are
+ * byte-identical, so the object is one bitmap replicated for
+ * redundancy. 0xc105 is four-character tags stored reversed -- SCfg,
+ * SrNm with the serial, FwId, HwId, HwVr, SwVr, MLB#, Regn, BMac,
+ * Mod#.
+ *
+ * The FPart data was checked too, both halves of it, since that is the
+ * obvious place to look next. The first 0x80 bytes of each object are
+ * (bank, block) assignment pairs, and they are self-describing rather
+ * than a directory of anything else: 0xc101 lists bank 1 blk 2085,
+ * 0xc104 lists bank 2 blk 2085 and bank 1 blk 2084, 0xc105 lists bank
+ * 3 and bank 0. Five entries, which is exactly the five copies of the
+ * three objects above. And the signature is 0x600 bytes of which only
+ * the first 0x40 carry anything: magic, versions, geometry, the string
+ * "00230g)" at +0x40, one config byte at +0xb8, and zeros to the end.
+ *
+ * So nothing here points at the FTL checkpoint, which is what a
+ * context is normally wanted for. openiBoot vsvfl reaches the FTL
+ * through control_block[3] in its VFLCxt; this part has no equivalent
+ * field. The checkpoint can only be found by classifying superblocks,
+ * which is what recovery already does, so reading the context cannot
+ * remove the scan -- the context does not know where the map is.
+ *
+ * The bitmap is loaded and reported but deliberately not used to skip
+ * blocks. 29 blocks are marked, all inside the first 256, in a regular
+ * pattern of two or three low bits per byte, which reads more like
+ * reserved blocks than like wear scattered across the device. Skipping
+ * a block that actually holds data would lose it, and whether a clear
+ * bit means bad or reserved is not established.
+ *
+ * Four things here were wrong, and each of them alone was enough to
+ * make the scan find nothing.
+ *
+ * It looked for meta[0] == 0x20. Nothing on this part carries that.
+ * FPART_SCAN counts the whole system area and reports
+ * meta0_top=ff/454 00/5 30/5 20/0 -- 454 erased pages, five of type
+ * 0x30, and not one of 0x20. The system objects are all meta[0] 0x30,
+ * the FPart special type, and what separates them is a type word at
+ * meta+2. Enumerating all five across all four banks:
+ *
+ *   bank 1 blk 2085  0xc101  payload "xrmw"          the signature
+ *   bank 0 blk 2085  0xc105  payload "SCfg".."SrNm"  config, serial
+ *   bank 3 blk 2085  0xc105  mirror of bank 0
+ *   bank 1 blk 2084  0xc104  fc f8 fc fc .. ff ff    block status
+ *   bank 2 blk 2085  0xc104  mirror of bank 1
+ *
+ * 0xc105 is identity, not a map. 0xc104 is the only structural object
+ * of the three, it is mirrored across CEs the way context is, and a
+ * bitmap over 2088 blocks is what a block status table looks like. So
+ * the context is keyed on 0xc104.
+ *
+ * It read from 0x100 and 0x200. An FPart object payload begins at
+ * FPART_SPECIAL_HDR, 0x80, so those offsets land 0x80 and 0x180 bytes
+ * into the object rather than at its start. That is why cxt_loc was
+ * always 0: there was never anything at 0x100 to count.
+ *
+ * It read the bitmap as one byte per block with the bits meaning
+ * banks, and validated it by rejecting any byte with bits set outside
+ * num_cau -- mask 0x3 here. Every byte actually present is fc, f8 or
+ * ff, so that test rejects all of them. It is a bit per block, not a
+ * byte per block.
+ *
+ * And it took whichever copy was scanned last. There are two, and a
+ * later one silently replaced an earlier one. The first valid copy now
+ * wins and a disagreeing mirror is reported rather than applied.
+ *
+ * The block status table is kept separately from vfl.bank_mask. That
+ * one is a byte per VBN whose bits select banks, whimory_vfl_bank()
+ * resolves every read through it, and it is not this. Loading one into
+ * the other is what sent reads to the wrong die when this function was
+ * matching the signature block.
+ */
+/*
+ * SysCfg tags are stored byte-reversed, so "SrNm" is 6d 4e 72 53.
+ */
+static bool whimory_syscfg_tag(const u8 *p, const char *tag)
+{
+	return p[0] == tag[3] && p[1] == tag[2] &&
+	       p[2] == tag[1] && p[3] == tag[0];
+}
+
+static void whimory_syscfg_str(char *dst, size_t dstlen, const u8 *src,
+			       size_t len)
+{
+	size_t i, n = min(len, dstlen - 1);
+
+	for (i = 0; i < n; i++) {
+		/*
+		 * Stop at the first byte that is not printable text.
+		 *
+		 * Padding is NUL or 0xff, but a value can also be followed
+		 * directly by binary belonging to the next field -- MLB# is,
+		 * and substituting a placeholder for it put a stray "?" on the
+		 * end of the board number. Two tags can also sit adjacent with
+		 * no value between them, which CNTB and MtCl do, and that is a
+		 * legitimately empty string rather than garbage.
+		 */
+		if (src[i] < 0x20 || src[i] > 0x7e)
+			break;
+		dst[i] = src[i];
+	}
+	dst[i] = 0;
+}
+
+/*
+ * Parse the SysCfg object into something a person can read.
+ *
+ * The record stride is not constant -- the serial takes 16 bytes and the
+ * board number more -- so rather than assume one, this locates every tag
+ * it knows and treats each value as running to the next tag found. That
+ * is robust to a size we guessed wrong and to tags we have not seen.
+ */
+static void whimory_syscfg_parse(struct whimory *w, const u8 *p,
+				 unsigned int len)
+{
+	static const char * const tags[] = {
+		"SrNm", "FwId", "HwId", "HwVr", "SwVr", "MLB#",
+		"CNTB", "MtCl", "Mod#", "Regn", "BMac",
+	};
+	unsigned int off[ARRAY_SIZE(tags)];
+	unsigned int i, o, n = 0;
+
+	kvfree(w->syscfg.raw);
+	memset(&w->syscfg, 0, sizeof(w->syscfg));
+	if (len < 24 || !whimory_syscfg_tag(p, "SCfg"))
+		return;
+	w->syscfg.entries = get_unaligned_le32(p + 0x14);
+
+	/*
+	 * Keep the section itself, and index every 4-byte-aligned printable
+	 * group in it.
+	 *
+	 * The decode below understands eleven tags. Anything else in the
+	 * section is unreachable, and this part carries records that have not
+	 * been identified. A printable group is a candidate rather than a
+	 * confirmed tag -- ASCII values such as the serial match the same
+	 * test -- so the candidates are reported as such, flagged when they
+	 * are one of the known tags, and the verbatim bytes are kept beside
+	 * them so an unrecognised record can still be read out.
+	 */
+	w->syscfg.raw = NULL;
+	w->syscfg.raw_len = 0;
+	w->syscfg.n_cand = 0;
+	w->syscfg.raw = kvmalloc(len, GFP_KERNEL);
+	if (w->syscfg.raw) {
+		memcpy(w->syscfg.raw, p, len);
+		w->syscfg.raw_len = len;
+	}
+
+	for (o = 0; o + 4 <= len && w->syscfg.n_cand < N31_SYSCFG_MAX_CAND;
+	     o += 4) {
+		unsigned int k, idx;
+		char *t;
+
+		for (k = 0; k < 4; k++)
+			if (p[o + k] < 0x20 || p[o + k] > 0x7e)
+				break;
+		if (k != 4)
+			continue;
+
+		idx = w->syscfg.n_cand++;
+		t = w->syscfg.cand[idx].tag;
+		/* Tags sit byte-reversed on disk; record them forwards. */
+		t[0] = p[o + 3];
+		t[1] = p[o + 2];
+		t[2] = p[o + 1];
+		t[3] = p[o + 0];
+		t[4] = 0;
+		w->syscfg.cand[idx].off = o;
+		w->syscfg.cand[idx].known = false;
+		for (k = 0; k < ARRAY_SIZE(tags); k++)
+			if (!strcmp(t, tags[k]))
+				w->syscfg.cand[idx].known = true;
+	}
+	/* A record runs to the next candidate, or to the end of the section. */
+	for (i = 0; i < w->syscfg.n_cand; i++)
+		w->syscfg.cand[i].len =
+			((i + 1 < w->syscfg.n_cand) ? w->syscfg.cand[i + 1].off
+						    : len) -
+			w->syscfg.cand[i].off;
+
+	for (i = 0; i < ARRAY_SIZE(tags); i++)
+		off[i] = 0;
+
+	/* Locate every tag we know, on its 4-byte alignment. */
+	for (o = 4; o + 4 <= len; o += 4) {
+		for (i = 0; i < ARRAY_SIZE(tags); i++) {
+			if (!off[i] && whimory_syscfg_tag(p + o, tags[i])) {
+				off[i] = o;
+				n++;
+				break;
+			}
+		}
+	}
+	if (!n)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(tags); i++) {
+		unsigned int vstart, vend, j;
+
+		if (!off[i])
+			continue;
+		vstart = off[i] + 4;
+		vend = len;
+		/* Value runs to the next tag that was found after this one. */
+		for (j = 0; j < ARRAY_SIZE(tags); j++)
+			if (off[j] > off[i] && off[j] < vend)
+				vend = off[j];
+		if (vend <= vstart)
+			continue;
+
+		if (!strcmp(tags[i], "SrNm"))
+			whimory_syscfg_str(w->syscfg.serial,
+					   sizeof(w->syscfg.serial),
+					   p + vstart, vend - vstart);
+		else if (!strcmp(tags[i], "Mod#"))
+			whimory_syscfg_str(w->syscfg.model,
+					   sizeof(w->syscfg.model),
+					   p + vstart, vend - vstart);
+		else if (!strcmp(tags[i], "MLB#"))
+			whimory_syscfg_str(w->syscfg.mlb,
+					   sizeof(w->syscfg.mlb),
+					   p + vstart, vend - vstart);
+		else if (!strcmp(tags[i], "SwVr"))
+			whimory_syscfg_str(w->syscfg.sw_ver,
+					   sizeof(w->syscfg.sw_ver),
+					   p + vstart, vend - vstart);
+		else if (!strcmp(tags[i], "CNTB"))
+			whimory_syscfg_str(w->syscfg.cnt_b,
+					   sizeof(w->syscfg.cnt_b),
+					   p + vstart, vend - vstart);
+		else if (!strcmp(tags[i], "MtCl"))
+			whimory_syscfg_str(w->syscfg.mt_cl,
+					   sizeof(w->syscfg.mt_cl),
+					   p + vstart, vend - vstart);
+		else if (!strcmp(tags[i], "BMac") && vend - vstart >= 6) {
+			memcpy(w->syscfg.mac, p + vstart, 6);
+			w->syscfg.mac_ok = true;
+		} else if (!strcmp(tags[i], "Regn") && vend - vstart >= 4)
+			w->syscfg.region = get_unaligned_le32(p + vstart);
+		else if (!strcmp(tags[i], "HwVr") && vend - vstart >= 8)
+			w->syscfg.hw_ver = get_unaligned_le32(p + vstart + 4);
+		else if (!strcmp(tags[i], "FwId") && vend - vstart >= 8)
+			w->syscfg.fw_id = get_unaligned_le32(p + vstart + 4);
+	}
+
+	/*
+	 * Touch calibration: the panel calibration block, kept for apple-grape.
+	 *
+	 * The SysCfg object carries a second region past the identity records,
+	 * at 0x1dc0 into the payload. It is not identity and it is not map
+	 * data: tags NI and MB, then per-node byte tables and 16-bit pairs.
+	 * That is panel calibration, and it belongs to the touch controller
+	 * rather than to storage -- but this is the only place it exists, so
+	 * the FTL is where it has to be read from.
+	 *
+	 * Copied verbatim rather than interpreted. The layout is the touch
+	 * driver problem, and guessing at it here would only add a second
+	 * opinion about bytes this code has no stake in.
+	 */
+	/*
+	 * Look for a real touch calibration container anywhere in the page.
+	 *
+	 * apple-grape wants the blob whose magic word is 0x53797349, and
+	 * takes its calibration from decimal +350 for 0x200 bytes,
+	 * byte-swapped per u32 -- so the container has to be at least 862
+	 * bytes long. The region this driver has been exposing as touch_cal
+	 * lives at a fixed offset and carries no such magic, so it is some
+	 * other SysCfg record and cannot be what the touch controller is
+	 * asking for. Scan for the magic rather than trusting the offset,
+	 * and report what is actually there.
+	 */
+	w->syscfg.touch_cal_magic_off = -1;
+	for (i = 0; i + 4 <= len; i += 4) {
+		if (get_unaligned_le32(p + i) == 0x53797349u) {
+			w->syscfg.touch_cal_magic_off = (int)i;
+			dev_info(w->dev,
+				 "SysCfg touch calibration magic at +0x%x (%u bytes to end of page)\n",
+				 i, len - i);
+			break;
+		}
+	}
+	if (w->syscfg.touch_cal_magic_off < 0)
+		dev_info(w->dev,
+			 "SysCfg has no touch calibration magic; touch_cal region is a different record\n");
+
+	/*
+	 * Copy the container the scan actually found, whole.
+	 *
+	 * Stock copies 0x560 bytes from the calibration descriptor and apple-grape
+	 * reads its calibration at +350 for 0x200, so the consumer needs
+	 * 862 bytes measured from the magic. Two things here used to make
+	 * that impossible:
+	 *
+	 *   - the copy came from N31_TOUCH_CAL_OFF, a fixed offset that the scan
+	 *     above reports carries no touch calibration magic, so it was some other
+	 *     SysCfg record entirely;
+	 *   - the length was trimmed back to the last byte that was neither
+	 *     0x00 nor 0xff, which silently shortens any blob whose tail is
+	 *     padding -- and calibration data ending in zeros is ordinary.
+	 *
+	 * So: take it from the magic when the magic is present, keep the
+	 * full length, and say so when the page cannot supply all of it.
+	 * N31_TOUCH_CAL_OFF remains only as the fallback for a page with no
+	 * magic at all, where there is nothing better to point at.
+	 */
+	if (w->syscfg.touch_cal_magic_off >= 0) {
+		unsigned int off = (unsigned int)w->syscfg.touch_cal_magic_off;
+		unsigned int n = min_t(unsigned int, len - off,
+				       (unsigned int)sizeof(w->syscfg.touch_cal));
+
+		memcpy(w->syscfg.touch_cal, p + off, n);
+		w->syscfg.touch_cal_len = n;
+		if (n < N31_TOUCH_CAL_LEN)
+			dev_warn(w->dev,
+				 "SysCfg touch calibration truncated: %u of %u bytes (page ends %u after the magic)\n",
+				 n, N31_TOUCH_CAL_LEN, len - off);
+		if (n < N31_TOUCH_CAL_CAL_OFF + N31_TOUCH_CAL_CAL_LEN)
+			dev_warn(w->dev,
+				 "SysCfg touch calibration too short for the touch calibration window (need %u, have %u)\n",
+				 N31_TOUCH_CAL_CAL_OFF + N31_TOUCH_CAL_CAL_LEN, n);
+	} else {
+		/*
+		 * No magic: this page does not carry the blob, so do not
+		 * present anything as if it did.
+		 *
+		 * The authoritative copy comes from the A34 handoff, which
+		 * U-Boot republishes in reserved DRAM and advertises as
+		 * /chosen apple,n31-touch_cal-addr and apple,n31-touch_cal-size --
+		 * measured on this device as 0x560 bytes, the same length
+		 * stock copies and the same length apple-grape demands
+		 * exactly. Handing a consumer 1376 bytes of some other
+		 * SysCfg record would satisfy that length check with the
+		 * wrong data, which is worse than returning nothing.
+		 */
+		w->syscfg.touch_cal_len = 0;
+		dev_info(w->dev,
+			 "SysCfg carries no touch calibration blob; the touch calibration source is the U-Boot region (/chosen apple,n31-touch_cal-*)\n");
+	}
+	w->syscfg.valid = true;
+	dev_info(w->dev,
+		 "SysCfg %u entries: serial=%s model=%s sw=%s\n",
+		 w->syscfg.entries, w->syscfg.serial, w->syscfg.model,
+		 w->syscfg.sw_ver);
+	dev_info(w->dev, "SysCfg touch calibration: %u bytes\n",
+		 w->syscfg.touch_cal_len);
+}
+
+/*
+ * Hand the raw touch calibration block to whoever owns the panel. Returns its length,
+ * or 0 when the SysCfg object has not been read.
+ */
+size_t whimory_syscfg_touch_cal(const u8 **out)
+{
+	struct whimory *w = whimory_dev;
+
+	if (!w || !w->syscfg.valid || !w->syscfg.touch_cal_len)
+		return 0;
+	if (out)
+		*out = w->syscfg.touch_cal;
+	return w->syscfg.touch_cal_len;
+}
+EXPORT_SYMBOL_GPL(whimory_syscfg_touch_cal);
+
+int whimory_touch_cal_show(char *buf, size_t len)
+{
+	const u8 *d = NULL;
+	size_t n = whimory_syscfg_touch_cal(&d);
+	int o = 0;
+	size_t i;
+
+	if (!n)
+		return scnprintf(buf, len, "no touch_cal block\n");
+	for (i = 0; i < n && o < (int)len - 80; i += 16)
+		o += scnprintf(buf + o, len - o, "%04zx: %*ph\n",
+				       i, (int)min_t(size_t, 16, n - i), d + i);
+	return o;
+}
+EXPORT_SYMBOL_GPL(whimory_touch_cal_show);
+
+int whimory_syscfg_show(char *buf, size_t len)
+{
+	struct whimory *w = whimory_dev;
+	int n = 0;
+
+	if (!w || !w->syscfg.valid)
+		return scnprintf(buf, len, "syscfg not read\n");
+	n += scnprintf(buf + n, len - n, "entries=%u\n", w->syscfg.entries);
+	n += scnprintf(buf + n, len - n, "serial=%s\n", w->syscfg.serial);
+	n += scnprintf(buf + n, len - n, "model=%s\n", w->syscfg.model);
+	n += scnprintf(buf + n, len - n, "mlb=%s\n", w->syscfg.mlb);
+	n += scnprintf(buf + n, len - n, "sw_version=%s\n", w->syscfg.sw_ver);
+	n += scnprintf(buf + n, len - n, "cntb=%s\n", w->syscfg.cnt_b);
+	n += scnprintf(buf + n, len - n, "mtcl=%s\n", w->syscfg.mt_cl);
+	if (w->syscfg.mac_ok)
+		n += scnprintf(buf + n, len - n, "bt_mac=%pM\n",
+				       w->syscfg.mac);
+	n += scnprintf(buf + n, len - n, "region=0x%08x\n", w->syscfg.region);
+	n += scnprintf(buf + n, len - n, "hw_version=0x%08x\n", w->syscfg.hw_ver);
+	n += scnprintf(buf + n, len - n, "fw_id=0x%08x\n", w->syscfg.fw_id);
+	return n;
+}
+EXPORT_SYMBOL_GPL(whimory_syscfg_show);
+
+int whimory_fpart_objects_show(char *buf, size_t len)
+{
+	struct whimory *w = whimory_dev;
+	int n = 0;
+	u16 i;
+
+	if (!w)
+		return scnprintf(buf, len, "no device\n");
+	n += scnprintf(buf + n, len - n,
+			  "# type_word bank ce cau block  what\n");
+	for (i = 0; i < w->fpart_ctx.count && n < (int)len - 96; i++) {
+		struct fpart_special_entry *e = &w->fpart_ctx.table[i];
+		unsigned int ce, cau;
+		const char *what;
+
+		fpart_bank_to_ce_cau(w, e->bank, &ce, &cau);
+		switch (e->type_word) {
+		case FPART_TYPE_SIGNATURE:
+			what = "signature";
+			break;
+		case FPART_TYPE_VFL_CXT:
+			what = "block status bitmap";
+			break;
+		case FPART_TYPE_CONFIG:
+			what = "SysCfg device identity";
+			break;
+		default:
+			what = "unknown";
+			break;
+		}
+		n += scnprintf(buf + n, len - n,
+				       "%u 0x%04x %u %u %u %u  %s\n",
+				       i, e->type_word, e->bank, ce, cau,
+				       e->block, what);
+	}
+	return n;
+}
+EXPORT_SYMBOL_GPL(whimory_fpart_objects_show);
+
+/*
+ * Log only the parts of an object that carry something.
+ *
+ * These objects are a few hundred bytes of content in a 4 KiB page, and
+ * dumping all of it buries the interesting part. This walks the page in
+ * 16-byte rows and prints a row only when it is neither all zero nor all
+ * 0xff, which is what fill looks like here.
+ */
+static void whimory_dump_sparse(struct whimory *w, const char *tag,
+				const u8 *p, unsigned int len)
+{
+	unsigned int o, shown = 0;
+
+	if (!fpart_dump)
+		return;
+
+	for (o = 0; o + 16 <= len && shown < 40; o += 16) {
+		unsigned int i;
+		bool zero = true, ones = true;
+
+		for (i = 0; i < 16; i++) {
+			if (p[o + i] != 0x00)
+				zero = false;
+			if (p[o + i] != 0xff)
+				ones = false;
+		}
+		if (zero || ones)
+			continue;
+		shown++;
+		dev_info(w->dev, "%s +%04x: %16ph\n", tag, o, p + o);
+	}
+	dev_info(w->dev, "%s: %u non-fill rows in %u bytes\n",
+		 tag, shown, len);
+}
+
 static int n31_vfl_ingest_ctx(struct whimory *w, unsigned int ce,
 			      unsigned int cau, unsigned int block,
 			      const u8 *page, unsigned int page_len,
 			      const u8 *meta)
 {
-	unsigned int i, loc = 0;
-	const u8 *tab;
-	bool magic_ok, type_ok;
+	unsigned int nbytes, nblk, i, bad = 0;
+	const u8 *payload;
+	u16 type_word;
 
-	if (!page || page_len < 0x200)
-		return 0;
-	magic_ok = (page[0] == 'w' && page[1] == 'r' && page[2] == 'm' &&
-		    page[3] == 'x') ||
-		   (page[0] == 'x' && page[1] == 'r' && page[2] == 'm' &&
-		    page[3] == 'w') ||
-		   (page[FPART_SPECIAL_HDR] == 'w' &&
-		    page[FPART_SPECIAL_HDR + 1] == 'r' &&
-		    page[FPART_SPECIAL_HDR + 2] == 'm' &&
-		    page[FPART_SPECIAL_HDR + 3] == 'x') ||
-		   (page[FPART_SPECIAL_HDR] == 'x' &&
-		    page[FPART_SPECIAL_HDR + 1] == 'r' &&
-		    page[FPART_SPECIAL_HDR + 2] == 'm' &&
-		    page[FPART_SPECIAL_HDR + 3] == 'w');
-	type_ok = meta && meta[0] == WHIMORY_META_TYPE_VFL_CXT;
-	if (!magic_ok && !type_ok)
+	if (!page || !meta)
 		return 0;
 	if (cau >= w->geom.num_cau || !w->vfl.remap[cau])
 		return 0;
-	w->vfl.ctx_ce[cau] = ce;
-	w->vfl.ctx_block[cau] = block;
+	if (meta[0] != FPART_META_TYPE_SPECIAL)
+		return 0;
 
-	/*
-	 * Copy locations live at +0x100, one 4-byte record each:
-	 * {le16 phys_block, u8 bank, u8 flags}. These point at the VFL
-	 * context copies in the block tail; they are not a user
-	 * virtual-to-physical table. On the glass the first record is
-	 * usually 0x827 (block 2087).
-	 */
-	tab = page + 0x100;
-	for (i = 0; i < 64 && 0x100 + 4 * (i + 1) <= 0x200; i++) {
-		u16 blk = get_unaligned_le16(tab + i * 4);
-		u8 bank = tab[i * 4 + 2];
-
-		if (!blk)
-			break;
-		if (blk < w->geom.blocks_per_cau && bank < w->geom.num_cau)
-			loc++;
+	type_word = get_unaligned_le16(meta + 2);
+	if (type_word == FPART_TYPE_CONFIG && !w->syscfg.valid) {
+		whimory_syscfg_parse(w, page + FPART_SPECIAL_HDR,
+				     page_len - FPART_SPECIAL_HDR);
+		whimory_dump_sparse(w, "C105", page, page_len);
 	}
-	w->vfl.cxt_loc_count += loc;
+	if (type_word == FPART_TYPE_VFL_CXT && !w->vfl.bitmap_loaded)
+		whimory_dump_sparse(w, "C104", page, page_len);
+	if (type_word != FPART_TYPE_VFL_CXT)
+		return 0;
 
-	/* Per-bank u16 context copy journal at +0x200 + 32 * bank. */
-	if (page_len >= WHIMORY_VFL_CXT_HDR +
-	    WHIMORY_VFL_SPARE_STRIDE * w->geom.num_cau + 2) {
-		unsigned int b, j, n16 = w->vfl.cxt_u16_len;
+	nblk = w->geom.blocks_per_cau;
+	nbytes = DIV_ROUND_UP(nblk, 8);
+	if (!nblk || page_len < FPART_SPECIAL_HDR + nbytes)
+		return 0;
+	payload = page + FPART_SPECIAL_HDR;
 
-		for (b = 0; b < w->geom.num_cau; b++) {
-			if (!w->vfl.cxt_u16[b])
-				continue;
-			for (j = 0; j < n16; j++) {
-				const u8 *src = page + WHIMORY_VFL_CXT_HDR +
-						WHIMORY_VFL_SPARE_STRIDE * b +
-						2 * j;
-				u16 v;
-
-				if (src + 2 > page + page_len)
-					break;
-				v = get_unaligned_le16(src);
-				w->vfl.cxt_u16[b][j] = v;
-				if (v != 0xffff && v != WHIMORY_VFL_SPARE_FREE)
-					w->vfl.spare_applied++;
-			}
-		}
+	if (!w->vfl.blk_status) {
+		w->vfl.blk_status = kvmalloc(nbytes, GFP_KERNEL);
+		if (!w->vfl.blk_status)
+			return 0;
+		memset(w->vfl.blk_status, 0xff, nbytes);
 	}
 
+	for (i = 0; i < nblk; i++)
+		if (!(payload[i >> 3] & (1u << (i & 7))))
+			bad++;
+
 	/*
-	 *bitmap: one byte per VBN (stride 0x8D0D0F0 = 1 on N31),
-	 * bit = bank. Not in the 0x200 header / spare journal. Try the
-	 * remainder of this CXT page; reject if any byte has bits outside
-	 * num_cau (would be unrelated payload).
+	 * A table claiming most of the device is unusable is not a table
+	 * we found, it is bytes that happened to sit at this offset.
 	 */
-	{
-		unsigned int off = WHIMORY_VFL_CXT_HDR +
-				   WHIMORY_VFL_SPARE_STRIDE * w->geom.num_cau;
-		u8 def = (1u << min_t(u32, w->geom.num_cau, 8)) - 1;
-		unsigned int i, nblk = w->geom.blocks_per_cau;
-
-		if (w->vfl.bank_mask && page_len >= off + nblk && nblk) {
-			const u8 *src = page + off;
-			bool ok = true;
-
-			for (i = 0; i < nblk; i++) {
-				if (src[i] & ~def) {
-					ok = false;
-					break;
-				}
-			}
-			if (ok) {
-				memcpy(w->vfl.bank_mask, src, nblk);
-				w->vfl.bitmap_loaded = 1;
-				w->vfl.cached_vbn = 0xffff;
-			}
-		}
+	if (bad > nblk / 4) {
+		dev_warn(w->dev,
+			 "VFL ctx blk=%u type=0x%04x rejected: %u of %u blocks marked bad\n",
+			 block, type_word, bad, nblk);
+		return 0;
 	}
 
-	/*
-	 * User VBN→PBN is identity over blocks_per_cau :
-	 * vbn < mcxt.dev.blocks_per_cau). Failed-block replacement lives
-	 * in the u16 tables, not in a 256-entry slice of +0x100.
-	 */
-	w->vfl.remap_count = w->geom.blocks_per_cau;
-	dev_info(w->dev,
-		 "VFL ingest ce=%u cau=%u blk=%u magic=%d type20=%d cxt_loc=%u identity=%u\n",
-		 ce, cau, block, magic_ok, type_ok, loc,
-		 w->geom.blocks_per_cau);
-	return loc || type_ok || magic_ok;
+	if (!w->vfl.bitmap_loaded) {
+		memcpy(w->vfl.blk_status, payload, nbytes);
+		w->vfl.blk_status_bad = bad;
+		w->vfl.blk_status_bank = ce * (w->geom.num_cau ? w->geom.num_cau : 1) + cau;
+		w->vfl.blk_status_block = block;
+		w->vfl.bitmap_loaded = 1;
+		w->vfl.ctx_ce[cau] = ce;
+		w->vfl.ctx_block[cau] = block;
+		dev_info(w->dev,
+			 "VFL ctx ce=%u cau=%u blk=%u type=0x%04x accepted: %u/%u blocks bad\n",
+			 ce, cau, block, type_word, bad, nblk);
+	} else if (memcmp(w->vfl.blk_status, payload, nbytes)) {
+		/* Mirrors should agree. Say so if they do not; keep the first. */
+		w->vfl.blk_status_mismatch++;
+		dev_warn(w->dev,
+			 "VFL ctx mirror ce=%u cau=%u blk=%u disagrees with blk=%u (kept)\n",
+			 ce, cau, block, w->vfl.blk_status_block);
+	}
+
+	/* VBN->PBN is identity here; replacement lives in the u16 tables. */
+	w->vfl.remap_count = nblk;
+	return 1;
 }
 
 static int n31_vfl_open(struct whimory *w)
 {
+	struct s5l8740_cs_page *csp;
 	u8 *page;
 	u8 meta[S5L8740_NAND_META_SIZE];
-	unsigned int ce, cau, b, start, pg, slc;
+	unsigned int ce, cau, b, start, pg, ncau;
 	int hits = 0;
+	int sess;
 
 	page = kvmalloc(S5L8740_NAND_PAGE_SIZE, GFP_KERNEL);
 	if (!page)
 		return -ENOMEM;
+	csp = kvmalloc(sizeof(*csp), GFP_KERNEL);
+	if (!csp) {
+		kvfree(page);
+		return -ENOMEM;
+	}
+	ncau = w->geom.num_cau ? w->geom.num_cau : 1;
 	start = w->geom.blocks_per_cau - w->geom.vfl_tail;
+
+	/*
+	 * Arm live CS for the sweep, the same way FPART_SCAN does.
+	 *
+	 * cs_phys_read_slc() needs the DMA session; without one it returns
+	 * -ENODEV before issuing anything, so the whole scan completed in
+	 * about sixty milliseconds and reported ctx_hits=0 -- the same
+	 * instant-failure profile the meta refusal used to produce, for a
+	 * different reason.
+	 *
+	 * Sessions nest and begin() always succeeds, so this owns exactly
+	 * its own end; an outer session keeps CS armed past it.
+	 */
+	sess = s5l8740_nand_dma_session_begin();
+	if (sess && sess != -EBUSY) {
+		dev_warn(w->dev, "VFL_Open no DMA session (%d)\n", sess);
+		kvfree(csp);
+		kvfree(page);
+		return sess;
+	}
 	s5l8740_nand_reset();
 	for (ce = 0; ce < w->geom.num_ce; ce++) {
 		for (cau = 0; cau < w->geom.num_cau; cau++) {
 			for (b = start; b < w->geom.blocks_per_cau; b++) {
 				for (pg = 0; pg < 8; pg++) {
-					int got = -EIO;
+					int got;
 
 					cond_resched();
-					for (slc = 0; slc < 2; slc++) {
-						got = s5l8740_nand_page_read(ce,
-							cau, b, pg, slc, 16,
-							page,
-							S5L8740_NAND_PAGE_SIZE,
-							meta, sizeof(meta));
-						if (!got)
-							break;
-					}
+					/*
+					 * fpart_fil_read_page(), not
+					 * s5l8740_nand_page_read(). This scan has never
+					 * read a page in its life: page_read refuses any
+					 * request carrying meta unless meta_dma_read is
+					 * set, and that is deliberately off because a
+					 * permanent live CS kick reboots the device. So
+					 * every one of these 512 reads returned
+					 * -EOPNOTSUPP before touching the NAND, and
+					 * VFL_Open reported ctx_hits=0 about a region
+					 * nobody had actually looked at.
+					 *
+					 * That is word for word the bug already found and
+					 * fixed on the FPart side -- see the comment above
+					 * s5l8740_nand_cs_phys_read_slc(). It was never
+					 * applied here, so the VFL context scan kept
+					 * failing silently and recovery kept falling back
+					 * to scanning the whole device.
+					 *
+					 * The shared helper also gets the plane right: the
+					 * tail of each CAU is SLC, so it tries slc=1
+					 * before slc=0. Reading it as MLC is what returns
+					 * a page of zeros that looks like a successful
+					 * read of an empty block.
+					 */
+					got = fpart_fil_read_page(w, (u16)(ce * ncau + cau),
+								  b, pg, csp, page, meta);
 					if (got)
 						continue;
 					if (n31_vfl_ingest_ctx(w, ce, cau, b,
@@ -3375,13 +4356,17 @@ static int n31_vfl_open(struct whimory *w)
 			}
 		}
 	}
+	if (sess == 0)
+		s5l8740_nand_dma_session_end();
+	kvfree(csp);
 	kvfree(page);
 	w->vfl.ctx_hits = hits;
 	w->vfl_ok = true;
 	dev_info(w->dev,
-		 "VFL_Open OK ctx_hits=%u remap_ents=%u cxt_loc=%u bitmap=%u spare=%u\n",
-		 hits, w->vfl.remap_count, w->vfl.cxt_loc_count,
-		 w->vfl.bitmap_loaded, w->vfl.spare_applied);
+		 "VFL_Open OK ctx_hits=%u remap_ents=%u bitmap=%u bad_blocks=%u src_bank=%u mirror_diff=%u\n",
+		 hits, w->vfl.remap_count, w->vfl.bitmap_loaded,
+		 w->vfl.blk_status_bad, w->vfl.blk_status_bank,
+		 w->vfl.blk_status_mismatch);
 	return 0;
 }
 
@@ -3393,6 +4378,166 @@ static u32 n31_vfl_get_param(struct whimory *w, u32 selector)
 	default:
 		return 0;
 	}
+}
+
+
+/*
+ * Read-ahead window, filled along the VBA axis.
+ *
+ * The first version of this prefetched consecutive physical pages of one
+ * block and made sequential reads four times SLOWER (1.6 MB/s against 6.7).
+ * Measured on the device, the FTL stripes consecutive LBAs across every
+ * (ce, cau) before advancing the page:
+ *
+ *   lba+0..3   ce0/cau1 pg36 slot0..3
+ *   lba+4..7   ce1/cau0 pg36 slot0..3
+ *   lba+8..11  ce1/cau1 pg36 slot0..3
+ *   lba+12..15 ce0/cau0 pg37 slot0..3
+ *
+ * so page+1 of one chip is 16 LBAs away, and a window of 8 consecutive
+ * pages held nothing the reader wanted next while costing eight pages of
+ * NAND to fill. Hence this version does not guess the stripe at all: it
+ * walks the VBAs the caller is about to ask for, unpacks each to its
+ * physical page, and fetches the distinct pages that fall out. That stays
+ * correct whatever the stripe turns out to be.
+ *
+ * Pages are grouped by CE because a command list is single-CE, so a lookahead
+ * spanning both chips costs one kick each rather than one in total.
+ */
+static int whimory_window_find(struct whimory_sftl *s, unsigned int ce,
+			       unsigned int cau, unsigned int pblock,
+			       unsigned int page)
+{
+	unsigned int i;
+
+	for (i = 0; i < s->rc_count; i++) {
+		if (s->rc_key[i].valid && s->rc_key[i].ce == ce &&
+		    s->rc_key[i].cau == cau &&
+		    s->rc_key[i].pblock == pblock &&
+		    s->rc_key[i].page == page)
+			return (int)i;
+	}
+	return -1;
+}
+
+static void whimory_window_fill(struct whimory *w, u32 vba)
+{
+	struct whimory_sftl *s = &w->sftl;
+	struct s5l8740_ppn_ref refs[WHIMORY_RC_SLOTS];
+	unsigned int ref_ce[WHIMORY_RC_SLOTS];
+	unsigned int want = read_prefetch_pages;
+	unsigned int i, n = 0, ce_i, base;
+
+	if (want > WHIMORY_RC_SLOTS)
+		want = WHIMORY_RC_SLOTS;
+
+	s->rc_count = 0;
+	for (i = 0; i < read_prefetch_vbas && n < want; i++) {
+		u32 ce, cau, vblock, page, slot, pblock;
+		unsigned int j;
+		bool dup = false;
+
+		if (whimory_unpack_vba(w, vba + i, &ce, &cau, &vblock, &page,
+				       &slot))
+			break;
+		if (page >= s->pages_per_sb || slot >= s->vbas_per_page)
+			break;
+		whimory_vfl_resolve(w, vblock, &cau, &pblock);
+		for (j = 0; j < n; j++) {
+			if (ref_ce[j] == ce && refs[j].cau == cau &&
+			    refs[j].block == pblock && refs[j].page == page) {
+				dup = true;
+				break;
+			}
+		}
+		if (dup)
+			continue;
+		ref_ce[n] = ce;
+		refs[n].cau = (u8)cau;
+		refs[n].block = (u16)pblock;
+		refs[n].page = (u8)page;
+		n++;
+	}
+	if (!n)
+		return;
+
+	/*
+	 * One kick per CE. Entries are emitted in the order they were
+	 * discovered so slot indices stay aligned with rc_key.
+	 */
+	base = 0;
+	for (ce_i = 0; ce_i < WHIMORY_NUM_CE_MAX; ce_i++) {
+		struct s5l8740_ppn_ref grp[WHIMORY_RC_SLOTS];
+		unsigned int map[WHIMORY_RC_SLOTS];
+		unsigned int g = 0;
+
+		for (i = 0; i < n; i++) {
+			if (ref_ce[i] != ce_i)
+				continue;
+			map[g] = i;
+			grp[g++] = refs[i];
+		}
+		if (!g)
+			continue;
+		rc_pages += g;
+		if (s5l8740_nand_cs_read_pages_batch((u8)ce_i, grp, g,
+						     s->rc_stage,
+						     s->rc_stage_meta)) {
+			rc_fails++;
+			continue;
+		}
+		for (i = 0; i < g; i++) {
+			unsigned int dst = base + i;
+
+			if (dst >= WHIMORY_RC_SLOTS)
+				break;
+			memcpy(s->rc_data + (size_t)dst * S5L8740_NAND_PAGE_SIZE,
+			       s->rc_stage + (size_t)i * S5L8740_NAND_PAGE_SIZE,
+			       S5L8740_NAND_PAGE_SIZE);
+			memcpy(s->rc_meta + (size_t)dst * S5L8740_NAND_META_SIZE,
+			       s->rc_stage_meta + (size_t)i * S5L8740_NAND_META_SIZE,
+			       S5L8740_NAND_META_SIZE);
+			s->rc_key[dst].ce = ref_ce[map[i]];
+			s->rc_key[dst].cau = refs[map[i]].cau;
+			s->rc_key[dst].pblock = refs[map[i]].block;
+			s->rc_key[dst].page = refs[map[i]].page;
+			s->rc_key[dst].valid = true;
+		}
+		base += g;
+		if (base > WHIMORY_RC_SLOTS)
+			base = WHIMORY_RC_SLOTS;
+		s->rc_count = base;
+		rc_fills++;
+	}
+}
+
+static int whimory_window_read(struct whimory *w, u32 vba, unsigned int ce,
+			       unsigned int cau, unsigned int pblock,
+			       unsigned int page, u8 *pagebuf, u8 *spare,
+			       size_t spare_len)
+{
+	struct whimory_sftl *s = &w->sftl;
+	int idx;
+
+	if (!read_prefetch_pages || !s->rc_data || !s->rc_meta || !s->rc_stage)
+		return -ENODEV;
+
+	idx = whimory_window_find(s, ce, cau, pblock, page);
+	if (idx < 0) {
+		whimory_window_fill(w, vba);
+		idx = whimory_window_find(s, ce, cau, pblock, page);
+		rc_misses++;
+		if (idx < 0)
+			return -ENOENT;
+	} else {
+		rc_hits++;
+	}
+
+	memcpy(pagebuf, s->rc_data + (size_t)idx * S5L8740_NAND_PAGE_SIZE,
+	       S5L8740_NAND_PAGE_SIZE);
+	memcpy(spare, s->rc_meta + (size_t)idx * S5L8740_NAND_META_SIZE,
+	       min_t(size_t, spare_len, S5L8740_NAND_META_SIZE));
+	return 0;
 }
 
 static int n31_vfl_read_vba(struct whimory *w, u32 vba, u32 count,
@@ -3420,16 +4565,56 @@ static int n31_vfl_read_vba(struct whimory *w, u32 vba, u32 count,
 		if (page >= w->sftl.pages_per_sb ||
 		    slot >= w->sftl.vbas_per_page)
 			return -ERANGE;
-		cau = whimory_vfl_bank(w, cau, vblock);
-		pblock = whimory_vfl_phys(w, cau, vblock);
+		whimory_vfl_resolve(w, vblock, &cau, &pblock);
 		if (ce != last_ce || cau != last_cau || pblock != last_pblock ||
 		    page != last_page) {
-			ret = whimory_cs_read_page(w, ce, cau, pblock, page,
-						   pagebuf,
-						   S5L8740_NAND_PAGE_SIZE,
-						   spare, sizeof(spare));
-			if (ret)
-				return ret;
+			/*
+			 * Cross-call page cache. The loop below already avoids
+			 * re-reading a page within one call, but the block
+			 * layer calls this with count == 1 for every 4 KiB, so
+			 * that only ever helped the recovery scans. Four LBAs
+			 * share a page, so a sequential read was fetching each
+			 * page four times.
+			 */
+			if (!whimory_window_read(w, vba + i, ce, cau, pblock,
+						 page, pagebuf, spare,
+						 sizeof(spare))) {
+				/* Served from the read-ahead window. */
+			} else if (w->sftl.page_cache &&
+				   w->sftl.page_cache_valid &&
+			    ce == w->sftl.pc_ce && cau == w->sftl.pc_cau &&
+			    pblock == w->sftl.pc_pblock &&
+			    page == w->sftl.pc_page) {
+				memcpy(pagebuf, w->sftl.page_cache,
+				       S5L8740_NAND_PAGE_SIZE);
+				memcpy(spare, w->sftl.page_cache_spare,
+				       sizeof(spare));
+			} else {
+				ret = whimory_cs_read_page(w, ce, cau, pblock,
+							   page, pagebuf,
+							   S5L8740_NAND_PAGE_SIZE,
+							   spare, sizeof(spare));
+				if (ret) {
+					/*
+					 * Do not leave a stale key pointing at
+					 * a buffer this read may have already
+					 * partly overwritten.
+					 */
+					w->sftl.page_cache_valid = false;
+					return ret;
+				}
+				if (w->sftl.page_cache) {
+					memcpy(w->sftl.page_cache, pagebuf,
+					       S5L8740_NAND_PAGE_SIZE);
+					memcpy(w->sftl.page_cache_spare, spare,
+					       sizeof(spare));
+					w->sftl.pc_ce = ce;
+					w->sftl.pc_cau = cau;
+					w->sftl.pc_pblock = pblock;
+					w->sftl.pc_page = page;
+					w->sftl.page_cache_valid = true;
+				}
+			}
 			last_ce = ce;
 			last_cau = cau;
 			last_pblock = pblock;
@@ -3646,9 +4831,19 @@ static int whimory_l2v_update_from_slot_meta(struct whimory *w,
 		return -ENOMEM;
 	}
 	w->sftl.claim_weave = 0;
-	w->sftl.btoc_meta_confirmed++;
-	w->sftl.btoc_l2v_updates++;
-	w->sftl.btoc_recs++;
+	/*
+	 * Same derivation, two callers. The BTOC walk builds the map from
+	 * scratch; the CXT repair path uses it to rebuild the part of the
+	 * map a stale checkpoint extent had claimed. Counting both as BTOC
+	 * would hide how much of a recovery was repair.
+	 */
+	if (w->sftl.claim_source == 3) {
+		w->sftl.cxt_repair_slots++;
+	} else {
+		w->sftl.btoc_meta_confirmed++;
+		w->sftl.btoc_l2v_updates++;
+		w->sftl.btoc_recs++;
+	}
 	return 1;
 }
 
@@ -3660,7 +4855,7 @@ static int whimory_btoc_confirm_page(struct whimory *w, unsigned int ce,
 	u8 spare[S5L8740_NAND_META_SIZE];
 	u8 *data = w->sftl.data_page;
 	unsigned int slot;
-	u32 pblock;
+	u32 pblock, rcau = cau;
 	int ret, hits = 0;
 
 	if (!btoc_meta_confirm)
@@ -3678,8 +4873,14 @@ static int whimory_btoc_confirm_page(struct whimory *w, unsigned int ce,
 	}
 	if (!data)
 		return -ENOMEM;
-	pblock = whimory_vfl_phys(w, cau, vblock);
-	ret = whimory_cs_read_page(w, ce, cau, pblock, page, data,
+	/*
+	 * Both steps. This did only the block translation, with the CAU the
+	 * caller passed in -- so the page confirmed here could come from a
+	 * different plane than the one every later read of the same VBA will
+	 * fetch. Identity today; wrong the moment the bank bitmap is loaded.
+	 */
+	whimory_vfl_resolve(w, vblock, &rcau, &pblock);
+	ret = whimory_cs_read_page(w, ce, rcau, pblock, page, data,
 				   S5L8740_NAND_PAGE_SIZE, spare,
 				   sizeof(spare));
 	if (ret)
@@ -4225,10 +5426,20 @@ static int whimory_rebuild_open_sb(struct whimory *w, struct whimory_sb *sb)
 					 prev ? (unsigned long long)prev->weave :
 						0ull);
 			}
-			if (whimory_l2v_update(w, lba, 1, vba)) {
+			/*
+			 * Propagate the real error. Flattening everything to
+			 * -ENOMEM here told the caller to abort the entire
+			 * recovery -- it treats any negative return that way --
+			 * on the strength of a guess about what went wrong.
+			 */
+			ret = whimory_l2v_update(w, lba, 1, vba);
+			if (ret) {
+				dev_err(w->dev,
+					"open rebuild: L2V update failed lba=%u vba=%u: %d\n",
+					lba, vba, ret);
 				w->sftl.claim_weave = 0;
 				w->sftl.claim_source = 0;
-				return -ENOMEM;
+				return ret;
 			}
 			w->sftl.claim_weave = 0;
 			w->sftl.open_l2v_updates++;
@@ -4298,8 +5509,7 @@ static bool whimory_vba_is_cxt(struct whimory *w, u32 vba)
 
 	if (whimory_unpack_vba(w, vba, &ce, &cau, &vblock, &page, &slot))
 		return false;
-	cau = whimory_vfl_bank(w, cau, vblock);
-	phys = whimory_vfl_phys(w, cau, vblock);
+	whimory_vfl_resolve(w, vblock, &cau, &phys);
 	for (i = 0; i < w->sftl.n_cxt_idx; i++) {
 		struct whimory_cxt_sb_id *c = &w->sftl.cxt_idx[i];
 
@@ -4354,7 +5564,27 @@ static int whimory_cxt_load_contig(struct whimory *w, const u8 *data,
 		if (vba == 0xffffffff || !span)
 			break;
 		w->sftl.cxt_records_seen++;
-		if (vba < w->l2v.invalid_vba && !whimory_vba_is_cxt(w, vba)) {
+		/*
+		 * A record whose vba is at or above invalid_vba is a hole,
+		 * and it has to be applied, not skipped.
+		 *
+		 * s_cxt_load.c inserts on
+		 *
+		 *	if (invalid_vba <= vba || !sbFilter_test(sb))
+		 *
+		 * so a hole is always inserted and everything else is
+		 * inserted unless its superblock is in the checkpoint diff
+		 * filter, which is empty at mount. whimory_l2v_update()
+		 * already reads vba >= invalid_vba as an unmap, so applying
+		 * the record is all that is needed.
+		 *
+		 * Skipping holes leaves whatever previously covered those
+		 * LBAs in the tree. The read then lands on a page belonging
+		 * to a different LBA and the meta check rejects it, which is
+		 * the "sftl lba mismatch want=X meta=Y" failure.
+		 */
+		if (vba >= w->l2v.invalid_vba ||
+		    !whimory_vba_is_cxt(w, vba)) {
 			if (whimory_l2v_update(w, lba, span, vba))
 				return -ENOMEM;
 			w->sftl.cxt_l2v_updates++;
@@ -4410,8 +5640,7 @@ static int whimory_cxt_load_sb(struct whimory *w, u32 sb_idx)
 						 &page, &slot);
 			if (ret)
 				return ret;
-			cau = whimory_vfl_bank(w, cau, vblock);
-			pblock = whimory_vfl_phys(w, cau, vblock);
+			whimory_vfl_resolve(w, vblock, &cau, &pblock);
 			if (ce != last_ce || cau != last_cau ||
 			    pblock != last_pblock || page != last_page) {
 				ret = whimory_cs_read_page(w, ce, cau, pblock,
@@ -4605,8 +5834,7 @@ static int whimory_cxt_read_ofs(struct whimory *w, u32 vblock, u32 ofs,
 	ret = whimory_unpack_vba(w, vba, &ce, &cau, &vb, &page, &slot);
 	if (ret)
 		return ret;
-	cau = whimory_vfl_bank(w, cau, vb);
-	pblock = whimory_vfl_phys(w, cau, vb);
+	whimory_vfl_resolve(w, vb, &cau, &pblock);
 	key = ((ce & 0xf) << 28) | ((cau & 0xf) << 24) |
 	      ((pblock & 0xffff) << 8) | (page & 0xff);
 	if (key != *last_key) {
@@ -4634,8 +5862,7 @@ static int whimory_cxt_read_vba(struct whimory *w, u32 sb_idx, u32 ofs,
 	ret = whimory_unpack_vba(w, vba, &ce, &cau, &vblock, &page, &slot);
 	if (ret)
 		return ret;
-	cau = whimory_vfl_bank(w, cau, vblock);
-	pblock = whimory_vfl_phys(w, cau, vblock);
+	whimory_vfl_resolve(w, vblock, &cau, &pblock);
 	key = ((ce & 0xf) << 28) | ((cau & 0xf) << 24) |
 	      ((pblock & 0xffff) << 8) | (page & 0xff);
 	if (key != *last_key) {
@@ -4856,9 +6083,11 @@ static void whimory_cxt_ext_reset(struct whimory *w)
 	w->n_cxt_ext = 0;
 	w->cxt_ext_weave = 0;
 	w->cxt_ext_sb = 0;
+	w->cxt_ext_max_span = 0;
 }
 
-static int whimory_cxt_ext_add(struct whimory *w, u32 lba, u32 span, u32 vba)
+static int whimory_cxt_ext_add(struct whimory *w, u32 lba, u32 span, u32 vba,
+			       u64 weave)
 {
 	struct whimory_cxt_extent *e;
 
@@ -4868,6 +6097,9 @@ static int whimory_cxt_ext_add(struct whimory *w, u32 lba, u32 span, u32 vba)
 	e->lba = lba;
 	e->span = span;
 	e->vba = vba;
+	e->weave = weave;
+	if (span > w->cxt_ext_max_span)
+		w->cxt_ext_max_span = span;
 	return 0;
 }
 
@@ -4907,7 +6139,7 @@ static void whimory_vba_describe(const struct whimory *w, u32 vba,
  */
 static int whimory_cxt_parse_tree(struct whimory *w, const u8 *data,
 				  unsigned int len, u32 *next_lba,
-				  bool *lba_valid)
+				  bool *lba_valid, u64 sb_weave)
 {
 	u32 lba, span, vba, i, n = len / 8;
 
@@ -4942,11 +6174,29 @@ static int whimory_cxt_parse_tree(struct whimory *w, const u8 *data,
 				 (u32)WHIMORY_CXT_CONTIG_SPAN, data);
 		return -EINVAL;
 	}
+	/*
+	 * A discontinuity used to abort the whole checkpoint, and with it
+	 * every record after this one -- on a superblock whose records run
+	 * into the thousands, and whose tail is where the newest mappings
+	 * live. The reasoning was that the logical cursor places every
+	 * following record, so a broken cursor puts mappings at wrong LBAs.
+	 *
+	 * That is true of the cursor and not of the records. Each record
+	 * carries its own start LBA in its header, which is what the check
+	 * compares against; when the two disagree, believing the header
+	 * re-anchors the cursor and the records after it land correctly.
+	 * Losing the cursor is not the same as losing the records.
+	 *
+	 * Counted, because a checkpoint that resynchronises repeatedly is
+	 * saying something about the decode that a silent recovery would
+	 * hide.
+	 */
 	if (*lba_valid && lba != *next_lba) {
-		dev_warn(w->dev,
-			 "CXT_TREE lba discontinuity want=%u got=%u\n",
-			 *next_lba, lba);
-		return -EINVAL;
+		w->sftl.cxt_resyncs++;
+		if (w->sftl.cxt_resyncs <= 8)
+			dev_warn(w->dev,
+				 "CXT_TREE lba discontinuity want=%u got=%u -- resyncing on the record header\n",
+				 *next_lba, lba);
 	}
 	*lba_valid = true;
 
@@ -5015,7 +6265,8 @@ static int whimory_cxt_parse_tree(struct whimory *w, const u8 *data,
 			u32 tvba;
 			int ret;
 			if (!whimory_cxt_vba_translate(w, vba, &tvba)) {
-				ret = whimory_cxt_ext_add(w, lba, chunk, tvba);
+				ret = whimory_cxt_ext_add(w, lba, chunk, tvba,
+							  sb_weave);
 				if (ret) {
 					/* Loud: a full table is a short map,
 					 * and a short map is lost files.
@@ -5051,7 +6302,8 @@ static int whimory_cxt_parse_tree(struct whimory *w, const u8 *data,
 }
 
 /* Walk the records of one CXT superblock and collect every TREE extent. */
-static int whimory_cxt_build_from_sb(struct whimory *w, u32 sb_idx)
+static int whimory_cxt_build_from_sb(struct whimory *w, u32 sb_idx,
+				     u64 sb_weave)
 {
 	struct whimory_sftl *s = &w->sftl;
 	u8 *data = s->gc_data;
@@ -5112,7 +6364,7 @@ static int whimory_cxt_build_from_sb(struct whimory *w, u32 sb_idx)
 			continue;
 		n_l2v++;
 		ret = whimory_cxt_parse_tree(w, data, WHIMORY_LBA_SIZE,
-					     &next_lba, &lba_valid);
+					     &next_lba, &lba_valid, sb_weave);
 		if (ret) {
 			/*
 			 * Stop this checkpoint, but say what stopping cost.
@@ -5173,21 +6425,51 @@ static int whimory_cxt_build_from_sb(struct whimory *w, u32 sb_idx)
  * Build the candidate map from the newest CXT base that parses cleanly.
  * Never touches w->ranges.
  */
+/*
+ * A total order, deliberately.
+ *
+ * This used to compare lba alone, which left every pair of extents with the
+ * same lba -- and the candidate map is the union of four checkpoint
+ * generations, so there are many -- in whatever order sort() happened to
+ * leave them. sort() is heapsort and is not stable, so that order was an
+ * artefact of the heap rather than of the flash: the same recovery over the
+ * same NAND could seed an LBA from either generation, and the map came out
+ * different on every boot.
+ *
+ * Ordering by weave second makes the newest extent for an lba the last one,
+ * every time. whimory_cxt_seed_l2v() then replays in index order and the
+ * newest legitimately wins, and whimory_cxt_lookup() takes the last match
+ * for the same reason.
+ */
 static int whimory_cxt_ext_cmp(const void *a, const void *b)
 {
 	const struct whimory_cxt_extent *x = a, *y = b;
 
 	if (x->lba != y->lba)
 		return x->lba < y->lba ? -1 : 1;
+	if (x->weave != y->weave)
+		return x->weave < y->weave ? -1 : 1;
+	/*
+	 * Same lba, same generation: order on vba so the result is a function
+	 * of the media and not of the heap. Two extents this alike are a
+	 * malformed checkpoint either way; CXT_VBA_OVERLAP reports them.
+	 */
+	if (x->vba != y->vba)
+		return x->vba < y->vba ? -1 : 1;
 	return 0;
 }
 
+/* Total order, for the same reason whimory_cxt_ext_cmp() is one. */
 static int whimory_cxt_ext_vba_cmp(const void *a, const void *b)
 {
 	const struct whimory_cxt_extent *x = a, *y = b;
 
 	if (x->vba != y->vba)
 		return x->vba < y->vba ? -1 : 1;
+	if (x->weave != y->weave)
+		return x->weave < y->weave ? -1 : 1;
+	if (x->lba != y->lba)
+		return x->lba < y->lba ? -1 : 1;
 	return 0;
 }
 
@@ -5202,14 +6484,17 @@ static int whimory_cxt_ext_vba_cmp(const void *a, const void *b)
  * looked for it -- overlaps=0 was measuring the other axis and reading as
  * "no collisions".
  *
- * If a VBA is claimed twice, the map keeps whichever extent the LBA sort
- * happened to place last, not whichever the FTL wrote last. There is no
- * weave arbitration in the seed, so the wrong one can win.
+ * The seed arbitrates on weave now, so a VBA claimed by two generations
+ * resolves the way the FTL wrote it: the newer extent wins. What ordering
+ * cannot fix is two extents at the SAME weave claiming overlapping VBAs --
+ * one checkpoint cannot have put two logical ranges in one physical place,
+ * so that is a decode fault. The two are counted apart, because lumping
+ * them together is what made a healthy map look damaged.
  */
 static void whimory_cxt_check_vba_overlaps(struct whimory *w)
 {
 	struct whimory_cxt_extent *by_vba;
-	unsigned int i, n = w->n_cxt_ext, hits = 0, shown = 0;
+	unsigned int i, n = w->n_cxt_ext, hits = 0, shown = 0, cross_gen = 0;
 	size_t bytes;
 
 	if (n < 2)
@@ -5229,23 +6514,34 @@ static void whimory_cxt_check_vba_overlaps(struct whimory *w)
 
 		if (c->vba >= p->vba + p->span)
 			continue;
+		/*
+		 * Different generations may legitimately describe the same
+		 * physical VBA; the seed resolves that on weave. Only a
+		 * same-generation collision is a fault.
+		 */
+		if (c->weave != p->weave) {
+			cross_gen++;
+			continue;
+		}
 		hits++;
 		if (shown < 8) {
 			shown++;
 			dev_err(w->dev,
-				"CXT_VBA_OVERLAP lba=%u span=%u vba=%u overlaps lba=%u span=%u vba=%u by %u\n",
+				"CXT_VBA_OVERLAP lba=%u span=%u vba=%u overlaps lba=%u span=%u vba=%u by %u (weave=%llu)\n",
 				c->lba, c->span, c->vba,
 				p->lba, p->span, p->vba,
-				p->vba + p->span - c->vba);
+				p->vba + p->span - c->vba,
+				(unsigned long long)c->weave);
 		}
 	}
 	if (hits)
 		dev_err(w->dev,
-			"CXT_VBA_OVERLAP %u extents claim a VBA another already holds\n",
+			"CXT_VBA_OVERLAP %u extents claim a VBA another at the same weave already holds -- decode fault\n",
 			hits);
 	else
 		dev_info(w->dev,
-			 "CXT_VBA_OVERLAP none -- every extent has its own VBAs\n");
+			 "CXT_VBA_OVERLAP none within a generation (cross_gen=%u, resolved by weave)\n",
+			 cross_gen);
 	kvfree(by_vba);
 }
 
@@ -5261,7 +6557,7 @@ static void whimory_cxt_check_vba_overlaps(struct whimory *w)
 static int whimory_cxt_build_candidate(struct whimory *w)
 {
 	struct whimory_cxt_base all[WHIMORY_CXT_MAX_SB];
-	unsigned int i, n_all, ok = 0, overlaps = 0;
+	unsigned int i, n_all, ok = 0, overlaps = 0, regenerated = 0;
 	int ret, sess;
 
 	/*
@@ -5289,13 +6585,14 @@ static int whimory_cxt_build_candidate(struct whimory *w)
 	w->sftl.cxt_hole_lbas = 0;
 	w->sftl.cxt_ext_nospc = 0;
 	w->sftl.cxt_records_lost = 0;
+	w->sftl.cxt_resyncs = 0;
 	w->sftl.cxt_sb_empty = 0;
 
 	sess = s5l8740_nand_dma_session_begin();
 	for (i = 0; i < n_all; i++) {
 		u32 before = w->n_cxt_ext;
 
-		ret = whimory_cxt_build_from_sb(w, all[i].sb);
+		ret = whimory_cxt_build_from_sb(w, all[i].sb, all[i].weave);
 		if (ret) {
 			dev_warn(w->dev,
 				 "CXT_CAND_MAP sb=%u parse failed %d\n",
@@ -5335,16 +6632,35 @@ static int whimory_cxt_build_candidate(struct whimory *w)
 	sort(w->cxt_ext, w->n_cxt_ext, sizeof(*w->cxt_ext),
 	     whimory_cxt_ext_cmp, NULL);
 	for (i = 1; i < w->n_cxt_ext; i++)
-		if (w->cxt_ext[i].lba <
-		    w->cxt_ext[i - 1].lba + w->cxt_ext[i - 1].span)
+	/*
+	 * Two different things used to be counted as one number.
+	 *
+	 * An extent that starts at the same LBA as the previous one is a
+	 * second checkpoint generation describing the same range; that is
+	 * expected, is now ordered by weave, and the seed resolves it. An
+	 * extent that starts partway into the previous one is a genuine
+	 * partial overlap and is not resolvable by ordering alone. Reporting
+	 * them together made a healthy map look damaged and hid the case
+	 * that matters.
+	 */
+	for (i = 1; i < w->n_cxt_ext; i++) {
+		const struct whimory_cxt_extent *p = &w->cxt_ext[i - 1];
+		const struct whimory_cxt_extent *c = &w->cxt_ext[i];
+
+		if (c->lba >= p->lba + p->span)
+			continue;
+		if (c->lba == p->lba)
+			regenerated++;
+		else
 			overlaps++;
+	}
 
 	dev_info(w->dev,
 		 "CXT_MAP sbs_used=%u/%u extents=%u records=%u holes=%u "
-		 "xlate_fail=%u overlaps=%u base_weave=%llu\n",
+		 "xlate_fail=%u overlaps=%u regenerated=%u base_weave=%llu\n",
 		 ok, n_all, w->n_cxt_ext, w->sftl.cxt_records_seen,
 		 w->sftl.cxt_hole_entries, w->sftl.cxt_xlate_fail, overlaps,
-		 (unsigned long long)w->cxt_ext_weave);
+		 regenerated, (unsigned long long)w->cxt_ext_weave);
 	/*
 	 * The accounting the previous line was missing. hole_lbas is the one
 	 * that settles whether the holes are a fault: this volume maps about
@@ -5354,9 +6670,11 @@ static int whimory_cxt_build_candidate(struct whimory *w)
 	 * not.
 	 */
 	dev_info(w->dev,
-		 "CXT_MAP hole_lbas=%u empty_sbs=%u records_lost=%u nospc=%u\n",
+		 "CXT_MAP hole_lbas=%u empty_sbs=%u records_lost=%u nospc=%u "
+		 "resyncs=%u hdr_bad=%u\n",
 		 w->sftl.cxt_hole_lbas, w->sftl.cxt_sb_empty,
-		 w->sftl.cxt_records_lost, w->sftl.cxt_ext_nospc);
+		 w->sftl.cxt_records_lost, w->sftl.cxt_ext_nospc,
+		 w->sftl.cxt_resyncs, w->sftl.cxt_hdr_bad);
 	whimory_cxt_check_vba_overlaps(w);
 	return 0;
 }
@@ -5450,25 +6768,49 @@ static void whimory_cxt_compare(struct whimory *w)
 	}
 }
 
-/* Resolve an LBA through the candidate map only. */
+/*
+ * Resolve an LBA through the candidate map only.
+ *
+ * The table is sorted (lba, weave) ascending and holds every checkpoint
+ * generation, so several extents can cover one LBA. Answering with the first
+ * one a binary search happens to land on picks a generation at random, which
+ * is the same fault whimory_cxt_ext_cmp() was fixed for. Find the upper
+ * bound on start LBA, then walk back and keep the newest weave among the
+ * extents that actually cover it.
+ *
+ * The walk is bounded: it stops as soon as it is further back than the
+ * longest extent in the table could reach.
+ */
 static int whimory_cxt_lookup(struct whimory *w, u32 lba, u32 *vba_out)
 {
-	u32 lo = 0, hi = w->n_cxt_ext;
+	u32 lo = 0, hi = w->n_cxt_ext, i;
+	u64 best_weave = 0;
+	bool found = false;
 
+	/* First index whose start LBA is strictly greater than lba. */
 	while (lo < hi) {
 		u32 mid = lo + (hi - lo) / 2;
-		struct whimory_cxt_extent *e = &w->cxt_ext[mid];
 
-		if (lba < e->lba)
-			hi = mid;
-		else if (lba >= e->lba + e->span)
+		if (w->cxt_ext[mid].lba <= lba)
 			lo = mid + 1;
-		else {
-			*vba_out = e->vba + (lba - e->lba);
-			return 0;
-		}
+		else
+			hi = mid;
 	}
-	return -ENOENT;
+
+	for (i = lo; i-- > 0; ) {
+		struct whimory_cxt_extent *e = &w->cxt_ext[i];
+
+		if (lba - e->lba >= w->cxt_ext_max_span)
+			break;
+		if (lba >= e->lba + e->span)
+			continue;
+		if (found && e->weave <= best_weave)
+			continue;
+		*vba_out = e->vba + (lba - e->lba);
+		best_weave = e->weave;
+		found = true;
+	}
+	return found ? 0 : -ENOENT;
 }
 
 /*
@@ -5594,20 +6936,226 @@ static void whimory_cxt_probe(struct whimory *w, unsigned int nsamples)
 /*
  * Seed the interval map from the CXT snapshot.
  *
- * Every extent is claimed at the CXT base weave, so the normal winner rules
- * apply unchanged: anything the diff replay finds with a newer weave
- * overrides it, and anything older is rejected as stale.
+ * Each extent is claimed at the weave of the checkpoint that produced it,
+ * not at the newest weave in the set. That is what lets the normal winner
+ * rules do their job: an older generation's extent loses to a newer one
+ * covering the same LBA, and the diff replay can still override either.
+ *
+ * Claiming everything at w->cxt_ext_weave -- as this used to -- made every
+ * seed extent look equally new, so whimory_range_update()'s stale check
+ * could never fire between two of them and the last one written won
+ * regardless of generation. Combined with an lba-only sort over an unstable
+ * sort(), which one that was came down to the heap.
  */
+/*
+ * Does the page a CXT extent points at actually hold the LBA it claims?
+ *
+ * A checkpoint is a snapshot of the map at one commit. Its (lba, span,
+ * vba) triples were true then, and stay true only while nothing moves.
+ * Everything written afterwards lives in the journal, and any LBA
+ * rewritten since has left its old page behind -- a page the allocator
+ * has very likely recycled and refilled with data belonging to some
+ * other LBA. Replay the snapshot without checking and those stale
+ * triples are indistinguishable from good ones, because nothing inside
+ * a CXT record can be self-inconsistent.
+ *
+ * Measured on this unit after RetailOS had written: seeding from CXT
+ * gave mapped_lbas=950050 and a map that failed nearly every read, with
+ * "sftl lba mismatch want=0xc085 meta=0xcd97a" -- thousands of scattered
+ * low LBAs all resolving into one narrow band of pages that belong to
+ * LBAs around 842000. Rebuilding with use_cxt=0 produced a smaller map
+ * that read correctly and found the BPB. The seed was not malformed. It
+ * was stale, and it was winning.
+ *
+ * The BTOC path never had this problem because it does not trust its own
+ * index: whimory_l2v_update_from_slot_meta() reads the page and takes
+ * the meta LBA as the authority, the same way the YaFTL reference does
+ * in verifyUserSpares(), checking spare.lpn against the page it was
+ * asked for. This holds the CXT path to that standard, so a stale
+ * checkpoint costs coverage rather than correctness.
+ *
+ * Only the first slot of the extent is read. An extent is a contiguous
+ * run laid down by one write, so its head is representative, and
+ * checking every slot would multiply recovery time by the run length to
+ * learn nothing new in the common case.
+ */
+static bool whimory_cxt_extent_confirmed(struct whimory *w,
+						 const struct whimory_cxt_extent *e)
+{
+	u8 spare[S5L8740_NAND_META_SIZE];
+	u8 *data = w->sftl.data_page;
+	u32 ce, cau, vblock, page, slot;
+	u32 pblock, rcau, meta_lba;
+	const u8 *m;
+	int ret;
+
+	if (!cxt_meta_confirm || !data)
+		return true;
+	if (cxt_confirm_max && w->sftl.cxt_confirm_pages >= cxt_confirm_max)
+		return true;
+	if (recover_budget_ms && w->sftl.confirm_start_jiffies &&
+		    time_after(jiffies, w->sftl.confirm_start_jiffies +
+			       msecs_to_jiffies(recover_budget_ms)))
+		return true;
+	if (whimory_unpack_vba(w, e->vba, &ce, &cau, &vblock, &page, &slot))
+		return true;
+	if (slot >= WHIMORY_VBAS_PER_PAGE)
+		return true;
+
+	rcau = cau;
+	whimory_vfl_resolve(w, vblock, &rcau, &pblock);
+	ret = whimory_cs_read_page(w, ce, rcau, pblock, page, data,
+				   S5L8740_NAND_PAGE_SIZE, spare, sizeof(spare));
+	if (ret) {
+		/*
+		 * Unreadable is not evidence of staleness. Keep the extent
+		 * and let the per-read meta check catch it later.
+		 */
+		w->sftl.cxt_confirm_unreadable++;
+		return true;
+	}
+	w->sftl.cxt_confirm_pages++;
+	if (recover_yield_us && (w->sftl.cxt_confirm_pages & 0x0f) == 0) {
+		cond_resched();
+		usleep_range(recover_yield_us, recover_yield_us + 500);
+	}
+
+	m = spare + slot * WHIMORY_META_SIZE;
+	if (whimory_meta_erased(m, WHIMORY_META_SIZE))
+		return true;
+	if (m[0] != WHIMORY_META_TYPE_DATA && m[0] != WHIMORY_META_TYPE_DATA2)
+		return true;
+
+	meta_lba = get_unaligned_le32(m + 8);
+	if (meta_lba == e->lba) {
+		w->sftl.cxt_meta_confirmed++;
+		return true;
+	}
+	w->sftl.cxt_meta_mismatch++;
+	dev_dbg(w->dev,
+		"cxt_meta_mismatch lba=%u span=%u vba=%u meta_lba=%u pg=%u slot=%u\n",
+		e->lba, e->span, e->vba, meta_lba, page, slot);
+	return false;
+}
+
+/*
+ * Rebuild the LBAs a stale checkpoint extent had claimed, from the pages
+ * themselves.
+ *
+ * Refusing a stale extent is necessary and on its own it is not enough.
+ * Dropping it leaves the range unclaimed, and the next-best claim for
+ * those LBAs is generally an even older one, so the map ends up wrong in
+ * a different way: on this unit, dropping alone moved LBA 49279 from a
+ * page holding someone else data to a page holding no data at all, and
+ * the FAT signature check failed instead of the read.
+ *
+ * So the extent is re-derived rather than deleted. Every page it covers
+ * is read once and each slot is applied from its own metadata, which is
+ * exactly how the BTOC walk builds the map and what the YaFTL reference
+ * does in restoreUserBlock(): the page says which logical block it holds,
+ * and that statement is authoritative because it was written with the
+ * data. A checkpoint can go stale. A page cannot lie about itself.
+ *
+ * Only extents that failed confirmation get here, so the cost is bounded
+ * by how wrong the checkpoint is rather than by its size -- 37 extents
+ * out of 3200 on this unit.
+ */
+static void whimory_cxt_extent_repair(struct whimory *w,
+					      const struct whimory_cxt_extent *e)
+{
+	u8 spare[S5L8740_NAND_META_SIZE];
+	u8 *data = w->sftl.data_page;
+	u32 last_ce = ~0u, last_cau = ~0u, last_vblock = ~0u, last_page = ~0u;
+	u32 i;
+
+	if (!data)
+		return;
+
+	for (i = 0; i < e->span; i++) {
+		u32 ce, cau, vblock, page, slot, pblock, rcau;
+		int ret;
+
+		if (whimory_unpack_vba(w, e->vba + i, &ce, &cau, &vblock,
+					      &page, &slot))
+			return;
+		if (slot >= WHIMORY_VBAS_PER_PAGE)
+			continue;
+
+		/* One read per page, not per slot. */
+		if (ce != last_ce || cau != last_cau ||
+		    vblock != last_vblock || page != last_page) {
+			if (recover_budget_ms && w->sftl.confirm_start_jiffies &&
+			    time_after(jiffies, w->sftl.confirm_start_jiffies +
+				       msecs_to_jiffies(recover_budget_ms)))
+				return;
+			rcau = cau;
+			whimory_vfl_resolve(w, vblock, &rcau, &pblock);
+			ret = whimory_cs_read_page(w, ce, rcau, pblock, page, data,
+						   S5L8740_NAND_PAGE_SIZE, spare,
+						   sizeof(spare));
+			if (ret)
+				return;
+			last_ce = ce;
+			last_cau = cau;
+			last_vblock = vblock;
+			last_page = page;
+			w->sftl.cxt_repair_pages++;
+			if (recover_yield_us &&
+			    (w->sftl.cxt_repair_pages & 0x0f) == 0) {
+				cond_resched();
+				usleep_range(recover_yield_us,
+					     recover_yield_us + 500);
+			}
+		}
+
+		/*
+		 * No BTOC hint: the checkpoint already proved itself wrong
+		 * about this run, so the metadata is the only witness left.
+		 */
+		if (whimory_l2v_update_from_slot_meta(w, ce, cau, vblock, page,
+							      slot,
+							      spare + slot *
+							      WHIMORY_META_SIZE,
+							      0xffffffffu) < 0)
+			return;
+	}
+}
+
 static int whimory_cxt_seed_l2v(struct whimory *w)
 {
-	u32 i, seeded = 0;
+	u32 i, seeded = 0, regenerated = 0;
 	int ret;
 
 	w->sftl.claim_source = 3;
 	for (i = 0; i < w->n_cxt_ext; i++) {
 		struct whimory_cxt_extent *e = &w->cxt_ext[i];
 
-		w->sftl.claim_weave = w->cxt_ext_weave;
+		/*
+		 * Everything is applied, oldest generation first.
+		 *
+		 * Skipping an extent because a newer one starts at the same
+		 * LBA looks tempting and is wrong: the two need not have the
+		 * same span. An old extent covering lba 100 for 1000 sectors
+		 * and a new one covering lba 100 for 10 describe the same
+		 * start and different amounts of the volume, and dropping the
+		 * old one would lose 990 sectors outright.
+		 *
+		 * Applying both in ascending weave order gets it right
+		 * without a special case: the older lands first, the newer
+		 * overwrites exactly the part it claims, and the rest of the
+		 * older extent stays. whimory_range_update() protects the
+		 * newer from ever being clobbered by an older claim.
+		 */
+		if (i && e->lba == w->cxt_ext[i - 1].lba)
+			regenerated++;
+
+		if (!whimory_cxt_extent_confirmed(w, e)) {
+			whimory_cxt_extent_repair(w, e);
+			cond_resched();
+			continue;
+		}
+
+		w->sftl.claim_weave = e->weave;
 		ret = whimory_l2v_update(w, e->lba, e->span, e->vba);
 		w->sftl.claim_weave = 0;
 		if (ret) {
@@ -5621,8 +7169,8 @@ static int whimory_cxt_seed_l2v(struct whimory *w)
 	}
 	w->sftl.claim_source = 0;
 	dev_info(w->dev,
-		 "CXT_SEED extents=%u lbas=%u ranges=%u base_weave=%llu\n",
-		 w->n_cxt_ext, seeded, w->sftl.range_nodes,
+		 "CXT_SEED extents=%u regenerated=%u lbas=%u ranges=%u base_weave=%llu\n",
+		 w->n_cxt_ext, regenerated, seeded, w->sftl.range_nodes,
 		 (unsigned long long)w->cxt_ext_weave);
 	return 0;
 }
@@ -5738,6 +7286,8 @@ static void whimory_print_recovery_stats(struct whimory *w)
 		 "  fpart_sig=%u vfl_ctx_hits=%u vfl_cxt_loc=%u vfl_bitmap=%u\n"
 		 "  classified_empty=%u classified_closed=%u classified_open=%u classified_cxt=%u classified_unknown=%u\n"
 		 "  cxt_blocks_seen=%u cxt_records_seen=%u cxt_l2v_updates=%u\n"
+		 "  cxt_meta_confirmed=%u cxt_meta_mismatch=%u cxt_confirm_pages=%u cxt_confirm_unreadable=%u\n"
+		 "  cxt_repair_pages=%u cxt_repair_slots=%u\n"
 		 "  btoc_pages_read=%u btoc_pages_valid=%u btoc_entries_seen=%u btoc_l2v_updates=%u\n"
 		 "  btoc_meta_confirmed=%u btoc_meta_mismatch=%u btoc_skipped_zero=%u\n"
 		 "  btoc_blank=%u be_bte=%u be_lpn=%u le_bte=%u hdr8=%u unclaimed=%u\n"
@@ -5759,6 +7309,9 @@ static void whimory_print_recovery_stats(struct whimory *w)
 		 s->empty_sbs, s->btoc_sbs, s->open_sbs, s->cxt_sbs,
 		 s->unknown_sbs,
 		 s->cxt_blocks_seen, s->cxt_records_seen, s->cxt_l2v_updates,
+		 s->cxt_meta_confirmed, s->cxt_meta_mismatch,
+		 s->cxt_confirm_pages, s->cxt_confirm_unreadable,
+		 s->cxt_repair_pages, s->cxt_repair_slots,
 		 s->btoc_pages_read, s->btoc_pages_valid, s->btoc_entries_seen,
 		 s->btoc_l2v_updates,
 		 s->btoc_meta_confirmed, s->btoc_meta_mismatch,
@@ -5918,8 +7471,7 @@ static void whimory_dump_vba_page(struct whimory *w, u32 vba, u32 fmss_lba)
 			 fmss_lba, vba);
 		return;
 	}
-	cau = whimory_vfl_bank(w, cau, vblock);
-	pblock = whimory_vfl_phys(w, cau, vblock);
+	whimory_vfl_resolve(w, vblock, &cau, &pblock);
 	ret = whimory_cs_read_page(w, ce, cau, pblock, page, data,
 				   S5L8740_NAND_PAGE_SIZE, spare,
 				   sizeof(spare));
@@ -5976,12 +7528,86 @@ static void whimory_dump_vba_page(struct whimory *w, u32 vba, u32 fmss_lba)
 	}
 }
 
+
+/*
+ * Batched meta pre-pass for one plane, in stock's shape.
+ *
+ * RetailOS scans superblocks by queueing two meta reads each -- the first
+ * page and the last -- and polling once per 256 records
+ * (s_cxt_diff.c:349, S_SCAN_META_SIZE). Every read in the batch lands its
+ * page data in the same discarded buffer while only the 16-byte meta cursor
+ * advances, so a kick covers 128 superblocks and costs 4 KiB of meta and
+ * one sector of data.
+ *
+ * This fills meta0[] and metaN[] for blocks [0, nscan) of one (ce, cau) so
+ * the classify loop that follows does no I/O at all.
+ *
+ * Returns 0 with both arrays filled, or negative if the scan transport is
+ * unavailable, in which case the caller reads per block as before.
+ */
+static int whimory_scan_plane_meta(struct whimory *w, unsigned int ce,
+				   unsigned int cau, unsigned int nscan,
+				   u8 *meta0, u8 *metaN)
+{
+	struct s5l8740_ppn_ref *refs;
+	u8 *mbuf;
+	unsigned int b, i, per_kick;
+	unsigned int last_page = w->sftl.pages_per_sb ?
+				 w->sftl.pages_per_sb - 1 : WHIMORY_BTOC_PAGE;
+	int ret = 0;
+
+	if (!stock_scan)
+		return -ENODEV;
+
+	/* Two records per superblock, so half the record cap in blocks. */
+	per_kick = S5L8740_NAND_BATCH_MAX / 2;
+
+	refs = kmalloc_array(per_kick * 2, sizeof(*refs), GFP_KERNEL);
+	mbuf = kmalloc_array(per_kick * 2, WHIMORY_META_SIZE, GFP_KERNEL);
+	if (!refs || !mbuf) {
+		kfree(refs);
+		kfree(mbuf);
+		return -ENOMEM;
+	}
+
+	for (b = 0; b < nscan; b += per_kick) {
+		unsigned int n = min(per_kick, nscan - b);
+
+		for (i = 0; i < n; i++) {
+			refs[2 * i].cau = (u8)cau;
+			refs[2 * i].block = (u16)(b + i);
+			refs[2 * i].page = 0;
+			refs[2 * i + 1].cau = (u8)cau;
+			refs[2 * i + 1].block = (u16)(b + i);
+			refs[2 * i + 1].page = (u8)last_page;
+		}
+		ret = s5l8740_nand_cs_scan_meta((u8)ce, refs, n * 2, mbuf);
+		if (ret)
+			break;
+		for (i = 0; i < n; i++) {
+			memcpy(meta0 + (size_t)(b + i) * WHIMORY_META_SIZE,
+			       mbuf + (size_t)(2 * i) * WHIMORY_META_SIZE,
+			       WHIMORY_META_SIZE);
+			memcpy(metaN + (size_t)(b + i) * WHIMORY_META_SIZE,
+			       mbuf + (size_t)(2 * i + 1) * WHIMORY_META_SIZE,
+			       WHIMORY_META_SIZE);
+		}
+		w->sftl.scan_kicks++;
+		cond_resched();
+	}
+	kfree(refs);
+	kfree(mbuf);
+	return ret;
+}
+
 static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 {
 	struct whimory_sftl *s = &w->sftl;
 	unsigned int ce, cau, b, nscan, nsb = 0, i, open_done = 0;
 	u8 meta0[S5L8740_NAND_META_SIZE];
 	u8 meta127[S5L8740_NAND_META_SIZE];
+	u8 *plane_m0 = NULL;
+	u8 *plane_mN = NULL;
 	u8 *p127;
 	u32 *meta0_hist;
 	u32 *meta127_hist;
@@ -6025,8 +7651,24 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 		 w->geom.num_ce, w->geom.num_cau, nscan,
 		 btoc_confirm_max, recover_budget_ms, audit_lba_winners);
 
+	plane_m0 = kvmalloc_array(nscan, WHIMORY_META_SIZE, GFP_KERNEL);
+	plane_mN = kvmalloc_array(nscan, WHIMORY_META_SIZE, GFP_KERNEL);
+	if (!plane_m0 || !plane_mN) {
+		kvfree(plane_m0);
+		kvfree(plane_mN);
+		plane_m0 = NULL;
+		plane_mN = NULL;
+	}
+
 	for (ce = 0; ce < w->geom.num_ce; ce++) {
 		for (cau = 0; cau < w->geom.num_cau; cau++) {
+			bool have_scan = false;
+
+			if (plane_m0 && plane_mN)
+				have_scan = !whimory_scan_plane_meta(w, ce, cau,
+								     nscan,
+								     plane_m0,
+								     plane_mN);
 			for (b = 0; b < nscan; b++) {
 				struct whimory_sb *sb;
 				int r0, r127;
@@ -6073,14 +7715,46 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 				 * either finishes here or escalates to the
 				 * full read, and nothing reads page 0 twice.
 				 */
+				if (have_scan) {
+					/*
+					 * Both metas already in hand from the
+					 * batched pre-pass, so this block
+					 * costs no I/O. An erased pair marks
+					 * a free superblock, which is the
+					 * only test stock applies here.
+					 */
+					const u8 *pm0 = plane_m0 +
+						(size_t)b * WHIMORY_META_SIZE;
+					const u8 *pmN = plane_mN +
+						(size_t)b * WHIMORY_META_SIZE;
+
+					memset(meta0, 0xff, sizeof(meta0));
+					memcpy(meta0, pm0, WHIMORY_META_SIZE);
+					memset(meta127, 0xff, sizeof(meta127));
+					memcpy(meta127, pmN, WHIMORY_META_SIZE);
+					r0 = 0;
+					r127 = 0;
+					if (meta0_hist)
+						meta0_hist[meta0[0]]++;
+					if (whimory_meta_erased(meta0,
+							WHIMORY_META_SIZE) &&
+					    whimory_meta_erased(meta127,
+							WHIMORY_META_SIZE)) {
+						s->empty_sbs++;
+						s->fast_empty_hits++;
+						continue;
+					}
+					goto have_meta;
+				}
+
 				r0 = -EAGAIN;
 				if (fast_empty_probe) {
 					const u8 *d0 = NULL;
 					u8 m0[WHIMORY_META_SIZE];
 
-					if (!whimory_cs_read_slot0(w, ce, cau,
-								   b, 0, &d0,
-								   m0)) {
+					if (!whimory_prefetch_slot0(w, ce, cau,
+								    b, nscan,
+								    &d0, m0)) {
 						if (whimory_page_blank(d0, 64) &&
 						    whimory_meta_erased(m0,
 							WHIMORY_META_SIZE)) {
@@ -6170,6 +7844,7 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 						continue;
 					}
 				}
+have_meta:
 				sb = &s->sbs[nsb];
 				sb->ce = ce;
 				sb->cau = cau;
@@ -6269,6 +7944,10 @@ classify_done:
 		 s->fast_empty_hits, s->empty_sbs);
 	dev_info(w->dev, "SFTL slot0 read settled %u non-empty blocks\n",
 		 s->fast_slot0_hits);
+	dev_info(w->dev,
+		 "SFTL batch prefetch served %u page-0 reads in %u kicks (%u per kick)\n",
+		 s->pf_hits, s->pf_kicks,
+		 s->pf_kicks ? s->pf_hits / s->pf_kicks : 0);
 
 	if (meta0_hist) {
 		char hb[192];
@@ -6315,6 +7994,9 @@ classify_done:
 		kfree(meta127_hist);
 		meta127_hist = NULL;
 	}
+
+	kvfree(plane_m0);
+	kvfree(plane_mN);
 
 	whimory_cxt_index_build(w, nsb);
 	/*
@@ -6406,6 +8088,21 @@ classify_done:
 				 (unsigned long long)sb->weave_max,
 				 sb->weave_max_p127,
 				 (unsigned long long)w->cxt_base_weave);
+		} else if (use_cxt && s->cxt_loaded && cxt_fast &&
+			   sb->weave_max &&
+			   sb->weave_max < w->cxt_base_weave) {
+			/*
+			 * Skip only what the checkpoint provably predates.
+			 *
+			 * A superblock with no usable weave at all is not in
+			 * that set: nothing bounds it, so there is no
+			 * evidence the checkpoint describes it. Those are
+			 * replayed. On this volume that is the 78 blocks
+			 * classify reports as unknown, which is cheap against
+			 * the 7541 it does skip.
+			 */
+			s->diff_skipped_sbs++;
+			continue;
 		} else if (use_cxt && s->cxt_loaded && sb->weave_max_p127 &&
 			   sb->weave_max && sb->weave_max < w->cxt_base_weave) {
 			s->diff_skipped_sbs++;
@@ -6589,6 +8286,22 @@ btoc_done:
 		s->packed_ok = true;
 	}
 	w->l2v_ok = true;
+	/*
+	 * A map that hit the node ceiling is short, and short is not the same
+	 * as complete. Nothing used to say so: range_budget_stop was counted
+	 * and printed among forty other statistics, so a truncated map and a
+	 * whole one produced the same "recover OK". The reads that follow a
+	 * truncation are unmapped LBAs scattered across the volume, which
+	 * reads as failing flash rather than as a driver that stopped writing
+	 * down where things are.
+	 */
+	if (w->sftl.range_budget_stop)
+		dev_err(w->dev,
+			"SFTL MAP IS SHORT: %u claims dropped at max_range_nodes=%u "
+			"(ranges=%u). Reads in the dropped regions will return "
+			"unmapped. Raise max_range_nodes and re-run recover.\n",
+			w->sftl.range_budget_stop, max_range_nodes,
+			w->sftl.range_nodes);
 	whimory_scan_closed_meta0(w, nsb);
 	whimory_print_recovery_stats(w);
 	return 0;
@@ -6611,11 +8324,107 @@ static int whimory_sftl_alloc(struct whimory *w)
 			nsb = p;
 	}
 	s->num_sb = nsb;
-	s->vba_factor_a = nsb;
-	s->vba_factor_b = s->vbas_per_sb;
+	/*
+	 * Size the L2V VBA field from the space whimory_pack_vba() actually
+	 * builds, which since the move to the native layout is
+	 *
+	 *   blocks_per_cau x (pages_per_sb x planes x vbas_per_page)
+	 *
+	 * These factors were num_sb x vbas_per_sb -- 7840 x 512 -- which is
+	 * the retired bank-major space. That gave bits_vba = 22 and an
+	 * invalid_vba sentinel of 4194303, against a native maximum VBA of
+	 * 2088 x 2048 - 1 = 4276223. Every VBA in virtual blocks 2048..2087
+	 * therefore compared >= the sentinel and was read as "unmapped" in
+	 * three places at once: the CXT parser scored it a hole, range_update
+	 * treated it as a true unmap and erased, and read_lba returned
+	 * -ENOENT.
+	 *
+	 * Nothing lands there today -- user data stops at user_blocks = 1960,
+	 * so real VBAs top out around 4014079 -- but it is a three percent
+	 * margin held by luck rather than by arithmetic. The tell is that the
+	 * correct width, 23 bits, gives sentinel 0x7FFFFF, which is exactly
+	 * WHIMORY_CXT_VBA_HOLE. The two were meant to agree.
+	 *
+	 * vbas_per_sb stays as the per-block VBA count that the BTOC parsers
+	 * and the GC zone use; it is simply not the right factor for this.
+	 */
+	{
+		u32 planes = w->geom.num_ce * w->geom.num_cau;
+
+		s->vba_factor_a = w->geom.blocks_per_cau ?
+				  w->geom.blocks_per_cau : s->user_blocks;
+		s->vba_factor_b = s->pages_per_sb * (planes ? planes : 1) *
+				  s->vbas_per_page;
+	}
 	s->nodepool_bytes = WHIMORY_MIN_NODEPOOL_BYTES;
 
 	s->btoc_page = kvmalloc(S5L8740_NAND_PAGE_SIZE, GFP_KERNEL);
+	/*
+	 * Cross-call NAND page cache; see the fields in struct whimory_sftl.
+	 * Not fatal if it fails -- n31_vfl_read_vba() falls back to reading
+	 * the page every time, which is exactly the old behaviour.
+	 */
+	s->page_cache = kvmalloc(S5L8740_NAND_PAGE_SIZE, GFP_KERNEL);
+	s->page_cache_valid = false;
+	/*
+	 * 64 KiB + 256 B for the classify prefetch window. Optional in the
+	 * same sense as the batch buffers in the NAND driver: without it
+	 * whimory_prefetch_slot0() falls through to the single-page read.
+	 */
+	/*
+	 * Legacy per-block prefetch, used only when the batched plane scan
+	 * is unavailable. Sized independently of S5L8740_NAND_BATCH_MAX,
+	 * which the meta-only scan raised to 256 records -- at a full 4 KiB
+	 * slot per entry that would be a megabyte for a fallback path.
+	 */
+	s->pf_data = kvmalloc((size_t)WHIMORY_PF_SLOTS *
+			      S5L8740_NAND_SLOT_DATA, GFP_KERNEL);
+	s->pf_meta = kvmalloc((size_t)WHIMORY_PF_SLOTS *
+			      S5L8740_NAND_BATCH_META_SIZE, GFP_KERNEL);
+	if (!s->pf_data || !s->pf_meta) {
+		kvfree(s->pf_data);
+		kvfree(s->pf_meta);
+		s->pf_data = NULL;
+		s->pf_meta = NULL;
+	}
+	s->pf_valid = false;
+	s->pf_failed = false;
+	s->pf_checked = false;
+	/*
+	 * 128 KiB + 512 B for the read-ahead window. Optional in the same
+	 * sense as everything else on this path: without it
+	 * whimory_window_read() returns -ENODEV and the single-page cache
+	 * below answers, exactly as it did before.
+	 */
+	s->rc_data = kvmalloc((size_t)WHIMORY_RC_SLOTS *
+			      S5L8740_NAND_PAGE_SIZE, GFP_KERNEL);
+	s->rc_meta = kvmalloc((size_t)WHIMORY_RC_SLOTS *
+			      S5L8740_NAND_META_SIZE, GFP_KERNEL);
+	if (!s->rc_data || !s->rc_meta) {
+		kvfree(s->rc_data);
+		kvfree(s->rc_meta);
+		s->rc_data = NULL;
+		s->rc_meta = NULL;
+	}
+	s->rc_stage = kvmalloc((size_t)S5L8740_NAND_PAGE_BATCH_MAX *
+			       S5L8740_NAND_PAGE_SIZE, GFP_KERNEL);
+	s->rc_stage_meta = kvmalloc((size_t)S5L8740_NAND_PAGE_BATCH_MAX *
+				    S5L8740_NAND_META_SIZE, GFP_KERNEL);
+	if (!s->rc_stage || !s->rc_stage_meta) {
+		kvfree(s->rc_stage);
+		kvfree(s->rc_stage_meta);
+		s->rc_stage = NULL;
+		s->rc_stage_meta = NULL;
+	}
+	memset(s->rc_key, 0, sizeof(s->rc_key));
+	s->rc_count = 0;
+	s->rc_fills = 0;
+	s->rc_hits = 0;
+	s->rc_misses = 0;
+	s->rc_fails = 0;
+	s->pf_count = 0;
+	s->pf_kicks = 0;
+	s->pf_hits = 0;
 	s->data_page = kvmalloc(S5L8740_NAND_PAGE_SIZE, GFP_KERNEL);
 	s->meta_page = kvmalloc(WHIMORY_META_SIZE * WHIMORY_VBAS_PER_PAGE *
 				(WHIMORY_DATA_PAGES_PER_SB + 1), GFP_KERNEL);
@@ -7037,7 +8846,17 @@ static void whimory_explain_bad_map(struct whimory *w, u32 lba, u32 meta_lba,
 	 */
 	{
 		struct whimory_meta m2;
-		u8 *tmp = w->sftl.data_page;
+		/*
+		 * A buffer of its own.
+		 *
+		 * This used to hand w->sftl.data_page to read_vba as the
+		 * destination -- and read_vba uses that same buffer as its
+		 * page scratch, so the copy out of it was self-overlapping
+		 * and the scratch came back holding a slice of itself. Only
+		 * an explainer, but an explainer that corrupts the buffer the
+		 * next real read will use is worse than no explainer.
+		 */
+		u8 *tmp = kmalloc(WHIMORY_LBA_SIZE, GFP_KERNEL);
 
 		if (tmp && w->vfl_ops && w->vfl_ops->read_vba &&
 		    !w->vfl_ops->read_vba(w, vba2, 1, tmp, &m2))
@@ -7077,6 +8896,7 @@ static void whimory_explain_bad_map(struct whimory *w, u32 lba, u32 meta_lba,
 					le32_to_cpu(m2.lba) == lba ?
 						"  <-- MATCH: the ce/cau plane order is reversed" : "");
 		}
+		kfree(tmp);
 	}
 }
 
@@ -7157,8 +8977,18 @@ static int n31_sftl_read_lba(struct whimory *w, u32 lba, void *buf,
 			whimory_dump_vba_page(w, vba, lba);
 	}
 	ret = w->vfl_ops->read_vba(w, vba, 1, buf, &meta);
-	if (ret)
+	if (ret) {
+		/*
+		 * A transport failure used to leave here without a word, so a
+		 * uECC or a disarmed CS looked exactly like a map hole from
+		 * the filesystem's side -- both arrive at vfat as a bare EIO.
+		 * They need entirely different fixes, so say which one it is.
+		 */
+		dev_err_ratelimited(w->dev,
+				    "sftl read failed lba=%u vba=%u: %d\n",
+				    lba, vba, ret);
 		return ret;
+	}
 	/* What the map actually answered, for the explainer below. */
 	w->bad_vba = vba;
 	w->bad_span = span;
@@ -7170,9 +9000,28 @@ static int n31_sftl_read_lba(struct whimory *w, u32 lba, void *buf,
 	return ret;
 }
 
+/*
+ * Both of these used to call n31_sftl_read_lba() directly, which walks the
+ * range tree and reads through w->sftl.cs_page / data_page -- shared
+ * scratch, under no lock and with CS unarmed. That was survivable only
+ * because the hook is installed by whimory_register_disk(), which cannot
+ * run while meta_dma_read=0. It is still reachable from
+ * nand_ftl_read_sector(), and apple-grape symbol_get()s that.
+ *
+ * Route both through whimory_read_fmss_lba(), which takes tree_lock and
+ * opens a DMA session, so the entry point does not decide whether the read
+ * path is safe.
+ */
 static int whimory_read_lba_4k(struct whimory *w, u32 lba, void *buf)
 {
-	return n31_sftl_read_lba(w, lba, buf, true);
+	int ret = whimory_read_fmss_lba(lba, buf);
+
+	/* The block layer wants a hole to read as erased, not to fail. */
+	if (ret == -ENOENT) {
+		memset(buf, 0xff, WHIMORY_LBA_SIZE);
+		return 0;
+	}
+	return ret;
 }
 
 static int whimory_ftl_read_hook(u64 lba, void *buf)
@@ -7183,7 +9032,7 @@ static int whimory_ftl_read_hook(u64 lba, void *buf)
 		return -ENODEV;
 	if (lba >= w->total_4k_sectors)
 		return -ERANGE;
-	return whimory_read_lba_4k(w, (u32)lba, buf);
+	return whimory_read_fmss_lba((u32)lba, buf);
 }
 
 static int whimory_check_lba0(struct whimory *w)
@@ -7455,13 +9304,125 @@ static ssize_t recover_progress_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(recover_progress);
 
+/*
+ * The decoded identity, and an index of every record the scan located.
+ *
+ * The decode understands eleven tags; the section holds more than that.
+ * Listing the candidates with their offsets and lengths makes the rest
+ * reachable, and pairing this with syscfg_raw is enough to identify a
+ * record without reflashing anything. "known" marks a candidate the
+ * decode already consumes, so an unknown one is a genuine find rather
+ * than a duplicate of a field printed above it.
+ */
+static ssize_t syscfg_show(struct device *dev, struct device_attribute *attr,
+			   char *buf)
+{
+	struct whimory *w = whimory_dev;
+	unsigned int i;
+	int len = 0;
+
+	if (!w)
+		return sysfs_emit(buf, "state=absent\n");
+	if (!w->syscfg.valid && !w->syscfg.raw_len)
+		return sysfs_emit(buf, "state=unread\n");
+
+	len += sysfs_emit_at(buf, len,
+			     "state=%s\nsection_bytes=%u\nentries=%u\n"
+			     "records=%u\n",
+			     w->syscfg.valid ? "valid" : "partial",
+			     w->syscfg.raw_len, w->syscfg.entries,
+			     w->syscfg.n_cand);
+	len += sysfs_emit_at(buf, len,
+			     "serial=%s\nmodel=%s\nmlb=%s\nsw_ver=%s\n"
+			     "cnt_b=%s\nmt_cl=%s\n",
+			     w->syscfg.serial, w->syscfg.model, w->syscfg.mlb,
+			     w->syscfg.sw_ver, w->syscfg.cnt_b,
+			     w->syscfg.mt_cl);
+	len += sysfs_emit_at(buf, len,
+			     "region=0x%08x\nhw_ver=0x%08x\nfw_id=0x%08x\n",
+			     w->syscfg.region, w->syscfg.hw_ver,
+			     w->syscfg.fw_id);
+	if (w->syscfg.mac_ok)
+		len += sysfs_emit_at(buf, len, "bt_mac=%pM\n", w->syscfg.mac);
+	len += sysfs_emit_at(buf, len,
+			     "touch_cal_magic_off=%d\ntouch_cal_bytes=%u\n",
+			     w->syscfg.touch_cal_magic_off,
+			     w->syscfg.touch_cal_len);
+
+	/*
+	 * One record per line: index, tag, offset and length into
+	 * syscfg_raw, and whether the decode above claims it.
+	 */
+	for (i = 0; i < w->syscfg.n_cand; i++)
+		len += sysfs_emit_at(buf, len,
+				     "record%u=%s off=0x%04x len=%u known=%u\n",
+				     i, w->syscfg.cand[i].tag,
+				     w->syscfg.cand[i].off,
+				     w->syscfg.cand[i].len,
+				     w->syscfg.cand[i].known ? 1 : 0);
+	return len;
+}
+static DEVICE_ATTR_RO(syscfg);
+
+/*
+ * The SysCfg section verbatim, so a record this driver does not decode
+ * can still be extracted. Offsets here are the ones syscfg reports.
+ */
+static ssize_t syscfg_raw_read(struct file *filp, struct kobject *kobj,
+			       struct bin_attribute *attr, char *buf,
+			       loff_t off, size_t count)
+{
+	struct whimory *w = whimory_dev;
+
+	if (!w || !w->syscfg.raw || !w->syscfg.raw_len)
+		return -ENODEV;
+	if (off >= w->syscfg.raw_len)
+		return 0;
+	if (off + count > w->syscfg.raw_len)
+		count = w->syscfg.raw_len - off;
+	memcpy(buf, w->syscfg.raw + off, count);
+	return count;
+}
+static BIN_ATTR_RO(syscfg_raw, S5L8740_NAND_PAGE_SIZE);
+
+/*
+ * The touch calibration container, at its full length. Reads short when
+ * the section did not carry one, which is the case whenever
+ * touch_cal_bytes above is 0 -- the source is then the U-Boot region.
+ */
+static ssize_t touch_cal_read(struct file *filp, struct kobject *kobj,
+			      struct bin_attribute *attr, char *buf,
+			      loff_t off, size_t count)
+{
+	const u8 *d = NULL;
+	size_t n = whimory_syscfg_touch_cal(&d);
+
+	if (!n)
+		return -ENODEV;
+	if (off >= n)
+		return 0;
+	if (off + count > n)
+		count = n - off;
+	memcpy(buf, d + off, count);
+	return count;
+}
+static BIN_ATTR_RO(touch_cal, N31_TOUCH_CAL_LEN);
+
 static struct attribute *ftl_attrs[] = {
 	&dev_attr_whimory_status.attr,
 	&dev_attr_recover_progress.attr,
+	&dev_attr_syscfg.attr,
+	NULL,
+};
+
+static struct bin_attribute *ftl_bin_attrs[] = {
+	&bin_attr_syscfg_raw,
+	&bin_attr_touch_cal,
 	NULL,
 };
 static const struct attribute_group ftl_attr_group = {
 	.attrs = ftl_attrs,
+	.bin_attrs = ftl_bin_attrs,
 };
 
 static void whimory_free(struct whimory *w)
@@ -7473,7 +9434,28 @@ static void whimory_free(struct whimory *w)
 	whimory_unregister_disk(w);
 	whimory_range_free(w);
 	whimory_l2v_free(w);
+	w->syscfg.raw_len = 0;
+	w->syscfg.n_cand = 0;
+	kvfree(w->syscfg.raw);
+	w->syscfg.raw = NULL;
 	kvfree(w->sftl.btoc_page);
+	w->sftl.page_cache_valid = false;
+	kvfree(w->sftl.page_cache);
+	w->sftl.page_cache = NULL;
+	w->sftl.pf_valid = false;
+	kvfree(w->sftl.pf_data);
+	kvfree(w->sftl.pf_meta);
+	w->sftl.pf_data = NULL;
+	w->sftl.pf_meta = NULL;
+	w->sftl.rc_count = 0;
+	kvfree(w->sftl.rc_data);
+	kvfree(w->sftl.rc_meta);
+	kvfree(w->sftl.rc_stage);
+	kvfree(w->sftl.rc_stage_meta);
+	w->sftl.rc_data = NULL;
+	w->sftl.rc_meta = NULL;
+	w->sftl.rc_stage = NULL;
+	w->sftl.rc_stage_meta = NULL;
 	kvfree(w->sftl.data_page);
 	kvfree(w->sftl.meta_page);
 	kvfree(w->sftl.cs_page);
@@ -7644,8 +9626,7 @@ int whimory_l2v_search_phys(u32 lba, u8 *ce, u8 *cau, u16 *blk, u8 *page,
 		mutex_unlock(&w->tree_lock);
 		return ret;
 	}
-	vcau = whimory_vfl_bank(w, vcau, vblock);
-	pblock = whimory_vfl_phys(w, vcau, vblock);
+	whimory_vfl_resolve(w, vblock, &vcau, &pblock);
 	mutex_unlock(&w->tree_lock);
 	if (ce)
 		*ce = (u8)vce;
@@ -7836,6 +9817,12 @@ static int whimory_sftl_recover_cs_locked(void)
 		w->sftl.open_l2v_updates = 0;
 		w->sftl.range_nodes = 0;
 		w->sftl.cxt_l2v_updates = 0;
+		w->sftl.cxt_meta_confirmed = 0;
+		w->sftl.cxt_meta_mismatch = 0;
+		w->sftl.cxt_confirm_pages = 0;
+		w->sftl.cxt_confirm_unreadable = 0;
+		w->sftl.cxt_repair_pages = 0;
+		w->sftl.cxt_repair_slots = 0;
 		w->sftl.range_budget_stop = 0;
 		w->sftl.stale_mapping_rejected = 0;
 		w->sftl.n_cxt_idx = 0;

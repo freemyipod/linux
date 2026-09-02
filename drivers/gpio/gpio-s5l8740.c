@@ -47,6 +47,13 @@
 #define S5L8740_GPIO_INEN_OFF		0x0c
 #define S5L8740_GPIO_DOUT_OFF		0x08
 #define S5L8740_GPIO_DIR_OFF		0x14
+
+/*
+ * Guards every read-modify-write of a per-bank GPIO register. PCON, DIR,
+ * PUNB and PUNC each pack eight pads into one word, so an unlocked RMW can
+ * silently drop a bit another caller just set.
+ */
+static DEFINE_RAW_SPINLOCK(s5l8740_gpio_reg_lock);
 #define S5L8740_GPIOCMD_OFF		0x1e0
 /*
  * 32 banks of 8 across the 0x400 the block occupies. The old 128 cleared
@@ -73,6 +80,15 @@ static void s5l8740_pinmux_apply_word(void __iomem *gpio_base, u32 a1)
 	void __iomem *base = gpio_base + 32u * bank;
 	u32 v;
 
+	unsigned long flags;
+
+	/*
+	 * Four per-bank registers, each shared by eight pads. Held across
+	 * the whole group so a concurrent pad change cannot land between the
+	 * function nibble and the direction bit and leave the pad half
+	 * configured.
+	 */
+	raw_spin_lock_irqsave(&s5l8740_gpio_reg_lock, flags);
 	v = readl(base + 0x00);
 	writel(((a1 & 0xfu) << (4u * pin)) | (v & ~(15u << (4u * pin))),
 	       base + 0x00);
@@ -85,6 +101,7 @@ static void s5l8740_pinmux_apply_word(void __iomem *gpio_base, u32 a1)
 
 	v = readl(base + 0x10);
 	writel((((a1 >> 8) & 1u) << pin) | (v & ~BIT(pin)), base + 0x10);
+	raw_spin_unlock_irqrestore(&s5l8740_gpio_reg_lock, flags);
 }
 
 static void s5l8740_pinmux_223C(struct device *dev, void __iomem *gpio_base)
@@ -233,8 +250,9 @@ static ssize_t s5l8740_pad_set_write(struct file *file,
 	       (func == S5L8740_GPIO_RELEASE ? 0 : (func & 0xff)),
 	       sg->gpiocmd);
 
-	dev_info(sg->gc.parent, "pad gpio %u (bank %u pin %u) -> func %u\n",
-		 gpio, bank, pin, func);
+	/* Echo of a debugfs pad write: tracing. */
+	dev_dbg(sg->gc.parent, "pad gpio %u (bank %u pin %u) -> func %u\n",
+		gpio, bank, pin, func);
 	return len;
 }
 
@@ -285,25 +303,49 @@ static void s5l8740_gpiocmd_mode(struct s5l8740_gpio *sg, unsigned int gpio,
 {
 	void __iomem *bank = s5l8740_bank(sg, gpio);
 	u32 pin = gpio & 7;
+	unsigned long flags;
 	u32 dir;
 	u8 cmd;
 
 	if (gpio == 200)
 		return;
 
-	if (mode == 1) {
+	if (mode == 1)
 		cmd = val ? S5L8740_CMD_OUT_HIGH : S5L8740_CMD_OUT_LOW;
-	} else if (mode == 0xFFFE) {
-		dir = readl(bank + S5L8740_GPIO_DIR_OFF);
-		writel(dir & ~BIT(pin), bank + S5L8740_GPIO_DIR_OFF);
+	else if (mode == 0xFFFE)
 		cmd = 0;
-	} else {
+	else
 		cmd = (u8)mode;
-		dir = readl(bank + S5L8740_GPIO_DIR_OFF);
-		writel(dir | BIT(pin), bank + S5L8740_GPIO_DIR_OFF);
-	}
 
+	/*
+	 * DIR follows the mode for everything except 0xFFFE, mode 1
+	 * included. sub_43D38C picks command 14 or 15 for mode 1 and then
+	 * falls through to the shared "DIR |= bit"; only the 0xFFFE arm
+	 * branches away to "DIR &= ~bit":
+	 *
+	 *     if (a2 == 1) { v8 = a3 ? 15 : 14; }
+	 *     else { ... if (a2 == 65534) { v9 = DIR & ~v7; goto L10; } }
+	 *     v9 = DIR | v7;
+	 *   L10: DIR = v9; GPIOCMD = ...;
+	 *
+	 * This used to skip DIR for mode 1, with a comment claiming stock
+	 * did the same. It does not, and the cost was that every output
+	 * this chip drove stayed an input: the Bluetooth controller's
+	 * REG_ON read back "in lo" in debugfs and the part never powered
+	 * up, so hci0 bound to a dead chip and every command timed out.
+	 *
+	 * Eight pads share one DIR word, so this is a read-modify-write
+	 * under the same lock as every other writer to the bank.
+	 */
+	raw_spin_lock_irqsave(&s5l8740_gpio_reg_lock, flags);
+	dir = readl(bank + S5L8740_GPIO_DIR_OFF);
+	if (mode == 0xFFFE)
+		dir &= ~BIT(pin);
+	else
+		dir |= BIT(pin);
+	writel(dir, bank + S5L8740_GPIO_DIR_OFF);
 	writel(((gpio >> 3) << 16) | (pin << 8) | cmd, sg->gpiocmd);
+	raw_spin_unlock_irqrestore(&s5l8740_gpio_reg_lock, flags);
 }
 
 static int s5l8740_gpio_get(struct gpio_chip *gc, unsigned int offset)
@@ -415,7 +457,7 @@ static u8 s5l8740_din_bit(struct s5l8740_gpio *sg, unsigned int gpio)
  *   OSOS never GPIOCMDs IIC0/IIC1 — IIC1 works from SEC/WTF leftover.
  *   OSOS 5714EE is UART pairs func2: (4,5)(78,79)(66,67)(83,84).
  *   OSOS 20690 is SPI2: 87/5, 88/3, 89/3, 90/3.
- *   Nimbus: 14 EN, 39 RST, 38 IRQ. Vol 40/41. nIRQ 86.
+ *   Grape: 14 EN, 39 RST, 38 IRQ. Vol 40/41. nIRQ 86.
  *   IIS0: OSOS BCB60 GPIOCMD 7 and 20 only (mode 3=on, 2=off).
  *   IIS1/IIS2: no 43D38C. Do not treat 21-22/49-54/57-63 as IIS.
  *   IIC0/IIC1: no named SCL/SDA GPIO; no PUNB/PUNC. Clock IIC1 =
@@ -450,7 +492,15 @@ static void s5l8740_log_pads(struct s5l8740_gpio *sg, const char *tag,
 		s5l8740_log_pad(sg, gpios[i], p, sizeof(p));
 		off += snprintf(buf + off, sizeof(buf) - off, " %s", p);
 	}
-	dev_err(sg->gc.parent, "%s\n", buf);
+	/*
+	 * Pad-state tracing, so dev_dbg rather than dev_err.
+	 *
+	 * This runs nine times for every IIS hw_params. At err level no
+	 * console loglevel can hide it, so a stream start buries whatever
+	 * else was being read at the time. Dynamic debug turns it back on
+	 * per call site when the pinmux is what is under investigation.
+	 */
+	dev_dbg(sg->gc.parent, "%s\n", buf);
 }
 
 static void s5l8740_log_pinmux_map(struct s5l8740_gpio *sg, const char *tag)
@@ -551,12 +601,14 @@ int s5l8740_gpio_set_pad(unsigned int gpio, unsigned int func, bool out)
 	struct s5l8740_gpio *sg = s5l8740_n31;
 	void __iomem *bank;
 	unsigned int pin = gpio & 7;
+	unsigned long flags;
 	u32 v;
 
 	if (!sg || !sg->base || func > 15)
 		return -ENODEV;
 	bank = sg->base + (gpio >> 3) * S5L8740_GPIO_BANK_STRIDE;
 
+	raw_spin_lock_irqsave(&s5l8740_gpio_reg_lock, flags);
 	v = readl(bank + S5L8740_GPIO_PCON_OFF);
 	v &= ~(0xfu << (pin * 4));
 	v |= (func & 0xf) << (pin * 4);
@@ -568,9 +620,45 @@ int s5l8740_gpio_set_pad(unsigned int gpio, unsigned int func, bool out)
 	else
 		v &= ~BIT(pin);
 	writel(v, bank + S5L8740_GPIO_DIR_OFF);
+	raw_spin_unlock_irqrestore(&s5l8740_gpio_reg_lock, flags);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(s5l8740_gpio_set_pad);
+
+/*
+ * Set one pad's direction bit, and nothing else, under the same lock.
+ *
+ * PCON, DIR, PUNB and PUNC are per-bank: eight pads share one word, so a
+ * read-modify-write on any of them can drop another pad's bit if two
+ * owners race. There were two owners -- this driver and s5l8740-i2s.c,
+ * which was doing its own unlocked RMW on DIR for the IIS pads. Exporting
+ * this gives the audio driver a way to set what it needs without becoming
+ * a second writer to a register it does not own.
+ */
+int s5l8740_gpio_dir_set(unsigned int gpio, bool out);
+int s5l8740_gpio_dir_set(unsigned int gpio, bool out)
+{
+	struct s5l8740_gpio *sg = s5l8740_n31;
+	unsigned int pin = gpio & 7;
+	unsigned long flags;
+	void __iomem *bank;
+	u32 v;
+
+	if (!sg || !sg->base)
+		return -ENODEV;
+	bank = sg->base + (gpio >> 3) * S5L8740_GPIO_BANK_STRIDE;
+
+	raw_spin_lock_irqsave(&s5l8740_gpio_reg_lock, flags);
+	v = readl(bank + S5L8740_GPIO_DIR_OFF);
+	if (out)
+		v |= BIT(pin);
+	else
+		v &= ~BIT(pin);
+	writel(v, bank + S5L8740_GPIO_DIR_OFF);
+	raw_spin_unlock_irqrestore(&s5l8740_gpio_reg_lock, flags);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(s5l8740_gpio_dir_set);
 
 void s5l8740_gpio_log_iis0_pads(const char *tag)
 {
@@ -606,7 +694,8 @@ static void s5l8740_key_edge(struct s5l8740_gpio *sg, unsigned int code,
 		input_report_key(sg->input, code, now ? 0 : 1);
 		input_sync(sg->input);
 	}
-	dev_err(sg->gc.parent, "n31-btn %s %s din=%u\n",
+	/* One line per key edge: tracing, not an error. */
+	dev_dbg(sg->gc.parent, "n31-btn %s %s din=%u\n",
 		name, now ? "release" : "PRESS", now);
 	*last = now;
 }

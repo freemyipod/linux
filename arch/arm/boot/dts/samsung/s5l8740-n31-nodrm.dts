@@ -23,7 +23,7 @@
     };
 
     chosen {
-        /* quiet: suppress non-critical boot spam; nimbus uses explicit prints */
+        /* quiet: suppress non-critical boot spam; grape uses explicit prints */
 		bootargs = "panic=-1 loglevel=8 nohlt";
         stdout-path = "serial0";
     };
@@ -93,12 +93,12 @@
             interrupt-controller;
             #interrupt-cells = <2>;
             /*
-             * Chain ONLY VIC EXT1 (group1 / GPIOs 32-63): Vol 40/41, Nimbus 38.
+             * Chain ONLY VIC EXT1 (group1 / GPIOs 32-63): Vol 40/41, Grape 38.
              * Chaining all EXT0-6 hung boot previously.
              */
             interrupt-parent = <&vic0>;
             interrupts = <1>; /* EXT1 */
-            /* boot-minimal v2: no EIC chain (IRQ storm risk without Nimbus) */
+            /* boot-minimal v2: no EIC chain (IRQ storm risk without Grape) */
             status = "disabled";
         };
 
@@ -109,7 +109,7 @@
             interrupts = <7>;
         };
 
-        /* Probe lcdif early — before SPI/Nimbus (boot-minimal bisect) */
+        /* Probe lcdif early — before SPI/Grape (boot-minimal bisect) */
         lcdif: lcdif@38300000 {
             compatible = "samsung,s5l8740-lcdif";
             reg = <0x38300000 0x10000>;
@@ -212,17 +212,17 @@
 
 
         spi2: spi@3d200000 {
-            /* N31 Nimbus on SPI2 — CLK_SPI2 (+ alt/secondary) + pinmux in driver */
+            /* N31 Grape on SPI2 — CLK_SPI2 (+ alt/secondary) + pinmux in driver */
             compatible = "apple,s5l8702-spi", "samsung,s5l8740-spi", "samsung,s5l8702-spi";
             reg = <0x3d200000 0x100>;
             clocks = <&clkctrl CLK_SPI2>, <&clkctrl CLK_SPI2_2>, <&clkctrl CLK_SPI2_ALT>;
             clock-names = "spi", "spi-2", "spi-alt";
-            /* SPI DMA peri IDs OPEN in N31 RE — Nimbus uses proven PIO path */
+            /* SPI DMA peri IDs OPEN in N31 RE — Grape uses proven PIO path */
             #address-cells = <1>;
             #size-cells = <0>;
             status = "disabled";
-            nimbus: touchscreen@0 {
-                compatible = "apple,nimbus";
+            grape: touchscreen@0 {
+                compatible = "apple,grape";
                 reg = <0>;
                 spi-max-frequency = <1000000>;
                 enable-gpios = <&gpio 14 GPIO_ACTIVE_HIGH>;

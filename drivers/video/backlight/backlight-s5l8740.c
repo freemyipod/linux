@@ -9,6 +9,22 @@
  * Init (matches U-Boot / panel bring-up): write 62 to +0x08, then set bit0
  * on +0x04 and +0x08. Brightness 0 = off; userspace 1..max → HW 1..62.
  *
+ * This is MMIO, not the Dialog PMIC, and that is from the decomp rather
+ * than from anyone's recollection:
+ *
+ *   - The stock bootloader ends its display bring-up with
+ *     sub_3522(0x3E000008, 62) -- sub_3522 is its plain MMIO write
+ *     helper, the same one used for CLKCON and IIC -- immediately after
+ *     the 0x3D7000xx LCDIF/DSI block and just before 0x3D700008 = 1.
+ *     62 is exactly this register's full-scale level.
+ *   - OSOS sub_4399FC sets 0x3E000008 bit 0 when SoC power domain 2
+ *     comes up, and domain 2 is the LCD domain. So the domain gates the
+ *     block; it does not supply the level.
+ *
+ * No PMIC register anywhere in the D1830 map carries brightness. A rail
+ * feeding the LED string would be a separate question, but nothing in the
+ * PMIC state analysis names one, so do not assume it either way.
+ *
  * Kconfig fragment (wire Makefile / Kconfig separately):
  *   config BACKLIGHT_S5L8740
  *   	tristate "Samsung/Apple S5L8740 backlight"

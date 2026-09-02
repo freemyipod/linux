@@ -27,6 +27,12 @@
 #define FPART_SPECIAL_CLASS		1u
 #define FPART_SPECIAL_CLASS_MASK	0x3fu
 #define FPART_SPECIAL_HDR		0x80u	/* chunk0 payload starts here */
+/* meta[0] of every FPart system object; the type word at meta+2 sorts them. */
+#define FPART_META_TYPE_SPECIAL	0x30u
+/* Enumerated on the glass: c101 signature, c105 config/serial, c104 context. */
+#define FPART_TYPE_SIGNATURE		0xc101u
+#define FPART_TYPE_VFL_CXT		0xc104u
+#define FPART_TYPE_CONFIG		0xc105u
 #define FPART_SPECIAL_LEN_OFF		0x24u
 #define FPART_SPECIAL_GEN_OFF		0x28u
 #define FPART_SPECIAL_TABLE_BYTES	0x2d0u	/* ctx+112; 120 × 6 */
@@ -55,6 +61,13 @@ struct whimory_fpart {
 #define WHIMORY_L2V_ROOT_REC_SIZE	6
 #define WHIMORY_L2V_INVALID_ROOT	0xffff
 #define WHIMORY_META_SIZE		16
+
+/* Pages held in the sequential read-ahead window (16 KiB each). */
+#define WHIMORY_RC_SLOTS		8
+
+/* Legacy per-block classify prefetch window, in 4 KiB slots. */
+#define WHIMORY_PF_SLOTS		16
+#define WHIMORY_NUM_CE_MAX		2
 #define WHIMORY_VBAS_PER_PAGE		4
 #define WHIMORY_PAGES_PER_SB		128
 #define WHIMORY_DATA_PAGES_PER_SB	127
@@ -214,11 +227,103 @@ struct whimory_vfl {
 	u32 ctx_hits;
 	u32 spare_applied;
 	u32 bitmap_loaded;
+	/* Block status table from the 0xc104 object: one bit per block. */
+	u8 *blk_status;
+	u32 blk_status_bad;
+	u32 blk_status_bank;
+	u32 blk_status_block;
+	u32 blk_status_mismatch;
+	bool syscfg_ok;
 	u32 bank_stride;	/* 0x8D0D0F0; N31 = 1 byte/VBN */
 	u8 *bank_mask;		/* [blocks_per_cau] bank bitmask; sub_3D1438 */
 	u16 cached_vbn;
 	u8 cached_n;
 	u8 cached_banks[S5L8740_NAND_MAX_CAU];
+};
+
+/*
+ * Apple SysCfg, the 0xc105 FPart object.
+ *
+ * A header naming the entry count, then that many records. Each record
+ * is a four-character tag followed by its value, and the tag is stored
+ * byte-reversed -- "SrNm" sits in the page as 6d 4e 72 53. Record sizes
+ * are not uniform, so the parser finds the tags and takes each value as
+ * the bytes up to the next one rather than assuming a stride.
+ *
+ * Read off the glass: 11 entries, SrNm FwId HwId HwVr SwVr MLB# CNTB
+ * MtCl Mod# Regn BMac.
+ */
+/*
+ * The touch calibration block, as an offset into the SysCfg payload.
+ *
+ * It sits at 0x1dc0 from the start of the page, and the payload starts at
+ * FPART_SPECIAL_HDR, so the payload-relative offset is 0x80 less. Using
+ * the page offset here started the block 0x80 bytes late and cut its
+ * header off.
+ */
+#define N31_TOUCH_CAL_OFF		(0x1dc0u - FPART_SPECIAL_HDR)
+
+/* Bytes stock copies from the touch calibration descriptor (sub_564). */
+#define N31_TOUCH_CAL_LEN		0x560u
+/* apple-grape's calibration window inside that blob. */
+#define N31_TOUCH_CAL_CAL_OFF	350u
+#define N31_TOUCH_CAL_CAL_LEN	0x200u
+
+/* Candidate tags recorded from one SysCfg section. */
+#define N31_SYSCFG_MAX_CAND	64u
+
+struct whimory_syscfg {
+	bool valid;
+	u32 entries;
+	char serial[24];	/* SrNm */
+	char model[24];	/* Mod# */
+	char mlb[32];		/* MLB#, the logic board */
+	char sw_ver[24];	/* SwVr */
+	char cnt_b[24];	/* CNTB */
+	char mt_cl[24];	/* MtCl */
+	u8 mac[6];		/* BMac */
+	bool mac_ok;
+	u32 region;		/* Regn */
+	u32 hw_ver;		/* HwVr */
+	u32 fw_id;		/* FwId */
+	/* touch calibration touchscreen calibration; raw, for apple-grape. */
+	/*
+	 * The touch calibration blob, verbatim and whole.
+	 *
+	 * Stock takes the descriptor at 0x2202FE18 (magic 0x53797349, data
+	 * pointer at +4) and copies 0x560 bytes from it; apple-grape then
+	 * reads its calibration window at +350 for 0x200. So the consumer
+	 * needs 862 bytes at minimum and the container is 1376, which is
+	 * what U-Boot republishes via /chosen apple,n31-touch_cal-addr and
+	 * apple,n31-touch_cal-size.
+	 *
+	 * A 1024-byte buffer could not hold it.
+	 */
+	u8 touch_cal[N31_TOUCH_CAL_LEN];
+	u32 touch_cal_len;
+	int touch_cal_magic_off;	/* offset of the container magic, -1 if absent */
+
+	/*
+	 * The whole SysCfg section, verbatim, plus every 4-byte-aligned
+	 * printable group found in it.
+	 *
+	 * The parser only decodes the eleven tags it knows. Everything else
+	 * in the section is invisible, and this device carries records
+	 * nobody has identified yet -- so keep the raw bytes and a list of
+	 * candidate tags, and let them be read out rather than guessed at.
+	 *
+	 * Tags are stored byte-reversed on disk ("SrNm" is 6d 4e 72 53), so
+	 * cand[].tag holds the un-reversed text.
+	 */
+	u8 *raw;
+	u32 raw_len;
+	struct {
+		char tag[5];
+		u32 off;
+		u32 len;
+		bool known;
+	} cand[N31_SYSCFG_MAX_CAND];
+	u32 n_cand;
 };
 
 struct whimory_sb {
@@ -250,7 +355,71 @@ struct whimory_sftl {
 	u8 *btoc_page;
 	u8 *data_page;
 	u8 *meta_page;
+	/*
+	 * Last NAND page read, cached across calls.
+	 *
+	 * A NAND page is 16 KiB and an LBA is 4 KiB, so four consecutive
+	 * LBAs live in one page. The block layer hands this driver one 4 KiB
+	 * LBA at a time, and n31_vfl_read_vba() reads a whole page to copy
+	 * 4 KiB out of it -- so a sequential read pulls the SAME page off the
+	 * media four times. Measured before this: 520 KB/s and 7.7 ms per
+	 * 4 KiB, on a device where a directory scan is hundreds of reads and
+	 * playback has 341 ms of buffer.
+	 *
+	 * The media is read-only here (whimory_submit_bio_range rejects
+	 * writes outright), so nothing can invalidate this behind our back
+	 * and the cache needs no coherence beyond being dropped on teardown.
+	 */
+	u8 *page_cache;
+	u8 page_cache_spare[S5L8740_NAND_META_SIZE];
+	u32 pc_ce, pc_cau, pc_pblock, pc_page;
+	bool page_cache_valid;
 	struct s5l8740_cs_page *cs_page; /* CS span4 scratch for recover/read */
+
+	/*
+	 * Batched page-0 prefetch window for the classify scan. pf_data is
+	 * 16 * 4 KiB and pf_meta 16 * 16 B, allocated at recover and freed
+	 * with it -- the scan is the only thing that reads whole ranges of
+	 * page 0 in order, so nothing outside it needs the window.
+	 */
+	u8 *pf_data;
+	u8 *pf_meta;
+	unsigned int pf_ce;
+	unsigned int pf_cau;
+	unsigned int pf_first;
+	unsigned int pf_count;
+	unsigned int pf_kicks;
+	unsigned int pf_hits;
+	bool pf_valid;
+	bool pf_failed;
+	bool pf_checked;
+
+	/*
+	 * Read-ahead window: S5L8740_NAND_PAGE_BATCH_MAX consecutive physical
+	 * pages of one block, filled by a single batched kick.
+	 *
+	 * This supersedes the one-page cross-call cache for sequential reads.
+	 * Four LBAs share a 16 KiB page, so the old cache turned four block
+	 * layer calls into one NAND read; the window turns thirty-two into
+	 * one, which is a whole 128 KiB readahead request per kick.
+	 */
+	u8 *rc_data;
+	u8 *rc_meta;
+	u8 *rc_stage;
+	u8 *rc_stage_meta;
+	struct {
+		unsigned int ce;
+		unsigned int cau;
+		unsigned int pblock;
+		unsigned int page;
+		bool valid;
+	} rc_key[WHIMORY_RC_SLOTS];
+	unsigned int rc_count;
+	unsigned int rc_fills;
+	unsigned int rc_hits;
+	unsigned int rc_misses;
+	unsigned int rc_fails;
+	unsigned int scan_kicks;
 	struct whimory_sb *sbs;
 	u32 mapped_roots;
 	u32 mapped_lbas;
@@ -279,6 +448,14 @@ struct whimory_sftl {
 	u32 cxt_l2v_updates;
 	u32 cxt_hole_entries;
 	u32 cxt_xlate_fail;
+	/* CXT extents checked against the page's own metadata before use. */
+	u32 cxt_meta_confirmed;
+	u32 cxt_meta_mismatch;
+	u32 cxt_confirm_pages;
+	u32 cxt_confirm_unreadable;
+	/* Extents a stale checkpoint lost, rebuilt from page metadata. */
+	u32 cxt_repair_pages;
+	u32 cxt_repair_slots;
 	u32 diff_replayed_sbs;
 	u32 diff_skipped_sbs;
 	u32 diff_open_kept;	/* open SBs the page-0 weave would have skipped */
@@ -307,6 +484,7 @@ struct whimory_sftl {
 	u32 cxt_dumped;		/* pairs printed by the record dump */
 	u32 cxt_hdr_skipped;	/* records whose header said nothing follows */
 	u32 cxt_hdr_bad;	/* records whose header was not a CONTIG marker */
+	u32 cxt_resyncs;	/* TREE records that re-anchored the LBA cursor */
 	u32 btoc_pages_read;
 	u32 btoc_pages_valid;
 	u32 btoc_entries_seen;
@@ -371,10 +549,23 @@ struct whimory_cxt_base {
  * Phase 3 keeps these in a candidate map, separate from the live interval
  * map, so the CXT decode can be validated without disturbing a working disk.
  */
+/*
+ * weave is the checkpoint generation this extent came from, and it is not
+ * optional bookkeeping.
+ *
+ * The candidate map is the union of every CXT superblock, and several
+ * generations describe the same logical ranges. Without a per-extent weave
+ * the seed had nothing to arbitrate with: it stamped every extent with one
+ * value, so the newest-wins rule in whimory_range_update() could never fire
+ * between two seed extents and whichever entry the sort placed last won.
+ * sort() is heapsort and unstable, so that was decided by the heap, and the
+ * map came out different on every boot from identical flash.
+ */
 struct whimory_cxt_extent {
 	u32 lba;
 	u32 span;
 	u32 vba;
+	u64 weave;
 };
 
 struct whimory_fpart_ops {
@@ -409,6 +600,7 @@ struct whimory {
 	struct whimory_signature sig;
 	struct whimory_l2v l2v;
 	struct whimory_vfl vfl;
+	struct whimory_syscfg	syscfg;
 	struct whimory_sftl sftl;
 	struct rb_root ranges;
 	struct whimory_fpart fpart_ctx;
@@ -429,6 +621,8 @@ struct whimory {
 	struct whimory_cxt_extent *cxt_ext;	/* candidate map (Phase 3) */
 	u32 n_cxt_ext;
 	u32 max_cxt_ext;
+	/* Longest span in cxt_ext; bounds the backward walk in cxt_lookup. */
+	u32 cxt_ext_max_span;
 	u64 cxt_ext_weave;			/* base weave it came from */
 	u32 cxt_ext_sb;
 	struct whimory_cxt_base cxt[WHIMORY_CXT_MAX_SB];
@@ -465,5 +659,7 @@ static inline u32 whimory_sig32(const u8 *sig, unsigned int off)
 {
 	return get_unaligned_le32(sig + off);
 }
+
+const char *whimory_recovery_state_name(void);
 
 #endif /* WHIMORY_S5L8740_H */

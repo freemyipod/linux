@@ -62,8 +62,51 @@
 #define FMUNK81C		0x81c
 
 #define FMSS_DMA_STATUS_LEN	512
+/* Consecutive IRQ-less-but-clean transfers before the driver stops waiting. */
+#define FMSS_IRQ_GIVEUP		8
 #define FMSS_DMA_CMDLIST_LEN	256
 #define FMSS_DMA_SPARE_LEN	256
+
+/*
+ * Batched meta scan.
+ *
+ * The command list is a chain of 8-dword descriptor pairs (CE-select then
+ * transfer) closed by a 0x00010002 terminator. Nothing in that format is
+ * single-page.
+ *
+ * A single-page kick costs about 1.54 ms against a NAND tR of 60-80 us, so
+ * roughly 1.45 ms of every read is fixed sequencer overhead paid once per
+ * page. Batching N pages behind one kick pays it once per N.
+ *
+ * The batch is 16 entries because that is what the spare buffer holds
+ * (256 B at 16 B per sector). It needs 16 * 4 KiB of data buffer: the
+ * transfer descriptor always lands a full sector even when only the meta is
+ * wanted.
+ */
+/*
+ * 256 meta records per kick, which is stock's S_SCAN_META_SIZE
+ * (s_cxt_diff.c:349). The scan queues two reads per superblock -- first
+ * page and last page -- so one kick covers 128 superblocks.
+ */
+#define FMSS_DMA_BATCH_MAX	256
+#define FMSS_DMA_BATCH_CMDL_LEN	(FMSS_DMA_BATCH_MAX * 32 + 16)
+
+/*
+ * Two shapes share these buffers, and the buffer is sized for whichever
+ * needs more of it:
+ *
+ *   classify   16 entries x span 1  ->  64 KiB data,  256 B spare
+ *   read ahead  8 entries x span 4  -> 128 KiB data,  512 B spare
+ *
+ * span is the descriptor's sector count. The classify scan wants one 4 KiB
+ * sector per block because all it reads is slot 0 meta across many blocks;
+ * the read path wants all four, because a 16 KiB page holds four
+ * consecutive LBAs and splitting it into four span-1 entries would make the
+ * NAND open the same page four times.
+ */
+#define FMSS_DMA_BATCH_SPAN_MAX	4
+#define FMSS_DMA_BATCH_DATA_LEN	(128 * 1024)
+#define FMSS_DMA_BATCH_SPARE_LEN	(FMSS_DMA_BATCH_MAX * 16)
 #define FMSS_SECTOR_LEN		4096
 
 #define FMSS_MAX_CHUNKS		16
@@ -254,7 +297,7 @@ MODULE_PARM_DESC(boot_carve_block,
 		 "cached aligned boot block (0=BTOC hunt for LPN0)");
 
 /* Default l2v_build width when sysfs omits NBLOCKS (user blocks to scan). */
-static unsigned int l2v_auto_blocks = 256;
+static unsigned int l2v_auto_blocks;
 module_param(l2v_auto_blocks, uint, 0644);
 MODULE_PARM_DESC(l2v_auto_blocks,
 		 "default l2v_build block span per CE/CAU (0=carve/boot hunt only)");
@@ -331,18 +374,39 @@ struct nand_s5l8740 {
 	struct device *dev;
 	void *seq;
 	void *cmdl;
+	void *bcmdl;
+	void *bdata;
+	void *bspare;
+	bool batch_ok;
 	void *data;
 	void *spare;
 	void *stbuf;
 	dma_addr_t seq_dma;
 	dma_addr_t cmdl_dma;
+	dma_addr_t bcmdl_dma;
+	dma_addr_t bdata_dma;
+	dma_addr_t bspare_dma;
 	dma_addr_t data_dma;
 	dma_addr_t spare_dma;
 	dma_addr_t stbuf_dma;
 	u32 last_dma_c0c;
+	/*
+	 * Bumped by every writer of last_dma_c0c -- preflight, ISR, poll.
+	 * fmss_dma_page_read() samples it either side of the kick so it can
+	 * tell a status word that belongs to this transfer from one left
+	 * over by the previous read.
+	 */
+	u32 c0c_seq;
 	u32 last_dma_d00;
 	u32 last_dma_c00;
 	int irq;
+	/*
+	 * Consecutive transfers whose IRQ never arrived but which then
+	 * polled clean. Past FMSS_IRQ_GIVEUP the line is not this driver's and the
+	 * 200 ms wait is pure cost, so stop taking it.
+	 */
+	unsigned int irq_timeouts;
+	bool irq_dead;
 	struct completion cs_irq;
 	u32 last_vic_raw;
 	u32 last_vic_en;
@@ -378,7 +442,7 @@ module_param(page_ctrl0_or, uint, 0644);
 MODULE_PARM_DESC(page_ctrl0_or, "FMCTRL0 extra bits for 50D960 page read (171MHz timing)");
 
 /* 50D960 wedges PPN after many reads; re-run 10453C+0xFF+power-state. */
-static unsigned int reset_every = 6;
+static unsigned int reset_every = 32;
 module_param(reset_every, uint, 0644);
 MODULE_PARM_DESC(reset_every, "nand_reset after this many page_read calls (0=off)");
 
@@ -399,17 +463,17 @@ module_param(cs_reads_total, uint, 0444);
 
 /* Where CS read wall time actually goes; reported by the heartbeat. */
 static u64 cs_ns_kick, cs_ns_copy;
+static unsigned int cs_batch_kicks;
 
 /*
- * On. The comment above explains exactly why this is needed and it then
- * defaulted to 0, so the counter was incremented in five places and acted
- * on in none. A recovery walks eight thousand pages of back-to-back live
- * C00 kicks with nothing reasserting the sequencer across the whole run,
- * which is the condition the comment describes.
+ * Must be non-zero. A recovery walks eight thousand pages of back-to-back
+ * live C00 kicks; with this at 0 the counter is incremented in five places
+ * and acted on in none, so nothing reasserts the sequencer across the whole
+ * run -- exactly the condition the comment above describes.
  *
- * 4096 is two register writes and two 10 us delays roughly twice per
- * recovery -- unmeasurable against the reads between them, and it bounds
- * how far the sequencer can drift before something puts it back.
+ * 4096 costs two register writes and two 10 us delays roughly twice per
+ * recovery, unmeasurable against the reads between them, and it bounds how
+ * far the sequencer can drift before something puts it back.
  */
 static unsigned int cs_reset_every = 4096;
 module_param(cs_reset_every, uint, 0644);
@@ -430,7 +494,7 @@ MODULE_PARM_DESC(spare_len,
  * Draining it before 4EB458 steals the syndrome (whitened data). A second
  * 50D960 with ecc_before_drain=0 copies META and keeps the first pass's data.
  * Extra style-1 FMLEN=15 beats after a style-0 page returned 0xFF and made
- * the next programmed page ECC-clean (glass 2026-08-27).
+ * the next programmed page ECC-clean.
  */
 static bool meta_pass = true;
 module_param(meta_pass, bool, 0644);
@@ -506,8 +570,10 @@ static unsigned int dma_kick = 0xfff5;
 module_param(dma_kick, uint, 0644);
 MODULE_PARM_DESC(dma_kick, "FMSEQ (C00) kick value (OSOS D39EC = 0xFFF5)");
 
-/* Default dry/disarmed: permanent live C00 kick reboots (glass 2026-08-27).
- * ftl_sftl_recover / cs_phys use dma_session_begin to arm live CS temporarily.
+/*
+ * Default dry and disarmed: leaving the C00 kick permanently live reboots
+ * the device. ftl_sftl_recover and cs_phys arm CS for the duration of an
+ * operation via dma_session_begin() and restore these on end.
  */
 static bool dma_dry = true;
 module_param(dma_dry, bool, 0644);
@@ -885,7 +951,7 @@ static int fmss_ecc_chunk(struct nand_s5l8740 *f, unsigned int seed_a1)
 /*
  *(ce, page_addr, buf, with_parity).
  * Per 1KiB chunk: parity beat → data xfer wait → 4EB458 → PIO drain.
- * Linux previously drained before ECC — that left DATA pages whitened.
+ * Draining before ECC leaves DATA pages whitened.
  */
 static void fmss_meta_ingest_spare(struct nand_s5l8740 *f, unsigned int ce,
 				   unsigned int cau, unsigned int block,
@@ -1080,56 +1146,6 @@ fail_ctrl0:
 }
 
 /*
- * FIL needs both descrambled data (pass 1, ECC) and 16B Sogeti META
- * (pass 2, drain 53-byte parity FIFO). Mutex is already held.
- */
-static int fmss_page_read_with_meta(struct nand_s5l8740 *f, unsigned int ce,
-				    u32 addr)
-{
-	static u8 page_bak[FMSS_PAGE_LEN];
-	unsigned int dlen;
-	int ret, ret2;
-	bool saved_ecc;
-	int saved_ce, saved_chunk;
-	u32 saved_addr;
-
-	ret = fmss_page_read(f, ce, addr);
-	if (ret || !meta_pass)
-		return ret;
-	/*
-	 * Erased PPN page: all 16 chunks ECC-clean. Spare is 0xFF; a second
-	 * 50D960 only burns the controller (tail+brute are mostly empty).
-	 */
-	if (f->last_clean_chunks &&
-	    f->last_clean_chunks >= (page_chunks ? page_chunks : 16)) {
-		memset(f->last_spare, 0xff, sizeof(f->last_spare));
-		f->last_spare_len = 64;
-		return ret;
-	}
-	dlen = f->last_page_len;
-	if (dlen > FMSS_PAGE_LEN)
-		dlen = FMSS_PAGE_LEN;
-	memcpy(page_bak, f->last_page, dlen);
-	saved_ce = f->last_page_ce;
-	saved_addr = f->last_page_addr;
-	saved_chunk = f->last_page_chunk;
-	saved_ecc = ecc_before_drain;
-	ecc_before_drain = false;
-	ret2 = fmss_page_read(f, ce, addr);
-	ecc_before_drain = saved_ecc;
-	memcpy(f->last_page, page_bak, dlen);
-	f->last_page_len = dlen;
-	f->last_page_ce = saved_ce;
-	f->last_page_addr = saved_addr;
-	f->last_page_chunk = saved_chunk;
-	f->last_page_ret = ret;
-	if (ret2 && !quiet)
-		pr_info("s5l8740-nand: meta pass ce=%u addr=%08x ret=%d (data kept)\n",
-			ce, addr, ret2);
-	return ret;
-}
-
-/*
  * OSOS 4EDDDC / D39EC: FMSS command-list DMA page read.
  * Sequence program is the OSOS blob at 0x8980EA0 (embedded).
  * 16-byte PPN spare per 4K sector lands in the spare DMA buffer
@@ -1148,19 +1164,30 @@ static int fmss_wait_cs_poll(struct nand_s5l8740 *f, unsigned int loops)
 		irq = readl(f->base + FMSEQIRQ);
 		if ((irq & 0xd) == 1) {
 			f->last_dma_c0c = irq;
+			f->c0c_seq++;
 			return 0;
 		}
 		if (irq & 0xc) {
 			f->last_dma_c0c = irq;
+			f->c0c_seq++;
 			return -EIO;
 		}
 		udelay(10);
 	}
 	f->last_dma_c0c = readl(f->base + FMSEQIRQ);
+	f->c0c_seq++;
 	return -ETIMEDOUT;
 }
 
-static bool fmss_cs_preflight(struct nand_s5l8740 *f)
+static int fmss_nand_reset(struct nand_s5l8740 *f);
+
+/*
+ * Try the idle gate once. Reports which half refused and what it saw.
+ *
+ * 0 = idle, 1 = interrupt status will not clear, 2 = sequencer not idle.
+ */
+static int fmss_cs_preflight_once(struct nand_s5l8740 *f, u32 *c00_out,
+				  u32 *c08_out, u32 *c0c_out)
 {
 	u32 c08, c0c, c00;
 
@@ -1180,17 +1207,90 @@ static bool fmss_cs_preflight(struct nand_s5l8740 *f)
 		f->last_dma_c0c = c0c;
 	}
 
+	*c00_out = c00;
+	*c08_out = c08;
+	*c0c_out = c0c;
+
 	/*
 	 * Conservative idle gate. Adjust allowed states only after glass logs.
 	 * Avoid kick if status already advertises completion/error/busy noise.
 	 */
 	if (c0c & 0x0d)
-		return false;
-
+		return 1;
 	if (c08 != 0 && c08 != 3)
+		return 2;
+	return 0;
+}
+
+/*
+ * Reset the controller once when the gate refuses, rather than failing
+ * every read until reboot.
+ *
+ * This gate is the only source of -EBUSY on the read path, and it said
+ * nothing at all: the caller turned it into a bare -EBUSY, n31_sftl_read_lba
+ * turned that into an EIO, and vfat printed "FAT read failed". Three layers
+ * and not one of them could say that the sequencer was not idle, which is
+ * the entire content of the failure.
+ *
+ * Observed on hardware after a hard hang: recovery completes -- thousands of
+ * CS reads -- and then every subsequent read returns -EBUSY, with the map
+ * intact and the LBAs resolving. That is a sequencer left mid-transaction,
+ * not a mapping fault, and it persisted across a driver reload because
+ * nothing reasserted the sequencer.
+ *
+ * fmss_nand_reset() is already run periodically on this path by
+ * cs_reset_every, so doing it here is not a new operation, only a better
+ * trigger for it: a gate that refuses is exactly the condition a reset
+ * exists to clear. If it does not help, the read fails as before and both
+ * register snapshots are in the log.
+ */
+static bool cs_preflight_reset = true;
+module_param(cs_preflight_reset, bool, 0644);
+MODULE_PARM_DESC(cs_preflight_reset,
+		 "Reset the controller when the CS idle gate refuses (default Y)");
+
+static unsigned int cs_preflight_fails;
+module_param(cs_preflight_fails, uint, 0444);
+static unsigned int cs_preflight_recovered;
+module_param(cs_preflight_recovered, uint, 0444);
+
+static bool fmss_cs_preflight(struct nand_s5l8740 *f)
+{
+	u32 c00, c08, c0c;
+	int why;
+
+	why = fmss_cs_preflight_once(f, &c00, &c08, &c0c);
+	if (!why)
+		return true;
+
+	cs_preflight_fails++;
+	dev_err_ratelimited(f->dev,
+			    "CS not idle (%s): C00=%08x C08=%08x C0C=%08x since_reset=%u\n",
+			    why == 1 ? "IRQ status will not clear" :
+				       "sequencer busy",
+			    c00, c08, c0c, f->pages_since_reset);
+
+	if (!cs_preflight_reset)
 		return false;
 
-	return true;
+	fmss_nand_reset(f);
+	f->pages_since_reset = 0;
+
+	why = fmss_cs_preflight_once(f, &c00, &c08, &c0c);
+	if (!why) {
+		cs_preflight_recovered++;
+		dev_warn_ratelimited(f->dev,
+				     "CS idle again after reset (recovered %u times)\n",
+				     cs_preflight_recovered);
+		return true;
+	}
+
+	dev_err_ratelimited(f->dev,
+			    "CS still not idle after reset (%s): C00=%08x C08=%08x C0C=%08x\n",
+			    why == 1 ? "IRQ status will not clear" :
+				       "sequencer busy",
+			    c00, c08, c0c);
+	return false;
 }
 
 static void fmss_dma_teardown(struct nand_s5l8740 *f)
@@ -1212,8 +1312,16 @@ static void fmss_dma_teardown(struct nand_s5l8740 *f)
 			dma_free_coherent(dev, FMSS_DMA_SPARE_LEN, f->spare, f->spare_dma);
 		if (f->stbuf)
 			dma_free_coherent(dev, FMSS_DMA_STATUS_LEN, f->stbuf, f->stbuf_dma);
+		if (f->bcmdl)
+			dma_free_coherent(dev, FMSS_DMA_BATCH_CMDL_LEN, f->bcmdl, f->bcmdl_dma);
+		if (f->bdata)
+			dma_free_coherent(dev, FMSS_DMA_BATCH_DATA_LEN, f->bdata, f->bdata_dma);
+		if (f->bspare)
+			dma_free_coherent(dev, FMSS_DMA_BATCH_SPARE_LEN, f->bspare, f->bspare_dma);
 	}
 	f->seq = f->cmdl = f->data = f->spare = f->stbuf = NULL;
+	f->bcmdl = f->bdata = f->bspare = NULL;
+	f->batch_ok = false;
 	f->dma_ok = 0;
 	f->dma_mapped = 0;
 }
@@ -1225,6 +1333,7 @@ static irqreturn_t fmss_cs_irq(int irq, void *data)
 
 	st = readl(f->base + FMSEQIRQ);
 	f->last_dma_c0c = st;
+	f->c0c_seq++;
 
 	/*
 	 * Level-style VIC source: clear peripheral before parent EOI, or it
@@ -1272,6 +1381,24 @@ static int fmss_dma_setup(struct nand_s5l8740 *f, struct device *dev)
 		fmss_dma_teardown(f);
 		return -ENOMEM;
 	}
+	/*
+	 * Batch buffers are a speed path, not a correctness one: if the
+	 * allocator cannot find 64 KiB of coherent memory the single-page
+	 * transport still works, so record the failure and carry on rather
+	 * than failing the probe over it.
+	 */
+	f->bcmdl = dma_alloc_coherent(dev, FMSS_DMA_BATCH_CMDL_LEN,
+				      &f->bcmdl_dma, GFP_KERNEL);
+	f->bdata = dma_alloc_coherent(dev, FMSS_DMA_BATCH_DATA_LEN,
+				      &f->bdata_dma, GFP_KERNEL);
+	f->bspare = dma_alloc_coherent(dev, FMSS_DMA_BATCH_SPARE_LEN,
+				       &f->bspare_dma, GFP_KERNEL);
+	f->batch_ok = f->bcmdl && f->bdata && f->bspare;
+	if (!f->batch_ok)
+		nand_dev_info(dev, "batch DMA buffers unavailable, single-page reads only\n");
+	else
+		memset(f->bcmdl, 0, FMSS_DMA_BATCH_CMDL_LEN);
+
 	memcpy(f->seq, fmss_seq_read_blob, FMSS_SEQ_READ_LEN);
 	memset(f->cmdl, 0, FMSS_DMA_CMDLIST_LEN);
 	memset(f->data, 0, FMSS_PAGE_LEN);
@@ -1308,6 +1435,7 @@ static int fmss_dma_page_read(struct nand_s5l8740 *f, unsigned int ce, u32 addr)
 	u8 *dp;
 	int ret = 0;
 	u32 dregs[32];
+	u32 c0c_seq_before = 0;
 
 	memset(dregs, 0, sizeof(dregs));
 
@@ -1419,10 +1547,12 @@ static int fmss_dma_page_read(struct nand_s5l8740 *f, unsigned int ce, u32 addr)
 	writel((u32)f->seq_dma, f->base + FMSEQBASE);	/* C04 = seq program */
 	/*
 	 * Do NOT poke +0x81C here — that is 4EB458 ECC, not in 4EDDDC/D39EC.
-	 * A spurious 81C write before CS previously correlated with SoC wedges.
+	 * A spurious 81C write before CS correlates with SoC wedges.
 	 */
 	/* D39EC: C00 = 0xFFF5. Do NOT use 0x80000 (reset) here. */
 	reinit_completion(&f->cs_irq);
+	/* Everything after this that observes C0C bumps c0c_seq; see below. */
+	c0c_seq_before = f->c0c_seq;
 	fmss_info("dma kick ce=%u addr=%08x seq=%08x cmdl=%08x data=%08x meta=%08x st=%08x d14=%u kick=%04x dry=%d armed=%d\n",
 		  ce, addr, (u32)f->seq_dma, (u32)f->cmdl_dma, (u32)f->data_dma,
 		  (u32)f->spare_dma, (u32)f->stbuf_dma, dma_d14, dma_kick,
@@ -1464,23 +1594,57 @@ static int fmss_dma_page_read(struct nand_s5l8740 *f, unsigned int ce, u32 addr)
 	 * Prefer IRQ completion snapshot (ISR already W1C'd C0C). Fall back
 	 * to short poll only when no IRQ or completion never arrived.
 	 */
-	if (f->irq > 0) {
+	/*
+	 * dma_irq is a hardcoded Linux IRQ number (this device has no DT node
+	 * -- it is created with platform_device_register_simple), so it is
+	 * only right as long as nothing changes the order in which VIC lines
+	 * get mapped. Boot now loads the periph drivers before storage, which
+	 * is exactly the kind of change that can move it.
+	 *
+	 * request_irq() still succeeds on the wrong line, and the symptom is
+	 * not an error: every read waits the full 200 ms and then polls
+	 * successfully, so the volume works and is two hundred times slower
+	 * than it should be. Notice that instead of paying it forever.
+	 */
+	if (f->irq > 0 && !f->irq_dead) {
 		if (wait_for_completion_timeout(&f->cs_irq,
 						msecs_to_jiffies(200))) {
+			f->irq_timeouts = 0;
 			ret = 0;
 		} else {
 			ret = fmss_wait_cs_poll(f, 2000);
+			if (!ret && ++f->irq_timeouts >= FMSS_IRQ_GIVEUP) {
+				f->irq_dead = true;
+				dev_warn(f->dev,
+					 "CS IRQ %d has not fired in %u transfers that then polled clean -- polling from now on\n",
+					 f->irq, f->irq_timeouts);
+			}
 		}
 	} else {
 		ret = fmss_wait_cs_poll(f, 20000);
 	}
 
 	/*
-	 * Avoid require C0C to still be live — ISR clears it for VIC EOI.
-	 * Trust the saved snapshot from ISR or poll.
+	 * Avoid requiring C0C to still be live — the ISR clears it for VIC
+	 * EOI. Trust the saved snapshot from the ISR or the poll.
+	 *
+	 * The snapshot has to be from THIS transfer, though. last_dma_c0c is
+	 * written by the preflight, the ISR and the poll, and the check used
+	 * to skip itself entirely when the value was zero -- so a transfer
+	 * whose ISR never ran passed on a stale word from the previous read,
+	 * or on the zero the preflight left, and a failed read was reported
+	 * as a good one with whatever happened to be in the DMA buffer.
+	 *
+	 * c0c_seq is stamped by every writer; if it did not move across the
+	 * kick, nothing observed this transfer's status and the result is
+	 * not trustworthy.
 	 */
-	if (!ret && f->last_dma_c0c &&
-	    ((f->last_dma_c0c & 0x0d) != 1))
+	if (!ret && f->c0c_seq == c0c_seq_before) {
+		fmss_info("dma no status observed for this transfer (c0c=%08x)\n",
+			  f->last_dma_c0c);
+		ret = -EIO;
+	}
+	if (!ret && (f->last_dma_c0c & 0x0d) != 1)
 		ret = -EIO;
 
 	f->last_dma_d00 = readl(f->base + FMGEN0);
@@ -1560,6 +1724,387 @@ dma_done:
 	}
 	return ret;
 }
+
+/*
+ * Batched meta read: N pages, one sequencer kick.
+ *
+ * This is the transport the FTL classify scan wants. It is deliberately a
+ * separate function rather than a generalisation of fmss_dma_page_read():
+ * that one carries the diagnostic apparatus for CS bring-up and is the path
+ * the block layer uses. Reworking it to loop would put every read at risk to
+ * speed up mount, which is the wrong trade.
+ *
+ * The list is the same 4EDDDC shape, just longer:
+ *
+ *   per page i:  [8i+0] CE-select   1<<(ce+16), bit31 on the last one only
+ *                [8i+1] 0
+ *                [8i+2] col_len     rec*span | (rec*slot)<<16
+ *                [8i+3] ppn
+ *                [8i+4] transfer    (1<<(ce+16))|1
+ *                [8i+5] span
+ *                [8i+6] meta target
+ *                [8i+7] data target
+ *   terminator:  [8n]   0x00010002
+ *
+ * Every page in a batch must be on the same CE, because bit31 marks the last
+ * CE-select for a CE and the caller has no way to express a second one here.
+ * The FTL scans a CE at a time anyway.
+ *
+ * span is forced to 1: the scan wants 16 bytes of meta per page, and a
+ * one-sector transfer is the smallest the descriptor can express. The 4 KiB
+ * of data it lands anyway is not wasted -- the classifier needs the head of
+ * slot 0 for its blank test.
+ */
+static int fmss_dma_meta_read_batch(struct nand_s5l8740 *f, unsigned int ce,
+				    const u32 *addrs, unsigned int n,
+				    unsigned int span, bool scan_mode)
+{
+	u32 *cl;
+	u32 ce_bit, col_len, rec;
+	unsigned int i;
+	int ret = 0;
+
+	if (!f->dma_ok || !f->batch_ok)
+		return -ENODEV;
+	if (ce > 7 || n < 1 || n > FMSS_DMA_BATCH_MAX)
+		return -EINVAL;
+	if (span < 1 || span > FMSS_DMA_BATCH_SPAN_MAX)
+		return -EINVAL;
+	if (!scan_mode && n * span * FMSS_SECTOR_LEN > FMSS_DMA_BATCH_DATA_LEN)
+		return -EINVAL;
+	if (scan_mode && span * FMSS_SECTOR_LEN > FMSS_DMA_BATCH_DATA_LEN)
+		return -EINVAL;
+	if (n * span * 16 > FMSS_DMA_BATCH_SPARE_LEN)
+		return -EINVAL;
+
+	memcpy(f->seq, fmss_seq_read_blob, FMSS_SEQ_READ_LEN);
+	memset(f->bdata, 0, FMSS_DMA_BATCH_DATA_LEN);
+	memset(f->bspare, 0, FMSS_DMA_BATCH_SPARE_LEN);
+	memset(f->stbuf, 0, FMSS_DMA_STATUS_LEN);
+	memset(f->bcmdl, 0, FMSS_DMA_BATCH_CMDL_LEN);
+
+	cl = f->bcmdl;
+	ce_bit = 1u << (16 + ce);
+	rec = dma_rec ? dma_rec : FMSS_PPN_REC;
+	col_len = rec * span;		/* slot 0, span sectors */
+
+	for (i = 0; i < n; i++) {
+		u32 *d = cl + i * 8;
+
+		d[0] = ce_bit;
+		d[1] = 0;
+		if (dma_d14 >= 7) {
+			d[2] = col_len;
+			d[3] = addrs[i];
+		} else {
+			d[2] = addrs[i];
+			d[3] = 0;
+		}
+		d[4] = ce_bit | 1u;
+		d[5] = span;
+		d[6] = (u32)f->bspare_dma + i * span * 16;
+		/*
+		 * In scan mode every entry writes its page data to the same
+		 * buffer and only the meta pointer advances, so a 256-entry
+		 * list needs one sector of data buffer rather than 256.
+		 * Stock does exactly this: the data argument to its read is a
+		 * fixed pointer across the whole batch while the meta cursor
+		 * steps by 16.
+		 */
+		d[7] = scan_mode ? (u32)f->bdata_dma
+				 : (u32)f->bdata_dma + i * span * FMSS_SECTOR_LEN;
+	}
+	/* bit31 = last CE-select for this CE, so only the final descriptor. */
+	cl[(n - 1) * 8] |= 0x80000000u;
+	cl[n * 8] = 0x00010002u;
+
+	writel(dma_c6c, f->base + 0xc6c);
+
+	if (!fmss_cs_preflight(f))
+		return -EBUSY;
+
+	writel(page_ctrl0_or, f->base + FMGEN1);
+	writel((u32)f->bcmdl_dma, f->base + FMGEN2);
+	writel(FMSS_SECTOR_LEN, f->base + FMGEN3);
+	writel((u32)f->stbuf_dma, f->base + FMGEN4);
+	writel(dma_d14, f->base + FMGEN5);
+	writel((u32)f->seq_dma, f->base + FMSEQBASE);
+
+	reinit_completion(&f->cs_irq);
+
+	if (dma_dry)
+		return -EAGAIN;
+	if (!dma_armed)
+		return -EPERM;
+
+	readl(f->base + FMGEN2);
+	readl(f->base + FMGEN3);
+	readl(f->base + FMGEN4);
+	readl(f->base + FMGEN5);
+	readl(f->base + FMSEQBASE);
+
+	writel(dma_kick, f->base + FMSEQ);
+	readl(f->base + FMSEQ);
+
+	/*
+	 * Same completion rule as the single-page path, with the timeout
+	 * scaled by the batch: n pages behind one kick is n tR of NAND time
+	 * before the sequencer can finish, and a fixed 200 ms would start
+	 * declaring the IRQ dead on the larger batches.
+	 */
+	if (f->irq > 0 && !f->irq_dead) {
+		if (wait_for_completion_timeout(&f->cs_irq,
+						msecs_to_jiffies(200 + 20 * n))) {
+			f->irq_timeouts = 0;
+			ret = 0;
+		} else {
+			ret = fmss_wait_cs_poll(f, 2000 * n);
+		}
+	} else {
+		ret = fmss_wait_cs_poll(f, 20000 * n);
+	}
+
+	f->last_stat48 = readl(f->base + FMSTAT48);
+	f->last_nandstat = readl(f->base + NANDSTAT);
+	return ret;
+}
+
+/*
+ * Meta for n blocks on one CE, same page in each, in one kick.
+ *
+ * meta_out is n * S5L8740_NAND_BATCH_META_SIZE bytes of raw spare.
+ *
+ * data_out, when given, gets data_bytes from the head of each page, packed
+ * at that stride. The transfer always lands a full 4 KiB sector whatever is
+ * asked for, so the choice is purely how much the caller wants copied out:
+ * S5L8740_NAND_BATCH_DATA_HEAD (64) is enough for a blank test, and
+ * S5L8740_NAND_SLOT_DATA (4096) hands over the whole slot, which is what the
+ * classify scan needs to finish a block without reading it a second time.
+ * Pass 0 for meta only.
+ *
+ * Returns 0 with the outputs filled, or a negative error with neither.
+ */
+int s5l8740_nand_cs_read_meta_batch(u8 ce, u8 cau, const u16 *blocks, u8 page,
+				    unsigned int n, u8 *meta_out, u8 *data_out,
+				    unsigned int data_bytes)
+{
+	struct nand_s5l8740 *f = nand_dev;
+	u32 *addrs;
+	bool saved_armed;
+	unsigned int i;
+	int ret;
+	u64 t0, t1;
+
+	if (!f || !blocks || !meta_out)
+		return -ENODEV;
+	if (!f->dma_ok || !f->batch_ok)
+		return -ENODEV;
+	if (ce >= FMSS_NUM_CE || cau >= FMSS_NUM_CAU || page > FMSS_BTOC_PAGE)
+		return -EINVAL;
+	if (n < 1 || n > FMSS_DMA_BATCH_MAX)
+		return -EINVAL;
+	if (data_bytes > FMSS_SECTOR_LEN)
+		return -EINVAL;
+	if (dma_dry)
+		return -EAGAIN;
+	if (!dma_armed)
+		return -EPERM;
+
+	addrs = kmalloc_array(n, sizeof(*addrs), GFP_KERNEL);
+	if (!addrs)
+		return -ENOMEM;
+	for (i = 0; i < n; i++) {
+		if (blocks[i] >= FMSS_BLOCKS_PER_CAU) {
+			kfree(addrs);
+			return -EINVAL;
+		}
+		addrs[i] = fmss_ppn_addr(cau, blocks[i], page, 0);
+	}
+
+	mutex_lock(&f->lock);
+	if (cs_reset_every && f->pages_since_reset >= cs_reset_every) {
+		fmss_nand_reset(f);
+		f->pages_since_reset = 0;
+	}
+	saved_armed = dma_armed;
+	dma_armed = true;
+	dma_skip_ingest = true;
+	t0 = ktime_get_ns();
+	ret = fmss_dma_meta_read_batch(f, ce, addrs, n, 1, true);
+	t1 = ktime_get_ns();
+	dma_skip_ingest = false;
+	if (!dma_one_shot)
+		dma_armed = saved_armed;
+	f->pages_since_reset += n;
+
+	if (!ret) {
+		for (i = 0; i < n; i++) {
+			memcpy(meta_out + i * S5L8740_NAND_BATCH_META_SIZE,
+			       (u8 *)f->bspare + i * 16,
+			       S5L8740_NAND_BATCH_META_SIZE);
+			if (data_out && data_bytes)
+				memcpy(data_out + i * data_bytes,
+				       (u8 *)f->bdata + i * FMSS_SECTOR_LEN,
+				       data_bytes);
+		}
+		cs_ns_kick += t1 - t0;
+		cs_reads_total += n;
+		cs_batch_kicks++;
+		if (cs_heartbeat && (cs_batch_kicks & 0x3f) == 0)
+			pr_info("s5l8740-nand: cs_batch kicks=%u pages=%u n=%u kick_us=%llu\n",
+				cs_batch_kicks, cs_reads_total, n,
+				div_u64(t1 - t0, 1000));
+	}
+	mutex_unlock(&f->lock);
+	kfree(addrs);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(s5l8740_nand_cs_read_meta_batch);
+
+/*
+ * n consecutive whole pages of one block, in one sequencer kick.
+ *
+ * This is the read path's version of the batch. The classify scan wants one
+ * sector from each of many blocks; a file read wants every sector of a few
+ * consecutive pages, because four 4 KiB LBAs share a 16 KiB page and the
+ * LBAs after them are in the next page along. So the axis is transposed:
+ * one block, pages first_page .. first_page + n - 1, span 4.
+ *
+ * data_out gets n * S5L8740_NAND_PAGE_SIZE bytes, meta_out (optional) gets
+ * n * S5L8740_NAND_META_SIZE -- four 16-byte slot metas per page, laid out
+ * exactly as s5l8740_nand_cs_phys_read returns them, so a caller can swap
+ * between the two without reshaping anything.
+ */
+int s5l8740_nand_cs_read_pages_batch(u8 ce, const struct s5l8740_ppn_ref *refs,
+				     unsigned int n, u8 *data_out, u8 *meta_out)
+{
+	struct nand_s5l8740 *f = nand_dev;
+	u32 *addrs;
+	bool saved_armed;
+	unsigned int i;
+	int ret;
+	u64 t0, t1;
+
+	if (!f || !data_out || !refs)
+		return -ENODEV;
+	if (!f->dma_ok || !f->batch_ok)
+		return -ENODEV;
+	if (ce >= FMSS_NUM_CE)
+		return -EINVAL;
+	if (n < 1 || n > S5L8740_NAND_PAGE_BATCH_MAX)
+		return -EINVAL;
+	if (dma_dry)
+		return -EAGAIN;
+	if (!dma_armed)
+		return -EPERM;
+
+	addrs = kmalloc_array(n, sizeof(*addrs), GFP_KERNEL);
+	if (!addrs)
+		return -ENOMEM;
+	for (i = 0; i < n; i++) {
+		if (refs[i].cau >= FMSS_NUM_CAU ||
+		    refs[i].block >= FMSS_BLOCKS_PER_CAU ||
+		    refs[i].page > FMSS_BTOC_PAGE) {
+			kfree(addrs);
+			return -EINVAL;
+		}
+		addrs[i] = fmss_ppn_addr(refs[i].cau, refs[i].block,
+					 refs[i].page, 0);
+	}
+
+	mutex_lock(&f->lock);
+	if (cs_reset_every && f->pages_since_reset >= cs_reset_every) {
+		fmss_nand_reset(f);
+		f->pages_since_reset = 0;
+	}
+	saved_armed = dma_armed;
+	dma_armed = true;
+	dma_skip_ingest = true;
+	t0 = ktime_get_ns();
+	ret = fmss_dma_meta_read_batch(f, ce, addrs, n,
+				       S5L8740_NAND_SLOTS_PER_PAGE, false);
+	t1 = ktime_get_ns();
+	dma_skip_ingest = false;
+	if (!dma_one_shot)
+		dma_armed = saved_armed;
+	f->pages_since_reset += n;
+
+	if (!ret) {
+		memcpy(data_out, f->bdata,
+		       (size_t)n * S5L8740_NAND_PAGE_SIZE);
+		if (meta_out)
+			memcpy(meta_out, f->bspare,
+			       (size_t)n * S5L8740_NAND_META_SIZE);
+		cs_ns_kick += t1 - t0;
+		cs_reads_total += n;
+		cs_batch_kicks++;
+	}
+	mutex_unlock(&f->lock);
+	kfree(addrs);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(s5l8740_nand_cs_read_pages_batch);
+
+int s5l8740_nand_cs_scan_meta(u8 ce, const struct s5l8740_ppn_ref *refs,
+			      unsigned int n, u8 *meta_out)
+{
+	struct nand_s5l8740 *f = nand_dev;
+	u32 *addrs;
+	bool saved_armed;
+	unsigned int i;
+	int ret;
+
+	if (!f || !refs || !meta_out)
+		return -ENODEV;
+	if (!f->dma_ok || !f->batch_ok)
+		return -ENODEV;
+	if (ce >= FMSS_NUM_CE)
+		return -EINVAL;
+	if (n < 1 || n > FMSS_DMA_BATCH_MAX)
+		return -EINVAL;
+	if (dma_dry)
+		return -EAGAIN;
+	if (!dma_armed)
+		return -EPERM;
+
+	addrs = kmalloc_array(n, sizeof(*addrs), GFP_KERNEL);
+	if (!addrs)
+		return -ENOMEM;
+	for (i = 0; i < n; i++) {
+		if (refs[i].cau >= FMSS_NUM_CAU ||
+		    refs[i].block >= FMSS_BLOCKS_PER_CAU ||
+		    refs[i].page > FMSS_BTOC_PAGE) {
+			kfree(addrs);
+			return -EINVAL;
+		}
+		addrs[i] = fmss_ppn_addr(refs[i].cau, refs[i].block,
+					 refs[i].page, 0);
+	}
+
+	mutex_lock(&f->lock);
+	if (cs_reset_every && f->pages_since_reset >= cs_reset_every) {
+		fmss_nand_reset(f);
+		f->pages_since_reset = 0;
+	}
+	saved_armed = dma_armed;
+	dma_armed = true;
+	dma_skip_ingest = true;
+	ret = fmss_dma_meta_read_batch(f, ce, addrs, n, 1, true);
+	dma_skip_ingest = false;
+	if (!dma_one_shot)
+		dma_armed = saved_armed;
+	f->pages_since_reset += n;
+	if (!ret) {
+		memcpy(meta_out, f->bspare, (size_t)n * 16);
+		cs_reads_total += n;
+		cs_batch_kicks++;
+	}
+	mutex_unlock(&f->lock);
+	kfree(addrs);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(s5l8740_nand_cs_scan_meta);
+
 
 /*
  * Read the 512-byte PPN parameter page.
@@ -1925,6 +2470,141 @@ static ssize_t dma_read_store(struct device *dev, struct device_attribute *attr,
 	return ret ? ret : count;
 }
 static DEVICE_ATTR_WO(dma_read);
+
+/*
+ * batch_read: prove the batched transport before anything depends on it.
+ *
+ *   echo "<ce> <cau> <first_block> <page> <count>" > batch_read
+ *   cat batch_read
+ *
+ * It reads count consecutive blocks in one kick and prints each page's meta
+ * next to what the single-page path returns for the same page. The two
+ * columns must match. They are the whole point of this file: the descriptor
+ * list format is read out of the 4EDDDC decomp, not measured, and the one
+ * thing the decomp does not answer is whether the loaded CS microcode blob
+ * walks a multi-descriptor list or executes one page and stops at the
+ * terminator. In the latter case every row past the first comes back wrong
+ * or zero, and this is where that shows up -- not in the middle of a mount.
+ */
+static char batch_log[4096];
+static unsigned int batch_log_len;
+
+static ssize_t batch_read_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct nand_s5l8740 *f = nand_dev;
+	/*
+	 * Heap, not stack: the three of these come to about 1.3 KiB, which
+	 * is most of a kernel stack frame budget for a debug path that has
+	 * no business consuming one.
+	 */
+	u8 *meta, *head;
+	u16 blocks[S5L8740_NAND_BATCH_MAX];
+	unsigned int ce, cau, first, page, n, i;
+	unsigned int len = 0, mismatch = 0, single_failed = 0;
+	u64 t0, t1, tb, ts;
+	int ret;
+
+	if (!f)
+		return -ENODEV;
+	if (!f->batch_ok)
+		return -ENODEV;
+	if (sscanf(buf, "%u %u %u %u %u", &ce, &cau, &first, &page, &n) != 5)
+		return -EINVAL;
+	if (n < 1 || n > S5L8740_NAND_BATCH_MAX)
+		return -EINVAL;
+	if (first + n > FMSS_BLOCKS_PER_CAU)
+		return -EINVAL;
+
+	meta = kzalloc(S5L8740_NAND_BATCH_MAX * S5L8740_NAND_BATCH_META_SIZE,
+		       GFP_KERNEL);
+	head = kzalloc(S5L8740_NAND_BATCH_MAX * S5L8740_NAND_BATCH_DATA_HEAD,
+		       GFP_KERNEL);
+	if (!meta || !head) {
+		kfree(meta);
+		kfree(head);
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < n; i++)
+		blocks[i] = (u16)(first + i);
+
+	t0 = ktime_get_ns();
+	ret = s5l8740_nand_cs_read_meta_batch((u8)ce, (u8)cau, blocks, (u8)page,
+					      n, meta, head,
+					      S5L8740_NAND_BATCH_DATA_HEAD);
+	t1 = ktime_get_ns();
+	tb = t1 - t0;
+	if (ret) {
+		batch_log_len = scnprintf(batch_log, sizeof(batch_log),
+					  "batch ce=%u cau=%u blk=%u+%u page=%u FAILED ret=%d\n",
+					  ce, cau, first, n, page, ret);
+		kfree(meta);
+		kfree(head);
+		return ret;
+	}
+
+	len += scnprintf(batch_log + len, sizeof(batch_log) - len,
+			 "batch ce=%u cau=%u blk=%u+%u page=%u ok in %llu us (%llu us/page)\n",
+			 ce, cau, first, n, page, div_u64(tb, 1000),
+			 div_u64(tb, 1000 * n));
+
+	/* Same pages one at a time, for the column that has to match. */
+	t0 = ktime_get_ns();
+	for (i = 0; i < n; i++) {
+		struct s5l8740_cs_page *pg;
+		const u8 *bm = meta + i * S5L8740_NAND_BATCH_META_SIZE;
+		bool same = false;
+
+		pg = kzalloc(sizeof(*pg), GFP_KERNEL);
+		if (!pg)
+			break;
+		/*
+		 * Re-arm per read. dma_one_shot defaults on, so the first
+		 * single-page read disarms CS and every one after it returns
+		 * -EPERM -- which reads back as an all-zero meta and looks
+		 * exactly like the batch inventing data. It is not; it is
+		 * this column failing to be collected.
+		 */
+		dma_armed = true;
+		if (!s5l8740_nand_cs_phys_read_slot0((u8)ce, (u8)cau,
+						     blocks[i], (u8)page, pg))
+			same = !memcmp(pg->meta_raw[0], bm,
+				       S5L8740_NAND_BATCH_META_SIZE);
+		else
+			single_failed++;
+		if (!same)
+			mismatch++;
+		len += scnprintf(batch_log + len, sizeof(batch_log) - len,
+				 "  blk=%-5u batch=%16phN single=%16phN %s data=%8phN\n",
+				 blocks[i], bm, pg->meta_raw[0],
+				 same ? "OK" : "MISMATCH",
+				 head + i * S5L8740_NAND_BATCH_DATA_HEAD);
+		kfree(pg);
+	}
+	t1 = ktime_get_ns();
+	ts = t1 - t0;
+
+	len += scnprintf(batch_log + len, sizeof(batch_log) - len,
+			 "single %llu us (%llu us/page), %u mismatch, %u single-read failures\n",
+			 div_u64(ts, 1000), div_u64(ts, 1000 * n),
+			 mismatch, single_failed);
+	batch_log_len = len;
+	kfree(meta);
+	kfree(head);
+	return count;
+}
+
+static ssize_t batch_read_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	if (!batch_log_len)
+		return scnprintf(buf, PAGE_SIZE,
+				 "usage: echo \"<ce> <cau> <first_block> <page> <count>\" > batch_read\n");
+	return scnprintf(buf, PAGE_SIZE, "%s", batch_log);
+}
+static DEVICE_ATTR_RW(batch_read);
 
 /*
  * CS descriptor ABI canary — no FTL ingest / no lba_map mutation.
@@ -2518,8 +3198,12 @@ static void fmss_lba_claim_note_page(struct nand_s5l8740 *f, unsigned int ce,
 		c.typ = meta[0];
 		fmss_lba_claim_insert(&c);
 		lba_claim_hits++;
-		/* Raw META for positive-control / endian debug. */
-		pr_info("s5l8740-nand: META hit lba=%u typ=%02x weave=%012llx ce=%u cau=%u blk=%u pg=%u slot=%u meta=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
+		/*
+		 * Raw META for positive-control / endian debug. One line per
+		 * hit with no bound, so it goes through the quiet gate like
+		 * the rest of the per-item tracing in this file.
+		 */
+		fmss_info("META hit lba=%u typ=%02x weave=%012llx ce=%u cau=%u blk=%u pg=%u slot=%u meta=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x\n",
 			lba_le, meta[0], (unsigned long long)c.weave,
 			ce, cau, block, page, s,
 			meta[0], meta[1], meta[2], meta[3],
@@ -2608,7 +3292,8 @@ static int fmss_lba_weave_scan(struct nand_s5l8740 *f, unsigned int start,
 						break;
 				}
 				if ((b & 7) == 0) {
-					pr_info("s5l8740-nand: lba_weave_scan prog targets=%u scanned=%u hits=%u small=%u be_alt=%u ce=%u cau=%u blk=%u\n",
+					/* Progress every 8 blocks: quiet-gated. */
+					fmss_info("lba_weave_scan prog targets=%u scanned=%u hits=%u small=%u be_alt=%u ce=%u cau=%u blk=%u\n",
 						lba_claim_ntargets,
 						lba_claim_scanned, lba_claim_hits,
 						lba_claim_small, lba_claim_be_alt,
@@ -3353,7 +4038,7 @@ static int __maybe_unused fmss_early_lba_ensure(void)
 
 /*
  * Plausible YaFTL/Whimory BTOC: first entries are small LPNs and usually
- * sequential (we see 11,12,13 on blk 64 or 0,1,... on the boot superblock).
+ * sequential (11,12,13 on blk 64, or 0,1,... on the boot superblock).
  * Used by on-demand lpn_read scan; l2v_build uses a looser ingest.
  */
 static bool fmss_btoc_plausible(const u8 *btoc_page, unsigned int target_lpn,
@@ -5449,7 +6134,7 @@ static ssize_t readme_read_store(struct device *dev, struct device_attribute *at
 				if (b >= FMSS_BLOCKS_PER_CAU - FMSS_VFL_TAIL)
 					break;
 				for (p = 0; p < FMSS_BTOC_PAGE && !found; p++) {
-					unsigned int off, show, dump;
+					unsigned int off, dump;
 
 					if (reset_every &&
 					    f->pages_since_reset >= reset_every) {
@@ -5648,7 +6333,7 @@ static DEVICE_ATTR_WO(ftl_ascii);
 
 /*
  * OSOS 4EB7E4 / Sogeti PPN-VFL: walk last blocks of each CAU, SLC page 0.
- * Without DMA meta we keep any non-blank data page and dump the 512-byte
+ * Without DMA meta, any non-blank data page is kept and the 512-byte
  * VFLCxt header plus the u32 table at +256.
  */
 static ssize_t vfl_scan_store(struct device *dev, struct device_attribute *attr,
@@ -5824,7 +6509,7 @@ static DEVICE_ATTR_RO(btoc_log);
 
 /*
  * Sogeti/YaFTL BTOC: last page of a user superblock lists LPNs for pages 0..n-2.
- * N31 page 127 is a BE u32 array (we saw 11,12,13,... on cau1 blk 64).
+ * N31 page 127 is a BE u32 array (11,12,13,... observed on cau1 blk 64).
  * Find the block whose BTOC[0]==0 — that page 0 is logical page 0 (FAT boot).
  */
 static ssize_t btoc_scan_store(struct device *dev, struct device_attribute *attr,
@@ -6221,6 +6906,7 @@ static struct attribute *fmss_attrs[] = {
 	&dev_attr_read_id.attr,
 	&dev_attr_page_read.attr,
 	&dev_attr_dma_read.attr,
+	&dev_attr_batch_read.attr,
 	&dev_attr_cs_canary_read.attr,
 	&dev_attr_cs_canary_matrix.attr,
 	&dev_attr_cs_phys_read.attr,
@@ -6651,6 +7337,15 @@ static int fmss_dma_page_read_records(struct nand_s5l8740 *f,
 	unsigned int saved_rec = dma_rec;
 	int ret;
 
+	/*
+	 * dma_slot / dma_nsect / dma_rec are module-wide, and this borrows
+	 * them for the duration of one transfer. That is only safe under
+	 * f->lock, and both callers on the CS path take it -- assert it so a
+	 * third one cannot quietly arrive and start racing the geometry of
+	 * somebody else's read.
+	 */
+	lockdep_assert_held(&f->lock);
+
 	if (slot > 3)
 		return -EINVAL;
 	if (!span || span > 4 || slot + span > 4)
@@ -6737,17 +7432,16 @@ int s5l8740_nand_meta_pick_lba(const struct s5l8740_cs_page *page,
 		if (!n31_meta_is_data_record(cur) || cur->lba != fmss_lba)
 			continue;
 		if (best < 0 || n31_weave_newer(cur->weave, best_weave)) {
-			if (best >= 0 && page->meta[best].weave > cur->weave)
-				pr_info("s5l8740-nand: weave moved backward "
-					"fmss_lba=%u slot%u->%u "
-					"%012llx -> %012llx\n",
-					fmss_lba, best, s,
-					(unsigned long long)page->meta[best].weave,
-					(unsigned long long)cur->weave);
+			/*
+			 * A "weave moved backward" check does not belong in
+			 * this branch: n31_weave_newer() has just established
+			 * the opposite, so the test cannot fire. The
+			 * older-skipped case below is the one that reports.
+			 */
 			best = (int)s;
 			best_weave = cur->weave;
-		} else if (best >= 0 && cur->weave < best_weave) {
-			pr_info("s5l8740-nand: weave older skipped "
+		} else if (cur->weave < best_weave) {
+			pr_info_ratelimited("s5l8740-nand: weave older skipped "
 				"fmss_lba=%u slot=%u weave=%012llx "
 				"best=%012llx\n",
 				fmss_lba, s,
@@ -6805,12 +7499,12 @@ int s5l8740_nand_cs_phys_read_span(u8 ce, u8 cau, u16 block, u8 page,
  * The FPart region at the tail of each CAU does not: it is SLC, and locating
  * it means trying slc=1 before slc=0.
  *
- * That scan used to go through s5l8740_nand_page_read(), which refuses any
- * request for meta unless meta_dma_read is set -- and it is deliberately not
- * set, because a permanent live CS kick reboots the device. So every FPart
- * read returned -EOPNOTSUPP before touching the NAND: 512 reads, 512
- * failures, sixty milliseconds, and a "signature not found" verdict about a
- * region nobody had actually looked at.
+ * This must not be routed through s5l8740_nand_page_read(), which refuses
+ * any request for meta unless meta_dma_read is set -- and that is
+ * deliberately clear, because a permanently live CS kick reboots the
+ * device. Every FPart read would return -EOPNOTSUPP before touching the
+ * NAND, yielding a "signature not found" verdict about a region that was
+ * never actually read.
  */
 int s5l8740_nand_cs_phys_read_slc(u8 ce, u8 cau, u16 block, u8 page, u8 slc,
 				  struct s5l8740_cs_page *out, unsigned int span)
@@ -6913,9 +7607,40 @@ int s5l8740_nand_cs_phys_read_slc(u8 ce, u8 cau, u16 block, u8 page, u8 slc,
 EXPORT_SYMBOL_GPL(s5l8740_nand_cs_phys_read_slc);
 EXPORT_SYMBOL_GPL(s5l8740_nand_cs_phys_read);
 
-/* Batch CS sessions for map build: keep armed across many phys reads. */
+/*
+ * Batch CS sessions for map build: keep armed across many phys reads.
+ *
+ * This must be a nesting counter, not a single save slot.
+ *
+ * With a single slot begin() refuses with -EBUSY when one is already open,
+ * and every caller writes
+ *
+ *	sess = begin();
+ *	...
+ *	if (sess == 0)
+ *		end();
+ *
+ * which is only correct when every owner is shorter-lived than the one
+ * outside it. Three lifetimes use this: per-read (whimory_read_fmss_lba),
+ * per-operation (recover, fat-critical validation, the sysfs pokes) and
+ * per-disk (n31_ftl_register_disk).
+ *
+ * Nesting a per-disk acquisition inside a per-operation one makes the inner
+ * begin() fail with -EBUSY, so the disk records that it holds no session
+ * and the outer end() disarms CS with the disk live. Every csmap fallback
+ * read then returns -EAGAIN from the dma_dry test before reaching f->lock,
+ * silently, leaving the layer that exists to rescue a Whimory map miss
+ * inert. The other order leaks instead: the disk's session is never closed
+ * and dma_dry stays 0 for the lifetime of the gendisk, which is the
+ * permanently live C00 kick documented above as rebooting the device.
+ *
+ * A depth counter makes both orders correct and lets every call site keep
+ * the `if (sess == 0)` idiom -- begin() always returns 0, so the guard is
+ * always true and each begin has exactly one end.
+ */
+static DEFINE_MUTEX(fmss_dma_session_lock);
 static struct {
-	bool saved;
+	unsigned int depth;
 	bool dry;
 	bool armed;
 	bool one_shot;
@@ -6923,29 +7648,43 @@ static struct {
 
 int s5l8740_nand_dma_session_begin(void)
 {
-	if (fmss_dma_batch.saved)
-		return -EBUSY;
-	fmss_dma_batch.dry = dma_dry;
-	fmss_dma_batch.armed = dma_armed;
-	fmss_dma_batch.one_shot = dma_one_shot;
-	fmss_dma_batch.saved = true;
-	dma_dry = false;
-	dma_one_shot = false;
-	dma_armed = true;
+	mutex_lock(&fmss_dma_session_lock);
+	if (!fmss_dma_batch.depth) {
+		fmss_dma_batch.dry = dma_dry;
+		fmss_dma_batch.armed = dma_armed;
+		fmss_dma_batch.one_shot = dma_one_shot;
+		dma_dry = false;
+		dma_one_shot = false;
+		dma_armed = true;
+	}
+	fmss_dma_batch.depth++;
+	mutex_unlock(&fmss_dma_session_lock);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(s5l8740_nand_dma_session_begin);
 
 void s5l8740_nand_dma_session_end(void)
 {
-	if (!fmss_dma_batch.saved)
+	mutex_lock(&fmss_dma_session_lock);
+	if (WARN_ON_ONCE(!fmss_dma_batch.depth)) {
+		mutex_unlock(&fmss_dma_session_lock);
 		return;
-	dma_dry = fmss_dma_batch.dry;
-	dma_armed = fmss_dma_batch.armed;
-	dma_one_shot = fmss_dma_batch.one_shot;
-	fmss_dma_batch.saved = false;
+	}
+	if (!--fmss_dma_batch.depth) {
+		dma_dry = fmss_dma_batch.dry;
+		dma_armed = fmss_dma_batch.armed;
+		dma_one_shot = fmss_dma_batch.one_shot;
+	}
+	mutex_unlock(&fmss_dma_session_lock);
 }
 EXPORT_SYMBOL_GPL(s5l8740_nand_dma_session_end);
+
+/* Is CS currently armed by somebody's session? Diagnostics only. */
+unsigned int s5l8740_nand_dma_session_depth(void)
+{
+	return READ_ONCE(fmss_dma_batch.depth);
+}
+EXPORT_SYMBOL_GPL(s5l8740_nand_dma_session_depth);
 
 int s5l8740_nand_page_read(unsigned int ce, unsigned int cau,
 			   unsigned int block, unsigned int page,

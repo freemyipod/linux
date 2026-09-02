@@ -48,6 +48,7 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/property.h>
 #include <linux/serdev.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -1348,7 +1349,20 @@ static int mikey_bind(struct device *dev, struct serdev_device *serdev)
 	m->baud = baud;
 	m->auto_report = auto_report;
 	m->active_probe = active_probe;
-	m->force_plugged = force_plugged;
+	/*
+	 * The module parameter, OR the device tree. apple,force-plugged has
+	 * been in the N31 dts since the port began and was read by nothing:
+	 * this driver had no property reads at all, so the board said "assume
+	 * a headset is plugged in until the resistor backend exists" and
+	 * nothing was listening.
+	 *
+	 * Ported from n31/wip-local-backup-20260827 (8efa5c0e11ec). The rest
+	 * of that commit is superseded: its codec half stopped jack detection
+	 * returning -ENODEV, and this tree has since removed codec headset
+	 * detection altogether.
+	 */
+	m->force_plugged = force_plugged ||
+			   device_property_read_bool(dev, "apple,force-plugged");
 	m->force_model = force_model;
 
 	mutex_init(&m->lock);

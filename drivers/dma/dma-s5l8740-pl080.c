@@ -91,6 +91,47 @@
 static int force_peri = -1;
 module_param(force_peri, int, 0644);
 MODULE_PARM_DESC(force_peri, "override DT DMA peri id (-1 = use DT)");
+/*
+ * Put the transfer count in CxControl[11:0] as well as CONTROL2.
+ *
+ * Stock writes the count to the channel's +0x14 (CONTROL2) and to the 5th
+ * dword of the LLI -- sub_B424C does "*v25 = v27 & 0x1FFFFFFF" and
+ * "v21[4] = v27" -- which is the Samsung PL080S layout and is what this
+ * driver does. But stock also *preserves* CxControl's low bits: it only
+ * rewrites SI/DI, via "*v10 & 0xF3FFFFFF | v13 | v17". Whatever sits in
+ * CxControl[11:0] was put there by something else and stock never clears
+ * it. This driver rebuilds the word from scratch each time and leaves the
+ * field zero.
+ *
+ * Measured: with force_mem=1 the channel waits on no peripheral request at
+ * all and still stops after exactly 32 bytes, which rules out the I2S and
+ * points at the descriptor.
+ */
+/*
+ * DMACSync: leave the synchronisation logic ENABLED.
+ *
+ * On the PL080 a SET bit in DMACSync *disables* the synchronisation logic
+ * for that DMA request line. That logic exists for peripherals whose
+ * request signal is in a different clock domain from the DMA controller,
+ * which IIS0 is: it runs off the audio clock, not the AHB clock. With
+ * synchronisation off the request is sampled unreliably, and the channel
+ * takes one burst and then never sees another request -- no error, no
+ * terminal count.
+ *
+ * OSOS writes 0x38200034 zero times in the whole image, leaving it at its
+ * reset value of 0 with synchronisation enabled for every line. This driver
+ * does the same. sync_mask restores the old value for comparison.
+ */
+static unsigned int sync_mask;
+module_param(sync_mask, uint, 0644);
+MODULE_PARM_DESC(sync_mask,
+		 "DMACSync value; 0 = sync enabled (stock). Old behaviour was ~0.");
+
+static int ctl_count;
+module_param(ctl_count, int, 0644);
+MODULE_PARM_DESC(ctl_count,
+		 "1 = also place the transfer count in CxControl[11:0]");
+
 static int force_mem;
 module_param(force_mem, int, 0644);
 MODULE_PARM_DESC(force_mem, "1 = M2M flow + soft req, dest still FIFO");
@@ -205,13 +246,22 @@ struct s5l_pl080_chan {
 	dma_addr_t		fifo_addr;
 	struct s5l_pl080_desc	*running;
 	/*
-	 * DMA errors seen on this channel, and whether we have stopped
+	 * DMA errors seen on this channel, and whether the driver has stopped
 	 * trying. Bounded because an error that re-arms itself is an
 	 * interrupt storm, and a storm on this SoC is a dead device rather
 	 * than a slow one.
 	 */
 	unsigned int		err_count;
 	bool			err_stuck;
+	/*
+	 * Cyclic period callbacks are delivered from a workqueue, not from
+	 * virt-dma's tasklet. See s5l_pl080_cyc_workfn().
+	 */
+	struct work_struct	cyc_work;
+	atomic_t		cyc_pending;
+	dma_async_tx_callback	cyc_cb;
+	void			*cyc_cb_param;
+	bool			cyc_active;
 };
 
 struct s5l_pl080_desc {
@@ -228,6 +278,17 @@ struct s5l_pl080_desc {
 	size_t			period_len;
 	unsigned int		periods;
 	unsigned int		periods_done;
+	/*
+	 * Ring mode for the single self-linked node: the driver advances
+	 * lli[0].src itself, from the terminal-count interrupt, instead of
+	 * having a consumer post each period from process context.
+	 * See s5l_pl080_rearm_set_ring().
+	 */
+	bool			ring;
+	u32			ring_base;
+	u32			ring_bytes;
+	u32			ring_period;
+	u32			ring_off;
 	struct llist_node	free_node;
 };
 
@@ -249,6 +310,7 @@ struct s5l_pl080 {
 	 */
 	struct llist_head	free_list;
 	struct work_struct	free_work;
+	struct workqueue_struct	*cyc_wq;
 };
 
 static struct pl080_lli *s5l_pl080_lli_alloc(struct s5l_pl080 *pl,
@@ -409,11 +471,9 @@ static int s5l_pl080_width_enc(enum dma_slave_buswidth w)
 }
 
 /*
- * Width actually used for a channel. The slave config wins when the
- * client set one -- this driver used to ignore dma_slave_config
- * entirely and apply the xfer_width module parameter to every channel,
- * so a client asking for 32-bit FIFO writes silently got 16-bit ones.
- * xfer_width remains the fallback and the override for bring-up.
+ * Width actually used for a channel. A client's dma_slave_config wins;
+ * xfer_width is the fallback and the bring-up override. Ignoring the slave
+ * config here silently narrows a client that asked for 32-bit FIFO writes.
  */
 static unsigned int s5l_pl080_chan_width(struct s5l_pl080_chan *ch,
 					 bool dst)
@@ -452,7 +512,6 @@ static u32 s5l_pl080_build_ctl(struct s5l_pl080_chan *ch, u32 words,
 	unsigned int sb, db;
 	u32 ctl;
 
-	(void)words;
 	if (ch && (ch->dir == DMA_MEM_TO_DEV || ch->dir == DMA_DEV_TO_MEM)) {
 		sb = ch->src_burst;
 		db = ch->dst_burst;
@@ -477,6 +536,8 @@ static u32 s5l_pl080_build_ctl(struct s5l_pl080_chan *ch, u32 words,
 		ctl |= CTL_DST_AI;
 	if (irq)
 		ctl |= CTL_TC_IRQ;
+	if (ctl_count)
+		ctl |= words & 0xfff;
 	return ctl;
 }
 
@@ -505,6 +566,28 @@ static void s5l_pl080_chan_disable(struct s5l_pl080_chan *ch)
 	writel(BIT(id), b + PL080_INT_ERR_CLEAR);
 }
 
+/* SRAM window: 0x22000000..0x2202FFFF. */
+/*
+ * Stock programs Cx_LLI with bit 31 set.
+ *
+ * Measured on RetailOS with music playing: ch2 lli = 0x8b353be0. DRAM on
+ * this board is 0x08000000..0x0BFFFFFF (memory@8000000, 64 MiB), so that is
+ * 0x0b353be0 with bit 31 set -- an alias of a perfectly ordinary DRAM
+ * address, not a different region. A bare 0x09588000 is not equivalent.
+ *
+ * Note stock keeps the audio BUFFER in SRAM but the LLI descriptor in DRAM,
+ * through this alias.
+ *
+ * What bit 31 selects is NOT established -- an uncached view, or a
+ * different AHB master, are both plausible and neither is proven. It is
+ * applied because stock applies it. One define to revert.
+ */
+#define PL080_LLI_ALIAS		0x80000000u
+
+
+#define S5L8740_SRAM_BASE	0x22000000u
+#define S5L8740_SRAM_END	0x22030000u
+
 static void s5l_pl080_sync_buffer(struct s5l_pl080_chan *ch,
 				  struct s5l_pl080_desc *d)
 {
@@ -512,12 +595,98 @@ static void s5l_pl080_sync_buffer(struct s5l_pl080_chan *ch,
 
 	if (!d->buf_len || !dev)
 		return;
+
+	/*
+	 * Never do cache maintenance on an SRAM buffer.
+	 *
+	 * The audio PCM buffer now lives in SRAM, where stock keeps it
+	 * (measured PL080 ch2 src=0x220025d0 on RetailOS while playing). That
+	 * region is declared no-map, so it is not in the kernel linear map and
+	 * dma_sync_single_for_device() reaches v7_dma_clean_range() on an
+	 * address that has no cacheable mapping:
+	 *
+	 *	Unable to handle kernel paging request at virtual address da020000
+	 *	PC is at v7_dma_clean_range+0x1c/0x34
+	 *	LR is at arch_sync_dma_for_device+0x54/0xa8
+	 *	arch_sync_dma_for_device from s5l_pl080_start
+	 *
+	 * There is nothing to maintain in any case: SRAM is not cached, so
+	 * writes from the CPU are already visible to the controller. The sync
+	 * exists for DRAM buffers, where this engine is not coherent.
+	 */
+	if (d->buf_addr >= S5L8740_SRAM_BASE && d->buf_addr < S5L8740_SRAM_END)
+		return;
 	if (ch->dir == DMA_MEM_TO_DEV)
 		dma_sync_single_for_device(dev, d->buf_addr, d->buf_len,
 					   DMA_TO_DEVICE);
 	else if (ch->dir == DMA_DEV_TO_MEM)
 		dma_sync_single_for_device(dev, d->buf_addr, d->buf_len,
 					   DMA_FROM_DEVICE);
+}
+
+/*
+ * Cyclic period callbacks, delivered from process context.
+ *
+ * virt-dma hands descriptor callbacks to a tasklet. For a cyclic audio
+ * stream that callback is dmaengine_pcm_dma_complete(), which calls
+ * snd_pcm_period_elapsed(), which takes the PCM stream lock -- and both DAI
+ * links on this board are nonatomic, so that lock is a mutex, not a
+ * spinlock.
+ *
+ * A mutex_lock() in a tasklet is not reliably fatal, which is what made
+ * this so slow to find. Uncontended it takes the cmpxchg fast path and
+ * returns without sleeping, so short playback looks fine. It is only when
+ * the writer thread is actually holding the stream lock -- that is, during
+ * sustained playback -- that the tasklet tries to sleep, calls schedule()
+ * from atomic context, and takes the machine down. Playback that runs for
+ * a moment and then hangs the whole device is exactly that shape.
+ *
+ * So the callback is queued to a workqueue instead. The pending count is
+ * kept exactly, never coalesced: dmaengine_pcm_dma_complete() advances its
+ * own position by one period per call, so swallowing a call would desync
+ * the ALSA pointer from the hardware just as surely as never calling it.
+ */
+static void s5l_pl080_destroy_wq(void *wq)
+{
+	destroy_workqueue(wq);
+}
+
+static void s5l_pl080_cyc_workfn(struct work_struct *w)
+{
+	struct s5l_pl080_chan *ch = container_of(w, struct s5l_pl080_chan,
+						 cyc_work);
+	unsigned long flags;
+
+	while (atomic_dec_if_positive(&ch->cyc_pending) >= 0) {
+		dma_async_tx_callback cb;
+		void *param;
+
+		spin_lock_irqsave(&ch->vc.lock, flags);
+		cb = ch->cyc_active ? ch->cyc_cb : NULL;
+		param = ch->cyc_cb_param;
+		spin_unlock_irqrestore(&ch->vc.lock, flags);
+
+		if (!cb)
+			break;
+		cb(param);
+	}
+}
+
+/*
+ * Drop any callback still owed for this channel.
+ *
+ * Callers hold vc.lock, so this must not wait for a callback already in
+ * flight. Clearing cyc_active is what stops the work function dead: it
+ * re-reads the flag under the lock before every single invocation, so once
+ * this returns no further callback can start. One already past that check
+ * may still run, which is what device_synchronize() is for.
+ */
+static void s5l_pl080_cyc_drop(struct s5l_pl080_chan *ch)
+{
+	ch->cyc_active = false;
+	ch->cyc_cb = NULL;
+	ch->cyc_cb_param = NULL;
+	atomic_set(&ch->cyc_pending, 0);
 }
 
 static void s5l_pl080_start(struct s5l_pl080_chan *ch, struct s5l_pl080_desc *d)
@@ -538,10 +707,17 @@ static void s5l_pl080_start(struct s5l_pl080_chan *ch, struct s5l_pl080_desc *d)
 
 	s5l_pl080_sync_buffer(ch, d);
 	s5l_pl080_chan_disable(ch);
+	s5l_pl080_cyc_drop(ch);
+	if (d->cyclic) {
+		ch->cyc_cb = d->vd.tx.callback;
+		ch->cyc_cb_param = d->vd.tx.callback_param;
+		ch->cyc_active = true;
+	}
 	writel(le32_to_cpu(first->src), b + PL080_Cx_SRC(id));
 	writel(le32_to_cpu(first->dst), b + PL080_Cx_DST(id));
 	/* Next LLI, not the first (already loaded into SRC/DST/CTL/C2). */
-	writel(le32_to_cpu(first->lli), b + PL080_Cx_LLI(id));
+	writel(le32_to_cpu(first->lli) | PL080_LLI_ALIAS,
+	       b + PL080_Cx_LLI(id));
 	writel(le32_to_cpu(first->ctrl), b + PL080_Cx_CTL(id));
 	/* B424C: *v25 = v27 & 0x1FFFFFFF — count only, never the CTL word. */
 	writel(le32_to_cpu(first->ctrl2) & PL080S_XFER_COUNT_MASK,
@@ -612,16 +788,58 @@ static enum dma_status s5l_pl080_tx_status(struct dma_chan *c,
 	spin_lock_irqsave(&ch->vc.lock, flags);
 	d = ch->running;
 	if (d && d->buf_len) {
-		if (d->cyclic && d->period_len) {
-			size_t pos = (size_t)d->periods_done * d->period_len;
+		u8 id = ch->id % PL080_CH_COUNT;
+		u32 link, cnt, link2, cnt2;
 
-			pos %= d->buf_len;
-			state->residue = d->buf_len - pos;
+		/*
+		 * Derive the position from LINK and COUNT, never from SRCADDR.
+		 *
+		 * Rockbox's PL080 driver for this controller family documents
+		 * the behaviour of reading the channel registers while the
+		 * hardware is updating them: SRCADDR may return corrupted
+		 * data, while LINK and COUNT always read back valid, and the
+		 * pair is updated atomically. So read LINK, COUNT, LINK, COUNT
+		 * and take the second pair when the link moved underneath the read.
+		 *
+		 * An earlier version of this function read SRCADDR, which is
+		 * exactly the register that is not safe to trust here.
+		 */
+		link = readl(ch->base + PL080_Cx_LLI(id)) & ~PL080_LLI_ALIAS;
+		cnt = readl(ch->base + PL080S_Cx_CONTROL2(id)) &
+			PL080S_XFER_COUNT_MASK;
+		link2 = readl(ch->base + PL080_Cx_LLI(id)) & ~PL080_LLI_ALIAS;
+		cnt2 = readl(ch->base + PL080S_Cx_CONTROL2(id)) &
+			PL080S_XFER_COUNT_MASK;
+		if (link != link2) {
+			link = link2;
+			cnt = cnt2;
+		}
+
+		if (d->cyclic && d->nlli && d->lli && d->lli_phys &&
+		    link >= lower_32_bits(d->lli_phys)) {
+			u32 nodes = d->nlli;
+			u32 next = (link - lower_32_bits(d->lli_phys)) /
+				   sizeof(struct pl080_lli);
+			u32 cur = (next + nodes - 1) % nodes;
+			u32 per_node = d->buf_len / nodes;
+			u32 words = le32_to_cpu(d->lli[cur].ctrl2) &
+				    PL080S_XFER_COUNT_MASK;
+			u32 pos = cur * per_node;
+
+			/*
+			 * LINK points at the descriptor the hardware will load
+			 * next, so the one in flight is the previous node.
+			 */
+			if (words && cnt <= words)
+				pos += ((words - cnt) * per_node) / words;
+			if (pos < d->buf_len)
+				state->residue = d->buf_len - pos;
+			else
+				state->residue = d->buf_len;
 		} else {
-			u8 id = ch->id % PL080_CH_COUNT;
-
-			cur = readl(ch->base + ((ch->dir == DMA_DEV_TO_MEM) ?
-						PL080_Cx_DST(id) : PL080_Cx_SRC(id)));
+			cur = readl(ch->base +
+				    ((ch->dir == DMA_DEV_TO_MEM) ?
+				     PL080_Cx_DST(id) : PL080_Cx_SRC(id)));
 			start = lower_32_bits(d->buf_addr);
 			end = start + d->buf_len;
 			if (cur >= start && cur < end)
@@ -637,6 +855,39 @@ static enum dma_status s5l_pl080_tx_status(struct dma_chan *c,
 static int s5l_pl080_alloc(struct dma_chan *c)
 {
 	return 0;
+}
+
+/*
+ * Wait for a callback that was already past the cyc_active check when
+ * terminate ran. ALSA calls this via snd_pcm_sync_stop(), which is the
+ * point at which it is safe to sleep.
+ *
+ * The current_work() test is not defensive programming, it is the whole
+ * reason this function has a guard. The period callback is
+ * snd_pcm_period_elapsed(), and an xrun detected inside it walks straight
+ * back down into the driver:
+ *
+ *   s5l_pl080_cyc_workfn
+ *     snd_pcm_period_elapsed -> snd_pcm_update_state -> snd_pcm_do_stop
+ *       s5l8740_i2s_trigger(STOP) -> s5l8740_i2s_hw_stop
+ *         dmaengine_synchronize -> cancel_work_sync(&ch->cyc_work)
+ *
+ * which is this work item waiting for itself to finish. It hangs the
+ * worker, and then everything that touches the PCM -- the player, the
+ * launcher reading /proc/asound, anything reading a status file -- piles
+ * up behind the stream mutex the dead worker still holds. The device looks
+ * exactly as bricked as a real lockup.
+ *
+ * Inside the callback there is nothing to wait for: the caller is the
+ * thing synchronize would have waited on.
+ */
+static void s5l_pl080_synchronize(struct dma_chan *c)
+{
+	struct s5l_pl080_chan *ch = to_s5l_chan(c);
+
+	if (current_work() != &ch->cyc_work)
+		cancel_work_sync(&ch->cyc_work);
+	vchan_synchronize(&ch->vc);
 }
 
 static void s5l_pl080_free(struct dma_chan *c)
@@ -769,7 +1020,7 @@ s5l_pl080_prep_slave_sg(struct dma_chan *c, struct scatterlist *sgl,
 							     PL080S_XFER_COUNT_MASK);
 
 				if (idx < nlli - 1)
-					lli[idx].lli = cpu_to_le32(
+					lli[idx].lli = cpu_to_le32(PL080_LLI_ALIAS |
 						lower_32_bits(s5l_pl080_lli_pa(
 							lli_phys, idx + 1)));
 				else
@@ -892,10 +1143,11 @@ s5l_pl080_prep_dma_cyclic(struct dma_chan *c, dma_addr_t buf_addr,
 						     PL080S_XFER_COUNT_MASK);
 
 			if (idx + 1 < nlli)
-				lli[idx].lli = cpu_to_le32(lower_32_bits(
+				lli[idx].lli = cpu_to_le32(PL080_LLI_ALIAS |
+							   lower_32_bits(
 					s5l_pl080_lli_pa(lli_phys, idx + 1)));
 			else
-				lli[idx].lli = cpu_to_le32(
+				lli[idx].lli = cpu_to_le32(PL080_LLI_ALIAS |
 					lower_32_bits(lli_phys));
 
 			sg_off += chunk;
@@ -904,7 +1156,8 @@ s5l_pl080_prep_dma_cyclic(struct dma_chan *c, dma_addr_t buf_addr,
 		}
 	}
 	if (idx)
-		lli[idx - 1].lli = cpu_to_le32(lower_32_bits(lli_phys));
+		lli[idx - 1].lli = cpu_to_le32(PL080_LLI_ALIAS |
+					       lower_32_bits(lli_phys));
 
 	d->lli = lli;
 	d->lli_phys = lli_phys;
@@ -985,6 +1238,8 @@ static int s5l_pl080_terminate(struct dma_chan *c)
 		 readl(ch->base + PL080_RAW_ERR));
 	s5l_pl080_chan_disable(ch);
 	spin_lock_irqsave(&ch->vc.lock, flags);
+	/* Before the descriptor is freed -- cyc_cb points into it. */
+	s5l_pl080_cyc_drop(ch);
 	if (ch->running) {
 		s5l_pl080_desc_free(&ch->running->vd);
 		ch->running = NULL;
@@ -1002,25 +1257,22 @@ static int s5l_pl080_terminate(struct dma_chan *c)
 /*
  * The DMA interrupt.
  *
- * Two things here were capable of hanging the whole device rather than just
- * stopping the audio, and playback that runs for a few seconds and then
- * takes the system with it is their shape exactly.
+ * Two rules here decide whether a fault stops the audio or hangs the
+ * device.
  *
- * The error latch was cleared and nothing else was done. The channel stayed
- * enabled, so whatever raised the error raised it again immediately, and the
- * handler cleared it again -- an interrupt storm on a single core with the
- * watchdog disarmed, which looks identical to a lockup from outside. An
- * error now disables the channel and ends its transfer, and a channel that
- * keeps erroring is shut down for good after a bounded number of tries
- * rather than being allowed to spin.
+ * An error must disable the channel and end its transfer, and a channel
+ * that keeps erroring must be shut down for good after a bounded number of
+ * tries. Clearing the error latch alone leaves the channel enabled, so
+ * whatever raised the error raises it again immediately -- an interrupt
+ * storm on a single core with the watchdog disarmed, indistinguishable
+ * from a lockup from outside.
  *
- * And the handler returned IRQ_HANDLED unconditionally, including when
- * neither engine had anything pending. That tells the kernel every
- * interrupt on the line was ours and dealt with, which disables the
- * spurious-interrupt protection that would otherwise notice a line stuck
- * active and mask it. Claiming only what we actually serviced lets that
- * protection do its job -- the audio still dies, but the device stays up
- * and says why.
+ * And the handler must claim only what it actually serviced. Returning
+ * IRQ_HANDLED unconditionally, including when neither engine had anything
+ * pending, tells the kernel every interrupt on the line was handled, which
+ * disables the spurious-interrupt protection that would otherwise notice a
+ * line stuck active and mask it. Claiming accurately lets that protection
+ * work: the audio still dies, but the device stays up and says why.
  */
 #define PL080_MAX_CH_ERRS	8
 
@@ -1030,94 +1282,153 @@ static irqreturn_t s5l_pl080_irq(int irq, void *data)
 	unsigned int eng, i;
 	u32 tc, err;
 	bool serviced = false;
+	bool pending;
 
-	for (eng = 0; eng < 2; eng++) {
-		void __iomem *b = pl->base[eng];
+	/*
+	 * Drain every pending source before returning.
+	 *
+	 * The VIC line for this controller is configured edge-triggered, and
+	 * a PL080 holds its interrupt asserted until the matching status bit
+	 * is cleared. Servicing exactly one terminal count per invocation is
+	 * therefore not enough: if another period completes while the handler
+	 * is still running, the line never falls, no fresh edge is produced,
+	 * and the channel goes silent for the rest of the stream. Servicing
+	 * one source per invocation yields one DMA interrupt per playback
+	 * where a 6 s file at 1024-frame periods needs a few hundred, so ALSA
+	 * receives no period callbacks and every stream runs to XRUN.
+	 */
+	do {
+		pending = false;
+		for (eng = 0; eng < 2; eng++) {
+			void __iomem *b = pl->base[eng];
 
-		if (!b)
-			continue;
-		tc = readl(b + PL080_INT_TC_STATUS);
-		err = readl(b + PL080_INT_ERR_STATUS);
-		if (!tc && !err)
-			continue;
-		serviced = true;
-		dev_dbg(pl->dev, "irq eng%u tc=0x%x err=0x%x\n",
-			eng, tc, err);
-		if (tc)
-			writel(tc, b + PL080_INT_TC_CLEAR);
-		if (err)
-			writel(err, b + PL080_INT_ERR_CLEAR);
-
-		for (i = 0; i < PL080_CH_COUNT; i++) {
-			struct s5l_pl080_chan *ech =
-				&pl->chans[eng * PL080_CH_COUNT + i];
-			struct s5l_pl080_desc *ed;
-			unsigned long eflags;
-
-			if (!(err & BIT(i)))
+			if (!b)
 				continue;
-
-			/*
-			 * Stop the channel before anything else. Leaving it
-			 * enabled is what turns one error into a storm.
-			 */
-			s5l_pl080_chan_disable(ech);
-
-			spin_lock_irqsave(&ech->vc.lock, eflags);
-			ed = ech->running;
-			ech->running = NULL;
-			if (++ech->err_count >= PL080_MAX_CH_ERRS)
-				ech->err_stuck = true;
-			spin_unlock_irqrestore(&ech->vc.lock, eflags);
-
-			dev_err_ratelimited(pl->dev,
-					    "ch%u DMA error (%u so far)%s -- channel stopped\n",
-					    ech->id, ech->err_count,
-					    ech->err_stuck ? ", giving up on it" : "");
-
-			if (ed) {
-				spin_lock_irqsave(&ech->vc.lock, eflags);
-				vchan_cookie_complete(&ed->vd);
-				spin_unlock_irqrestore(&ech->vc.lock, eflags);
-			}
-		}
-
-		for (i = 0; i < PL080_CH_COUNT; i++) {
-			if (!(tc & BIT(i)))
+			tc = readl(b + PL080_INT_TC_STATUS);
+			err = readl(b + PL080_INT_ERR_STATUS);
+			if (!tc && !err)
 				continue;
-			{
-				struct s5l_pl080_chan *ch =
+			serviced = true;
+			pending = true;
+			dev_dbg(pl->dev, "irq eng%u tc=0x%x err=0x%x\n",
+				eng, tc, err);
+			if (tc)
+				writel(tc, b + PL080_INT_TC_CLEAR);
+			if (err)
+				writel(err, b + PL080_INT_ERR_CLEAR);
+
+			for (i = 0; i < PL080_CH_COUNT; i++) {
+				struct s5l_pl080_chan *ech =
 					&pl->chans[eng * PL080_CH_COUNT + i];
-				struct s5l_pl080_desc *d;
-				unsigned long flags;
+				struct s5l_pl080_desc *ed;
+				unsigned long eflags;
 
-				spin_lock_irqsave(&ch->vc.lock, flags);
-				d = ch->running;
-				if (d && d->cyclic) {
-					d->periods_done++;
-					if (d->periods)
-						d->periods_done %= d->periods;
-					vchan_cyclic_callback(&d->vd);
-					spin_unlock_irqrestore(&ch->vc.lock,
-							       flags);
+				if (!(err & BIT(i)))
 					continue;
+
+				/*
+				 * Stop the channel before anything else. Leaving it
+				 * enabled is what turns one error into a storm.
+				 */
+				s5l_pl080_chan_disable(ech);
+
+				spin_lock_irqsave(&ech->vc.lock, eflags);
+				ed = ech->running;
+				ech->running = NULL;
+				if (++ech->err_count >= PL080_MAX_CH_ERRS)
+					ech->err_stuck = true;
+				spin_unlock_irqrestore(&ech->vc.lock, eflags);
+
+				dev_err_ratelimited(pl->dev,
+						    "ch%u DMA error (%u so far)%s -- channel stopped\n",
+						    ech->id, ech->err_count,
+						    ech->err_stuck ? ", giving up on it" : "");
+
+				if (ed) {
+					spin_lock_irqsave(&ech->vc.lock, eflags);
+					vchan_cookie_complete(&ed->vd);
+					spin_unlock_irqrestore(&ech->vc.lock, eflags);
 				}
-				ch->running = NULL;
-				if (d)
-					vchan_cookie_complete(&d->vd);
+			}
+
+			for (i = 0; i < PL080_CH_COUNT; i++) {
+				if (!(tc & BIT(i)))
+					continue;
 				{
-					struct virt_dma_desc *vd =
-						vchan_next_desc(&ch->vc);
-					if (vd) {
-						list_del(&vd->node);
-						s5l_pl080_start(ch,
-								to_s5l_desc(vd));
+					struct s5l_pl080_chan *ch =
+						&pl->chans[eng * PL080_CH_COUNT + i];
+					struct s5l_pl080_desc *d;
+					unsigned long flags;
+
+					spin_lock_irqsave(&ch->vc.lock, flags);
+					d = ch->running;
+					if (d && d->cyclic) {
+						d->periods_done++;
+						if (d->periods)
+							d->periods_done %= d->periods;
+						/*
+						 * Advance the self-linked node HERE,
+						 * not from the consumer's workqueue.
+						 *
+						 * The terminal count and the LLI
+						 * reload are one hardware event: by
+						 * the time this handler runs the
+						 * PL080S has already latched lli[0]
+						 * and started the next period. The
+						 * window to write the period after
+						 * that is exactly one period long,
+						 * and a process-context consumer
+						 * loses that race whenever the box
+						 * is busy -- the hardware then
+						 * replays the stale source and the
+						 * stream stutters with no FIFO
+						 * underrun to show for it.
+						 *
+						 * Two stores to coherent memory is
+						 * all it takes, so there is no
+						 * reason for it to be anywhere but
+						 * in the interrupt.
+						 */
+						if (d->ring && d->lli) {
+							d->ring_off += d->ring_period;
+							if (d->ring_off >= d->ring_bytes)
+								d->ring_off = 0;
+							d->lli[0].src = cpu_to_le32(
+								d->ring_base +
+								d->ring_off);
+						}
+						/*
+						 * Not vchan_cyclic_callback(): that
+						 * runs the callback in a tasklet, and
+						 * this one sleeps. See
+						 * s5l_pl080_cyc_workfn().
+						 */
+						if (ch->cyc_active) {
+							atomic_inc(&ch->cyc_pending);
+							queue_work(pl->cyc_wq,
+								   &ch->cyc_work);
+						}
+						spin_unlock_irqrestore(&ch->vc.lock,
+								       flags);
+						continue;
 					}
+					ch->running = NULL;
+					if (d)
+						vchan_cookie_complete(&d->vd);
+					{
+						struct virt_dma_desc *vd =
+							vchan_next_desc(&ch->vc);
+						if (vd) {
+							list_del(&vd->node);
+							s5l_pl080_start(ch,
+									to_s5l_desc(vd));
+						}
+					}
+					spin_unlock_irqrestore(&ch->vc.lock, flags);
 				}
-				spin_unlock_irqrestore(&ch->vc.lock, flags);
 			}
 		}
-	}
+	} while (pending);
 	return serviced ? IRQ_HANDLED : IRQ_NONE;
 }
 
@@ -1277,6 +1588,144 @@ int s5l_pl080_peri_snapshot(unsigned int peri, u32 *src, u32 *dst, u32 *en)
 }
 EXPORT_SYMBOL_GPL(s5l_pl080_peri_snapshot);
 
+/*
+ * Rewrite the source address of a running single-node cyclic transfer.
+ *
+ * This exists to reproduce how RetailOS actually drives audio playback. Stock
+ * builds ONE 20-byte descriptor whose next-pointer points at ITSELF, so the
+ * transfer never terminates: after each terminal count the PL080S reloads
+ * SrcAddr, DstAddr, LLI, Control and Control2 from that descriptor, and
+ * because LLI reloads with its own address the cycle repeats forever. The
+ * channel's Enable bit stays set for the entire life of the stream and no
+ * software touches a channel register on the data path at all -- the producer
+ * only rewrites the descriptor in memory and then waits for the TC interrupt.
+ *
+ * Re-arming with dmaengine_prep_slave_single() per period cannot match
+ * that: it terminates the channel at every period boundary and reprograms
+ * it from a workqueue, and the IIS TX FIFO drains in about a millisecond,
+ * so every period boundary is an underrun window.
+ *
+ * prep_dma_cyclic already builds stock's topology when buf_len equals
+ * period_len: nlli == 1 and lli[0].lli == lli_phys, a node pointing at
+ * itself. This function supplies the one missing piece, a way to move the
+ * source between terminal counts.
+ *
+ * Deliberately touches NO channel register -- not Cx_SrcAddr, Cx_Control,
+ * Cx_Control2, Cx_LLI or Cx_Config -- and never disables or restarts the
+ * channel. Writing any of those is what stock does exactly once, at start.
+ * The LLI block is dma_alloc_coherent, so a plain store is enough and no
+ * cache maintenance is needed.
+ */
+int s5l_pl080_rearm_set_src(struct dma_chan *c, dma_addr_t addr, size_t bytes)
+{
+	struct s5l_pl080_chan *ch;
+	struct s5l_pl080_desc *d;
+	unsigned long flags;
+	unsigned int words;
+	int ret = 0;
+
+	if (!c)
+		return -ENODEV;
+	ch = to_s5l_chan(c);
+
+	spin_lock_irqsave(&ch->vc.lock, flags);
+	d = ch->running;
+	if (!d || !d->lli) {
+		ret = -ENXIO;
+		goto out;
+	}
+	/*
+	 * Only the stock shape is accepted. A multi-node chain is a different
+	 * model and silently rewriting node 0 of one would corrupt it.
+	 */
+	if (!d->cyclic || d->nlli != 1) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	d->lli[0].src = cpu_to_le32(lower_32_bits(addr));
+
+	words = (unsigned int)(bytes / s5l_pl080_unit());
+	if ((le32_to_cpu(d->lli[0].ctrl2) & PL080S_XFER_COUNT_MASK) != words)
+		d->lli[0].ctrl2 = cpu_to_le32(words & PL080S_XFER_COUNT_MASK);
+out:
+	spin_unlock_irqrestore(&ch->vc.lock, flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(s5l_pl080_rearm_set_src);
+
+/*
+ * Hand the whole ring to the controller once, and let the terminal-count
+ * interrupt walk it.
+ *
+ * s5l_pl080_rearm_set_src() above requires a consumer to post every period
+ * from process context, inside a one-period window. That works and it is
+ * what stock does -- sub_C4960 writes the descriptor and blocks on the
+ * per-channel semaphore -- but stock's producer is a dedicated task on a
+ * system with nothing else running. This driver runs a workqueue item behind
+ * snd_pcm_period_elapsed() on a single core that is also servicing USB,
+ * and it misses the window often enough to be audible: the hardware
+ * reloads the stale source, replays the period it just finished, and
+ * nothing anywhere reports an error because the FIFO never ran dry.
+ *
+ * The source walk is entirely deterministic for a cyclic ALSA buffer --
+ * base, wrap at base+bytes, step by one period -- so there is no reason
+ * for software scheduling to be in the loop at all. This installs the
+ * three numbers and the interrupt does the arithmetic.
+ *
+ * ring_off starts at one period, not zero: s5l_pl080_start() has already
+ * loaded period zero into Cx_SrcAddr, so what the FIRST terminal count
+ * reloads has to be period one.
+ */
+size_t s5l_pl080_max_seg_bytes(void)
+{
+	return (size_t)PL080_MAX_XFER_WORDS * s5l_pl080_unit();
+}
+EXPORT_SYMBOL_GPL(s5l_pl080_max_seg_bytes);
+
+int s5l_pl080_rearm_set_ring(struct dma_chan *c, dma_addr_t base, size_t bytes,
+			     size_t period)
+{
+	struct s5l_pl080_chan *ch;
+	struct s5l_pl080_desc *d;
+	unsigned long flags;
+	unsigned int words;
+	int ret = 0;
+
+	if (!c || !bytes || !period || bytes % period)
+		return -EINVAL;
+	ch = to_s5l_chan(c);
+
+	spin_lock_irqsave(&ch->vc.lock, flags);
+	d = ch->running;
+	if (!d || !d->lli) {
+		ret = -ENXIO;
+		goto out;
+	}
+	/* Same restriction as set_src: only the single self-linked node. */
+	if (!d->cyclic || d->nlli != 1) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	d->ring_base = lower_32_bits(base);
+	d->ring_bytes = (u32)bytes;
+	d->ring_period = (u32)period;
+	d->ring_off = (u32)period % (u32)bytes;
+	d->lli[0].src = cpu_to_le32(d->ring_base + d->ring_off);
+
+	words = (unsigned int)(period / s5l_pl080_unit());
+	if ((le32_to_cpu(d->lli[0].ctrl2) & PL080S_XFER_COUNT_MASK) != words)
+		d->lli[0].ctrl2 = cpu_to_le32(words & PL080S_XFER_COUNT_MASK);
+
+	/* Last, so the interrupt never sees a half-installed ring. */
+	d->ring = true;
+out:
+	spin_unlock_irqrestore(&ch->vc.lock, flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(s5l_pl080_rearm_set_ring);
+
 static ssize_t chregs_show(struct device *dev, struct device_attribute *attr,
 			   char *buf)
 {
@@ -1347,11 +1796,38 @@ static int s5l_pl080_probe(struct platform_device *pdev)
 
 	id0 = readl(pl->base[0] + 0xfe0) & 0xff;
 	writel(PL080_CONFIG_EN, pl->base[0] + PL080_CONFIG);
-	writel(~0u, pl->base[0] + PL080_SYNC);
+	writel(sync_mask, pl->base[0] + PL080_SYNC);
 	if (pl->base[1]) {
 		writel(PL080_CONFIG_EN, pl->base[1] + PL080_CONFIG);
-		writel(~0u, pl->base[1] + PL080_SYNC);
+		writel(sync_mask, pl->base[1] + PL080_SYNC);
 	}
+	/*
+	 * Nothing else is seeded here, and two things that briefly were have
+	 * been removed because stock does not write them.
+	 *
+	 * SoftBReq: a working RetailOS reads 0x00000008 while playing, but
+	 * the register is never written anywhere in the image -- a search of
+	 * the whole decomp for 0x38200020 / 0x38700020 finds zero hits. That
+	 * value is a reset default or hardware-set, not configuration.
+	 *
+	 * Idle-channel Control: RetailOS holds 0x80249000 in ch0/ch1 while
+	 * playing, and it is tempting to seed it. But sub_A4F94 writes
+	 * Cx_Control only for the channel it is ALLOCATING, and from a
+	 * per-peripheral table at 0x0891DB94:
+	 *
+	 *	v20 = 32 * chan + 0x3820010C;   // Cx_CTL(chan)
+	 *	*(u32 *)0x38200030 = 1;         // DMACConfiguration
+	 *	*v20 = *(u32 *)(4 * peri + 0x891DB94);
+	 *
+	 * so the value in an idle channel is residue from its last
+	 * allocation, not state stock maintains. Cx_Control is already written
+	 * at channel start, which is the equivalent.
+	 *
+	 * Reading a register on a working device says what it holds. It does
+	 * not say the software put it there.
+	 */
+	dev_info(dev, "DMACSync=0x%08x (0 = sync enabled, as stock)\n",
+		 sync_mask);
 
 	/* DDI0196 M2M: try AHB1/AHB2 × 16/32-bit. dst0==pattern means the engine copies. */
 	{
@@ -1423,6 +1899,19 @@ static int s5l_pl080_probe(struct platform_device *pdev)
 	dma_cap_zero(pl->ddev.cap_mask);
 	dma_cap_set(DMA_SLAVE, pl->ddev.cap_mask);
 	dma_cap_set(DMA_CYCLIC, pl->ddev.cap_mask);
+	/*
+	 * WQ_HIGHPRI because a missed period is an audible dropout, and
+	 * WQ_MEM_RECLAIM because playback must keep draining under memory
+	 * pressure rather than deadlock against it.
+	 */
+	pl->cyc_wq = alloc_workqueue("pl080-cyc",
+				     WQ_HIGHPRI | WQ_MEM_RECLAIM, 0);
+	if (!pl->cyc_wq)
+		return -ENOMEM;
+	ret = devm_add_action_or_reset(dev, s5l_pl080_destroy_wq, pl->cyc_wq);
+	if (ret)
+		return ret;
+
 	dma_cap_set(DMA_PRIVATE, pl->ddev.cap_mask);
 	pl->ddev.dev = dev;
 	pl->ddev.device_alloc_chan_resources = s5l_pl080_alloc;
@@ -1433,12 +1922,19 @@ static int s5l_pl080_probe(struct platform_device *pdev)
 	pl->ddev.device_prep_dma_cyclic = s5l_pl080_prep_dma_cyclic;
 	pl->ddev.device_config = s5l_pl080_config;
 	pl->ddev.device_terminate_all = s5l_pl080_terminate;
+	pl->ddev.device_synchronize = s5l_pl080_synchronize;
 	pl->ddev.src_addr_widths = BIT(DMA_SLAVE_BUSWIDTH_2_BYTES) |
 				   BIT(DMA_SLAVE_BUSWIDTH_4_BYTES);
 	pl->ddev.dst_addr_widths = BIT(DMA_SLAVE_BUSWIDTH_2_BYTES) |
 				   BIT(DMA_SLAVE_BUSWIDTH_4_BYTES);
 	pl->ddev.directions = BIT(DMA_MEM_TO_DEV) | BIT(DMA_DEV_TO_MEM);
-	pl->ddev.residue_granularity = DMA_RESIDUE_GRANULARITY_DESCRIPTOR;
+	/*
+	 * The position now comes from the channel's live transfer pointer
+	 * (see s5l_pl080_tx_status), so residue is accurate to a burst rather
+	 * than to a whole descriptor. Declaring DESCRIPTOR made ALSA treat the
+	 * stream as batched and mis-size its own timing.
+	 */
+	pl->ddev.residue_granularity = DMA_RESIDUE_GRANULARITY_BURST;
 	INIT_LIST_HEAD(&pl->ddev.channels);
 
 	for (i = 0; i < PL080_CH_COUNT * 2; i++) {
@@ -1450,6 +1946,8 @@ static int s5l_pl080_probe(struct platform_device *pdev)
 		if (!ch->base)
 			continue;
 		ch->vc.desc_free = s5l_pl080_desc_free;
+		INIT_WORK(&ch->cyc_work, s5l_pl080_cyc_workfn);
+		atomic_set(&ch->cyc_pending, 0);
 		vchan_init(&ch->vc, &pl->ddev);
 	}
 
@@ -1510,7 +2008,7 @@ static void s5l_pl080_remove(struct platform_device *pdev)
 	device_remove_file(&pdev->dev, &dev_attr_chregs);
 	of_dma_controller_free(pdev->dev.of_node);
 	dma_async_device_unregister(&pl->ddev);
-	/* Descriptors parked by s5l_pl080_desc_free() must not outlive us. */
+	/* Descriptors parked by s5l_pl080_desc_free() must not outlive the channel. */
 	cancel_work_sync(&pl->free_work);
 	s5l_pl080_free_work(&pl->free_work);
 }
@@ -1523,7 +2021,7 @@ static void s5l_pl080_remove(struct platform_device *pdev)
  * dma_device says nothing to the hardware.
  *
  * Clearing CONFIG_EN halts both controllers outright rather than
- * unwinding channel by channel, which is what you want here: nothing
+ * unwinding channel by channel, which is what is wanted here: nothing
  * after this point needs the engine, and a per-channel teardown has
  * more ways to get stuck than to succeed.
  */

@@ -27,8 +27,8 @@
         bootargs = "console=tty0 fbcon=font:MINI4x6 earlyprintk nohlt panic=0 clk_ignore_unused init=/init netconsole=6666@192.168.7.2/,6666@192.168.7.1/";
         stdout-path = "serial0";
         /*
-         * U-Boot ft_board_setup adds apple,n31-isys-addr / apple,n31-isys-size
-         * pointing at a reserved DRAM copy of the A34 IsyS object (0x560).
+         * U-Boot ft_board_setup adds apple,n31-touch_cal-addr / apple,n31-touch_cal-size
+         * pointing at a reserved DRAM copy of the A34 touch calibration object (0x560).
          * Do not consume the original 0x2202FE1C pointer from Linux.
          */
     };
@@ -64,8 +64,8 @@
     };
 
     /*
-     * U-Boot copies the 0x560 A34 IsyS object here (gap below DFU load,
-     * above the 16 MiB bootm window). Chosen apple,n31-isys-* is filled
+     * U-Boot copies the 0x560 A34 touch calibration object here (gap below DFU load,
+     * above the 16 MiB bootm window). Chosen apple,n31-touch_cal-* is filled
      * at ft_board_setup; this node keeps Linux from recycling the page.
      */
     reserved-memory {
@@ -73,9 +73,75 @@
         #size-cells = <1>;
         ranges;
 
-        n31-isys@9dff000 {
-            compatible = "apple,n31-isys";
+        n31-touch_cal@9dff000 {
+            compatible = "apple,n31-touch_cal";
             reg = <0x09DFF000 0x1000>;
+            no-map;
+        };
+
+        /*
+         * Audio DMA buffer in SRAM, where stock keeps it.
+         *
+         * Measured on RetailOS with music playing: PL080 ch2 runs
+         * src=0x220025d0 -> dst=0x3ca00010, i.e. the source is SRAM, not
+         * DRAM. Ours was in DRAM at 0x095c0020.
+         *
+         * A second read, taken with playback PAUSED and the screen off,
+         * showed src at 0x22002868 -- still inside SRAM, and with
+         * EnbldChns still 4, Config still 1 and ctl/cfg unchanged. The
+         * two reads bracket a stretch of playback, so they establish that
+         * the source advances through SRAM; they do NOT show it moving at
+         * the instant of the second read, because it was paused by then.
+         * What the paused read does show is that stock leaves the channel
+         * ENABLED across a pause, which is consistent with the
+         * self-linked LLI never terminating.
+         *
+         * SRAM is 0x22000000..0x2202FFFF (192 KiB; the bootloader
+         * descriptor at file offset 0x4BDC gives 0x00030000).
+         *
+         * This pool sits at 0x22002000, i.e. where stock puts its buffer
+         * (measured src 0x220025d0 and 0x22002868 across two reads). It
+         * was briefly at 0x22020000 -- the TOP of SRAM -- chosen to avoid
+         * the resident code seen in the RetailOS SRAM dump. That was a
+         * guess dressed as caution: the resident code is RetailOS's, and
+         * with the buffer up there the PL080 moved ZERO bytes (c2 stayed
+         * 0x800, src advanced only the 16-byte prefetch), where the same
+         * channel from DRAM had at least moved one 32-byte burst. Whether
+         * the top of SRAM is even reachable by the DMA is not
+         * established, and there is no reason to find out: stock uses low
+         * SRAM, so we use low SRAM.
+         */
+        i2s_sram: audio-dma@22002000 {
+            compatible = "shared-dma-pool";
+            reg = <0x22002000 0x10000>;
+            no-map;
+        };
+
+        /*
+         * IIS2 (BCM2078 FM/PCM capture) buffer, immediately above the
+         * playback pool.
+         *
+         * In SRAM for the same reason the playback buffer is: the one
+         * DRAM-sourced playback attempt moved a single 32-byte burst and
+         * then stalled, and there is no reason to find out the hard way
+         * whether the receive side behaves differently. Better to have
+         * both ports in the memory stock uses.
+         *
+         * Placed as LOW as it can go without overlapping the playback
+         * pool, which ends at 0x22012000. That is deliberate: the top of
+         * SRAM has already been tried for playback and moved ZERO bytes
+         * (c2 stayed 0x800, src advanced only the 16-byte prefetch), so
+         * whether the DMA can even reach up there is unestablished. Low
+         * SRAM is the part that is known to work.
+         *
+         * 32 KiB, not the 256 KiB the generic dmaengine-pcm config would
+         * preallocate: SRAM is 192 KiB in total and 64 KiB of it is
+         * already the playback buffer. A capture buffer does not need to
+         * be large -- at 48 kHz stereo this is still ~85 ms.
+         */
+        i2s2_sram: audio-dma@22012000 {
+            compatible = "shared-dma-pool";
+            reg = <0x22012000 0x8000>;
             no-map;
         };
     };
@@ -273,9 +339,12 @@
 
         lcdif: lcdif@38300000 {
             compatible = "samsung,s5l8740-lcdif";
-            /* LCDIF, then the clock controller: an LCDIF reset has to
-             * cycle two gates in it. */
-            reg = <0x38300000 0x10000>, <0x3c500000 0x100>;
+            /* LCDIF, the clock controller (an LCDIF reset has to cycle
+             * two gates in it), then the MIPI DSI host. The panel is a
+             * DCS command-mode panel: the window is set through the DSI
+             * host and only the pixels go through LCDIF. */
+            reg = <0x38300000 0x10000>, <0x3c500000 0x100>,
+                  <0x3d800000 0x1000>;
         };
 
         /* MMIO backlight only. Never LCDIF CON/PHTIME. U-Boot already
@@ -488,7 +557,7 @@
         };
 
         /*
-         * SPI2 @0x3D200000 — TI 343S0538 Nimbus. Pads 87/5, 88/3, 89/3,
+         * SPI2 @0x3D200000 — TI 343S0538 Grape. Pads 87/5, 88/3, 89/3,
          * 90/3 (OSOS 20690). EN 14, RST 39, IRQ 38. No clocks= — CCF
          * only publishes SHA/AES/PRNG; ungate-all + SPI PWRCON poke.
          */
@@ -500,8 +569,8 @@
             #size-cells = <0>;
             status = "okay";
 
-            nimbus: touchscreen@0 {
-                compatible = "apple,nimbus";
+            grape: touchscreen@0 {
+                compatible = "apple,grape";
                 reg = <0>;
                 /* Stock runs this bus at 12 MHz (divider 2 from 24 MHz).
                  * The controller programs its own divider, so this is
@@ -533,6 +602,26 @@
         i2s0: i2s@3ca00000 {
             compatible = "apple,s5l8740-i2s", "samsung,s5l8740-i2s";
             reg = <0x3ca00000 0x1000>;
+            /*
+             * This node had NO clocks property, so
+             * devm_clk_bulk_get_all() returned zero clocks and nothing
+             * ever ungated IIS0. PWRCON1 bit 7 is CLK_I2S0 in
+             * clk-s5l8702.c, and stock clears it via sub_345D70(0x26,0,1)
+             * from sub_C09AC before writing I2SCLKCON -- measured on
+             * RetailOS as PWRCON1 0xef226fe3 idle -> 0xef226f23 playing.
+             * CLK_CG16_9 is the codec gate, CLKCON+0x0C bit 15
+             * (sub_41CBD8 case 9). The nodrm variant already had both.
+             */
+            clocks = <&clkctrl CLK_I2S0>, <&clkctrl CLK_CG16_9>;
+            clock-names = "i2s", "cg16";
+            memory-region = <&i2s_sram>;
+            /*
+             * SRAM is uncached, so the CPU and the PL080 already see the
+             * same bytes and no cache maintenance is needed. Without this,
+             * the DMA API tries to clean a no-map region that has no
+             * cacheable kernel mapping and oopses in v7_dma_clean_range.
+             */
+            dma-coherent;
             /* RetailOS music: TX peri 10 confirmed. RX 11 still assumed. */
             dmas = <&dmac 10 0>, <&dmac 11 0>;
             dma-names = "tx", "rx";
@@ -551,6 +640,9 @@
             reg = <0x3d400000 0x1000>;
             dmas = <&dmac 13 0>;
             dma-names = "rx";
+            /* Capture buffer in low SRAM; see the i2s2_sram node. */
+            memory-region = <&i2s2_sram>;
+            dma-coherent;
             #sound-dai-cells = <0>;
             status = "okay";
         };

@@ -28,6 +28,26 @@
 #define S5L8740_NAND_MAX_CAU		2U
 #define S5L8740_NAND_PAGE_SIZE		16384U
 #define S5L8740_NAND_META_SIZE		64U	/* 4 × 16-byte SFTL slots */
+
+/*
+ * Batched meta scan (see s5l8740_nand_cs_read_meta_batch).
+ *
+ * A batch transfers one sector per page, so it yields slot 0 meta only --
+ * 16 bytes, not the 64-byte four-slot record a full-page read returns. That
+ * is what a classify scan reads, and asking for less is what makes the
+ * batch fit: 16 pages of meta land in the 256-byte spare buffer the
+ * sequencer already had.
+ */
+#define S5L8740_NAND_BATCH_META_SIZE	16U
+#define S5L8740_NAND_BATCH_DATA_HEAD	64U
+#define S5L8740_NAND_BATCH_MAX		256U
+
+/*
+ * Read-path batch: whole pages, so the cap is lower than the meta scan's --
+ * 8 * 16 KiB is the 128 KiB the shared DMA buffer holds, and it happens to
+ * be exactly one 128 KiB readahead window (8 pages * 4 LBAs).
+ */
+#define S5L8740_NAND_PAGE_BATCH_MAX	8U
 #define S5L8740_NAND_SLOTS_PER_PAGE	4U
 #define S5L8740_NAND_SLOT_DATA		4096U
 #define S5L8740_NAND_SLOT_META		16U
@@ -107,6 +127,34 @@ int s5l8740_nand_query_geometry(struct s5l8740_nand_geom *g);
  * fills 4 data + 4 meta slots; no lba_map ingest
  * Requires dma_dry=0 and dma_armed=1 (one-shot friendly).
  */
+int s5l8740_nand_cs_read_meta_batch(u8 ce, u8 cau, const u16 *blocks, u8 page,
+				    unsigned int n, u8 *meta_out, u8 *data_out,
+				    unsigned int data_bytes);
+/*
+ * One physical page, named. A batch is a list of these on a single CE --
+ * cau, block and page all vary per entry, because the FTL stripes
+ * consecutive LBAs across every (ce, cau) before it advances the page, so
+ * the pages a sequential read wants next are never consecutive on one chip.
+ */
+struct s5l8740_ppn_ref {
+	u16 block;
+	u8 cau;
+	u8 page;
+};
+
+int s5l8740_nand_cs_read_pages_batch(u8 ce, const struct s5l8740_ppn_ref *refs,
+				     unsigned int n, u8 *data_out,
+				     u8 *meta_out);
+
+/*
+ * Meta-only scan: n arbitrary pages on one CE, one kick, 16 bytes of spare
+ * per page and no page data at all. This is stock's mount scan shape
+ * (s_cxt_diff.c:349) -- every read lands its data in the same discarded
+ * buffer while only the meta cursor advances, so 256 pages cost one kick
+ * and 4 KiB of meta.
+ */
+int s5l8740_nand_cs_scan_meta(u8 ce, const struct s5l8740_ppn_ref *refs,
+			      unsigned int n, u8 *meta_out);
 int s5l8740_nand_cs_phys_read_slot0(u8 ce, u8 cau, u16 block, u8 page,
 				    struct s5l8740_cs_page *out);
 int s5l8740_nand_cs_phys_read_span(u8 ce, u8 cau, u16 block, u8 page,
@@ -116,9 +164,14 @@ int s5l8740_nand_cs_phys_read_slc(u8 ce, u8 cau, u16 block, u8 page, u8 slc,
 int s5l8740_nand_cs_phys_read(u8 ce, u8 cau, u16 block, u8 page,
 			      struct s5l8740_cs_page *out);
 
-/* Hold dma_armed across a multi-page CS scan; restores prior dry/one_shot. */
+/*
+ * Hold dma_armed across a multi-page CS scan; restores prior dry/one_shot
+ * when the last nested session closes. begin() always returns 0 and nests,
+ * so every begin must be paired with exactly one end.
+ */
 int s5l8740_nand_dma_session_begin(void);
 void s5l8740_nand_dma_session_end(void);
+unsigned int s5l8740_nand_dma_session_depth(void);
 
 void s5l8740_nand_meta_decode(const u8 *m16,
 			      struct s5l8740_meta_decoded *out);

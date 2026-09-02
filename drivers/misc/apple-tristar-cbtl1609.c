@@ -37,6 +37,7 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/i2c.h>
+#include <linux/bitfield.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -59,6 +60,87 @@
 /* nyansatan 0x75 first byte: ACCx[7:6] Dx[5:4] DATA[3:0] */
 #define TS_ID_ACCX(id0)		(((id0) >> 6) & 3)
 #define TS_ID_DX(id0)		(((id0) >> 4) & 3)
+
+/*
+ * Control/status register map for this accessory switch.
+ *
+ * This part is the Lightning-side analogue mux: two "Dx" data lanes and two
+ * accessory lanes, each routed by a small field, plus an ID bus with a byte
+ * FIFO the accessory answers on. Until now this driver had no register
+ * semantics whatsoever -- it dumped 0x00..0x3F and pattern-matched the
+ * result -- which is why its audio-path line could only ever report
+ * "unmapped".
+ *
+ * Names here are ours. The field layout is what the hardware does.
+ */
+#define TS_REG_DX_SWITCH	0x01	/* both Dx lanes */
+#define TS_REG_ACC_SWITCH	0x02	/* both accessory lanes */
+#define TS_REG_CHARGE_DET	0x03	/* charger-detect source/sink */
+#define TS_REG_IDBUS_CTL	0x05
+#define TS_REG_DIG_ID		0x06	/* raw ID-pin levels */
+#define TS_REG_STATUS		0x0c
+#define TS_REG_FIFO_TOP		0x3f	/* ID FIFO; payload reads downward */
+
+/* TS_REG_DX_SWITCH: lane 1 in bits 2:0, lane 2 in bits 6:4, override above each */
+#define TS_DX1_SEL		GENMASK(2, 0)
+#define TS_DX1_OVERRIDE		BIT(3)
+#define TS_DX2_SEL		GENMASK(6, 4)
+#define TS_DX2_OVERRIDE		BIT(7)
+#define TS_DX_SEL_OPEN		0
+#define TS_DX_SEL_USB		1
+#define TS_DX_SEL_UART0		2
+#define TS_DX_SEL_DIGITAL_ID	3
+#define TS_DX_SEL_BRICK_ID_P	4
+#define TS_DX_SEL_BRICK_ID_N	5
+/* 6 and 7 differ per lane: lane 1 gives a second USB and JTAG data, */
+/* lane 2 gives two further UARTs. */
+#define TS_DX1_SEL_USB_ALT	6
+#define TS_DX1_SEL_JTAG_DIO	7
+#define TS_DX2_SEL_UART2	6
+#define TS_DX2_SEL_UART1	7
+
+/* TS_REG_ACC_SWITCH: lane 1 in bits 1:0, lane 2 in bits 4:3 */
+#define TS_ACC1_SEL		GENMASK(1, 0)
+#define TS_ACC1_OVERRIDE	BIT(2)
+#define TS_ACC2_SEL		GENMASK(4, 3)
+#define TS_ACC2_OVERRIDE	BIT(5)
+#define TS_ACC_SEL_OPEN		0
+#define TS_ACC_SEL_UART1	1	/* rx on lane 1, tx on lane 2 */
+#define TS_ACC_SEL_JTAG		2	/* data on lane 1, clock on lane 2 */
+#define TS_ACC_SEL_ACC_POWER	3
+
+/* TS_REG_CHARGE_DET */
+#define TS_CHG_ID_SINK_EN	BIT(3)
+#define TS_CHG_SRC_SEL		GENMASK(2, 0)
+#define TS_CHG_SRC_OFF		0
+#define TS_CHG_SRC_DP1		1
+#define TS_CHG_SRC_DN1		2
+#define TS_CHG_SRC_DP2		3
+#define TS_CHG_SRC_DN2		4
+
+/* TS_REG_IDBUS_CTL */
+#define TS_IDBUS_RESET		BIT(3)
+#define TS_IDBUS_BREAK		BIT(2)
+#define TS_IDBUS_REORIENT	BIT(1)
+#define TS_IDBUS_SINK_EN	BIT(0)
+
+/* TS_REG_DIG_ID: raw levels on the two Dx and two accessory ID pins */
+#define TS_DIG_ID_DX1		BIT(3)
+#define TS_DIG_ID_DX0		BIT(2)
+#define TS_DIG_ID_ACC1		BIT(1)
+#define TS_DIG_ID_ACC0		BIT(0)
+
+/* TS_REG_STATUS */
+#define TS_ST_IDBUS_CONNECTED	BIT(7)
+#define TS_ST_IDBUS_ORIENT	BIT(6)
+#define TS_ST_SWITCH_EN		BIT(5)
+#define TS_ST_HOST_RESET	BIT(4)
+#define TS_ST_OVP		BIT(3)
+#define TS_ST_CON_DET_N		BIT(2)	/* active low: set means NOT detected */
+
+/* The accessory answers with this marker before the ID payload. */
+#define TS_ID_FIFO_MARKER	0x75
+#define TS_ID_PAYLOAD_LEN	6
 
 struct tristar_id_sig {
 	u8 bytes[6];
@@ -573,6 +655,94 @@ int apple_tristar_config_reg11(u8 *val)
 }
 EXPORT_SYMBOL_GPL(apple_tristar_config_reg11);
 
+/* Human-readable routing for one Dx lane. Lanes 1 and 2 differ at 6 and 7. */
+static const char *tristar_dx_route(u8 sel, bool lane2)
+{
+	switch (sel) {
+	case TS_DX_SEL_OPEN:		return "open";
+	case TS_DX_SEL_USB:		return "usb";
+	case TS_DX_SEL_UART0:		return "uart0";
+	case TS_DX_SEL_DIGITAL_ID:	return "digital-id";
+	case TS_DX_SEL_BRICK_ID_P:	return "brick-id+";
+	case TS_DX_SEL_BRICK_ID_N:	return "brick-id-";
+	case 6:				return lane2 ? "uart2" : "usb-alt";
+	case 7:				return lane2 ? "uart1" : "jtag-dio";
+	}
+	return "?";
+}
+
+static const char *tristar_acc_route(u8 sel, bool lane2)
+{
+	switch (sel) {
+	case TS_ACC_SEL_OPEN:		return "open";
+	case TS_ACC_SEL_UART1:		return lane2 ? "uart1-tx" : "uart1-rx";
+	case TS_ACC_SEL_JTAG:		return lane2 ? "jtag-clk" : "jtag-dio";
+	case TS_ACC_SEL_ACC_POWER:	return "acc-power";
+	}
+	return "?";
+}
+
+/*
+ * Read the accessory ID off the ID bus.
+ *
+ * The accessory answers with a fixed marker byte at the top of the FIFO,
+ * followed by the payload in the registers *below* it, read downward. If the
+ * marker is not there the bus may simply be the wrong way round, and a
+ * re-orient plus a settle makes it answer.
+ *
+ * This driver never implemented any of that -- it dumped 0x00..0x3F and
+ * pattern-matched, so it could not distinguish "no accessory" from "cable in
+ * the other orientation".
+ *
+ * The re-orient step is a write, so it is skipped when the driver is in its
+ * default read-only mode; the caller is told which case it got.
+ */
+static int tristar_read_accessory_id(struct apple_tristar *ts,
+				     u8 id[TS_ID_PAYLOAD_LEN])
+{
+	u8 status = 0, marker = 0;
+	unsigned int i;
+	int ret;
+
+	ret = tristar_read_reg(ts, TS_REG_STATUS, &status);
+	if (ret)
+		return ret;
+
+	if ((status & TS_ST_CON_DET_N) || !(status & TS_ST_IDBUS_CONNECTED))
+		return -ENODEV;
+
+	ret = tristar_read_reg(ts, TS_REG_FIFO_TOP, &marker);
+	if (ret)
+		return ret;
+
+	if (marker != TS_ID_FIFO_MARKER) {
+		if (read_only) {
+			dev_dbg(&ts->client->dev,
+				"id: marker 0x%02x, re-orient needs a write (read_only=1)\n",
+				marker);
+			return -EAGAIN;
+		}
+		ret = i2c_smbus_write_byte_data(ts->client, TS_REG_IDBUS_CTL,
+						TS_IDBUS_REORIENT);
+		if (ret < 0)
+			return ret;
+		msleep(100);
+		ret = tristar_read_reg(ts, TS_REG_FIFO_TOP, &marker);
+		if (ret)
+			return ret;
+	}
+
+	if (marker != TS_ID_FIFO_MARKER)
+		return -EAGAIN;
+
+	for (i = 0; i < TS_ID_PAYLOAD_LEN; i++) {
+		ret = tristar_read_reg(ts, TS_REG_FIFO_TOP - (i + 1), &id[i]);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 void apple_tristar_log_audio_path(struct device *audio_dev)
 {
 	struct apple_tristar *ts;
@@ -590,7 +760,52 @@ void apple_tristar_log_audio_path(struct device *audio_dev)
 	}
 	mutex_lock(&ts->lock);
 	tristar_refresh_locked(ts, "audio-path");
-	dev_info(audio_dev,
+	{
+		u8 status = 0, dx = 0, acc = 0;
+		u8 id[TS_ID_PAYLOAD_LEN] = {};
+		int idret;
+
+		/*
+		 * Report what the switches are actually doing.
+		 *
+		 * Decoded switch state, so dev_dbg: this whole block runs on
+		 * every stream start and is a snapshot for diagnosis, not an
+		 * event. Dynamic debug brings it back per call site.
+		 */
+		if (!tristar_read_reg(ts, TS_REG_STATUS, &status) &&
+		    !tristar_read_reg(ts, TS_REG_DX_SWITCH, &dx) &&
+		    !tristar_read_reg(ts, TS_REG_ACC_SWITCH, &acc)) {
+			dev_dbg(audio_dev,
+				 "tristar: connected=%d orient=%d switch_en=%d con_det=%d ovp=%d\n",
+				 !!(status & TS_ST_IDBUS_CONNECTED),
+				 !!(status & TS_ST_IDBUS_ORIENT),
+				 !!(status & TS_ST_SWITCH_EN),
+				 !(status & TS_ST_CON_DET_N),
+				 !!(status & TS_ST_OVP));
+			dev_dbg(audio_dev,
+				 "tristar: Dx1=%s%s Dx2=%s%s ACC1=%s%s ACC2=%s%s\n",
+				 tristar_dx_route(FIELD_GET(TS_DX1_SEL, dx), false),
+				 (dx & TS_DX1_OVERRIDE) ? "(ovrd)" : "",
+				 tristar_dx_route(FIELD_GET(TS_DX2_SEL, dx), true),
+				 (dx & TS_DX2_OVERRIDE) ? "(ovrd)" : "",
+				 tristar_acc_route(FIELD_GET(TS_ACC1_SEL, acc), false),
+				 (acc & TS_ACC1_OVERRIDE) ? "(ovrd)" : "",
+				 tristar_acc_route(FIELD_GET(TS_ACC2_SEL, acc), true),
+				 (acc & TS_ACC2_OVERRIDE) ? "(ovrd)" : "");
+		}
+
+		idret = tristar_read_accessory_id(ts, id);
+		if (!idret)
+			dev_dbg(audio_dev, "tristar: accessory id %*ph\n",
+				 TS_ID_PAYLOAD_LEN, id);
+		else if (idret == -ENODEV)
+			dev_dbg(audio_dev, "tristar: nothing on the ID bus\n");
+		else
+			dev_dbg(audio_dev,
+				 "tristar: ID bus did not answer (%d)\n", idret);
+	}
+
+	dev_dbg(audio_dev,
 		 "tristar audio-path: lightning=%s flat=%d echo=%d usb_dx=%u accx=%u analog_lightning=%d — 3.5mm jack is CS42+Mikey not Dx; USB route does not mute jack\n",
 		 tristar_id_label(ts), ts->dump_flat, ts->i2c_echo, ts->dx,
 		 ts->accx, tristar_is_lightning_analog(ts));

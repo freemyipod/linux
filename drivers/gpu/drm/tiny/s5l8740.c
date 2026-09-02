@@ -14,7 +14,10 @@
 #include <drm/drm_crtc_helper.h>
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
+#include <linux/delay.h>
+#include <drm/drm_damage_helper.h>
 #include <drm/drm_fbdev_shmem.h>
+#include <drm/drm_rect.h>
 #include <drm/drm_format_helper.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem_atomic_helper.h>
@@ -45,6 +48,33 @@
 /* GATE0: 1us was too short (stride/FIFO); 100ms wait, pitch-aware blit */
 #define S5L8740_LCD_TIMEOUT_US 100000
 
+/*
+ * Transfer framing.
+ *
+ * A transfer is not just a run of pixel writes. Stock brackets it, and
+ * sub_A25C0 is the whole shape of it:
+ *
+ *   if (MEMORY[0x3830008C] << 30)  return -1;   busy: bits 0-1 set
+ *   MEMORY[0x38300080] = 1;                     open
+ *   sub_AEFAC(0, 0, w, h);                      window, then pixels
+ *   do sub_345D68(); while (!v3);               settle
+ *   MEMORY[0x38300080] = 0;                     close
+ *
+ * and sub_A96E4() is the bare wait, "while (MEMORY[0x3830008C] << 30);"
+ * -- a left shift of 30 tests bits 0 and 1, so nonzero means busy.
+ *
+ * Without the bracket the panel is handed a stream that neither begins
+ * nor ends where it expects, so its write pointer does not come back to
+ * the origin and the next frame starts from wherever the last one
+ * stopped. Rows stay intact and the image walks up and down the screen,
+ * which is exactly what this driver did while every DSI window command
+ * was reporting success.
+ */
+#define S5L8740_LCD_XFER		0x80	/* 1 = transfer open */
+#define S5L8740_LCD_XSTAT		0x8c	/* bits 0-1 busy */
+#define S5L8740_LCD_XSTAT_BUSY	0x3
+#define S5L8740_LCD_XFER_TIMEOUT_US	100000
+
 #define WIDTH 240
 #define HEIGHT 432
 
@@ -61,6 +91,7 @@
 
     /* memory management */
 	void __iomem *lcdif;
+	void __iomem *dsi;	/* MIPI DSI host; NULL = no windowing */
 	void __iomem *clkcon;	/* gates cycled across an LCDIF reset */
 
 	/* display power */
@@ -76,6 +107,39 @@
     struct drm_encoder encoder;
     struct drm_connector connector;
 };
+
+/*
+ * MIPI DSI host, a separate block from the LCDIF.
+ *
+ * The panel is a DCS command-mode panel with full windowed addressing.
+ * Before each transfer stock sends set_column_address, set_page_address and
+ * write_memory_start through this host, and only then streams pixels into
+ * LCDIF. RetailOS never writes LCD_WDATA without doing that first.
+ *
+ * Verified in the decomp. The short and long paths genuinely wait on the
+ * status register differently, which is not a transcription slip:
+ *
+ *   short: MEMORY[0x3D800034] = dt & 0x3F | (p0 << 8) | (p1 << 16);
+ *          wait until (status & 0x400000) == 0            bit 22 clears
+ *   long:  MEMORY[0x3D800038] = payload words, LSB first;
+ *          MEMORY[0x3D800034] = dt & 0x3F | (len << 8);
+ *          wait until (status & 0x500000) == 0x500000     bits 20+22 set
+ */
+#define S5L8740_DSI_CTL			0x10
+#define S5L8740_DSI_CTL_LONG_GATE	BIT(28)
+#define S5L8740_DSI_HDR			0x34
+#define S5L8740_DSI_PAYLOAD		0x38
+#define S5L8740_DSI_STATUS		0x44
+#define S5L8740_DSI_ST_SHORT		0x400000u
+#define S5L8740_DSI_ST_LONG		0x500000u
+#define S5L8740_DSI_TIMEOUT_US		2000
+
+#define S5L8740_DSI_DT_DCS_SHORT_0P	0x05
+#define S5L8740_DSI_DT_GEN_LONG		0x29
+
+#define S5L8740_DCS_SET_COLUMN		0x2a
+#define S5L8740_DCS_SET_PAGE		0x2b
+#define S5L8740_DCS_WRITE_START		0x2c
 
 static inline void s5l8740_lcd_writel(struct s5l8740_device *lcd_dev,
 					  u32 reg, u32 val)
@@ -103,62 +167,322 @@ static int s5l8740_primary_plane_helper_atomic_check(struct drm_plane *plane, st
 						   false, false);
 }
 
-static void s5l8740_primary_plane_helper_atomic_update(struct drm_plane *plane,
-    struct drm_atomic_state *state)
+/*
+ * The stock sequence waits between enabling the rail and touching the
+ * LCDIF. That wait is a thunk into ROM, so its length is not recoverable;
+ * this is a conservative stand-in, tunable if the panel proves fussy.
+ */
+/*
+ * Send the whole panel on every update, the way stock does, rather than
+ * only the rectangles DRM reports as damaged.
+ *
+ * Off is faster and was the default while the drift was being chased. It
+ * is kept because it is the one knob that reproduces the fault, and a
+ * regression here is otherwise hard to tell from a slow frame.
+ */
+static bool lcd_partial;
+module_param(lcd_partial, bool, 0644);
+MODULE_PARM_DESC(lcd_partial,
+		 "Send only damaged rectangles instead of the whole panel");
+
+/*
+ * Bracket each update with the LCDIF transfer gate. Off reproduces the
+ * unframed streaming this driver did before, for comparison.
+ */
+static bool lcd_frame_xfer = true;
+module_param(lcd_frame_xfer, bool, 0644);
+MODULE_PARM_DESC(lcd_frame_xfer,
+		 "Open and close the LCDIF transfer around each update (default Y)");
+
+/* Wait for the interface to leave a transfer. */
+static int s5l8740_xfer_idle(struct s5l8740_device *sdev)
 {
-    struct drm_plane_state *plane_state = drm_atomic_get_new_plane_state(state, plane);
-    struct drm_shadow_plane_state *shadow_plane_state = to_drm_shadow_plane_state(plane_state);
-    struct drm_framebuffer *fb = plane_state->fb;
-    struct drm_device *dev = plane->dev;
-    struct s5l8740_device *sdev = s5l8740_device_of_dev(dev);
-    int idx;
+	u32 st;
 
-    if (!fb || drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE))
-        return;
+	return readl_poll_timeout_atomic(sdev->lcdif + S5L8740_LCD_XSTAT, st,
+					 !(st & S5L8740_LCD_XSTAT_BUSY), 0,
+					 S5L8740_LCD_XFER_TIMEOUT_US);
+}
 
-    /*
-     * Never push pixels at a stopped interface. Each write waits on the
-     * status register, so a full frame against a powered-down LCDIF would
-     * stall for the timeout on every one of them. The panel is repainted
-     * by n31_lcd_power() once it is running again.
-     */
-    if (!READ_ONCE(sdev->powered)) {
-        drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
-        return;
-    }
+static int s5l8740_xfer_open(struct s5l8740_device *sdev)
+{
+	int ret;
 
-    if (!drm_dev_enter(dev, &idx))
-        goto out_drm_gem_fb_end_cpu_access;
+	if (!lcd_frame_xfer)
+		return 0;
+	/*
+	 * Opening on top of a transfer still running is what stock refuses
+	 * outright, returning -1 rather than queueing behind it.
+	 */
+	ret = s5l8740_xfer_idle(sdev);
+	if (ret)
+		return ret;
+	writel(1, sdev->lcdif + S5L8740_LCD_XFER);
+	return 0;
+}
 
-    unsigned int x, y, pitch_px;
-    u32 *src = shadow_plane_state->data[0].vaddr;
+static void s5l8740_xfer_close(struct s5l8740_device *sdev)
+{
+	if (!lcd_frame_xfer)
+		return;
+	/*
+	 * Let the interface drain before dropping the gate. Closing under a
+	 * transfer truncates it, which leaves the panel mid-row and is the
+	 * failure this framing exists to prevent.
+	 */
+	s5l8740_xfer_idle(sdev);
+	writel(0, sdev->lcdif + S5L8740_LCD_XFER);
+}
 
-    pitch_px = fb->pitches[0] / 4;
-    if (!pitch_px)
-	pitch_px = fb->width;
+/* Short DCS write, no parameters. */
+static int s5l8740_dsi_short(struct s5l8740_device *sdev, u8 dt, u8 cmd)
+{
+	u32 st;
 
-    for (y = 0; y < fb->height; y++) {
-	const u32 *row = src + y * pitch_px;
+	if (!sdev->dsi)
+		return -ENODEV;
+	writel((dt & 0x3f) | (cmd << 8), sdev->dsi + S5L8740_DSI_HDR);
+	/*
+	 * Flush the header write and let the host react before polling.
+	 *
+	 * The done bits are set while the host is idle -- measured
+	 * 0x0155541D with nothing in flight -- so they only mean anything
+	 * after issuing a command has cleared them. Polling straight after a
+	 * posted write reads the stale idle value, returns success
+	 * immediately, and the next command then pushes its payload over one
+	 * still in flight.
+	 *
+	 * That is what put the panel window wrong in one axis only: the
+	 * column write survived because setting up the page write gave it
+	 * time, and the page write was clobbered by write_memory_start
+	 * arriving on its heels. Horizontal placement correct, vertical
+	 * placement wherever the previous command happened to leave it.
+	 */
+	readl(sdev->dsi + S5L8740_DSI_STATUS);
+	udelay(1);
+	/*
+	 * Wait for the bit to SET, not clear.
+	 *
+	 * The two waits stock uses are opposites and it is easy to read one
+	 * as the other:
+	 *
+	 *   sub_3D11B0(r, m, v)  while ((*r & m) == v)  -- until NOT equal
+	 *   sub_714C  (r, m, v)  while ((*r & m) != v)  -- until equal
+	 *
+	 * The short path calls sub_3D11B0(status, 0x400000, 0), so it waits
+	 * until bit 22 is no longer zero. Waiting for it to clear instead
+	 * hangs forever: the bit reads 1 at idle -- measured 0x0155541D on
+	 * the glass -- and only drops while a command is in flight.
+	 */
+	return readl_poll_timeout_atomic(sdev->dsi + S5L8740_DSI_STATUS, st,
+					 st & S5L8740_DSI_ST_SHORT, 0,
+					 S5L8740_DSI_TIMEOUT_US);
+}
 
-	for (x = 0; x < fb->width; x++) {
-		int ret;
-		u32 status;
+/* Long write: payload first, LSB-first into the FIFO, then the header. */
+static int s5l8740_dsi_long(struct s5l8740_device *sdev, u8 dt,
+			    const u8 *buf, unsigned int len)
+{
+	unsigned int i;
+	u32 w = 0, st;
 
-		ret = readl_poll_timeout_atomic(sdev->lcdif + S5L8740_LCD_STATUS, status,
-					!(status & S5L8740_LCD_STATUS_BUSY), 0,
-					S5L8740_LCD_TIMEOUT_US);
-		if (unlikely(ret)) {
-			drm_warn_once(dev, "S5L8740_LCD_STATUS_BUSY timeout\n");
-			goto out_drm_dev_exit;
+	if (!sdev->dsi)
+		return -ENODEV;
+	writel(readl(sdev->dsi + S5L8740_DSI_CTL) & ~S5L8740_DSI_CTL_LONG_GATE,
+		       sdev->dsi + S5L8740_DSI_CTL);
+
+	for (i = 0; i < len; i++) {
+		w |= (u32)buf[i] << (8 * (i & 3));
+		if ((i & 3) == 3) {
+			writel(w, sdev->dsi + S5L8740_DSI_PAYLOAD);
+			w = 0;
 		}
-		s5l8740_lcd_writel(sdev, S5L8740_LCD_WDATA, row[x]);
 	}
-    }
+	if (len & 3)
+		writel(w, sdev->dsi + S5L8740_DSI_PAYLOAD);
 
-out_drm_dev_exit:
-    drm_dev_exit(idx);
-out_drm_gem_fb_end_cpu_access:
-    drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
+	writel((dt & 0x3f) | (len << 8), sdev->dsi + S5L8740_DSI_HDR);
+	/*
+	 * Flush the header write and let the host react before polling.
+	 *
+	 * The done bits are set while the host is idle -- measured
+	 * 0x0155541D with nothing in flight -- so they only mean anything
+	 * after issuing a command has cleared them. Polling straight after a
+	 * posted write reads the stale idle value, returns success
+	 * immediately, and the next command then pushes its payload over one
+	 * still in flight.
+	 *
+	 * That is what put the panel window wrong in one axis only: the
+	 * column write survived because setting up the page write gave it
+	 * time, and the page write was clobbered by write_memory_start
+	 * arriving on its heels. Horizontal placement correct, vertical
+	 * placement wherever the previous command happened to leave it.
+	 */
+	readl(sdev->dsi + S5L8740_DSI_STATUS);
+	udelay(1);
+	return readl_poll_timeout_atomic(sdev->dsi + S5L8740_DSI_STATUS, st,
+					 (st & S5L8740_DSI_ST_LONG) ==
+					 S5L8740_DSI_ST_LONG, 0,
+					 S5L8740_DSI_TIMEOUT_US);
+}
+
+/* Point the panel at one rectangle and rewind its write pointer. */
+static int s5l8740_dsi_window(struct s5l8740_device *sdev,
+			      u32 x, u32 y, u32 w, u32 h)
+{
+	u8 col[5] = { S5L8740_DCS_SET_COLUMN, (x >> 8) & 0xff, x & 0xff,
+		      ((x + w - 1) >> 8) & 0xff, (x + w - 1) & 0xff };
+	u8 row[5] = { S5L8740_DCS_SET_PAGE, (y >> 8) & 0xff, y & 0xff,
+		      ((y + h - 1) >> 8) & 0xff, (y + h - 1) & 0xff };
+	int ret;
+
+	ret = s5l8740_dsi_long(sdev, S5L8740_DSI_DT_GEN_LONG, col, sizeof(col));
+	if (ret)
+		return ret;
+	ret = s5l8740_dsi_long(sdev, S5L8740_DSI_DT_GEN_LONG, row, sizeof(row));
+	if (ret)
+		return ret;
+
+	return s5l8740_dsi_short(sdev, S5L8740_DSI_DT_DCS_SHORT_0P,
+				 S5L8740_DCS_WRITE_START);
+}
+
+/*
+ * Point the panel at one rectangle and stream it.
+ *
+ * Returns nonzero only when the interface stopped answering, which costs
+ * the rest of the frame; a window command that will not take is not fatal
+ * and falls through to the pixels, since the panel keeps whatever window
+ * it had and one crooked frame beats a frozen display.
+ */
+static int s5l8740_blit(struct s5l8740_device *sdev, const u32 *src,
+			unsigned int pitch_px, const struct drm_rect *clip)
+{
+	unsigned int x, y;
+
+	if (sdev->dsi &&
+	    s5l8740_dsi_window(sdev, clip->x1, clip->y1,
+			       drm_rect_width(clip), drm_rect_height(clip)))
+		drm_warn_once(&sdev->dev, "DSI window timeout\n");
+
+	for (y = clip->y1; y < (unsigned int)clip->y2; y++) {
+		const u32 *row = src + y * pitch_px;
+
+		for (x = clip->x1; x < (unsigned int)clip->x2; x++) {
+			u32 status;
+
+			if (readl_poll_timeout_atomic(sdev->lcdif +
+						      S5L8740_LCD_STATUS,
+						      status,
+						      !(status & S5L8740_LCD_STATUS_BUSY),
+						      0, S5L8740_LCD_TIMEOUT_US)) {
+				drm_warn_once(&sdev->dev,
+					      "LCDIF stayed busy; frame dropped\n");
+				return -ETIMEDOUT;
+			}
+
+			s5l8740_lcd_writel(sdev, S5L8740_LCD_WDATA, row[x]);
+		}
+	}
+
+	return 0;
+}
+
+static void s5l8740_primary_plane_helper_atomic_update(struct drm_plane *plane,
+						       struct drm_atomic_state *state)
+{
+	struct drm_plane_state *plane_state = drm_atomic_get_new_plane_state(state, plane);
+	struct drm_plane_state *old_state = drm_atomic_get_old_plane_state(state, plane);
+	struct drm_shadow_plane_state *shadow = to_drm_shadow_plane_state(plane_state);
+	struct drm_framebuffer *fb = plane_state->fb;
+	struct drm_device *dev = plane->dev;
+	struct s5l8740_device *sdev = s5l8740_device_of_dev(dev);
+	unsigned int pitch_px;
+	const u32 *src;
+	int idx;
+
+	if (!fb || drm_gem_fb_begin_cpu_access(fb, DMA_FROM_DEVICE))
+		return;
+
+	/*
+	 * Never push pixels at a stopped interface. Each write waits on the
+	 * status register, so a full frame against a powered-down LCDIF would
+	 * stall for the timeout on every one of them. The panel is repainted
+	 * by n31_lcd_power() once it is running again.
+	 */
+	if (!READ_ONCE(sdev->powered))
+		goto out_end_cpu_access;
+
+	if (!drm_dev_enter(dev, &idx))
+		goto out_end_cpu_access;
+
+	src = shadow->data[0].vaddr;
+	pitch_px = fb->pitches[0] / 4;
+	if (!pitch_px)
+		pitch_px = fb->width;
+
+	/*
+	 * Open the transfer before any command or pixel goes out, and close it
+	 * once, after the last rectangle. The bracket belongs around the whole
+	 * update rather than around each rectangle: stock opens once, blits,
+	 * and closes.
+	 */
+	if (s5l8740_xfer_open(sdev)) {
+		drm_warn_once(dev, "LCDIF busy; update skipped\n");
+		goto out_dev_exit;
+	}
+
+	/*
+	 * Stock refreshes the panel exactly one way. From sub_A25C0:
+	 *
+	 *   if (MEMORY[0x3830008C] << 30)  return -1;   busy
+	 *   MEMORY[0x38300080] = 1;                     open
+	 *   sub_AEFAC(0, 0, w, h);                      window
+	 *   do sub_345D68(); while (!v3);               settle
+	 *   MEMORY[0x38300080] = 0;                     close
+	 *
+	 * and sub_AEFAC is one instruction, "b.w sub_75D44" -- a tail jump
+	 * into the DCS window setter. So the window is (0, 0, w, h), the whole
+	 * panel, on every refresh. The firmware has no partial-window path at
+	 * all.
+	 *
+	 * That is why damage-clipped updates walked up and down the screen.
+	 * The LCDIF is programmed once at init with the panel geometry,
+	 * 0x38300074 = h | (w << 16), and never again; it frames what it sends
+	 * by that register, so a narrower rectangle is still framed to the
+	 * full panel width and each row lands further from where it belongs.
+	 * The error grows with (panel width - rect width), which is why it
+	 * looked as though it depended on what was being drawn. Full-screen
+	 * repaints have no discrepancy and landed correctly -- exactly the
+	 * split that showed on the glass, fresh screens right and menu deltas
+	 * adrift.
+	 *
+	 * That init is not ours to change, so send full frames like stock.
+	 */
+	if (lcd_partial) {
+		struct drm_atomic_helper_damage_iter iter;
+		struct drm_rect clip;
+
+		drm_atomic_helper_damage_iter_init(&iter, old_state, plane_state);
+		drm_atomic_for_each_plane_damage(&iter, &clip)
+			if (s5l8740_blit(sdev, src, pitch_px, &clip))
+				break;
+	} else {
+		struct drm_rect full = {
+			.x1 = 0,
+			.y1 = 0,
+			.x2 = fb->width,
+			.y2 = fb->height,
+		};
+
+		s5l8740_blit(sdev, src, pitch_px, &full);
+	}
+
+	s5l8740_xfer_close(sdev);
+out_dev_exit:
+	drm_dev_exit(idx);
+out_end_cpu_access:
+	drm_gem_fb_end_cpu_access(fb, DMA_FROM_DEVICE);
 }
 
 static const struct drm_plane_helper_funcs s5l8740_primary_plane_helper_funcs = {
@@ -236,11 +560,6 @@ static unsigned int lcd_power_tries = S5L8740_LCD_RESET_TRIES;
 module_param(lcd_power_tries, uint, 0644);
 MODULE_PARM_DESC(lcd_power_tries, "Attempts to bring the display up (default 5)");
 
-/*
- * The stock sequence waits between enabling the rail and touching the
- * LCDIF. That wait is a thunk into ROM, so its length is not recoverable;
- * this is a conservative stand-in, tunable if the panel proves fussy.
- */
 static unsigned int lcd_rail_settle_us = 3000;
 module_param(lcd_rail_settle_us, uint, 0644);
 MODULE_PARM_DESC(lcd_rail_settle_us,
@@ -621,6 +940,17 @@ static int s5l8740_probe(struct platform_device *pdev)
         return PTR_ERR(sdev->lcdif);
 
     mutex_init(&sdev->power_lock);
+
+    /*
+     * Third window is the MIPI DSI host. Optional: without it the panel
+     * window cannot be set and every update repaints the whole frame.
+     */
+    res = platform_get_resource(pdev, IORESOURCE_MEM, 2);
+    if (res) {
+        sdev->dsi = devm_ioremap_resource(&pdev->dev, res);
+        if (IS_ERR(sdev->dsi))
+            sdev->dsi = NULL;
+    }
 
     /*
      * Second window is the clock controller. Only two gates are touched,
