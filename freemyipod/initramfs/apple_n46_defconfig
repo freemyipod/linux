@@ -1,0 +1,15 @@
+CONFIG_CROSS_COMPILER_PREFIX="arm-linux-gnueabihf-"
+CONFIG_EXTRA_CFLAGS="-mcpu=arm926ej-s"
+CONFIG_STATIC=y
+CONFIG_STATIC_LIBGCC=y
+# tc needs kernel-specific headers not available in the cross toolchain sysroot
+CONFIG_TC=n
+# Busybox's nanddump can't handle a 4 GiB MTD (size field is u32 and
+# wraps to 0). We use a custom dumpall tool built below instead.
+CONFIG_NANDDUMP=n
+CONFIG_NANDWRITE=n
+# Networking utils for USB gadget + telnet shell
+CONFIG_IFCONFIG=y
+CONFIG_FEATURE_IFCONFIG_STATUS=y
+CONFIG_TELNETD=y
+CONFIG_FEATURE_TELNETD_STANDALONE=y
