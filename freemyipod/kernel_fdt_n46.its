@@ -1,7 +1,7 @@
 /dts-v1/;
 
 / {
-    description = "Linux kernel + FDT for iPod nano 3g (N46, S5L8702)";
+    description = "Linux kernel + FDT for iPod nano (3rd generation) (N46, S5L8702)";
     #address-cells = <1>;
 
     images {
