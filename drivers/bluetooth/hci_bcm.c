@@ -1580,6 +1580,19 @@ static struct bcm_device_data cyw4373a0_device_data = {
 	.no_uart_clock_set = true,
 };
 
+/*
+ * The N31's BCM2078 does not answer a vendor command until it has been
+ * reset at its power-on rate. RetailOS sphwBluetooth_Init opens the port
+ * at 115200 and sends HCI_Reset, Read_Local_Version and Read_BD_ADDR
+ * before it sends 0xfc18 to move the link to 2400000. Letting serdev
+ * apply max-speed before setup() runs inverts that: 0xfc18 goes out
+ * first, to a controller that is not listening for it yet, and every
+ * command after it times out.
+ */
+static struct bcm_device_data bcm2078_device_data = {
+	.no_early_set_baudrate = true,
+};
+
 static struct bcm_device_data cyw55572_device_data = {
 	.max_autobaud_speed = 921600,
 };
@@ -1587,6 +1600,7 @@ static struct bcm_device_data cyw55572_device_data = {
 static const struct of_device_id bcm_bluetooth_of_match[] = {
 	{ .compatible = "brcm,bcm20702a1" },
 	{ .compatible = "brcm,bcm4329-bt" },
+	{ .compatible = "brcm,bcm2078", .data = &bcm2078_device_data },
 	{ .compatible = "brcm,bcm4330-bt" },
 	{ .compatible = "brcm,bcm4334-bt" },
 	{ .compatible = "brcm,bcm4345c5" },

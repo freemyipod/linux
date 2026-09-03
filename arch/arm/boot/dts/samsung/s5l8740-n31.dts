@@ -233,7 +233,7 @@
             /* BCM2078KUBG on UART1 @115200 — serdev → hci_bcm → hci0.
              * Companion GPIO/FM lives under apple,n31-bcm2078-companion. */
             bluetooth {
-                compatible = "brcm,bcm4329-bt", "brcm,bcm2078";
+                compatible = "brcm,bcm2078", "brcm,bcm4329-bt";
                 /*
                  * sphwBluetooth_Init opens the port and immediately
                  * sends 01 18 FC 06 00 00 00 9F 24 00 -- vendor command
