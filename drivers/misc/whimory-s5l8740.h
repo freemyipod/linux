@@ -93,6 +93,18 @@ struct whimory_fpart {
 #define WHIMORY_SB_CXT			7	/* s_cxt_diff.c type 7 */
 
 #define WHIMORY_SB_UNKNOWN		3
+/*
+ * A bank of a superblock that some other bank's BTOC already describes.
+ *
+ * classify enumerates (ce, cau, vblock) plane-blocks, but a superblock is
+ * one virtual block striped across its banks with exactly one table of
+ * contents -- measured here as 2010 vblocks carrying one BTOC and none
+ * carrying three or four. The other banks hold plain data at page 127 and
+ * used to classify as OPEN, which is why 6029 "open superblocks" appeared
+ * on a volume with about 2025 real ones, and why the diff replay walked
+ * 127 pages of each instead of reading one BTOC.
+ */
+#define WHIMORY_SB_MEMBER		4
 
 #define WHIMORY_CXT_MAX_SB		32
 #define WHIMORY_CXT_TAG_BASE		1
@@ -450,6 +462,16 @@ struct whimory_sftl {
 	u32 sb_bank_hist[S5L8740_NAND_MAX_CE * S5L8740_NAND_MAX_CAU + 1];
 	u32 sb_bank_overflow;	/* CXT offsets past the derived superblock end */
 	u32 sb_bank_conflicts;	/* members the VFL bad-block table calls bad */
+	u16 *cxt_sb_used;	/* TAG_SB: addresses each superblock holds */
+	u8 *cxt_sb_type;	/* TAG_SB: superblock type byte */
+	u32 cxt_sb_entries;	/* TAG_SB entries parsed */
+	u32 cxt_sb_disagree;	/* nbanks: classify vs TAG_SB */
+	u32 cxt_mismatch_newer;	/* stale: page recycled since the checkpoint */
+	u32 cxt_mismatch_older;	/* decode fault: page older than the checkpoint */
+	u32 btoc_slot_nonzero;	/* BTOC found in a slot other than 0 */
+	u32 btoc_slot_missing;	/* page had no slot with a BTOC meta */
+	u8 *btoc_per_vblock;	/* BTOCs seen per virtual block */
+	u32 member_sbs;		/* banks folded into a superblock's BTOC */
 
 	struct whimory_sb *sbs;
 	u32 mapped_roots;
@@ -664,6 +686,7 @@ struct whimory {
 	 */
 	u64 cxt_top_weave;
 	u32 cxt_save_num_sb;	/* first word of the BASE record payload */
+	bool cxt_confirm_active;/* confirm extents against their pages this run */
 	struct whimory_cxt_extent *cxt_ext;	/* candidate map (Phase 3) */
 	u32 n_cxt_ext;
 	u32 max_cxt_ext;

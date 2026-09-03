@@ -146,6 +146,11 @@ module_param(force_replay_vblock, uint, 0644);
 MODULE_PARM_DESC(force_replay_vblock,
 		 "replay this vblock even when the CXT covers it (0 = off)");
 
+static unsigned int cxt_sb_probe;
+module_param(cxt_sb_probe, uint, 0644);
+MODULE_PARM_DESC(cxt_sb_probe,
+		 "Print the checkpoint's TAG_SB entry for this superblock index (0 = off)");
+
 static unsigned int cxt_trace_sb;
 module_param(cxt_trace_sb, uint, 0644);
 MODULE_PARM_DESC(cxt_trace_sb, "trace this many leading records of each CXT superblock");
@@ -169,10 +174,47 @@ MODULE_PARM_DESC(btoc_meta_fallback,
 		 "(default N; overrides the CXT and corrupts the map when "
 		 "the CXT is newer, which it is on N31)");
 
-static unsigned int max_open_sbs = 4096;
+/*
+ * No cap by default.
+ *
+ * This was 4096, and it is the fallback path's version of the bug
+ * require_cxt fixed on the fast path: a volume with more open superblocks
+ * than the cap gets a map that is short by construction, and the recover
+ * says so in a dev_warn and then hands it over anyway.
+ *
+ * Caught on the glass. After an unclean RetailOS shutdown this unit had
+ * 6029 open superblocks, so a use_cxt=0 rebuild -- the path that exists
+ * precisely to be the ground truth the checkpoint is checked against --
+ * dropped 1933 of them and produced a map missing 47 per cent of the
+ * volume. It was then used to arbitrate a question about the checkpoint,
+ * and it gave the wrong answer with no sign anything was wrong except one
+ * warning in a log full of them.
+ *
+ * The oracle has to be complete or it is not an oracle. So the cap is
+ * still here -- an unbounded rebuild on a damaged volume should not run
+ * forever -- but it is above anything this device can present, and hitting
+ * it is now a failure rather than a shrug. See allow_short_map.
+ *
+ * 8192 against a hard ceiling of num_ce * num_cau * blocks_per_cau = 8352,
+ * so it can still be reached in principle; it will say so if it is.
+ */
+static unsigned int max_open_sbs = 8192;
 module_param(max_open_sbs, uint, 0644);
 MODULE_PARM_DESC(max_open_sbs,
-		 "Max open superblocks to META-rebuild (0 = all; default 4096)");
+		 "Max open superblocks to META-rebuild (0 = all; default 8192)");
+
+/*
+ * A short map is a failure, not a result.
+ *
+ * Two things can silently shorten a rebuild: max_open_sbs dropping open
+ * superblocks, and max_range_nodes stopping the interval map. Both used to
+ * log and continue, which is how a map missing half the volume got used as
+ * evidence. Both now fail the recover unless this says otherwise.
+ */
+static bool allow_short_map;
+module_param(allow_short_map, bool, 0644);
+MODULE_PARM_DESC(allow_short_map,
+		 "Return a map known to be missing claims instead of failing (default N)");
 
 /*
  * Scan every block. 256 was a bring-up limit that was never lifted, and
@@ -511,6 +553,37 @@ MODULE_PARM_DESC(use_cxt,
  * With this set, a checkpoint that will not load is an error and the
  * recover stops there. Clearing it restores the old silent fallback.
  */
+/*
+ * Treat the banks of a closed superblock as part of it, rather than as
+ * open superblocks of their own. See WHIMORY_SB_MEMBER and
+ * docs/n7g-storage/SFTL-SUPERBLOCK-MODEL.md.
+ */
+/*
+ * Off until it is correct, not until it is fast.
+ *
+ * Measured on a dirty volume, same NAND, back to back: folding takes the
+ * recover from 126 s to 60 s and leaves mapped_lbas identical at 3901881,
+ * with range_nodes dropping 15419 -> 5927. It also takes a 15558-read
+ * strided sweep from 69 wrong and 384 unmapped to 266 wrong and 581
+ * unmapped, so it fails the acceptance gate in
+ * docs/n7g-storage/SFTL-SUPERBLOCK-MODEL.md and does not ship.
+ *
+ * What the page walks were doing that the BTOC does not: the 362
+ * superblocks the diff replays are the last 363 entries of the sorted
+ * array -- the tail blocks above user_blocks, where this volume's recent
+ * writes and its checkpoint both live -- and each contributes about 508
+ * L2V updates when walked. Folding them away leaves those updates to their
+ * superblock's BTOC, and the sweep says the BTOC is not supplying them.
+ * Either the BTOC on those virtual blocks does not describe every bank, or
+ * 14 of 89 being unclaimed matters more than it looks.
+ *
+ * Set sb_fold=1 to reproduce both halves of that measurement.
+ */
+static bool sb_fold;
+module_param(sb_fold, bool, 0644);
+MODULE_PARM_DESC(sb_fold,
+		 "Fold non-BTOC banks into their superblock instead of replaying each (default N)");
+
 static bool require_cxt = true;
 module_param(require_cxt, bool, 0644);
 MODULE_PARM_DESC(require_cxt,
@@ -546,6 +619,19 @@ MODULE_PARM_DESC(recover_force,
  * moves on. It costs one page read per extent -- 6276 on this volume --
  * and is kept only as a diagnostic.
  */
+/*
+ * Confirm automatically when the volume says it needs it.
+ *
+ * cxt_meta_confirm forces the check on always, which costs a page read per
+ * extent -- 5828 of them here -- and is not worth paying on a volume whose
+ * checkpoint is the newest thing on it. This turns it on for exactly the
+ * case that needs it: at least one superblock written after the checkpoint.
+ */
+static bool cxt_confirm_auto = true;
+module_param(cxt_confirm_auto, bool, 0644);
+MODULE_PARM_DESC(cxt_confirm_auto,
+		 "Confirm CXT extents against their pages when any superblock is newer than the checkpoint (default Y)");
+
 static bool cxt_meta_confirm;
 module_param(cxt_meta_confirm, bool, 0644);
 MODULE_PARM_DESC(cxt_meta_confirm,
@@ -1292,10 +1378,25 @@ static u32 s_g_vba_to_ofs(const struct whimory *w, u32 vba)
 	return vba % per_vb;
 }
 
+/* Defined below; the superblock index needs its block count. */
+static u32 whimory_vba_blocks(const struct whimory *w);
+
 static u32 whimory_sb_index(const struct whimory *w, u32 ce, u32 cau,
 			    u32 vblock)
 {
-	return (ce * w->geom.num_cau + cau) * w->sftl.user_blocks + vblock;
+	/*
+	 * Stride by blocks_per_cau, not user_blocks.
+	 *
+	 * This index is a bank-major (ce, cau, vblock) triple packed into one
+	 * number, and vblock runs to blocks_per_cau -- classify enumerates
+	 * all of them and the FTL puts both data and checkpoints above
+	 * user_blocks. With a 1960 stride every vblock from 1960 up aliased
+	 * onto the next plane's low blocks, so whimory_cxt_sb_vblock() gave
+	 * the wrong virtual block back and the checkpoint walk read someone
+	 * else's superblock: cxt=4 found, and then -ENODATA because not one
+	 * record parsed.
+	 */
+	return (ce * w->geom.num_cau + cau) * whimory_vba_blocks(w) + vblock;
 }
 
 /*
@@ -1386,15 +1487,16 @@ static u32 whimory_pack_vba(const struct whimory *w, u32 ce, u32 cau,
  */
 static u32 whimory_sb_ofs_to_vba(const struct whimory *w, u32 sb_idx, u32 ofs)
 {
-	u32 per_ce = w->geom.num_cau * w->sftl.user_blocks;
+	u32 nblk = whimory_vba_blocks(w);
+	u32 per_ce = w->geom.num_cau * nblk;
 	u32 ce, cau, vblock, rem;
 
-	if (!per_ce || !w->sftl.user_blocks || !w->sftl.vbas_per_page)
+	if (!per_ce || !nblk || !w->sftl.vbas_per_page)
 		return 0;
 	ce = sb_idx / per_ce;
 	rem = sb_idx % per_ce;
-	cau = rem / w->sftl.user_blocks;
-	vblock = rem % w->sftl.user_blocks;
+	cau = rem / nblk;
+	vblock = rem % nblk;
 
 	return whimory_pack_vba(w, ce, cau, vblock,
 				ofs / w->sftl.vbas_per_page,
@@ -1404,11 +1506,12 @@ static u32 whimory_sb_ofs_to_vba(const struct whimory *w, u32 sb_idx, u32 ofs)
 /* The virtual block a bank-major superblock index names. */
 static u32 whimory_cxt_sb_vblock(const struct whimory *w, u32 sb_idx)
 {
-	u32 per_ce = w->geom.num_cau * w->sftl.user_blocks;
+	u32 nblk = whimory_vba_blocks(w);
+	u32 per_ce = w->geom.num_cau * nblk;
 
-	if (!per_ce || !w->sftl.user_blocks)
+	if (!per_ce || !nblk)
 		return 0;
-	return (sb_idx % per_ce) % w->sftl.user_blocks;
+	return (sb_idx % per_ce) % nblk;
 }
 
 
@@ -4621,7 +4724,16 @@ static u32 n31_vfl_get_param(struct whimory *w, u32 selector)
 {
 	switch (selector) {
 	case WHIMORY_VFL_PARAM_NUM_SB:
-		return w->geom.num_ce * w->geom.num_cau * w->geom.user_blocks;
+		/*
+		 * s_g_max_sb: every superblock the VFL can address, not just
+		 * the user ones. This returned user_blocks and so overrode
+		 * the sizing in whimory_sftl_alloc() straight back to 7840,
+		 * which is the bound that hid a checkpoint living above
+		 * user_blocks. See the classify comment.
+		 */
+		return w->geom.num_ce * w->geom.num_cau *
+		       (w->geom.blocks_per_cau ? w->geom.blocks_per_cau :
+						 w->geom.user_blocks);
 	default:
 		return 0;
 	}
@@ -5602,12 +5714,50 @@ static void whimory_btoc_verify(struct whimory *w, struct whimory_sb *sb,
 	}
 }
 
+/*
+ * Parse the slot the BTOC is actually in, not the start of the page.
+ *
+ * A 16 KiB page is four 4 KiB slots with a 16-byte meta each, and only one
+ * of them is the block table of contents -- the one whose meta type is
+ * WHIMORY_META_TYPE_BTOC. It is the last VBA the superblock used, so for a
+ * superblock with `used` addresses it lands in slot (used-1) % 4, which is
+ * slot 3 on a full block and anything at all on a short one.
+ *
+ * classify has always got this right: whimory_meta_any_btoc() tests all
+ * four slots, which is why 1918 superblocks classify as closed. The ingest
+ * did not -- it was handed the page base and every parser read from offset
+ * 0, so what they were being asked to validate as a BTE array was slot 0's
+ * user data. That is why btoc_pages_valid was 0 on every run, on every
+ * format, for the whole life of this driver.
+ *
+ * The cost of that was not just the closed superblocks: with no BTOC the
+ * diff replay has nothing to override a stale checkpoint extent with, and
+ * every dirty superblock has to be walked page by page instead of read
+ * once.
+ */
 static int whimory_ingest_btoc_page(struct whimory *w, unsigned int ce,
 				    unsigned int cau, unsigned int vblock,
-				    const u8 *page, unsigned int len)
+				    const u8 *page, unsigned int len,
+				    const u8 *spare)
 {
 	const char *verdict = "NONE";
 	int hit = 0;
+	unsigned int slot;
+
+	if (spare) {
+		for (slot = 0; slot < WHIMORY_VBAS_PER_PAGE; slot++)
+			if (spare[slot * WHIMORY_META_SIZE] ==
+			    WHIMORY_META_TYPE_BTOC)
+				break;
+		if (slot < WHIMORY_VBAS_PER_PAGE) {
+			if (slot)
+				w->sftl.btoc_slot_nonzero++;
+			page += (size_t)slot * WHIMORY_LBA_SIZE;
+			len = WHIMORY_LBA_SIZE;
+		} else {
+			w->sftl.btoc_slot_missing++;
+		}
+	}
 
 	if (whimory_page_blank(page, 64)) {
 		w->sftl.btoc_blank++;
@@ -6227,7 +6377,7 @@ static void whimory_cxt_dump_sb(struct whimory *w, u32 sb_idx, u64 weave,
 {
 	struct whimory_sftl *s = &w->sftl;
 	u32 counts[8] = {0}, clean = 0, other = 0, end_at = ~0u;
-	u32 ofs, last_key = ~0u, trees = 0, base_seen = 0;
+	u32 ofs, last_key = ~0u, trees = 0, base_seen = 0, sbrecs = 0;
 	u8 *data = s->gc_data;
 	u8 meta[WHIMORY_META_SIZE];
 	u8 spare[S5L8740_NAND_META_SIZE];
@@ -6304,6 +6454,52 @@ static void whimory_cxt_dump_sb(struct whimory *w, u32 sb_idx, u64 weave,
 			dev_info(w->dev,
 				 "CXT_BASE_REC sb=%u ofs=%u first64=%32ph %32ph\n",
 				 sb_idx, ofs, data, data + 32);
+		}
+		/*
+		 * The superblock state array, which is how stock knows what
+		 * is dirty without reading the flash.
+		 *
+		 * s_cxt_load.c sub_50A1A4 case 3 takes a u16 first-index at
+		 * meta+8 and a u16 count at meta+10, then copies 8 bytes per
+		 * superblock out of the payload, and lifts HIWORD of each
+		 * entry's second word into the per-SB validLbas field.
+		 * sub_569BFC then walks those and puts every superblock whose
+		 * recorded weave is newer than the checkpoint base into
+		 * diff->sbFilter.
+		 *
+		 * Dumped here so the layout can be read off real media
+		 * before anything depends on it.
+		 */
+		/*
+		 * One named entry, so the array can be checked against
+		 * superblocks whose shape is already known by measurement.
+		 */
+		if (tag == WHIMORY_CXT_TAG_SB && cxt_sb_probe) {
+			u32 first = get_unaligned_le16(meta + 8);
+			u32 n = get_unaligned_le16(meta + 10);
+
+			if (cxt_sb_probe >= first && cxt_sb_probe < first + n) {
+				const u8 *e = data + 8 * (cxt_sb_probe - first);
+
+				dev_info(w->dev,
+					 "CXT_SB_ENTRY idx=%u type=0x%02x used=%u f6=%u raw=%8ph\n",
+					 cxt_sb_probe, e[0],
+					 get_unaligned_le16(e + 2),
+					 get_unaligned_le16(e + 6), e);
+			}
+		}
+		if (tag == WHIMORY_CXT_TAG_SB && sbrecs++ < 2) {
+			dev_info(w->dev,
+				 "CXT_SB_REC sb=%u ofs=%u meta=%16ph first_idx=%u count=%u\n",
+				 sb_idx, ofs, meta,
+				 get_unaligned_le16(meta + 8),
+				 get_unaligned_le16(meta + 10));
+			dev_info(w->dev,
+				 "CXT_SB_REC sb=%u ofs=%u data+00=%32ph\n",
+				 sb_idx, ofs, data);
+			dev_info(w->dev,
+				 "CXT_SB_REC sb=%u ofs=%u data+32=%32ph\n",
+				 sb_idx, ofs, data + 32);
 		}
 		if (tag == WHIMORY_CXT_TAG_L2V && trees < 1) {
 			unsigned int b;
@@ -6802,6 +6998,37 @@ static int whimory_cxt_build_from_sb(struct whimory *w, u32 sb_idx,
 
 			if (n && n <= WHIMORY_CXT_MAX_SB)
 				w->cxt_save_num_sb = n;
+		}
+		/*
+		 * The checkpoint's own superblock array. Each entry is 8
+		 * bytes and the u16 at +2 is how many addresses the
+		 * superblock holds, which is
+		 * nbanks * pages_per_sb * vbas_per_page -- so it gives the
+		 * bank count directly. meta+8 is the first superblock index
+		 * the record covers, meta+10 how many it covers.
+		 *
+		 * Captured to check the count classify derives from page-0
+		 * membership, which is a heuristic: a block retired from a
+		 * superblock but never erased still carries a record at page
+		 * 0 and would be counted as a member.
+		 */
+		if (meta[1] == WHIMORY_CXT_TAG_SB && s->cxt_sb_used) {
+			u32 first = get_unaligned_le16(meta + 8);
+			u32 n = get_unaligned_le16(meta + 10);
+			u32 j;
+
+			for (j = 0; j < n; j++) {
+				u32 idx = first + j;
+
+				if (idx >= s->sb_bank_blocks)
+					break;
+				if (8 * j + 8 > WHIMORY_LBA_SIZE)
+					break;
+				s->cxt_sb_used[idx] =
+					get_unaligned_le16(data + 8 * j + 2);
+				s->cxt_sb_type[idx] = data[8 * j];
+				s->cxt_sb_entries++;
+			}
 		}
 		if (meta[1] != WHIMORY_CXT_TAG_L2V)
 			continue;
@@ -7435,7 +7662,7 @@ static bool whimory_cxt_extent_confirmed(struct whimory *w,
 	const u8 *m;
 	int ret;
 
-	if (!cxt_meta_confirm || !data)
+	if (!w->cxt_confirm_active || !data)
 		return true;
 	if (cxt_confirm_max && w->sftl.cxt_confirm_pages >= cxt_confirm_max)
 		return true;
@@ -7478,9 +7705,38 @@ static bool whimory_cxt_extent_confirmed(struct whimory *w,
 		return true;
 	}
 	w->sftl.cxt_meta_mismatch++;
-	dev_dbg(w->dev,
-		"cxt_meta_mismatch lba=%u span=%u vba=%u meta_lba=%u pg=%u slot=%u\n",
-		e->lba, e->span, e->vba, meta_lba, page, slot);
+	/*
+	 * The page's own weave against the checkpoint's, because that is the
+	 * one number that says which kind of failure this is and it has been
+	 * argued about instead of logged.
+	 *
+	 * A genuinely stale extent names a page the allocator recycled after
+	 * the snapshot, so the page must have been erased and reprogrammed
+	 * since: its weave is NEWER than the base. A page that is OLDER has
+	 * not been touched since before the checkpoint was written, so the
+	 * checkpoint never described it that way and the fault is in how the
+	 * address was decoded, not in the checkpoint going out of date.
+	 *
+	 * Counted both ways so the answer survives in the recovery stats
+	 * without needing dynamic debug turned on.
+	 */
+	{
+		u64 pw = whimory_weave48(m);
+
+		if (pw > w->cxt_base_weave)
+			w->sftl.cxt_mismatch_newer++;
+		else
+			w->sftl.cxt_mismatch_older++;
+		if (w->sftl.cxt_meta_mismatch <= 8)
+			dev_info(w->dev,
+				 "cxt_meta_mismatch lba=%u span=%u vba=%u meta_lba=%u pg=%u slot=%u page_weave=%llu base=%llu %s\n",
+				 e->lba, e->span, e->vba, meta_lba, page, slot,
+				 (unsigned long long)pw,
+				 (unsigned long long)w->cxt_base_weave,
+				 pw > w->cxt_base_weave ?
+					"NEWER: recycled since the checkpoint, genuinely stale" :
+					"older: untouched since before the checkpoint, so this is a decode fault");
+	}
 	return false;
 }
 
@@ -7625,6 +7881,41 @@ static int whimory_cxt_seed_l2v(struct whimory *w)
  * Fast path: seed from the CXT, then let the caller replay only the
  * superblocks newer than the checkpoint. Returns 0 when the map is seeded.
  */
+/*
+ * The weave above which a page must have been written after the
+ * checkpoint. See the fast-forward note in whimory_cxt_fast_load().
+ */
+static void whimory_cxt_set_top_weave(struct whimory *w)
+{
+	u32 nsb = w->cxt_save_num_sb ? w->cxt_save_num_sb :
+		  (w->n_cxt ? w->n_cxt : 1);
+
+	w->cxt_top_weave = w->cxt_base_weave +
+			   (u64)nsb * whimory_vbas_per_vblock(w) + 1;
+}
+
+/*
+ * Superblocks bounded by a weave at or above the checkpoint's own write
+ * span, which is to say written after it. Free: classify already read the
+ * bounding weave of every superblock.
+ */
+static u32 whimory_cxt_count_newer(const struct whimory *w)
+{
+	const struct whimory_sftl *s = &w->sftl;
+	u32 i, newer = 0;
+
+	if (!s->sbs)
+		return 0;
+	for (i = 0; i < s->num_sb; i++) {
+		if (s->sbs[i].kind == WHIMORY_SB_CXT)
+			continue;
+		if (s->sbs[i].weave_max &&
+		    s->sbs[i].weave_max >= w->cxt_top_weave)
+			newer++;
+	}
+	return newer;
+}
+
 static int whimory_cxt_fast_load(struct whimory *w)
 {
 	int ret;
@@ -7636,10 +7927,98 @@ static int whimory_cxt_fast_load(struct whimory *w)
 			 ret);
 		return ret;
 	}
+	/*
+	 * Decide, before seeding, whether this checkpoint can be trusted at
+	 * face value.
+	 *
+	 * A checkpoint is a snapshot. Every LBA rewritten since points at a
+	 * page the allocator has very likely recycled, and nothing inside a
+	 * CXT record can be self-inconsistent, so a stale triple is
+	 * indistinguishable from a good one until the page is read. On a
+	 * cleanly shut down volume there is nothing newer than the
+	 * checkpoint and the question does not arise; on a dirty one it is
+	 * the whole question. Measured here: 157 of 5828 extents stale, and
+	 * 69 wrong mappings in a 15558-read sweep because of them.
+	 *
+	 * "Newer than the checkpoint" is free -- classify already has every
+	 * superblock's bounding weave -- so the expensive check is paid for
+	 * only when the cheap one says it is needed.
+	 */
+	w->cxt_base_weave = w->cxt_ext_weave;
+	whimory_cxt_set_top_weave(w);
+
+	/*
+	 * Check the bank count against the checkpoint's own record.
+	 *
+	 * nbanks decides how every address in a superblock decomposes, and
+	 * classify derives it from a heuristic -- which banks carry a record
+	 * at page 0. A block retired from a superblock but never erased
+	 * still carries one, so the heuristic can over-count, and one bank
+	 * too many puts every read in that superblock on the wrong page.
+	 *
+	 * TAG_SB's `used` is the superblock's write cursor, not its capacity.
+	 * That distinction cost an afternoon: on a filled superblock the two
+	 * coincide -- 1020, 1531, 2044 all sit just under a multiple of
+	 * pages_per_sb * vbas_per_page -- so a handful of full superblocks
+	 * read exactly like a bank count. They are not. This volume has
+	 * vblk 33 at used=2 and vblk 63 at used=69, which are barely-written
+	 * superblocks, not one-bank ones.
+	 *
+	 * So `used` bounds the bank count from below and nothing more:
+	 *
+	 *   ceil(used / addresses_per_bank) <= nbanks
+	 *
+	 * A superblock whose cursor implies MORE banks than classify found
+	 * is a real fault -- classify missed a member, and every address in
+	 * that superblock decodes one bank too narrow. A cursor implying
+	 * fewer is just a superblock that is not full yet.
+	 *
+	 * Reported, not enforced. The bank map's real validation is that a
+	 * clean volume reads 15558 sampled LBAs with zero mismatches; if the
+	 * count were wrong anywhere the sweep touches, it could not.
+	 */
+	if (w->sftl.cxt_sb_used && w->sftl.cxt_sb_entries) {
+		u32 per_bank = w->sftl.pages_per_sb * w->sftl.vbas_per_page;
+		u32 v, disagree = 0, shown = 0, checked = 0;
+
+		for (v = 0; v < w->sftl.sb_bank_blocks; v++) {
+			u32 used = w->sftl.cxt_sb_used[v];
+			u32 want, got;
+
+			if (!used || !per_bank)
+				continue;
+			want = DIV_ROUND_UP(used, per_bank);
+			got = whimory_sb_banks(w, v, NULL);
+			checked++;
+			if (want <= got)
+				continue;	/* not full yet; no information */
+			disagree++;
+			if (shown++ < 8)
+				dev_warn(w->dev,
+					 "CXT_SB_BANKS vblk=%u used=%u needs at least %u banks, classify found %u (type=0x%02x) -- classify missed a member\n",
+					 v, used, want, got,
+					 w->sftl.cxt_sb_type[v]);
+		}
+		w->sftl.cxt_sb_disagree = disagree;
+		dev_info(w->dev,
+			 "CXT_SB_BANKS entries=%u checked=%u under_counted=%u (write cursor implies more banks than classify found)\n",
+			 w->sftl.cxt_sb_entries, checked, disagree);
+	}
+	w->cxt_confirm_active = cxt_meta_confirm;
+	if (!w->cxt_confirm_active && cxt_confirm_auto) {
+		u32 newer = whimory_cxt_count_newer(w);
+
+		if (newer) {
+			w->cxt_confirm_active = true;
+			dev_info(w->dev,
+				 "CXT %u superblocks are newer than the checkpoint: confirming every extent against its page\n",
+				 newer);
+		}
+	}
+
 	ret = whimory_cxt_seed_l2v(w);
 	if (ret)
 		return ret;
-	w->cxt_base_weave = w->cxt_ext_weave;
 	/*
 	 * The weave fast-forward, from s_cxt.c:81.
 	 *
@@ -7662,13 +8041,13 @@ static int whimory_cxt_fast_load(struct whimory *w)
 		u32 nsb = w->cxt_save_num_sb ? w->cxt_save_num_sb :
 			  (w->n_cxt ? w->n_cxt : 1);
 
-		w->cxt_top_weave = w->cxt_base_weave +
-				   (u64)nsb * whimory_vbas_per_vblock(w) + 1;
+		/* Already set before the seed; this only reports it. */
 		dev_info(w->dev,
-			 "CXT_WEAVE base=%llu top=%llu (num_sb=%u src=%s)\n",
+			 "CXT_WEAVE base=%llu top=%llu (num_sb=%u src=%s) confirm=%d\n",
 			 (unsigned long long)w->cxt_base_weave,
 			 (unsigned long long)w->cxt_top_weave, nsb,
-			 w->cxt_save_num_sb ? "BASE" : "classify");
+			 w->cxt_save_num_sb ? "BASE" : "classify",
+			 w->cxt_confirm_active);
 	}
 	w->sftl.cxt_loaded = true;
 	/*
@@ -8091,9 +8470,32 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 	u32 *meta127_hist;
 	int ret;
 
-	nscan = scan_blocks ? scan_blocks : s->user_blocks;
-	if (nscan > s->user_blocks)
-		nscan = s->user_blocks;
+	/*
+	 * Classify every block a VBA can name, not just the user ones.
+	 *
+	 * This scanned user_blocks, 1960 of 2088, and the checkpoint is not
+	 * always in that range. Caught on the glass: a boot that had been
+	 * finding cxt=4 came up
+	 *
+	 *   SFTL classified nsb=7663 closed=1918 open=5667 cxt=0 ...
+	 *   SFTL meta0 types 00:76 01:7579 02:6 4b:2 ff:177
+	 *
+	 * with no 0x1f anywhere in a histogram that covers all 7840 blocks
+	 * it looked at -- so the checkpoint was not merely stale, it was
+	 * outside the window. The 128 blocks above user_blocks are not
+	 * spare: a scan of 1960..1991 on one plane returns 16384 valid data
+	 * records spanning lba 49279..3906265, and checkpoint extents have
+	 * always referenced vblocks 1987..1991 and 2048.
+	 *
+	 * Stock scans the whole thing. s_cxt_diff.c walks sb from 0 to
+	 * s_g_max_sb queueing two metas per superblock, and registers a CXT
+	 * candidate on meta[0] == 31 -- there is no user_blocks bound in it.
+	 * Ours is the odd one out, and the cost of matching it is 512 more
+	 * page reads on a pass that already does 7840.
+	 */
+	nscan = scan_blocks ? scan_blocks : whimory_vba_blocks(w);
+	if (nscan > whimory_vba_blocks(w))
+		nscan = whimory_vba_blocks(w);
 
 	/*
 	 * The bank map has to cover every block a VBA may name, which is
@@ -8143,6 +8545,17 @@ static int whimory_sftl_recover_l2v_from_media(struct whimory *w)
 	 */
 	if (s->sb_bank_mask)
 		memset(s->sb_bank_mask, 0, s->sb_bank_blocks);
+	if (s->btoc_per_vblock)
+		memset(s->btoc_per_vblock, 0, s->sb_bank_blocks);
+	if (s->cxt_sb_used)
+		memset(s->cxt_sb_used, 0,
+		       s->sb_bank_blocks * sizeof(*s->cxt_sb_used));
+	if (s->cxt_sb_type)
+		memset(s->cxt_sb_type, 0, s->sb_bank_blocks);
+	s->cxt_sb_entries = 0;
+	s->cxt_sb_disagree = 0;
+	s->cxt_mismatch_newer = 0;
+	s->cxt_mismatch_older = 0;
 	s->sb_bank_known = 0;
 	s->sb_bank_partial = 0;
 	s->sb_bank_overflow = 0;
@@ -8430,6 +8843,21 @@ have_meta:
 				} else if (!r127 && whimory_meta_any_btoc(meta127)) {
 					sb->kind = WHIMORY_SB_CLOSED;
 					s->btoc_sbs++;
+					/*
+					 * Which vblocks carry a BTOC, and on
+					 * how many of their banks. One per
+					 * virtual block means a superblock is
+					 * a vblock across its banks and this
+					 * loop is enumerating planes.
+					 */
+					{
+						u32 vb = whimory_vfl_virt(w, cau, b);
+
+						if (s->btoc_per_vblock &&
+						    vb < s->sb_bank_blocks &&
+						    s->btoc_per_vblock[vb] < 255)
+							s->btoc_per_vblock[vb]++;
+					}
 				} else if ((!r0 && whimory_meta_is_data_raw(meta0)) ||
 					   (!r127 && whimory_meta_is_data_raw(meta127))) {
 					sb->kind = WHIMORY_SB_OPEN;
@@ -8587,6 +9015,79 @@ classify_done:
 				 "SFTL the 0xc104 bitmap is not bank %u's block list -- do not read it as one\n",
 				 bank);
 	}
+	/*
+	 * Fold the banks of a closed superblock into it.
+	 *
+	 * classify walks plane-blocks, so a four-bank superblock that has
+	 * been sealed produces one entry whose page 127 carries the BTOC and
+	 * three whose page 127 carries plain user data. The three used to
+	 * classify as OPEN and be replayed by walking up to 127 pages each,
+	 * which on this volume is 6029 "open superblocks" where there are
+	 * about two, and 362 page walks in the diff where there should be
+	 * ninety BTOC reads.
+	 *
+	 * They are marked MEMBER instead and the replay leaves them to the
+	 * BTOC. That is sound because whimory_ingest_btoc_page() converts
+	 * whole-superblock offsets through whimory_btoc_ofs_to_page(), so one
+	 * BTOC already resolves addresses on every bank of its superblock.
+	 *
+	 * Two BTOCs are seen on 15 of 2025 virtual blocks and are not yet
+	 * explained; the later one wins, and both are kept out of MEMBER so
+	 * neither is silently dropped.
+	 */
+	if (sb_fold && s->btoc_per_vblock) {
+		u32 folded = 0;
+
+		for (i = 0; i < nsb; i++) {
+			struct whimory_sb *sb = &s->sbs[i];
+			u32 vb;
+
+			if (sb->kind != WHIMORY_SB_OPEN)
+				continue;
+			vb = whimory_vfl_virt(w, sb->cau, sb->block);
+			if (vb >= s->sb_bank_blocks ||
+			    !s->btoc_per_vblock[vb])
+				continue;
+			sb->kind = WHIMORY_SB_MEMBER;
+			folded++;
+		}
+		s->open_sbs -= folded;
+		s->member_sbs = folded;
+		dev_info(w->dev,
+			 "SFTL folded %u banks into their superblock's BTOC (open now %u)\n",
+			 folded, s->open_sbs);
+	}
+
+	/*
+	 * How many BTOCs each virtual block carries.
+	 *
+	 * This settles what a superblock is. If a superblock were one
+	 * (ce, cau, vblock) plane-block, every closed one would carry its
+	 * own table of contents and this histogram would be flat at 1 across
+	 * as many entries as there are closed blocks. If a superblock is a
+	 * virtual block striped over its banks, there is exactly one BTOC
+	 * per vblock -- written to the last VBA the superblock used, on
+	 * whichever bank that lands on -- and the other banks of the same
+	 * superblock carry plain data at page 127.
+	 */
+	if (s->btoc_per_vblock) {
+		u32 v, h[5] = {0}, over = 0, with = 0;
+
+		for (v = 0; v < s->sb_bank_blocks; v++) {
+			u8 n = s->btoc_per_vblock[v];
+
+			if (n)
+				with++;
+			if (n < ARRAY_SIZE(h))
+				h[n]++;
+			else
+				over++;
+		}
+		dev_info(w->dev,
+			 "SFTL btoc per vblock 0:%u 1:%u 2:%u 3:%u 4:%u over:%u (vblocks with a btoc=%u, closed plane-blocks=%u)\n",
+			 h[0], h[1], h[2], h[3], h[4], over, with,
+			 s->btoc_sbs);
+	}
 	dev_info(w->dev, "SFTL fast-empty probe settled %u of %u blocks\n",
 		 s->fast_empty_hits, s->empty_sbs);
 	dev_info(w->dev, "SFTL slot0 read settled %u non-empty blocks\n",
@@ -8705,6 +9206,12 @@ classify_done:
 
 		if (sb->kind == WHIMORY_SB_CXT)
 			continue;
+		/*
+		 * A bank whose superblock's BTOC is on another bank. The
+		 * BTOC entry for the same virtual block covers it.
+		 */
+		if (sb->kind == WHIMORY_SB_MEMBER)
+			continue;
 
 		/*
 		 * Skip what the checkpoint already covers -- but only when we
@@ -8821,7 +9328,8 @@ classify_done:
 			s->claim_source = 1;
 			ingested = whimory_ingest_btoc_page(w, sb->ce, sb->cau,
 							    vblock, s->btoc_page,
-							    S5L8740_NAND_PAGE_SIZE);
+							    S5L8740_NAND_PAGE_SIZE,
+							    meta127);
 			s->claim_weave = 0;
 			s->claim_source = 0;
 			if (ingested) {
@@ -8952,6 +9460,21 @@ btoc_done:
 			 "SFTL %u open superblocks dropped by max_open_sbs=%u -- "
 			 "recent writes in them are NOT in the map\n",
 			 s->open_truncated, max_open_sbs);
+	/*
+	 * Refuse to hand back a map we already know is incomplete. Checked
+	 * here rather than at the end because everything after this point
+	 * treats w->ranges as the whole truth.
+	 */
+	if (!allow_short_map && (s->open_truncated || s->range_budget_stop)) {
+		dev_err(w->dev,
+			"SFTL MAP IS SHORT and allow_short_map is not set: %u open superblocks dropped by max_open_sbs=%u, %u claims dropped by max_range_nodes=%u. Refusing to bind a map missing recent writes; raise the limits or set allow_short_map=1.\n",
+			s->open_truncated, max_open_sbs,
+			s->range_budget_stop, max_range_nodes);
+		whimory_set_status(w, "map short (open=%u ranges=%u)",
+				   s->open_truncated, s->range_budget_stop);
+		w->l2v_defer_pack = false;
+		return -ENODATA;
+	}
 	w->l2v_defer_pack = false;
 	ret = whimory_l2v_build_from_ranges(w);
 	if (ret) {
@@ -8998,7 +9521,13 @@ static int whimory_sftl_alloc(struct whimory *w)
 	s->pages_per_sb = WHIMORY_PAGES_PER_SB;
 	s->vbas_per_sb = WHIMORY_VBAS_PER_SB;
 	s->user_blocks = w->geom.user_blocks;
-	nsb = w->geom.num_ce * w->geom.num_cau * s->user_blocks;
+	/*
+	 * Sized by blocks_per_cau, because classify now enumerates all of
+	 * them. At user_blocks this array held 7840 entries and the classify
+	 * loop's "nsb >= num_sb" guard would have stopped the walk exactly
+	 * at the tail the checkpoint had moved into.
+	 */
+	nsb = w->geom.num_ce * w->geom.num_cau * whimory_vba_blocks(w);
 	if (w->vfl_ops && w->vfl_ops->get_param) {
 		u32 p = w->vfl_ops->get_param(w, WHIMORY_VFL_PARAM_NUM_SB);
 
@@ -9126,8 +9655,15 @@ static int whimory_sftl_alloc(struct whimory *w)
 	s->sb_bank_blocks = whimory_vba_blocks(w);
 	s->sb_bank_mask = kvcalloc(s->sb_bank_blocks,
 				   sizeof(*s->sb_bank_mask), GFP_KERNEL);
+	s->btoc_per_vblock = kvcalloc(s->sb_bank_blocks,
+				      sizeof(*s->btoc_per_vblock), GFP_KERNEL);
+	s->cxt_sb_used = kvcalloc(s->sb_bank_blocks,
+				  sizeof(*s->cxt_sb_used), GFP_KERNEL);
+	s->cxt_sb_type = kvcalloc(s->sb_bank_blocks,
+				  sizeof(*s->cxt_sb_type), GFP_KERNEL);
 	if (!s->btoc_page || !s->data_page || !s->meta_page || !s->cs_page ||
-	    !s->sbs || !s->btoc_map || !s->sb_bank_mask)
+	    !s->sbs || !s->btoc_map || !s->sb_bank_mask ||
+	    !s->btoc_per_vblock || !s->cxt_sb_used || !s->cxt_sb_type)
 		return -ENOMEM;
 
 	/*
@@ -10157,6 +10693,12 @@ static void whimory_free(struct whimory *w)
 	kvfree(w->cxt_ext);
 	kvfree(w->sftl.sbs);
 	kvfree(w->sftl.sb_bank_mask);
+	kvfree(w->sftl.btoc_per_vblock);
+	w->sftl.btoc_per_vblock = NULL;
+	kvfree(w->sftl.cxt_sb_used);
+	w->sftl.cxt_sb_used = NULL;
+	kvfree(w->sftl.cxt_sb_type);
+	w->sftl.cxt_sb_type = NULL;
 	w->sftl.sb_bank_mask = NULL;
 	w->sftl.sb_bank_blocks = 0;
 	kvfree(w->sftl.gc_data);
