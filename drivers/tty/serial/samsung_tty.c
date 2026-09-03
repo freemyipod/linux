@@ -1402,7 +1402,59 @@ static unsigned int s3c24xx_serial_getclk(struct s3c24xx_uart_port *ourport,
 			continue;
 		}
 
-		if (ourport->info->has_divslot) {
+		if (ourport->info->type == TYPE_APPLE_S5L) {
+			/*
+			 * The S5L divisor register carries two fields: the
+			 * divisor in the low bits and, in bits 19:16, 16 minus
+			 * the oversampling ratio. The ratio is programmable
+			 * from 16 down to 4, so a rate that divides badly at
+			 * one ratio can be exact at another.
+			 *
+			 * RetailOS sub_1E10 walks the ratios from 16 down and
+			 * keeps whichever leaves the divisor closest to a whole
+			 * number, rounding it and packing the ratio alongside:
+			 *
+			 *     round((clk / i) / baud - 1) | ((16 - i) << 16)
+			 *
+			 * At the 24 MHz this part runs, 115200 is best at i=16
+			 * (divisor 12) and 2400000 is exact at i=10 (divisor 0),
+			 * which is why the Broadcom controller is moved to that
+			 * rate rather than a rounder-looking one.
+			 *
+			 * Verified on an N31 against a serial capture: 0x0000000c
+			 * and 0x00080019 both put the line on 115200, which is
+			 * the same baud reached at two different ratios.
+			 */
+			unsigned int best_frac = 10, best_ratio = 16, best_div = 0;
+			int ratio;
+
+			for (ratio = 16; ratio >= 4; ratio--) {
+				unsigned long tenths;
+				unsigned int frac;
+				long scaled;
+
+				tenths = 10UL * (rate / ratio);
+				if (!req_baud)
+					break;
+				scaled = (long)(tenths / req_baud) - 10;
+				if (scaled < 0)
+					continue;
+
+				frac = scaled % 10;
+				if (frac > 5)
+					frac = 10 - frac;
+
+				if (frac < best_frac) {
+					best_frac = frac;
+					best_div = (scaled + 5) / 10;
+					best_ratio = ratio;
+				}
+			}
+
+			quot = best_div | ((16 - best_ratio) << 16);
+			baud = rate / (best_ratio * (best_div + 1));
+			goto have_quot;
+		} else if (ourport->info->has_divslot) {
 			unsigned long div = rate / req_baud;
 
 			/* The UDIVSLOT register on the newer UARTs allows us to
@@ -1420,6 +1472,7 @@ static unsigned int s3c24xx_serial_getclk(struct s3c24xx_uart_port *ourport,
 			baud = rate / (quot * 16);
 		}
 		quot--;
+have_quot:
 
 		calc_deviation = abs(req_baud - baud);
 
@@ -1572,7 +1625,18 @@ static void s3c24xx_serial_set_termios(struct uart_port *port,
 	port->status &= ~UPSTAT_AUTOCTS;
 
 	umcon = rd_regl(port, S3C2410_UMCON);
-	if (termios->c_cflag & CRTSCTS) {
+	/*
+	 * Never arm auto flow control on this SoC.
+	 *
+	 * RetailOS sub_571468 programs every one of these ports with
+	 * UMCON = 1 -- RTS asserted, AFC off -- and nothing turns it on
+	 * later. Honouring CRTSCTS here left the transmitter waiting on an
+	 * nCTS that never came: UART1 sat with 14 bytes stuck in its TX
+	 * FIFO (UFSTAT 0xE0) and hci_bcm reported "command 0xfc18 tx
+	 * timeout". Clearing the bit drained the FIFO immediately.
+	 */
+	if ((termios->c_cflag & CRTSCTS) &&
+	    ourport->info->type != TYPE_APPLE_S5L) {
 		umcon |= S3C2410_UMCOM_AFC;
 		/* Disable RTS when RX FIFO contains 63 bytes */
 		umcon &= ~S3C2412_UMCON_AFC_8;
