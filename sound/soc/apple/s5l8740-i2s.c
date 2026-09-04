@@ -1,23 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * S5L8740 I2S platform DAIs — N31
+ * S5L8740 I2S platform DAIs (iPod nano 7G / N31).
  *
- * Both of the board's audio ports live here because they share the
- * SoC audio clock gate at CLKCON+0x30, and arbitrating that across two
- * modules is not worth the symbol traffic:
+ * Both of the board's audio ports live here because they share the SoC audio
+ * clock gate, and arbitrating that across two modules is not worth the symbol
+ * traffic:
  *
  *   IIS0 @ 0x3CA00000  TX FIFO +0x10, PL080 peri 10 -> CS42L81 headphones
  *   IIS2 @ 0x3D400000  RX FIFO +0x38, PL080 peri 13 <- BCM2078 digital PCM
  *
- * They face different chips, but to userspace they are simply the
- * playback and capture PCMs of one card.
+ * They face different chips, but to userspace they are simply the playback
+ * and capture PCMs of one card. IIS1 @ 0x3CD00000 is XSP and always reads
+ * zero -- it is not a BCM port. A2DP does not appear here at all: it is
+ * host-encoded over UART1 HCI.
  *
- * IIS2 register program is from the RetailOS fm-playing MMIO capture:
+ * The register sequences are transcribed from the stock firmware;
+ * docs-internal/n7g-audio/N31-AUDIO-STOCK-MAP.md records where each one comes
+ * from. The IIS2 program below is from a capture of stock playing FM:
+ *
  *   CLKCON +0x00 = 0x1        TXCON  +0x04 = 0x0b000099
  *   RXCON  +0x30 = 0x1000     RXCOM  +0x34 = 0x6 running, 0x2 idle
  *   CLKDIV +0x40 = 0x96       REG44  +0x44 = 0x00010007
- * IIS1 @ 0x3CD00000 is XSP and always reads zero -- it is not a BCM port.
- * A2DP does not appear here at all: it is host-encoded over UART1 HCI.
  */
 #include <linux/atomic.h>
 #include <linux/math64.h>
@@ -62,56 +65,39 @@
 #define I2SRXCOM	0x34
 #define I2SRXFIFO	0x38
 #define I2SSTATUS	0x3c
-#define I2SCLKDIV	0x40	/* OSOS 4F716: *(base+64). Not Rockbox +0x24. */
-/* RetailOS music IIS0+0x44 readback 0x00010007 (oracle 2026-08-25). */
+#define I2SCLKDIV	0x40	/* Stock writes the divider here, not at +0x24. */
+/* Readback from stock with music playing: 0x00010007. Never written. */
 #define I2SREG44	0x44
 /*
- * OSOS sub_C095E(port, ch): STATUS W1C — TX sticky is bit15 (1<<15).
- * Linux never cleared this; silent dumps always show 0x8xxx.
+ * STATUS write-1-to-clear: the TX sticky bit. Leaving it set is why silent
+ * dumps always read 0x8xxx.
  */
 #define I2SSTATUS_TX_W1C	0x8000u
 #define MCLK_ASSUME_HZ	12000000u
 /*
- * TXCON, read out of sub_BCB60 (0x080BCB60).
+ * TXCON.
  *
- * sub_BCB60 builds this register two ways, selected by its a3 argument,
- * and a3 also picks the pad function in s5l8740_i2s_pads():
+ * Stock builds this register two ways, selected by one argument that also
+ * picks the pad function:
  *
- *     a3 == 0:  r0 = (*txcon & 0x780) | 0x08000018;   pads function 2
- *     a3 != 0:  r0 = 0x00100098;                      pads function 3
- *     both:     r0 |= (a5 == 24) ? 0x03000041 : 0x03000001;
- *               *txcon = r0;  *(base + 0x30) = 0x1000;
+ *     arm A:  (old & 0x780) | 0x08000018;   pads at function 2
+ *     arm B:  0x00100098;                   pads at function 3
+ *     both:   |= (width == 24) ? 0x03000041 : 0x03000001
+ *             and 0x1000 into the register at +0x30
  *
- * Which arm IIS0 takes is NOT statically known. sub_BCB60 has two callers:
+ * Which arm IIS0 takes is not statically determined -- the selector is
+ * runtime data this image does not pin down -- so mastership_profile below
+ * selects it, and both arms are legitimate stock configurations.
  *
- *   0x0815DE20  passes a3 = 0 and a5 = 16 as immediates, but its own two
- *               callers pass unit 2 (0x08471CB0, followed by r7 = 32000)
- *               and unit 1 (0x08471DD0). It never runs for IIS0. The GPIO
- *               7 and 20 mux inside sub_BCB60 is guarded by
- *               sub_414FAA() == unit, and sub_414FAA returns 0, so those
- *               two pads are muxed only for unit 0 -- they are IIS0's, and
- *               the 97/98/119 that caller muxes are IIS1/IIS2's.
- *
- *   0x08414FC4  sub_414FAE, which loads all five arguments from bytes at
- *               [r4+21 .. r4+25]. This is the path IIS0 reaches, and its
- *               a3 is runtime data this image does not pin down.
- *
- * So the arm is chosen here on two pieces of evidence rather than on a
- * static read:
- *
- *   - Hardware. With bit 20 set (the a3 != 0 constant) the transmitter
- *     never starts: STATUS sits at 0x00000024 indefinitely, the TX FIFO
- *     fills to its eight entries, and the DMA stops with no error and no
- *     terminal count. Clearing it moves STATUS to 0x00008020 at once.
- *     Only the a3 == 0 arm produces a word without bit 20.
- *
- *   - The IIS2 oracle. The RetailOS MMIO capture of IIS2 during FM reads
- *     TXCON 0x0b000099 (IIS2_TXCON_FM below), which is exactly what the
- *     a3 == 0 arm yields with bit 7 already set. That confirms the arm's
- *     arithmetic, on a port we have a capture for.
- *
- * There is no IIS0 TXCON capture. If one is ever taken and it shows
- * 0x03100099, this and the pad function both belong on the a3 != 0 arm.
+ * Two pieces of evidence bear on the choice. With bit 20 set (arm B) the
+ * transmitter has been observed not to start: STATUS sits at 0x00000024
+ * indefinitely, the TX FIFO fills to its eight entries, and the DMA stops
+ * with no error and no terminal count; clearing it moves STATUS to
+ * 0x00008020 at once. Against that, a capture of stock playing FM on IIS2
+ * reads TXCON 0x0b000099, which is exactly what arm A yields with bit 7
+ * already set -- confirming arm A's arithmetic on a port we have a capture
+ * for. There is no IIS0 TXCON capture; if one is ever taken and reads
+ * 0x03100099, arm B is the music path.
  */
 #define I2STXCON_KEEP		0x780u		/* preserved across the RMW */
 #define I2STXCON_A3_0		0x08000018u
@@ -120,95 +106,57 @@
 #define I2STXCON_WIDTH_24	0x03000041u
 #define I2SRXCON_N31		0x1000u
 /*
- * 0 follows sub_BCB60; anything else is written verbatim, which is what the
- * bring-up sweeps use.
+ * 0 follows the computed value; anything else is written verbatim, which is
+ * what the bring-up sweeps use.
  */
 static uint txcon;
 /* 0=soc_master, 1=ext_clock, 2=ext_clock with codec ASP bit7 cleared. */
 /*
- * TEST 2026-09-01: defaulted to profile 1 to run the other coherent pairing.
+ * TXCON arm and pad function, which stock selects together:
  *
- * sub_BCB60 selects the pad function and the TXCON word from the same a3:
+ *	0  pads at function 2, TXCON = (old & 0x780) | 0x08000018 | width
+ *	1  pads at function 3, TXCON = 0x00100098 | width
+ *	2  as 1, with the codec ASP bit 7 cleared
  *
- *	a3 == 0:  pads 7,20 -> fn 2,  TXCON = (old & 0x780) | 0x8000018 | 0x03000001
- *	a3 != 0:  pads 7,20 -> fn 3,  TXCON = 0x100098 | ...
+ * Default 1. The configuration data stock loads for this port selects that
+ * arm, giving TXCON 0x03100099 and pads 7 and 20 at function 3.
  *
- * Both are stock configurations; which one the music path uses depends on
- * sub_BCB60's caller, and sub_414FAE has six callers that have not been
- * resolved. Profile 0 (fn 2) has been tested repeatedly and is silent.
- * Profile 1 (fn 3) has never been run -- and the one historical report of
- * audible, wrong-pitch output came from that combination, which would mean
- * signal actually reaching the amplifier.
- *
- * Revert to 0 if this is also silent; it is an A/B between two legitimate
- * stock pairings, not a claim that 1 is correct.
- */
-/*
- * TXCON mastership arm. Default 1, which is what stock asks for.
- *
- * sub_414FAE calls sub_BCB60(cfg[21], cfg[22], cfg[23], cfg[24], cfg[25])
- * and sub_AA0AE sets cfg[23] = 1, so a3 = 1 is stock, giving TXCON
- * 0x03100099 and pads 7/20 at function 3.
- *
- * This defaulted to 0 on the strength of a measurement and a hypothesis,
- * and the hypothesis was wrong. The comment here used to say profile 1
- * could not move a sample "until that register is identified from the
- * decomp" -- meaning a codec master-clock enable. No such register exists.
- * A raw Thumb-BL scan of the whole image finds only three codec accessors
- * (sub_43CDB4, sub_43CDFA, sub_42A5D6) and their complete call set contains
- * no master/slave, clock-direction, port-format or frame-length write.
- *
- * The freeze that justified profile 0 -- one 32-byte burst into the TX
- * FIFO, src stuck at 0x09600020, hw_ptr never leaving 3 -- was measured
- * against a codec carrying two writes of our own invention: 0x0500 = 0x05,
- * which stock only writes in an override branch off the audio path, and a
- * clear of 0x000F bit 7, which stock sets once and never clears. Both are
- * gone, so that measurement no longer describes this driver.
- *
- * If profile 1 still freezes, the cause is NOT a missing codec master
- * enable, and looking for one again is a dead end.
+ * There is no codec-side master-clock enable to go with it. The complete
+ * call set of every codec register accessor in the stock image contains no
+ * master/slave, clock-direction, port-format or frame-length write, so if
+ * this arm stalls the transmitter the cause is elsewhere.
  */
 static uint mastership_profile = 1;
 /* module_param moved below s5l8740_i2s_iis0; see txcon_set(). */
 /*
  * D34C0 → 4F716(port, div). Table in n31-audio-rates.h.
- * 0 = 12 MHz / rate (272 @ 44.1 kHz RetailOS music).
+ * 0 = 12 MHz / rate (272 at 44.1 kHz, which is what stock uses).
  */
 
 static uint clkdiv;
 module_param(clkdiv, uint, 0644);
-MODULE_PARM_DESC(clkdiv, "I2SCLKDIV override; 0 = OSOS table / 12000000/rate");
+MODULE_PARM_DESC(clkdiv, "I2SCLKDIV override; 0 = the rate table, 12000000/rate");
 /*
  * Default IIS program rate for clk_run when no ALSA hw_params.
- * 0 = RetailOS 44100. ALSA playback uses the PCM rate, not this.
+ * 0 = 44100, stock's default. ALSA playback uses the PCM rate, not this.
  */
 static uint default_rate;
 module_param(default_rate, uint, 0644);
-MODULE_PARM_DESC(default_rate, "clk_run rate; 0 = 44100 OSOS default");
+MODULE_PARM_DESC(default_rate, "clk_run rate; 0 = 44100, stock's default");
 /*
- * dma_tone / pio_tone sample rate. 0 = default_rate / OSOS 44100.
+ * dma_tone / pio_tone sample rate. 0 = default_rate, else 44100.
  */
 
 /* Keep TX/codec up this long after START even if ALSA xruns. */
 /*
- * Off, and the stop path it used to suppress is fixed.
+ * Ignore-stop window, in milliseconds. Leave it at 0.
  *
- * Ignoring ALSA's STOP for five seconds is a bring-up crutch and it makes
- * the PCM layer and the hardware disagree about whether a stream is
- * running. It should be 0. But setting it to 0 was the one behavioural
- * change between a clean boot and a boot that hangs, and the reason is
- * that the STOP path has never actually executed: with the crutch in
- * place it was skipped every time.
- *
- * What it hits is s5l8740_i2s_cancel_asp() -> cs42l81_cancel_post_iis(),
- * which is a cancel_delayed_work_sync() on a work item that takes
- * c->lock. That blocks until the work completes, so if the work is
- * waiting on that lock the stop never returns.
- *
- * That cancel is now the non-blocking form, so the stop path no longer
- * waits on a work item that wants the codec lock. Dead code that has never
- * run is not the same as code that works, which is the whole reason this
- * surfaced the moment the crutch came off.
+ * Suppressing ALSA's STOP is a bring-up crutch: it makes the PCM layer and
+ * the hardware disagree about whether a stream is running, and it hides the
+ * stop path entirely rather than fixing it. The path it hid reached a
+ * synchronous cancel of a work item that takes the codec lock, which
+ * deadlocked whenever the work was waiting on that lock. That cancel is now
+ * the non-blocking form.
  */
 /*
  * Backtrace the first few hw_params calls, on by default until the thing
@@ -255,32 +203,29 @@ module_param(fifo_prefill, uint, 0644);
 MODULE_PARM_DESC(fifo_prefill,
 		 "silent stereo words to push into TX FIFO before TXCOM kick");
 /*
- * OSOS B6620(port,0) does TXCOM |= 6 after PL080 is armed (peri 10).
- * RE body: sub_B6620 only ORs 0x6 — not 0xC. Hybrid 0xE was Linux invention.
+ * TXCOM run bit. Stock sets bits 1 and 2 after the DMA channel is armed --
+ * bits 1 and 2 only, never bit 3.
  */
 #define I2STXCOM_DMA	0x6
 #define I2STXCOM_PIO	0xc
 /*
- * Stopping the TX transport clears bit 2 ONLY -- it does not zero the
+ * Stopping the TX transport clears bit 2 only -- it does not zero the
  * register.
  *
  * Stock arms and disarms with read-modify-writes, never plain stores:
  *
- *	arm    (sub_B6620, dir 0):  *(iis + 0x08) |= 6
- *	disarm (sub_5705DC, dir 0): *(iis + 0x08) &= ~4
+ *	arm     *(iis + 0x08) |= 6
+ *	disarm  *(iis + 0x08) &= ~4
  *
- * (The RX side is the same pair against +0x34.) The disarm deliberately
- * leaves bit 1 set; only bit 2 is dropped.
- *
- * This driver used to store 0 here, clearing bit 1 as well, on every stop --
- * including the stop that immediately precedes each arm. Whatever bit 1
- * latches, stock keeps it across the whole stop/start cycle and we were
- * destroying it every trigger.
+ * and the RX side is the same pair against +0x34. The disarm deliberately
+ * leaves bit 1 set. Storing zero here instead would clear bit 1 on every
+ * stop, including the stop that immediately precedes each arm, destroying
+ * whatever it latches.
  */
 #define I2STXCOM_RUN	BIT(2)		/* the bit stock drops on disarm */
 #define I2STXCOM_STOP	0x0		/* legacy; do not store this */
 #define CLKCON_PHYS	0x3c500000ul
-/* RetailOS oracle dwords at CLKCON+0x30 (music vs idle/A2DP). */
+/* Values captured at CLKCON+0x30, music playing versus idle. */
 /* SRAM window: 0x22000000..0x2202FFFF, 192 KiB (bootloader descriptor). */
 #define S5L8740_SRAM_BASE	0x22000000u
 #define S5L8740_SRAM_END	0x22030000u
@@ -297,17 +242,11 @@ MODULE_PARM_DESC(fifo_prefill,
 /*
  * Bit 15 of CLKCON+0x10, and nothing else.
  *
- * This is stock's own gate, sub_41CBD8 case 11:
- *
- *   if (a2) MEMORY[0x3C500010] &= 0xFFFF7FFF;
- *   else    MEMORY[0x3C500010] |= 0x8000;
- *
- * so on clears bit 15 and off sets it. Every write to this register in the
- * firmware was checked: case 11 above, the divider setter, and the
- * save/restore critical section. None of them touches bit 2, which this
- * driver used to set from a value of its own -- that bit is not ours and
- * is not attested anywhere. CLKCON is shared with every other peripheral
- * on this SoC, so the rest of the word is not ours either.
+ * This is stock's own FM clock gate: clearing bit 15 enables, setting it
+ * disables. Every write to this register in the stock firmware touches only
+ * bit 15 or the divider field -- never bit 2, and never the rest of the
+ * word. CLKCON is shared with every other peripheral on this SoC, so
+ * anything outside this bit is not ours to write.
  */
 #define CLKCON_FM_GATE_MASK	0x8000u
 
@@ -322,15 +261,16 @@ MODULE_PARM_DESC(fifo_prefill,
 #define IIS2_REGS_LEN		0x48
 
 /*
- * IIS2 PCM pads. sub_15DD5C claims these three at function 2 when FM
- * powers on and releases them to input when it powers off, in the same
- * breath as programming device 2 (0x3D400000) and kicking RXCOM -- so
- * they belong to this port, not to the Bluetooth controller. They were
- * previously described as BCM shutdown / device-wakeup / host-wakeup and
- * handed to hci_bcm, which drove the capture bus as GPIOs.
+ * IIS2 PCM pads.
  *
- * Claimed alongside the register program rather than from FM power-on,
- * so opening the capture PCM works regardless of who owns the tuner.
+ * Stock claims these three at function 2 when FM powers on and releases them
+ * to input when it powers off, in the same breath as programming this port
+ * and kicking RXCOM -- so they belong here, not to the Bluetooth controller,
+ * despite having been described as BCM shutdown and wakeup lines and handed
+ * to hci_bcm, which drove the capture bus as GPIOs.
+ *
+ * Claimed alongside the register program rather than from FM power-on, so
+ * opening the capture PCM works regardless of who owns the tuner.
  */
 #define IIS2_PAD_BCLK		97	/* 0x61 */
 #define IIS2_PAD_SYNC		98	/* 0x62 */
@@ -346,7 +286,7 @@ MODULE_PARM_DESC(fifo_prefill,
 #define GPIOCMD_PHYS	0x3cf001e0ul
 
 /*
- * RetailOS user volume is 0..256 (VolumeScalar, 256 = unity). CS42
+ * Stock's user volume is 0..256, with 256 as unity. CS42
  * analog 0x527 is only mute/unmute; the integer is a PCM Q8 gain.
  */
 #define S5L8740_USER_VOL_MAX	256
@@ -416,7 +356,7 @@ MODULE_PARM_DESC(sample_swap_lr, "Swap left and right within each frame");
 
 
 /*
- * 1 = drive the DMA the way RetailOS does: one period-sized transfer at a
+ * 1 = drive the DMA the way stock does: one period-sized transfer at a
  * time, re-armed from the completion callback, instead of snd_dmaengine_pcm's
  * free-running cyclic chain. See s5l8740_rearm_submit().
  */
@@ -433,16 +373,14 @@ static void s5l8740_rearm_sync(struct s5l8740_i2s *i2s);
 static uint reg44;
 module_param(reg44, uint, 0644);
 /*
- * Stock NEVER writes IIS0+0x44. All eight functions that resolve an IIS base
- * through sub_43A858 -- sub_4F6DC, sub_4F716, sub_B6620, sub_BCB60,
- * sub_C093C, sub_C095E, sub_C09AC, sub_5705DC -- contain no access to it at
- * all, read or write.
+ * Stock never writes IIS0+0x44. Every function in the stock image that
+ * resolves an IIS base leaves it alone, read and write alike.
  *
- * A live read of RetailOS with music playing gives 0x00010007, so that is a
- * reset default or a bootloader leftover, not something the audio path
- * programs. Leaving it alone is therefore correct and is NOT a gap; the
- * register is logged next to the others so ours can be compared against
- * 0x00010007 rather than assumed.
+ * A live read of stock with music playing gives 0x00010007, so that is a
+ * reset default or a bootloader leftover rather than something the audio
+ * path programs. Leaving it alone is correct and is not a gap; it is logged
+ * next to the others so ours can be compared against 0x00010007 rather than
+ * assumed.
  */
 MODULE_PARM_DESC(reg44,
 		 "IIS0+0x44 override; 0 = leave alone (default, and what stock does)");
@@ -497,7 +435,7 @@ MODULE_PARM_DESC(use_pio, "1 = CPU FIFO PCM; 0 = PL080 M2P peri 10 from DT (defa
 
 static int txcom_pio = I2STXCOM_PIO;
 module_param(txcom_pio, int, 0644);
-MODULE_PARM_DESC(txcom_pio, "TXCOM when use_pio=1 (default 0xC; OSOS DMA is 0x6)");
+MODULE_PARM_DESC(txcom_pio, "TXCOM when use_pio=1 (default 0xC; the stock DMA value is 0x6)");
 
 /*
  * TXCOM kick mode (checkpoint-003 / handoff P0.3):
@@ -506,8 +444,8 @@ MODULE_PARM_DESC(txcom_pio, "TXCOM when use_pio=1 (default 0xC; OSOS DMA is 0x6)
  *   2 = hybrid: bit3 then |0x6 (glass experimental default)
  */
 /*
- * RetailOS music-playing SCSI oracle 2026-08-25: TXCOM readback = 0x6.
- * sub_B6620 does |= 6 only. Hybrid 0xE was a Linux false lead.
+ * A readback taken from stock with music playing gives TXCOM = 0x6, which
+ * matches the arm sequence: bits 1 and 2, and nothing else.
  */
 static int txcom_mode;
 module_param(txcom_mode, int, 0644);
@@ -521,7 +459,7 @@ static int txcom_exact = -1;
 module_param(txcom_exact, int, 0644);
 MODULE_PARM_DESC(txcom_exact, "Exact TXCOM write when >=0; -1=txcom_mode (default)");
 
-/* RetailOS local music CLKDIV=0x110 (272) ≈ 12 MHz / 44100. */
+/* Stock plays local music at CLKDIV 0x110 (272), 12 MHz / 44100. */
 
 /*
  * BCB60 sets DIR. Measured: with DIR left as an input, GPIO 7/20 stop
@@ -530,13 +468,13 @@ MODULE_PARM_DESC(txcom_exact, "Exact TXCOM write when >=0; -1=txcom_mode (defaul
  */
 
 /*
- * Pad bring-up variants (exhaust RE before RetailOS GPIO oracle):
- *   0 = local 43D38C(7,3)(20,3) only [BCB60 — CONFIRMED OSOS body]
- *   1 = +43D38C(6,3) — NO OSOS 43D38C call site for GPIO6; debug only
- *   2 = gpio-s5l8740 s5l8740_iis0_pads_enable(3) — SEC pinmux + GPIOCMD
- *   3 = gpio driver mode 2 (BCB60 teardown)
- *   4 = SEC pinmux 6/7/20 + local mode3 on all three
- *   5 = mode2 + SEC pinmux refresh (func2 only, no mode3)
+ * Pad bring-up variants, for bisecting a silent jack:
+ *   0 = local pinmux on GPIO 7 and 20 only (matches stock)
+ *   1 = also GPIO 6; stock has no such call, debug only
+ *   2 = gpio-s5l8740 s5l8740_iis0_pads_enable(3)
+ *   3 = gpio driver mode 2
+ *   4 = SEC pinmux 6/7/20 plus local mode 3 on all three
+ *   5 = mode 2 plus a SEC pinmux refresh, function 2 only
  */
 
 struct s5l8740_i2s {
@@ -599,17 +537,17 @@ struct s5l8740_i2s {
 };
 
 /*
- * SEC sub_2034 leftovers. OSOS 983430 never programs clock 9;
- * it does program clocks 6/20 into +0x1C after SEC. If U-Boot
- * zeroed the pair, IIS has no parent. Do not write +00/+04/+44.
+ * Audio clock parent, CLKCON+0x1C.
  *
- * RetailOS music-playing oracle (checkpoint-010): +0x1C = 0xD0052003.
- * That is a sample of a live register, not a value stock ever stores:
- * only its bits 29:16 are ours, and only those are written.
- * Leaving the SEC bring-up value 0x10122003 yields IIS STATUS 0x82A0
- * and a silent jack even with TXCOM=6 / CS42 unmuted. The divider field
- * is what that turned out to need; the gate bits in the same word were
- * never ours, and writing them is what cost us storage.
+ * The bootloader leaves this at 0x10122003, which yields IIS STATUS 0x82A0
+ * and a silent jack even with the transport running and the codec unmuted.
+ * A capture of stock playing music reads 0xD0052003. The two differ only in
+ * the upper half, which is where the audio parent selection lives.
+ *
+ * That capture is a sample of a live register, not a value stock ever
+ * stores, so only the divider field is taken from it -- see
+ * s5l8740_i2s_clkcon_audio(). The gate bits sharing the word belong to other
+ * peripherals. Do not write +0x00, +0x04 or +0x44 here.
  */
 #define SEC_CLKCON_18		0x20012001u
 #define SEC_CLKCON_1C		0x10122003u
@@ -621,34 +559,30 @@ struct s5l8740_i2s {
 #define STOCK_CLKCON_18		0x20012001u
 #define STOCK_CLKCON_1C		0xD0052003u
 /*
- * The divider field of CLKCON+0x1C, and the only part of it that belongs to
- * audio. Bits 31:30 and 15:14 are clock-domain gates (sub_41CBD8 cases
- * 'E','F','G','H'), and bits 13:0 are a second domain's divider; none of
- * them are ours to write. Mirrors stock's own "& 0xC000FFFF" writer.
+ * The divider field of CLKCON+0x1C, and the only part of the word that
+ * belongs to audio. Bits 31:30 and 15:14 are clock-domain gates and bits
+ * 13:0 are a second domain's divider; none of them are ours to write. This
+ * mirrors the mask stock's own writer for this field uses.
  */
 #define CLKCON_1C_DIV_MASK	0x3FFF0000u
 
 /*
- * CLKCON+0x10 is the FM clock, and both paths write it.
+ * CLKCON+0x10 is the FM clock, and both the playback and capture paths
+ * reach it.
  *
- * The decomp names it: sub_15DD5C powers FM through sub_41CBD8(v2, on)
- * with v2 = sub_4E7B0() = 11, and case 11 of sub_41CBD8 clears bit 15
- * of 0x3C500010 to enable and sets it to disable. That is exactly the
- * CLKCON_FM_GATE_ON / _IDLE pair below, which had been derived from the
- * oracle.
+ * Stock powers FM through the same gate: clearing bit 15 enables and setting
+ * it disables, which is the pair below.
  *
- * s5l8740_i2s_ungate writes the whole music-playing CLKCON snapshot,
- * and in that snapshot FM is off -- STOCK_CLKCON_10 is 0x8000, bit 15
- * set, divider nibble zeroed. Playback starting while FM capture ran
- * therefore gated off the capture's own clock and destroyed its
- * divider. That is the same failure the +0x30 arbitration above already
- * fixes in the other direction, so it gets the same treatment: while
- * IIS2 holds the FM gate, playback leaves +0x10 alone.
+ * In a captured music-playing image FM is off -- bit 15 set, divider nibble
+ * zeroed -- so stamping that image on playback start gates off the capture's
+ * own clock and destroys its divider. While IIS2 holds the FM gate, playback
+ * leaves +0x10 alone: the same arbitration the audio gate uses in the other
+ * direction.
  */
 static bool s5l8740_fm_gate_held;
 
 /*
- * OFF by default. This pushes a RetailOS music-playing snapshot into
+ * Off by default. This pushes a captured music-playing image into
  * CLKCON +0x08..0x1C as whole-register writes, and those are SoC-wide
  * clock gates, not audio-private ones. Blind full-register writes
  * therefore discard whatever every other block had set. Observed: the
@@ -671,29 +605,21 @@ static bool s5l8740_fm_gate_held;
  * divider field only. See the note at the write site.
  */
 /*
- * Write only CLKCON+0x1C, and nothing else.
+ * Write only CLKCON+0x1C, and only its divider field.
  *
- * The whole-snapshot path that used to sit below is deleted. It pushed
- * a sampled copy into +0x08..0x1C, and those are SoC-wide gates:
- * the first audio start took the FMSS clock with it and storage was gone
- * until reboot. That is a good reason to distrust the snapshot, and a bad
- * reason to leave the one register the oracle actually calls out.
+ * +0x08, +0x0C, +0x10 and +0x14 are SoC-wide gates shared with storage, the
+ * display and USB. Stamping a captured image across them takes the FMSS
+ * clock with it and storage does not come back until reboot. There is no
+ * safe version of that write, so there is no parameter for it.
  *
- * Checkpoint-010's truth table gives +0x1C = 0xD0052003 for RetailOS
- * playing music. We run 0x10122003, the SEC bring-up value. The low half
- * is identical -- 0x2003 either way -- so the difference is entirely in
- * the upper 16 bits, which is where the audio parent selection lives.
- *
- * +0x08, +0x0C, +0x10 and +0x14 are the registers that killed the NAND and
- * they are not touched. This writes one register that the oracle attests
- * to, and the storage path is checked after every test.
+ * What audio needs from this block is done here, one field at a time.
  */
 static bool stock_clkcon_1c = true;
 module_param(stock_clkcon_1c, bool, 0644);
 MODULE_PARM_DESC(stock_clkcon_1c,
-		 "write the RetailOS audio parent to CLKCON+0x1C only (default Y)");
+		 "write the stock audio parent to CLKCON+0x1C only (default Y)");
 
-/* sub_41CBD8(9,1): CLKCON+0x0C bit 15 clear = IIS0 CG16 on. */
+/* CLKCON+0x0C bit 15 clear = the IIS0 codec clock is on. */
 static void s5l8740_i2s_ungate(struct s5l8740_i2s *i2s)
 {
 	u32 v, r18, r1c;
@@ -703,55 +629,35 @@ static void s5l8740_i2s_ungate(struct s5l8740_i2s *i2s)
 	r18 = readl(i2s->clkcon + 0x18);
 	r1c = readl(i2s->clkcon + 0x1c);
 	/*
-	 * The whole-register CLKCON snapshot that used to live here is gone.
+	 * Only the audio parent is written here, one field at a time.
 	 *
-	 * force_stock_audio_parent stamped a sampled copy of CLKCON+0x08
-	 * through +0x1C -- six SoC-wide clock registers -- straight over
-	 * whatever every other peripheral had configured. It was sampled
-	 * while RetailOS played music, so it carried the NAND, display and
-	 * USB clock bits along with the audio ones and republished all of
-	 * them. It is documented as destroying storage, and it does.
-	 *
-	 * There is no safe version of that write, so there is no parameter
-	 * for it any more. What audio actually needs from this block is
-	 * done below, one field at a time.
+	 * Stamping a captured copy of CLKCON+0x08 through +0x1C across six
+	 * SoC-wide clock registers republishes every other peripheral's bits
+	 * in whatever state they were sampled in, which destroys storage.
 	 */
 	{
 		if (!r18)
 			writel(SEC_CLKCON_18, i2s->clkcon + 0x18);
 		if (stock_clkcon_1c) {
 			/*
-			 * Write the divider field ONLY. Never the whole word.
+			 * Write the divider field only. Never the whole word.
 			 *
-			 * This register was killing the NAND, and it did it by
-			 * construction: STOCK_CLKCON_1C is a snapshot of the live
-			 * register sampled while RetailOS played music, and a
-			 * snapshot carries every other peripheral's bits in
-			 * whatever state they happened to be in at that instant.
-			 * Storing it whole republished all of them.
-			 *
-			 * Measured here: live 0x10122003 -> our 0xD0052003, so the
-			 * top two bits go 00 -> 11. Per sub_41CBD8 cases 'E' and
-			 * 'F' those two bits are clock-domain gates whose polarity
-			 * is set-means-off ("if (a2) clear else set"), so the blind
-			 * store gated off two domains, one of which the FMSS needs.
-			 * That is the whole story of storage working at boot and
-			 * dying with -EBUSY the moment audio ran: the CS sequencer
-			 * lost its clock mid-flight and never went idle again,
-			 * which is what fmss_cs_preflight() then refused on.
+			 * Bits 31:30 are clock-domain gates whose polarity is
+			 * set-means-off, and one of the domains they gate is
+			 * the one the storage sequencer runs on. A whole-word
+			 * store of a captured value takes them from 00 to 11,
+			 * which gates that domain off mid-flight: storage then
+			 * fails with -EBUSY from the moment audio first runs
+			 * and never goes idle again.
 			 *
 			 * Stock never leaves a whole-word value here. Every
-			 * audio-path access is a masked read-modify-write, and the
-			 * writer for this very field is
+			 * audio-path access is a masked read-modify-write, and
+			 * the writer for this field preserves bits 31:30 and
+			 * 15:0. The only whole-word store in the firmware saves
+			 * the register first and restores it before returning.
 			 *
-			 *   MEMORY[0x3C50001C] =
-			 *       MEMORY[0x3C50001C] & 0xC000FFFF | ...
-			 *
-			 * preserving bits 31:30 and 15:0. The only whole-word store
-			 * in the firmware saves the register first and restores it
-			 * before returning.
-			 *
-			 * So this uses stock's own mask: bits 29:16, nothing else.
+			 * So this uses stock's own mask: bits 29:16, nothing
+			 * else.
 			 */
 			u32 want = (r1c & ~CLKCON_1C_DIV_MASK) |
 				   (STOCK_CLKCON_1C & CLKCON_1C_DIV_MASK);
@@ -771,12 +677,12 @@ static void s5l8740_i2s_ungate(struct s5l8740_i2s *i2s)
 	}
 }
 
-/* RetailOS absolute dword — better than sticky play when idle. */
+/* Absolute value captured from stock, rather than a sticky play value. */
 /*
- * CLKCON+0x30 gates the audio clock for IIS0 and IIS2 together. Each port
- * used to write it directly, so stopping FM capture also idled the clock
- * out from under music that was still playing. Track which ports want it
- * running and only idle the gate once nobody does.
+ * Both ports share this gate, so each declaring its own intent and writing
+ * directly means stopping FM capture idles the clock out from under music
+ * that is still playing. Track which ports want it running and only idle it
+ * once nobody does.
  */
 static DEFINE_SPINLOCK(s5l8740_audio_clk_lock);
 static bool s5l8740_audio_clk_wanted[S5L8740_AUDIO_PORTS];
@@ -784,35 +690,24 @@ static bool s5l8740_audio_clk_wanted[S5L8740_AUDIO_PORTS];
 /*
  * CLKCON+0x30 is a PLL parameter, not an audio clock gate. Do not write it.
  *
- * This used to writel() CLKCON_AUDIO_PLAY (0x32190) here on every play and
- * CLKCON_AUDIO_IDLE (0x1c20) on every stop, on the reading that +0x30 was
- * the audio enable. It is not. The register is accessed exactly once in the
- * whole OSOS image, inside the PLL bring-up at sub_63B4:
+ * The register is accessed exactly once in the whole stock image, inside the
+ * PLL bring-up, which stores 7200 into it as one of a group of PLL
+ * parameters and then spins for lock.
  *
- *     if ((MEMORY[0x3C500044] & 1) == 0) {
- *         MEMORY[0x3C500044] &= ~0x10000u;
- *         MEMORY[0x3C500044] &= ~1u;
- *         MEMORY[0x3C500020] = <params from 0x8789194/98/9C>;
- *         MEMORY[0x3C500030] = 7200;
- *         MEMORY[0x3C500044] |= 0x10001u;
- *         while ((MEMORY[0x3C500040] & 1) == 0)
- *             ;
- *     }
+ * 7200 is 0x1C20 -- the value this driver once called CLKCON_AUDIO_IDLE,
+ * writing it on every stop and 0x32190 on every play. So every playback
+ * corrupted the PLL and every stop quietly repaired it, which is why the
+ * register always read 0x1c20 when inspected at rest and nothing looked
+ * wrong.
  *
- * 7200 is 0x1C20 -- the value this driver called CLKCON_AUDIO_IDLE. So the
- * "idle" write happened to restore the correct PLL parameter, and the
- * "play" write put 0x32190 into it. Every playback corrupted the PLL and
- * every stop quietly repaired it, which is why the register always read
- * 0x1c20 whenever it was inspected at rest and nothing looked wrong.
- *
- * That is consistent with the whole symptom set: the IIS0 serialiser gets
- * no usable clock while playing, so the TX FIFO fills once and never
- * drains and the DMA stalls after topping it up; and the FMSS loses its
+ * That accounts for the whole symptom set: the IIS0 serialiser gets no
+ * usable clock while playing, so the TX FIFO fills once and never drains and
+ * the DMA stalls after topping it up, and the storage controller loses its
  * clock too, which is how the NAND died mid-session and stayed dead until
  * reboot.
  *
- * The real audio gate is sub_41CBD8, one bit per clock id -- id 9 is
- * CLKCON+0x0C bit 15 and is handled by s5l8740_codec_clk_gate().
+ * The real audio gate is one bit per clock id; the codec's is CLKCON+0x0C
+ * bit 15, handled by s5l8740_codec_clk_gate().
  *
  * The wanted[] bookkeeping stays so the ports still declare intent and the
  * log still says who wanted the clock; it simply no longer writes.
@@ -834,10 +729,8 @@ static void s5l8740_audio_clk_set(void __iomem *clkcon, unsigned int port,
 
 	/*
 	 * Nothing is written to CLKCON+0x30 here, and there is no parameter
-	 * to make it happen any more. That register is the audio PLL, it is
-	 * shared, and writing it corrupted the PLL and took the NAND with
-	 * it. The knob existed only to reproduce that on demand, which is
-	 * not something this driver needs to be able to do. The port
+	 * to make it happen. That register is the audio PLL, it is shared,
+	 * and writing it corrupts the PLL and takes storage with it. The port
 	 * bookkeeping above is the entire job.
 	 */
 	(void)any;
@@ -848,12 +741,11 @@ static struct s5l8740_i2s *s5l8740_i2s_iis0;
 /*
  * Apply TXCON to the live register as soon as it is written.
  *
- * Sweeping TXCON used to mean setting clkdiv to defeat the "already
- * programmed" check in s5l8740_i2s_program(), which re-ran the pad mux and
- * the CLKCON writes on every play. This writes IIS0+0x04 and nothing else,
- * so a sweep cannot disturb any clock.
+ * This writes IIS0+0x04 and nothing else, so sweeping TXCON cannot disturb
+ * any clock. The alternative -- forcing s5l8740_i2s_program() to re-run by
+ * changing clkdiv -- also re-ran the pad mux and the CLKCON writes.
  */
-/* Resolve a coherent sub_BCB60 arm (or the explicit lab override). */
+/* Resolve a coherent TXCON arm, or the explicit lab override. */
 static u32 s5l8740_i2s_txcon_value(struct s5l8740_i2s *i2s)
 {
 	u32 forced = READ_ONCE(txcon);
@@ -921,26 +813,19 @@ static const struct kernel_param_ops txcon_ops = {
 	.get = param_get_uint,
 };
 module_param_cb(txcon, &txcon_ops, &txcon, 0644);
-MODULE_PARM_DESC(txcon, "I2STXCON override; 0 (default) follows sub_BCB60");
+MODULE_PARM_DESC(txcon, "I2STXCON override; 0 (default) follows the computed arm");
 
 /*
- * The codec clock gate, RetailOS sub_41CBD8 with the id sub_4F82F8 returns.
+ * The codec clock gate: CLKCON+0x0C bit 15, active low. Clearing it runs the
+ * clock, setting it stops it.
  *
- * sub_4F82F8() returns 9, and case 9 of sub_41CBD8 is CLKCON+0x0C bit 15,
- * active low:
- *
- *     if (on)  MEMORY[0x3C50000C] &= 0xFFFF7FFF;
- *     else     MEMORY[0x3C50000C] |= 0x8000;
- *
- * D3280(1) ends by turning it OFF and D3280(3) begins by turning it back
- * ON, which is what the 0x0006 / 0x0007 bit-6 freeze latch is bracketing:
- * the codec is parked, its clock is stopped, and then the clock returns and
- * the latch is released. This driver left the clock running the whole time,
- * so that transition never happened.
+ * Park ends by turning the clock off and run begins by turning it back on.
+ * That transition is what the codec's freeze latch brackets -- the part is
+ * parked, its clock is stopped, then the clock returns and the latch is
+ * released. Leaving the clock running the whole time skips it.
  *
  * Exported because the CLKCON mapping lives here and the codec driver needs
- * it. One bit, read-modify-write, nothing else touched -- the opposite of
- * what s5l8740_audio_clk_set() used to do to CLKCON+0x30.
+ * it. One bit, read-modify-write, nothing else touched.
  */
 void s5l8740_codec_clk_gate(bool on)
 {
@@ -964,30 +849,16 @@ void s5l8740_codec_clk_gate(bool on)
 EXPORT_SYMBOL_GPL(s5l8740_codec_clk_gate);
 
 /*
- * Codec clock divider — RetailOS sub_345D28(9, 0, div).
+ * Codec clock divider: CLKCON+0x0C bits 3:0, held as div-1.
  *
- * The C export shows this as a bare sub_345D28() with no arguments, which is
- * why it was read as a delay for so long. The arguments are visible in the
- * disassembly at 0x080D32BE: clock id 9 (the same id s5l8740_codec_clk_gate
- * gates), selector 0, and a divider taken from the MCLK word --
- * 2 when it reads 12000, otherwise 4.
+ * Stock selects 2 at a 12 MHz master clock and 4 otherwise, so it runs the
+ * codec clock at source/2. A register left at zero runs it at source/1 --
+ * twice stock's rate.
  *
- * The body is a ROM thunk into IRAM at 0x22000930, which sub_434() copies
- * from ROM. Its clock-9 case is:
- *
- *	r6 = 0x3C500000				(CLKCON)
- *	r2 = CLKCON[0x0C]
- *	bfc r2, #0, #15				clear bits 14:0
- *	(selector 0 adds no source bits)
- *	if (div != 1 && div <= 17) r2 |= (div - 1) & 0xF
- *	CLKCON[0x0C] = r2
- *
- * So bits 3:0 of CLKCON+0x0C are the codec clock divider, held as div-1,
- * bits 13:12 are a source select, and bit 15 is the gate. Stock therefore
- * runs the codec clock at source/2, and a register left at zero runs it at
- * source/1 -- twice stock's rate.
- *
- * Bit 15 is preserved so this composes with the gate in either order.
+ * The underlying ROM routine clears bits 14:0, ORs in (div - 1) when the
+ * divider is between 2 and 17, and adds source bits from its selector
+ * argument. Bit 15 is preserved here so this composes with the gate in
+ * either order.
  */
 void s5l8740_codec_clk_divider(unsigned int div)
 {
@@ -1002,26 +873,21 @@ void s5l8740_codec_clk_divider(unsigned int div)
 		return;
 
 	/*
-	 * CLKCON+0x0C is CG16_AUD0, a 16-bit clock-gate register; CG16_AUD1
-	 * sits at +0x0E and therefore occupies bits 31:16 of the same 32-bit
-	 * word (Rockbox s5l87xx.h). The output is
+	 * CLKCON+0x0C is a 16-bit clock-gate register, and its sibling at
+	 * +0x0E occupies bits 31:16 of the same 32-bit word. The output is
 	 *
 	 *	!DISABLE * SEL_freq / (DIV1 + 1) / (DIV2 + 1)
 	 *
-	 *	bit 15		DISABLE, set masks the clock -- the "gate"
+	 *	bit 15		DISABLE, set masks the clock -- the gate
 	 *			owned by s5l8740_codec_clk_gate()
 	 *	bits 13:12	SEL, source select (0 = OSC, 1..3 = PLL0..2)
 	 *	bits 7:4	DIV2
 	 *	bits 3:0	DIV1
 	 *
-	 * This is exactly the layout the ROM routine drives: its clock-9 case
-	 * clears bits 14:0 and ORs in (div - 1), and its selector argument
-	 * contributes 0x1000/0x2000/0x3000 -- the SEL field.
-	 *
-	 * Bits 14:0 are all AUD0's own fields, so clearing them is safe and
-	 * reproduces the ROM exactly. What must be preserved is bit 15, which
-	 * belongs to the gate, and bits 31:16, which are CG16_AUD1 -- another
-	 * I2S clock. Never write this register as a whole word.
+	 * Bits 14:0 are all this register's own fields, so clearing them is
+	 * safe. What must be preserved is bit 15, which belongs to the gate,
+	 * and bits 31:16, which are another I2S clock. Never write this
+	 * register as a whole word.
 	 */
 	spin_lock_irqsave(&s5l8740_audio_clk_lock, flags);
 	v = readl(i2s->clkcon + 0x0c);
@@ -1033,18 +899,10 @@ void s5l8740_codec_clk_divider(unsigned int div)
 	/*
 	 * Wait for the divider to take before returning.
 	 *
-	 * The bootloader's sub_14FC does exactly this, and the wait is the
-	 * part that was missing here:
-	 *
-	 *	v1 = (read(0x3C50000C) >> 15 << 15) | 1;
-	 *	write(0x3C50000C, v1);
-	 *	while (read(0x3C50000C) != v1)   ;
-	 *	clear bit 15                        (release the gate)
-	 *
-	 * It writes, spins until the register reads back what it wrote, and
-	 * only then ungates. This driver wrote and returned, leaving the
-	 * caller free to release the gate immediately -- so the codec could
-	 * be handed a clock whose divider had not settled.
+	 * The bootloader writes this register, spins until it reads back what
+	 * it wrote, and only then releases the gate. Writing and returning
+	 * immediately leaves the caller free to ungate a clock whose divider
+	 * has not settled.
 	 *
 	 * Bounded, because a spin with no escape in a driver is not the same
 	 * proposition as one in a bootloader that owns the machine.
@@ -1074,8 +932,8 @@ static void s5l8740_i2s_clkcon_audio(struct s5l8740_i2s *i2s, u32 val)
 }
 
 /*
- * STOP teardown (beats RetailOS sticky TX): TXCOM stop → terminate DMA →
- * clear I2SCLKCON → CLKCON+0x30 idle dword.
+ * Stop teardown: TXCOM stop, terminate the DMA, clear I2SCLKCON, then idle
+ * the audio clock.
  */
 static void s5l8740_i2s_iis0_gate(struct s5l8740_i2s *i2s, bool on);
 
@@ -1127,31 +985,25 @@ static void s5l8740_i2s_hw_stop(struct s5l8740_i2s *i2s,
 	/*
 	 * No teardown. Stock does not tear the transmitter down on stop.
 	 *
-	 * MEASURED on RetailOS. After a music session was stopped and the
-	 * FM radio entered and stopped, with the screen off, IIS0 still read:
+	 * Measured: after a music session was stopped, and the FM radio
+	 * entered and stopped, with the screen off, IIS0 still read
 	 *
 	 *	CLKCON 00000001   TXCON  03100099   TXCOM 00000006
 	 *	RXCON  00001000   RXCOM  00000000   REG44 00010007
 	 *
 	 * every one identical to the values captured while it was playing.
-	 * PL080 ch2 was still enabled at the same time -- EnbldChns 4,
-	 * Config 1, cfg 00028a81, ctl 84249000 -- with only src and the
-	 * count at different positions. PWRCON1 bit 7 was still CLEAR, so
-	 * the clock had not been re-gated either.
+	 * The DMA channel was still enabled at the same time, and the
+	 * peripheral clock had not been re-gated either.
 	 *
-	 * So sub_C09AC(iis, 0) exists in the image but is not what a normal
-	 * stop runs. This function used to transliterate it faithfully --
-	 * TXCOM=0, RXCOM=0, CLKCON=0, spin for the stop-ack, re-gate -- and
-	 * that was a faithful copy of a path stock does not take.
-	 *
-	 * It also broke the start side by implication: our start ran against
-	 * a fully torn-down block every time, while stock starts against one
-	 * that is already configured, enabled and clocked. Same start code,
-	 * different initial state.
+	 * A full teardown exists in the stock image but is not what a normal
+	 * stop runs. Transliterating it left this driver starting against a
+	 * torn-down block every time, while stock starts against one that is
+	 * already configured, enabled and clocked -- the same start code
+	 * against a different initial state.
 	 *
 	 * The DMA is still terminated above, because ALSA owns that buffer
 	 * and must not have it read after the stream goes away. Everything
-	 * the I2S block holds is left exactly as stock leaves it.
+	 * the I2S block holds is left as stock leaves it.
 	 */
 }
 
@@ -1169,12 +1021,11 @@ static void s5l8740_i2s_gpiocmd(struct s5l8740_i2s *i2s, unsigned int gpio, u8 c
 	 * The direction bit goes through the gpio driver, which owns this
 	 * register and takes a lock across it.
 	 *
-	 * DIR is per-bank: eight pads in one word. This used to be an
-	 * unlocked read-modify-write here while gpio-s5l8740.c did its own
-	 * unlocked read-modify-write on the same word, so either could drop
-	 * a bit the other had just set. Two owners of one register is the
-	 * bug; doing our half under a lock the other owner does not take
-	 * would not have fixed it.
+	 * DIR is per-bank: eight pads in one word. An unlocked
+	 * read-modify-write here races gpio-s5l8740.c doing its own on the
+	 * same word, and either can drop a bit the other just set. Two owners
+	 * of one register is the bug; taking a lock the other owner does not
+	 * take would not fix it.
 	 *
 	 * Only the direction is delegated. GPIOCMD below is a separate
 	 * write-only register and this driver is its only user.
@@ -1208,32 +1059,29 @@ static void s5l8740_i2s_log_iis_gpio(struct s5l8740_i2s *i2s, const char *tag)
 }
 
 /*
- * GPIO 4/5 are deliberately left alone. Two stock paths claim them and it
- * is not settled which applies here: sub_71B8 drives them as a two-bit
- * output mux, while the per-bus I2C pinmux helper puts them at function 2
- * as a SCL/SDA pair. i2c0 is the Tristar bus and it times out on glass,
- * so the I2C reading is the more likely one and forcing them to outputs
- * would make that permanent. Nothing in the audio path needs them.
+ * GPIO 4 and 5 are deliberately left alone. Two stock paths claim them and it
+ * is not settled which applies here: one drives them as a two-bit output mux,
+ * while the per-bus I2C pinmux helper puts them at function 2 as an SCL/SDA
+ * pair. i2c0 is the Tristar bus and it times out on glass, so the I2C reading
+ * is the more likely one and forcing them to outputs would make that
+ * permanent. Nothing in the audio path needs them.
  */
 
 /*
- * sub_BCB60 muxes both IIS0 pads together on every TX enable:
- * sub_43D38C(0x14, 3) and sub_43D38C(7, 3), and puts them back to
- * function 2 on disable. GPIO 7 is an I2S pad, not a display pad -- the
- * panel is driven entirely from the LCDIF and no display code here
- * touches GPIO at all. Claiming only GPIO 20 leaves the bus incomplete
- * and the jack silent.
+ * Stock muxes both IIS0 pads together on every TX enable and puts them back
+ * to function 2 on disable. GPIO 7 is an I2S pad, not a display pad -- the
+ * panel is driven entirely from the LCDIF and no display code here touches
+ * GPIO at all. Claiming only GPIO 20 leaves the bus incomplete and the jack
+ * silent.
  */
 /*
- * The stock pad set while RetailOS plays, from audio checkpoint-010:
+ * The stock pad set while music is playing:
  * bank0 PCON 0x32112224 / DIR 0xFF, bank2 PCON 0x02230000 / DIR 0x70.
  *
- * We set 7 and 20 and have never touched 6, 21 or 22. That gap is worth
- * closing now because everything else matches the oracle -- TXCON, TXCOM,
- * CLKDIV 272, CLKCON +0x18 and +0x1C, IIS STATUS 0x424, PL080 channel 2 on
- * peri 10 -- and the jack is still silent. Clocks and status can all read
- * correct while the serialiser's data pin is not muxed out of the SoC,
- * which is exactly the case the checkpoint's "wire/data" branch describes.
+ * This driver sets 7 and 20 and has never touched 6, 21 or 22. Clocks and
+ * status can all read correct while the serialiser's data pin is not muxed
+ * out of the SoC, so the gap is worth closing when the jack is silent and
+ * everything else already matches.
  */
 static const struct { u8 gpio, func; } stock_audio_pads[] = {
 	{ 6, 2 }, { 7, 3 }, { 20, 3 }, { 21, 2 }, { 22, 2 },
@@ -1259,34 +1107,13 @@ static void s5l8740_i2s_pads(struct s5l8740_i2s *i2s)
 	unsigned int func = READ_ONCE(mastership_profile) ? 3 : 2;
 
 	/*
-		 * GPIO 7 and 20, with their function selected by the same profile
-		 * that selects TXCON.
+	 * GPIO 7 and 20, with their function selected by the same profile
+	 * that selects the TXCON arm -- stock takes both from one argument,
+	 * so they must not be split.
 	 *
-	 * sub_BCB60 muxes these two pads itself, guarded by
-	 * sub_414FAA() == unit -- and sub_414FAA is "movs r0, #0; bx lr", so
-	 * the guard passes only for unit 0. These are IIS0's pads; the 97, 98
-	 * and 119 muxed by sub_BCB60's other caller belong to IIS1 and IIS2.
-	 *
-	 * The function comes from the same a3 that selects the TXCON word:
-	 *
-	 *   80bcb8c  cbz  r7, 80bcbba      a3 == 0 ?
-	 *   80bcb96  movs r1, #3           a3 != 0: sub_43D38C(20, 3, 0)
-	 *   80bcba2  movs r1, #3                    sub_43D38C(7,  3, 0)
-	 *   80bcbc4  movs r1, #2           a3 == 0: sub_43D38C(20, 2, 0)
-	 *   80bcbce  movs r1, #2                    sub_43D38C(7,  2, 0)
-	 *
-	 * sub_43D38C is the pad-function call: its bank base is
-	 * 32*(gpio>>3) + 1022361600, and 1022361600 is 0x3CF00000.
-	 *
-		 * The old default split the two halves: function 3 (a3 != 0) with the
-		 * a3 == 0 TXCON. They are kept together here. Profile 1 restores the
-		 * coherent a3 != 0 combination from the only historical warm-boot run
-		 * in which an audible, wrong-pitch tone was reported. That result does
-		 * not establish a cold-boot default, so profile 0 remains the default
-		 * until the on-device matrix is captured.
-		 *
-		 * This is a controlled A/B mechanism, not a claim that either profile
-		 * is correct before the cold-boot evidence exists.
+	 * These two pads are IIS0's. Stock muxes them from the TXCON program
+	 * itself, guarded on the port index, and the other pads its other
+	 * caller muxes belong to IIS1 and IIS2.
 	 */
 	s5l8740_i2s_gpiocmd(i2s, 7, func);
 	s5l8740_i2s_gpiocmd(i2s, 20, func);
@@ -1466,112 +1293,38 @@ static void s5l8740_i2s_log_txcon(struct device *dev, u32 v, const char *tag)
 }
 
 /*
- * sub_C09AC(port, 1) is CLKCON = 1, but it is preceded by
- * sub_345D70(0x26, 0, 1), and what that call does is NOT established.
+ * Starting the port is CLKCON = 1, but stock precedes it with a
+ * per-peripheral gate call keyed by an id the port selects -- 0x26 for IIS0.
+ * That gate is PWRCON1 bit 7; see s5l8740_i2s_pwrcon1_gate() below, which
+ * documents how the id maps to the bit and why the clock framework owns it.
  *
- * This comment used to assert "345D70 is JUMPOUT 0x22000350 = bootloader
- * sub_350 (SCTLR C-bit)". The thunk half is right and the conclusion is
- * wrong. sub_345D70 is "ldr pc, [pc, #-4]" loading 0x22000351 -- bit 0 set,
- * so an interworking branch to THUMB at 0x22000350. In the bootloader image
- * we have on disk, file offset 0x350 is ARM:
- *
- *	0x350: mov r1,#4 / mrc p15,0,r0,c1,c0,0 / orr / mcr / bx lr
- *	0x364: same with bic          0x378: mov r1,#0x1000
- *
- * i.e. SCTLR C set, C cleared, I set. Two things rule that out as the
- * callee:
- *
- *   - A Thumb target cannot be that ARM code. Every sibling thunk in the
- *     same block has the Thumb bit set and lands on an ARM word too:
- *     345D28 -> 0x22000931 (e3a000d3), 345D40 -> 0x220002B3 (mid-word),
- *     345D48 -> 0x22001023, 345D58 -> 0x2200104B, 345CE8 -> 0x220011E5.
- *     The SRAM resident at 0x22000000 while the OS runs is not the
- *     bootloader image on disk; 0x350 merely happens to look decodable.
- *
- *   - An SCTLR cache-bit setter takes no arguments. sub_C09AC passes
- *     (0x26, 0, 1) and sub_11B70 passes (0x1E, 0, 1) before it touches any
- *     SPI2 register. Two unrelated callers supplying what reads as
- *     (peripheral id, ?, on) is not a cache toggle.
- *
- * So from usage it is a per-peripheral gate keyed by id, and the id is
- * selected by port. In sub_C09AC the selection is, from the raw image:
- *
- *	0x0C09CC  cbz  r2, 0x0C09DA      ; port 0
- *	0x0C09CE  cmp  r2, #1
- *	0x0C09D0  beq  0x0C09DE
- *	0x0C09D2  cmp  r2, #2
- *	0x0C09D4  beq  0x0C09F0
- *	0x0C09DA  movs r0, #0x26         ; IIS0  <-- our port
- *	0x0C09DE  movs r0, #0x23         ; IIS1
- *	0x0C09E0  movs r1, #0
- *	0x0C09E4  movs r2, #1            ; 0 on the disable path at 0x0C0A06
- *	0x0C09E6  blx  0x00345D70
- *
- * so IIS0 enable is sub_345D70(0x26, 0, 1). sub_11B70 does the same shape
- * for SPI with ids 0x22 and 0x2b (0x011BD8 / 0x011BDE), not 0x1E -- an
- * earlier note here had both SPI ids wrong.
- *
- * Note these are BLX, not BL: sub_345D70 is ARM. A BL scan finds nothing,
- * which is how the call sites got mis-reported once already.
- *
- * It is NOT sub_41CBD8/id 9. That one is CLKCON+0x0C bit 15, where CLEAR
- * means the IIS0 clock is on, and we already drive it via
- * s5l8740_codec_clk_gate(); measured 0x00000001 at trigger, i.e. correct.
- *
- * WE DO NOT ASSERT THE 0x26 GATE AT ALL. s5l8740_i2s_c09ac_start() below
- * writes CLKCON = 1 and nothing else, so this step of sub_C09AC has no
- * counterpart here.
- *
- * This matters: if the 0x26 gate is something the IIS needs and we never
- * assert an equivalent, that is a live candidate for the transmitter not
- * clocking. Do not resolve it by sweeping CLKCON.
- *
- * Play 414FAE only starts -- it does not C09AC-stop first.
- * RetailOS music: I2SCLKCON = 0x1 (not 0x2 stop-ack).
+ * Only the CLKCON write happens here. Stock's play path only starts the
+ * port; it does not stop it first, and a live capture reads I2SCLKCON = 0x1
+ * rather than the 0x2 stop acknowledgement.
  */
 /*
- * IIS0 peripheral clock gate -- CLKCON+0x4C (PWRCON1) bit 7.
+ * IIS0 peripheral clock gate: CLKCON+0x4C (PWRCON1) bit 7. A set bit gates
+ * the block off.
  *
- * MEASURED ON HARDWARE, RetailOS 1.0.2, with music playing and the output
- * captured on the USB mixer at -21 dBFS peak / -37.6 dBFS RMS, 92 of 99
- * 100 ms windows active, so the transmitter was demonstrably producing sound
- * at the moment these registers were read:
+ * Measured on stock with music playing and the output captured at -21 dBFS
+ * peak, so the transmitter was demonstrably producing sound when these were
+ * read:
  *
- *	PWRCON1 idle    0xef226fe3      bit 7 SET   -- IIS0 gated off
- *	PWRCON1 playing 0xef226f23      bit 7 CLEAR -- IIS0 ungated
+ *	PWRCON1 idle    0xef226fe3      bit 7 set   -- IIS0 gated off
+ *	PWRCON1 playing 0xef226f23      bit 7 clear -- IIS0 ungated
  *
- * The route to that bit: sub_C09AC(port, 1) calls sub_345D70(id, 0, 1) BEFORE
- * writing I2SCLKCON, and picks the id by port -- cbz r2 at 0x0C09CC sends
- * port 0 to "movs r0, #0x26". sub_345D70 lives in resident SRAM (not the
- * bootloader image on disk, which decodes to something else entirely at the
- * same address); dumped over untethered SCSI it is a gate keyed by id:
- *
- *	entry = 0x08917860 + id * 32
- *	[entry+0x04] -> mask for CLKCON+0x48    [entry+0x10] -> +0x68
- *	[entry+0x08] -> mask for CLKCON+0x4C    [entry+0x14] -> +0x6C
- *	[entry+0x0C] -> mask for CLKCON+0x58
- *	cbz r4 -> orrs, else bics, so on == 1 CLEARS the bit
- *
- * Live table entry 0x26 reads "26 00 00 00 | 80 00 00 00" -- id in field 0,
- * then mask 0x80 in the +0x08 slot, i.e. PWRCON1 bit 7. Every bit music
- * cleared is accounted for by an entry: 0x26 and 0x27 in PWRCON1, and 0x3C,
- * 0x3D, 0x3E in PWRCON3.
- *
- * Why this is the whole failure: with the gate set, the register interface is
- * still clocked, so every IIS0 register we program reads back correct and
- * identical to stock's working set -- CLKCON=1, TXCON=0x03100099, TXCOM=6,
- * RXCON=0x1000, CLKDIV=0x110. The serialiser is not clocked, so it neither
- * drains the TX FIFO nor raises an underrun; the DMA halts after its first
- * 32-byte burst, terminal count never arrives, and the PL080 interrupt never
- * fires. That is exactly what we measured.
+ * This gate is why a fully correct-looking register set can still be silent.
+ * With it set the register interface is still clocked, so every IIS0
+ * register reads back identical to stock's working set, but the serialiser
+ * is not clocked: it neither drains the TX FIFO nor raises an underrun, the
+ * DMA halts after its first burst, and terminal count never arrives.
  *
  * Strict single-bit read-modify-write. PWRCON1 packs 32 unrelated
- * peripherals and a set bit gates one OFF, so writing anything wider here
- * would switch off blocks nothing has claimed. Do not "simplify" this into a
- * whole-register write.
+ * peripherals and a set bit gates one off, so a wider write here switches
+ * off blocks nothing has claimed. Do not simplify it into a whole-register
+ * write.
  *
- * Only IIS0 is handled. sub_C09AC sends port 1 to id 0x23 and port 2 to the
- * arm at 0x0C09F0, which is not decoded, so those are left alone.
+ * Only IIS0 is handled; the ids for the other two ports are not decoded.
  */
 
 static void s5l8740_i2s_iis0_gate(struct s5l8740_i2s *i2s, bool on)
@@ -1579,26 +1332,19 @@ static void s5l8740_i2s_iis0_gate(struct s5l8740_i2s *i2s, bool on)
 	/*
 	 * Deliberately does nothing. PWRCON1 bit 7 has an owner.
 	 *
-	 * This briefly did a direct read-modify-write here, on the strength
-	 * of the RetailOS measurement (PWRCON1 0xef226fe3 idle ->
-	 * 0xef226f23 playing). The bit and the polarity were right and it
-	 * changed nothing: still 0 periods, still no PL080 interrupt.
-	 *
-	 * It was also the wrong way to do it. clk-s5l8702.c already
-	 * registers that exact bit as a clock:
+	 * clk-s5l8702.c registers that exact bit as a clock:
 	 *
 	 *	[CLK_I2S0] = GATE("i2s0", NULL, CLKCON_PWRCON1, 7)
 	 *
-	 * so a raw write here gives one bit two owners and fights the clock
-	 * framework. The real defect was in the devicetree: i2s@3ca00000 had
-	 * no clocks property at all, so devm_clk_bulk_get_all() returned
-	 * zero clocks and clk_bulk_prepare_enable() had nothing to enable.
-	 * The nodrm variant of the DTS already carried the property; the
-	 * main one did not. It does now, naming CLK_I2S0 and CLK_CG16_9.
+	 * so a raw write here would give one bit two owners and fight the
+	 * clock framework. When this gate appeared to be missing, the actual
+	 * defect was in the devicetree: i2s@3ca00000 had no clocks property,
+	 * so devm_clk_bulk_get_all() returned nothing to enable. It now names
+	 * CLK_I2S0 and CLK_CG16_9.
 	 *
-	 * Kept as a stub rather than deleted so the call sites still mark
-	 * where sub_C09AC gates and ungates, and so nobody re-adds the raw
-	 * write when the next gate turns up.
+	 * Kept as a stub rather than deleted, so the call sites still mark
+	 * where stock gates and ungates, and so nobody re-adds the raw write
+	 * when the next gate turns up.
 	 */
 	(void)i2s;
 	(void)on;
@@ -1606,12 +1352,12 @@ static void s5l8740_i2s_iis0_gate(struct s5l8740_i2s *i2s, bool on)
 
 static void s5l8740_i2s_c09ac_start(struct s5l8740_i2s *i2s)
 {
-	/* sub_C09AC order: gate first, then I2SCLKCON. */
+	/* Stock's order: gate first, then I2SCLKCON. */
 	s5l8740_i2s_iis0_gate(i2s, true);
 	writel(1, i2s->base + I2SCLKCON);
 }
 
-/* OSOS sub_C095E(port, 0): clear TX sticky STATUS bit15 (W1C). */
+/* Clear the sticky TX STATUS bit, write-1-to-clear. */
 static void s5l8740_i2s_status_w1c_tx(struct s5l8740_i2s *i2s)
 {
 	u32 before, after;
@@ -1673,7 +1419,7 @@ static void s5l8740_i2s_program(struct s5l8740_i2s *i2s, unsigned int rate)
 	s5l8740_i2s_c09ac_start(i2s);
 	s5l8740_i2s_set_codec_clock_role(i2s);
 	s5l8740_i2s_pads(i2s);
-	/* Coherent sub_BCB60 profile, a5 = 16; +0x30 = 0x1000. */
+	/* Coherent TXCON arm at 16-bit width, and 0x1000 into +0x30. */
 	txcon_v = s5l8740_i2s_txcon_value(i2s);
 	writel(txcon_v, i2s->base + I2STXCON);
 	if (i2s->dev)
@@ -1683,37 +1429,24 @@ static void s5l8740_i2s_program(struct s5l8740_i2s *i2s, unsigned int rate)
 	writel(rxcom & ~4u, i2s->base + I2SRXCOM);
 	writel(div, i2s->base + I2SCLKDIV);
 	/*
-	 * IIS0+0x44 is not written by stock. The 0x00010007 here came from a
-	 * register *readback* taken while RetailOS was playing, not from any
-	 * write in the image: enumerating every function that reaches the IIS
-	 * base through sub_43A858 gives offsets +0x00, +0x04, +0x08, +0x30,
-	 * +0x34, +0x3C and +0x40, and nothing else. Whatever put 0x00010007
-	 * there did it from somewhere we have not identified, so writing it
-	 * ourselves is a guess about a register we cannot name.
-	 *
-	 * reg44 restores the write for comparison.
+	 * IIS0+0x44 is not written by stock -- see the note at reg44. The
+	 * 0x00010007 came from a readback, not from any write in the image,
+	 * so writing it would be a guess about a register we cannot name.
+	 * The reg44 parameter restores the write for comparison.
 	 */
 	if (reg44)
 		writel((u32)reg44, i2s->base + I2SREG44);
 	/*
-	 * Setup only. TXCOM stays 0 until .trigger START (OSOS sub_B6620).
+	 * Setup only: drop the run bit and leave the rest. TXCOM is not armed
+	 * until .trigger START.
 	 *
-	 * A previous attempt left 0xC here so that bit 3 would be set before
-	 * dmaengine arms the channel, on the strength of a "bit 3 has to be
-	 * set before the DMA kick, or STATUS sticks at 0x24" note. That note
-	 * is this driver's own, and the Rockbox N7G port inherited it from
-	 * here -- so reading it back out of Rockbox was not corroboration.
-	 *
-	 * The image disagrees. TXCOM is written by exactly two functions in
-	 * the whole of OSOS: sub_B6620 ORs 6 into it (and 6 into RXCOM at
-	 * +52 on the capture side), and sub_C09AC writes 0 on stop. Bit 3 is
-	 * never set anywhere. Whatever makes the serialiser start, it is not
-	 * that.
-	 *
-	 * txcom_mode=2 still sets bit 3 for anyone who wants to retry it as a
-	 * deliberate experiment.
+	 * Bit 3 is never set anywhere in the stock image -- TXCOM has exactly
+	 * two writers there, the arm that sets bits 1 and 2 and the stop that
+	 * writes zero -- so whatever makes the serialiser start, it is not
+	 * that bit. txcom_mode = 2 still sets it for anyone who wants to
+	 * retry it as a deliberate experiment.
 	 */
-	/* sub_5705DC: clear bit 2, keep the rest. */
+	/* Stock's disarm: clear bit 2, keep the rest. */
 	writel(readl(i2s->base + I2STXCOM) & ~I2STXCOM_RUN,
 	       i2s->base + I2STXCOM);
 	i2s->rate = rate;
@@ -1721,8 +1454,8 @@ static void s5l8740_i2s_program(struct s5l8740_i2s *i2s, unsigned int rate)
 }
 
 /*
- * OSOS B6620(port,0): TXCOM |= 6 after PL080 armed. Glass also needs bit 3
- * (PIO path 0xC) or STATUS stays 0x24 / jack silent. Set bit 3 before DMA.
+ * Arm the transmitter after the DMA channel is armed, which is stock's
+ * order: bits 1 and 2 into TXCOM, as a read-modify-write.
  */
 static void s5l8740_i2s_tx_kick(struct s5l8740_i2s *i2s, bool dma)
 {
@@ -1752,10 +1485,8 @@ static void s5l8740_i2s_tx_kick(struct s5l8740_i2s *i2s, bool dma)
 		switch (txcom_mode) {
 		case 0:
 			/*
-			 * sub_B6620(port, 0) is *(base + 8) |= 6 -- an OR, and
-			 * it stays an OR. s5l8740_i2s_program() now leaves
-			 * 0xC here, so this lands on 0xE and bit 3 stays set
-			 * through playback rather than being dropped.
+			 * An OR, as stock does it, so this composes with
+			 * whatever setup left in the register.
 			 *
 			 * The read is kept because the stock start path does
 			 * one, and a read-then-write is not the same bus
@@ -1778,9 +1509,9 @@ static void s5l8740_i2s_tx_kick(struct s5l8740_i2s *i2s, bool dma)
 		writel(txcom_pio, i2s->base + I2STXCOM);
 	}
 	after = readl(i2s->base + I2STXCOM);
-	/* RetailOS music never leaves TX sticky 0x8000 set — clear after kick. */
+	/* Stock never leaves the sticky TX bit set; clear it after the kick. */
 	s5l8740_i2s_status_w1c_tx(i2s);
-	/* Keep C09AC start bit; 0x2 is stop-ack class (sub_C09AC wait). */
+	/* Keep the start bit; 0x2 is the stop acknowledgement. */
 	if ((readl(i2s->base + I2SCLKCON) & 1u) == 0)
 		writel(1, i2s->base + I2SCLKCON);
 	if (i2s->dev)
@@ -1792,27 +1523,51 @@ static void s5l8740_i2s_tx_kick(struct s5l8740_i2s *i2s, bool dma)
 }
 
 /*
- * s5l8740_i2s_dma_watch() is gone.
+ * There is no DMA progress watchdog.
  *
- * It sampled the PL080 source pointer every 100 ms and xrun-ed the stream
- * after dma_stall_ms of no movement. Stock has no counterpart: sub_43A858,
- * the only IIS base resolver, is called from exactly six functions and every
- * one is a configuration, enable, disable or status call on a control path.
- * Nothing in the image reads Cx_SrcAddr or Cx_DstAddr for progress, and there
- * are exactly two audio threads -- MeCCAInputTask and MeCCAOutputTask --
- * with no timer or monitor between them.
+ * Sampling the PL080 source pointer and xrun-ing the stream when it stops
+ * moving has no counterpart in stock: nothing in the image reads the source
+ * or destination address for progress, and there are exactly two audio
+ * threads with no timer or monitor between them. Stock's only bound is a
+ * per-submit semaphore timeout whose return value the caller discards
+ * outright -- a DMA timeout in its audio path is invisible and the task
+ * simply carries on to the next period.
  *
- * Stock's only bound on the DMA is the per-submit semaphore timeout inside
- * sub_B65F4 (10000 ticks, returning 31), and sub_BFA50 at EA 0x0BFA6E
- * discards that return entirely -- a DMA timeout in the audio path is
- * invisible and the task simply carries on to the next period.
- *
- * A kernel cannot copy that: stock's producer IS the RTOS task, while ours
- * has an ALSA writer blocked in snd_pcm_write() that would never be released.
- * s5l8740_rearm_watchfn() is now the single bound, and it sits at the same
- * point in the sequence as sub_B65F4 -- one deadline per submitted period.
- * Its value is OURS; the tick period behind stock's 10000 is not established.
+ * A kernel cannot copy that, because stock's producer is the RTOS task while
+ * ours has an ALSA writer blocked in snd_pcm_write() that would never be
+ * released. s5l8740_rearm_watchfn() is the single bound, and it sits at the
+ * same point in the sequence as stock's semaphore -- one deadline per
+ * submitted period. Its value is ours; stock's is in ticks of an
+ * unestablished period.
  */
+
+/*
+ * Per-transfer tracing off by default.
+ *
+ * printk to a serial console is synchronous: the console is on ttySAC0 at
+ * 115200, and one of these lines is on the order of ten milliseconds on the
+ * wire. Emitting them from hw_params, trigger and the re-arm path put that
+ * delay inside the window that re-arms audio DMA, which underran, which
+ * logged, which delayed the next re-arm. The stream then start-stopped about
+ * twice a second until printk's own rate limiter silenced it and playback
+ * recovered on its own.
+ *
+ * So these are dev_dbg unless asked for: available through dyndbg, and
+ * through i2s_vinfo=1 when a whole subsystem's trace is wanted at once. Probe,
+ * removal and anything at warning or above are unaffected.
+ */
+static bool verbose;
+module_param(verbose, bool, 0644);
+MODULE_PARM_DESC(verbose,
+		 "Log per-transfer audio activity (default N)");
+
+#define i2s_vinfo(dev, fmt, ...) \
+	do { \
+		if (verbose) \
+			dev_info((dev), fmt, ##__VA_ARGS__); \
+		else \
+			dev_dbg((dev), fmt, ##__VA_ARGS__); \
+	} while (0)
 
 static int s5l8740_i2s_hw_params(struct snd_pcm_substream *substream,
 				 struct snd_pcm_hw_params *params,
@@ -1861,7 +1616,7 @@ static int s5l8740_i2s_hw_params(struct snd_pcm_substream *substream,
 	 */
 	if (hw_params_trace) {
 		hw_params_seen++;
-		dev_info(dai->dev, "hw_params #%u by %s[%d] rate=%u\n",
+		i2s_vinfo(dai->dev, "hw_params #%u by %s[%d] rate=%u\n",
 			 hw_params_seen, current->comm, current->pid,
 			 params_rate(params));
 
@@ -1885,13 +1640,27 @@ static int s5l8740_i2s_hw_params(struct snd_pcm_substream *substream,
 			      params_rate(params));
 	}
 
+	/*
+	 * Divider before codec, which is the order stock uses.
+	 *
+	 * Stock programs the serialiser first and only then mutes the codec,
+	 * raises the hold, waits 50 ms, writes the rate inside the codec's
+	 * configuration guard, drops the hold and waits 60 ms. Both halves
+	 * sit inside one critical section, so the codec settles against a
+	 * divider that is already correct.
+	 *
+	 * Reversed, the codec is brought up and settled at the new rate and
+	 * the divider is only moved underneath it afterwards. ASoC runs the
+	 * codec DAI's hw_params before the CPU DAI's, so by the time we get
+	 * here the codec has already finished its settle.
+	 */
+	s5l8740_i2s_program(i2s, resolved);
 	ret = s5l8740_i2s_codec_prepare();
 	if (ret && i2s->dev)
 		dev_warn(i2s->dev, "codec prepare in hw_params: %d\n", ret);
-	s5l8740_i2s_program(i2s, resolved);
 	div = clkdiv ? clkdiv : (r ? r->clkdiv : 0);
 	s5l8740_i2s_log_clocks(i2s, "hw_params");
-	dev_info(dai->dev,
+	i2s_vinfo(dai->dev,
 		 "IIS hw_params rate=%u resolved=%u code=%u clkdiv=%u dma=%d pio=%d txcom=%08x\n",
 		 rate, resolved, r ? r->cs42_rate_code : 0, div, i2s->has_dma,
 		 use_pio, readl(i2s->base + I2STXCOM));
@@ -1910,18 +1679,11 @@ static int s5l8740_i2s_trigger(struct snd_pcm_substream *substream, int cmd,
 	/*
 	 * Name who is driving the trigger, and from where.
 	 *
-	 * The stream start/stops about nine times a second and never moves a
-	 * sample: DAI trigger START, then STOP under a millisecond later,
-	 * then START again. The 110 ms between cycles is just the codec
-	 * rate-change settle inside codec_play_start, so the loop is as
-	 * tight as the hardware allows. Nothing in this driver asks for that
-	 * STOP, and the re-arm engine is the only bound left, so the caller
-	 * is upstream of us and this is the only way to see it.
-	 *
-	 * Backtrace on the first few STOPs only. A trace every 110 ms would
-	 * push itself out of the ring buffer before anyone could read it,
-	 * which is exactly what happened to the last set of dump_stack()
-	 * calls put in the hw_params path.
+	 * A stream that start/stops several times a second without moving a
+	 * sample is being driven from above this driver, and the caller is
+	 * not otherwise visible. Backtrace the first few stops only: at that
+	 * rate a trace per stop pushes itself out of the ring buffer before
+	 * anyone can read it.
 	 */
 	{
 		static unsigned int trig_seen;
@@ -1996,7 +1758,7 @@ static int s5l8740_i2s_trigger(struct snd_pcm_substream *substream, int cmd,
 		dev_dbg(dai->dev, "trig: done\n");
 		i2s->pio_run = use_pio;
 		i2s->play_jiffies = jiffies;
-		dev_info_ratelimited(dai->dev,
+		i2s_vinfo(dai->dev,
 			 "DAI trigger START path_mode=%d txcom=%08x sustain=%ums\n",
 			 path_mode, readl(i2s->base + I2STXCOM), sustain_ms);
 		return 0;
@@ -2007,7 +1769,7 @@ static int s5l8740_i2s_trigger(struct snd_pcm_substream *substream, int cmd,
 		    time_before(jiffies,
 				i2s->play_jiffies +
 				msecs_to_jiffies(sustain_ms))) {
-			dev_info_ratelimited(dai->dev,
+			i2s_vinfo(dai->dev,
 					     "DAI trigger STOP ignored (%ums sustain)\n",
 					     sustain_ms);
 			return 0;
@@ -2020,7 +1782,7 @@ static int s5l8740_i2s_trigger(struct snd_pcm_substream *substream, int cmd,
 			s5l8740_rearm_stop(i2s);
 		s5l8740_i2s_codec_play_stop();
 		s5l8740_i2s_hw_stop(i2s, substream);
-		dev_info_ratelimited(dai->dev, "DAI trigger STOP txcom=0\n");
+		i2s_vinfo(dai->dev, "DAI trigger STOP txcom=0\n");
 		return 0;
 	default:
 		return -EINVAL;
@@ -2039,33 +1801,28 @@ static int s5l8740_i2s_dai_probe(struct snd_soc_dai *dai)
 /*
  * Bring the codec up here, not in the trigger.
  *
- * cs42l81_play_start() sleeps for 160 ms of stock's own settle time --
- * msleep(60) for the mode-18 path settle and msleep(100) for the stage-2
- * graph. Those durations are stock's and are not ours to shorten.
+ * cs42l81_play_start() sleeps for 160 ms of stock's own settle time, and
+ * those durations are not ours to shorten. Where they run is ours, and the
+ * trigger is the wrong place: it runs inside snd_pcm_start() with the PCM
+ * stream lock held, and on a nonatomic DAI link that lock is a mutex the
+ * writer needs in order to add a period.
  *
- * Where they ran was ours, and it was wrong. The trigger runs inside
- * snd_pcm_start() with the PCM stream lock held, and on a nonatomic DAI
- * link that lock is a mutex the writer needs to add a period. tinyalsa
- * starts the stream at a start_threshold of one period, so the sequence was:
- * write one period, block 160 ms in the trigger, DMA starts, the single
- * queued period drains in 23 ms, and snd_pcm_period_elapsed() finds
- * hw_ptr == appl_ptr and declares an underrun. The application had never
- * been scheduled with the lock free. Measured on the device: 1 period, then
- * XRUN, then the recovery paid the 160 ms again -- forever. Playback ran
- * about 200 ms per second and mmap playback, which prefills the whole
- * buffer before starting, ran a full 423-period file with 0 underruns.
+ * With a start threshold of one period that gives: write one period, block
+ * 160 ms in the trigger, start the DMA, drain the single queued period in
+ * 23 ms, and declare an underrun -- the application never having been
+ * scheduled with the lock free. Recovery then pays the 160 ms again, so
+ * playback runs about 200 ms per second. mmap playback, which prefills the
+ * whole buffer before starting, was unaffected.
  *
- * prepare() is the callback for exactly this: it runs before the
- * application fills anything and before the stream starts, so the settle
- * cost is paid once, off the playback clock. That is also stock's order --
- * the MeCCAOutputTask preamble at EA 0x080B5B1C precedes the producer
- * callback that fills the first buffer, which precedes the PL080 enable.
- * Running the codec start from the trigger put it AFTER the fill, which is
- * the divergence, not the fix.
+ * prepare() is the callback for exactly this: it runs before the application
+ * fills anything and before the stream starts, so the settle is paid once,
+ * off the playback clock. It is also stock's order -- its playback task
+ * preamble precedes the callback that fills the first buffer, which precedes
+ * the DMA enable.
  *
  * The trigger still calls it. cs42l81_play_start() returns immediately once
- * the state is CS42_PLAYING, so that call is a no-op on the normal path and
- * remains the backstop if prepare() was skipped.
+ * the codec is already playing, so that call is a no-op on the normal path
+ * and remains the backstop if prepare() was skipped.
  */
 static int s5l8740_i2s_dai_prepare(struct snd_pcm_substream *substream,
 				   struct snd_soc_dai *dai)
@@ -2219,38 +1976,33 @@ static int s5l8740_pio_thread(void *data)
 }
 
 /*
- * Per-buffer re-arm playback, the way RetailOS actually drives this DMA.
+ * Per-buffer re-arm playback, the way stock drives this DMA.
  *
  * snd_dmaengine_pcm drives the controller cyclically: one multi-period LLI
  * chain, submitted once, left to free-run while the hardware walks the
  * descriptors forever. Stock does not do that, and the difference sits on
  * exactly the path that stalls.
  *
- * From the playback engine at 0xB5B14 and sub_BFA50's dispatch:
+ * Stock hands the hardware one transfer at a time:
  *
- *   first buffer    sub_BBA2C -> sub_BFA50 -> sub_C34EE -> sub_B424C(a4=1)
- *                   builds a five-dword LLI whose next-pointer is ITSELF,
- *                   then falls through to sub_B6620 for TXCOM |= 6
+ *   first buffer     build a five-dword LLI whose next-pointer is itself,
+ *                    program the channel, enable it, then arm TXCOM
+ *   every one after  rewrite the channel registers directly, write the LLI
+ *                    register as 0, and never touch TXCOM again
  *
- *   every one after sub_BBA12 -> sub_BFA50 -> sub_C34DC -> sub_C4960(a4=0)
- *                   programs the channel registers directly, writes the LLI
- *                   register as 0, and never touches TXCOM again
- *
- * So the hardware is handed one transfer at a time and software re-arms it
- * from the completion path. The self-link on the first descriptor is what
- * keeps the channel busy if software is late -- it repeats the last period
- * rather than stopping.
+ * so software re-arms from the completion path. The self-link on the first
+ * descriptor is what keeps the channel busy if software is late -- it
+ * repeats the last period rather than stopping.
  *
  * This implements that model: one period-sized slave transfer at a time,
  * re-armed from the DMA completion callback, with the transport kick issued
  * once after the first submit. The ALSA pointer advances from the callback
  * rather than from residue, so it does not depend on the residue reporting
- * that the cyclic path needs.
+ * the cyclic path needs.
  *
  * The callback also reads IIS STATUS bit 15 and write-1-clears it, counting
- * asserts. That is what the stock loop does after every submit (sub_BB9F8
- * via sub_C093C/sub_C095E, incrementing a counter at +0x164), and it is an
- * underrun flag, not a completion handshake.
+ * asserts. Stock does the same after every submit; it is an underrun flag,
+ * not a completion handshake.
  */
 static void s5l8740_i2s_destroy_wq(void *wq)
 {
@@ -2285,30 +2037,27 @@ static int s5l8740_rearm_submit(struct s5l8740_i2s *i2s)
 	stage = rt->dma_addr + frames_to_bytes(rt, stage_pos);
 
 	/*
-	 * Stock arms the channel ONCE and then only rewrites the descriptor.
+	 * Stock arms the channel once and then only rewrites the descriptor.
 	 *
-	 * sub_BFA50 dispatches on a one-shot byte, obj[0x0C]: zero takes
-	 * sub_C34EE -> sub_B424C(a4=1), which programs SrcAddr, DstAddr, LLI,
-	 * Control, Control2 and finally Config with the enable bit, and builds
-	 * a descriptor whose next-pointer is ITSELF. Non-zero takes
-	 * sub_C34DC -> sub_C4960(a4=0), which writes only the 20-byte
-	 * descriptor in memory -- no channel register at all -- and then waits
-	 * on the per-channel semaphore.
+	 * Its first submit programs every channel register including the
+	 * enable bit, and builds a descriptor whose next-pointer is itself.
+	 * Every later submit writes only the 20-byte descriptor in memory --
+	 * no channel register at all -- and waits on a per-channel semaphore.
 	 *
 	 * Because the node points at itself the transfer never terminates:
-	 * after each terminal count the PL080S reloads SrcAddr, DstAddr, LLI,
-	 * Control and Control2 from the descriptor, and Config.Enable stays
-	 * set for the whole stream. There is no channel-disabled edge; the TC
-	 * interrupt is the only completion signal.
+	 * after each terminal count the controller reloads the addresses and
+	 * control words from the descriptor, and the enable bit stays set for
+	 * the whole stream. There is no channel-disabled edge; the terminal
+	 * count interrupt is the only completion signal.
 	 *
-	 * We used to call dmaengine_prep_slave_single() every period, which
-	 * terminates the channel at each boundary and reprograms it from a
-	 * workqueue. The IIS TX FIFO drains in about a millisecond, so every
-	 * period boundary was an underrun window.
+	 * Preparing a fresh single transfer every period instead terminates
+	 * the channel at each boundary and reprograms it from a workqueue.
+	 * The IIS TX FIFO drains in about a millisecond, so every period
+	 * boundary became an underrun window.
 	 *
 	 * prep_dma_cyclic() with buf_len == period_len builds exactly stock's
-	 * topology -- nlli == 1, lli[0].lli == lli_phys -- so the first call
-	 * arms it and every later call only moves the source.
+	 * topology, so the first call arms it and every later call only moves
+	 * the source.
 	 */
 	/*
 	 * Nothing to post per period any more -- see the ring note below.
@@ -2337,17 +2086,16 @@ static int s5l8740_rearm_submit(struct s5l8740_i2s *i2s)
 	 * Hand the ring over and let the terminal-count interrupt walk it.
 	 *
 	 * The source walk for a cyclic ALSA buffer is fully determined by
-	 * base, length and period, so software scheduling has no business
-	 * being in the loop. It used to be: this function posted the next
-	 * period from the same workqueue item as snd_pcm_period_elapsed(),
-	 * inside a window exactly one period wide. On a single core also
-	 * running USB that window gets missed, the PL080S reloads the stale
-	 * source, and it replays the period it just finished -- audible as
-	 * break-up, with nothing to show for it because the FIFO never ran
-	 * dry and the underrun counter stayed at zero.
+	 * base, length and period, so software scheduling has no business in
+	 * the loop. Posting the next period from the same workqueue item as
+	 * snd_pcm_period_elapsed() leaves a window exactly one period wide;
+	 * miss it and the controller reloads the stale source and replays the
+	 * period it just finished. That is audible as break-up with nothing
+	 * to show for it, because the FIFO never runs dry and the underrun
+	 * counter stays at zero.
 	 *
-	 * s5l_pl080_start() has already loaded period zero into Cx_SrcAddr,
-	 * which is why set_ring stages period one for the first reload.
+	 * s5l_pl080_start() has already loaded period zero into the source
+	 * address, which is why this stages period one for the first reload.
 	 */
 	ret = s5l_pl080_rearm_set_ring(i2s->tx_chan, rt->dma_addr,
 				       frames_to_bytes(rt, rt->buffer_size),
@@ -2474,14 +2222,13 @@ static void s5l8740_rearm_done(void *data)
 	if (!rt || !rt->period_size)
 		return;
 
-	/* sub_BB9F8: check and write-1-clear the underrun flag. */
+	/* Check and write-1-clear the underrun flag. */
 	if (i2s->base) {
 		st = readl(i2s->base + I2SSTATUS);
 		/*
-		 * sub_BB9F8: sub_C093C reads STATUS bit 15 and sub_C095E writes
-		 * that bit back. Stock issues the clear UNCONDITIONALLY on every
-		 * iteration, with only the counter gated on the test. We used to
-		 * skip the write whenever the bit read clear.
+		 * Stock issues this clear unconditionally on every iteration,
+		 * with only the counter gated on the test. Skipping the write
+		 * when the bit reads clear is not the same sequence.
 		 */
 		writel(I2SSTATUS_TX_W1C, i2s->base + I2SSTATUS);
 		if (st & I2SSTATUS_TX_W1C)
@@ -2527,7 +2274,7 @@ static int s5l8740_rearm_start(struct s5l8740_i2s *i2s)
 	i2s->rearm_underrun = 0;
 	WRITE_ONCE(i2s->rearm_run, true);
 
-	/* First transfer, then the transport kick -- sub_BFA50 then sub_B6620. */
+	/* First transfer, then the transport kick, which is stock's order. */
 	ret = s5l8740_rearm_submit(i2s);
 	if (ret) {
 		WRITE_ONCE(i2s->rearm_run, false);
@@ -2592,7 +2339,7 @@ static void s5l8740_rearm_stop(struct s5l8740_i2s *i2s)
 	cancel_work(&i2s->rearm_work);
 	if (i2s->tx_chan)
 		dmaengine_terminate_async(i2s->tx_chan);
-	dev_info_ratelimited(i2s->dev,
+	i2s_vinfo(i2s->dev,
 			     "rearm stop: %u periods, %u underruns\n",
 			     i2s->rearm_periods, i2s->rearm_underrun);
 }
@@ -2904,7 +2651,7 @@ static ssize_t volume_store(struct device *dev, struct device_attribute *attr,
 static ssize_t volume_show(struct device *dev, struct device_attribute *attr,
 			   char *buf)
 {
-	return sysfs_emit(buf, "%u/%u (RetailOS Q8, 256=unity)\n",
+	return sysfs_emit(buf, "%u/%u (Q8, 256 = unity)\n",
 			  s5l8740_get_user_vol_q8(), S5L8740_USER_VOL_MAX);
 }
 static DEVICE_ATTR_RW(volume);
@@ -2988,7 +2735,7 @@ static ssize_t clk_run_store(struct device *dev, struct device_attribute *attr,
 		s5l8740_i2s_program(i2s, n31_pick_rate(default_rate));
 		s5l8740_i2s_tx_kick(i2s, false);
 	} else {
-		/* sub_5705DC: clear bit 2, keep the rest. */
+		/* Stock's disarm: clear bit 2, keep the rest. */
 	writel(readl(i2s->base + I2STXCOM) & ~I2STXCOM_RUN,
 	       i2s->base + I2STXCOM);
 	}
@@ -3064,16 +2811,14 @@ static int s5l8740_i2s_probe(struct platform_device *pdev)
 
 	/*
 	 * Bind the SRAM DMA pool named by memory-region, so the PCM buffer
-	 * comes from SRAM the way stock's does.
-	 *
-	 * RetailOS runs PL080 ch2 with src in SRAM (0x220025d0 measured
-	 * while playing, dst 0x3ca00010); ours was DRAM at 0x095c0020.
-	 * Without this call the memory-region property is inert and
-	 * dma_alloc_coherent() still lands in the default CMA/DRAM pool.
+	 * comes from SRAM the way stock's does. Stock runs its playback
+	 * channel with the source in SRAM; without this call the
+	 * memory-region property is inert and dma_alloc_coherent() still
+	 * lands in the default CMA/DRAM pool.
 	 *
 	 * Non-fatal: if the pool is missing or too small we keep the DRAM
-	 * buffer rather than refusing to probe, because a working DRAM
-	 * buffer is strictly better than no sound card at all.
+	 * buffer rather than refusing to probe, because a working DRAM buffer
+	 * is better than no sound card at all.
 	 */
 	ret = of_reserved_mem_device_init(dev);
 	if (ret) {
@@ -3395,7 +3140,7 @@ static int s5l8740_iis2_hw_params(struct snd_pcm_substream *substream,
 	}
 	iis2->rate = params_rate(params);
 	iis2_program_rx(iis2);
-	dev_info(dai->dev,
+	i2s_vinfo(dai->dev,
 		 "IIS2 hw_params rate=%u ch=%u clkdiv=0x%x reg44=0x%x status=0x%x\n",
 		 iis2->rate, params_channels(params),
 		 readl(iis2->base + I2SCLKDIV), readl(iis2->base + I2SREG44),
@@ -3419,7 +3164,7 @@ static int s5l8740_iis2_trigger(struct snd_pcm_substream *substream, int cmd,
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 		iis2_program_rx(iis2);
 		writel(IIS2_RXCOM_DMA, iis2->base + I2SRXCOM);
-		dev_info(dai->dev,
+		i2s_vinfo(dai->dev,
 			 "IIS2 capture start rxcom=0x%x status=0x%x\n",
 			 readl(iis2->base + I2SRXCOM),
 			 readl(iis2->base + I2SSTATUS));

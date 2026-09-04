@@ -867,17 +867,48 @@ static int bcm_fm_seek(struct bcm2078_bt *bt, int up, u8 rssi)
  */
 static void bcm_bt_power_up(struct bcm2078_bt *bt)
 {
+	/*
+	 * sphwBluetooth_Init, read out of the image rather than the
+	 * decompiled export, which drops the delay arguments:
+	 *
+	 *   570064  bl   0x17d4dc      variant power pad
+	 *   570068  bl   0x51681c      delays
+	 *   570072  bl   0x43d38c      pad 70 high, again
+	 *   570076  movs r0, #50
+	 *   570078  blx  0x345d48      delay(50)
+	 *   57007e  bl   0x5703ea      delay, 50, delay
+	 *   570082  bl   0x570360      open the port
+	 *
+	 * The variant byte at 0x8925CAC is 0x05 in this image, so sub_17D4DC
+	 * takes its variant-5 arm -- pad 70 high, then the pad's +0x0C bit --
+	 * and sub_5703EA takes sub_5169A8. The variant 1 and 2 arm drives pad
+	 * 200, which sub_43D38C and sub_57056C both discard on a pad == 200
+	 * test, so no second pin is reachable on this part.
+	 */
 	bcm_43D38C(bt, BCM_GPIO_UART, BCM_MODE_POWER, 0);
+
+	/* sub_17D4DC(5) */
 	bcm_43D38C(bt, BCM_GPIO_PWR, 1, 1);
 	bcm_428F70(bt, BCM_GPIO_PWR, 1);
+
 	/*
-	 * The part needs to come out of reset before it will answer. Stock
-	 * waits here through a thunk into 0x2200xxxx, which is not in the
-	 * image, so the length is not recoverable; this is the same
-	 * conservative stand-in bcm_power_on() already uses.
+	 * sub_51681C: three sub_345D40 and one sub_345D48, all thunks into
+	 * SRAM at 0x2200xxxx, which the image does not carry, so these
+	 * lengths are not recoverable. 50 ms is the one stock states.
 	 */
-	msleep(150);
-	dev_info(bt->dev, "BT power-on: pad 80 fn2, pad 70 high + gate\n");
+	msleep(50);
+
+	/* the second pad 70 write, which stock does unconditionally */
+	bcm_43D38C(bt, BCM_GPIO_PWR, 1, 1);
+
+	/* delay(50) -- the argument the decompiled export drops */
+	msleep(50);
+
+	/* sub_5703EA(5) -> sub_5169A8: delay, sub_43E006(50, 0), delay */
+	msleep(50);
+
+	dev_info(bt->dev,
+		 "BT power-on: pad 80 fn2, pad 70 high + gate, stock delays\n");
 }
 
 static int bcm_power_on(struct bcm2078_bt *bt)

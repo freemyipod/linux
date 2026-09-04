@@ -2,43 +2,17 @@
 /*
  * CS42L81 / Apple 338S1146 codec, SPI control port (iPod nano 7G / N31).
  *
- * Every register sequence here is transcribed from the RetailOS image
- * (osos.dec.bin) and is documented, access by access, in
- * docs-internal/n7g-audio/N31-REGISTER-TRACE-STOCK.md. The matching trace of
- * this driver is N31-REGISTER-TRACE-LINUX.md, and the differences between
- * them are enumerated in N31-REGISTER-TRACE-COMPARISON.md.
+ * The register sequences here are transcribed from the iPod nano 7G stock
+ * firmware. docs-internal/n7g-audio/N31-AUDIO-STOCK-MAP.md maps every
+ * function in this file to the stock routine it came from, documents the
+ * register semantics, and records the evidence behind the choices that are
+ * not self-evident from the code. Read it before changing any sequence
+ * below: the ordering, the settling delays and the register values are all
+ * load-bearing, and several of them are not what they look like.
  *
- * Function names follow the stock routine each one transcribes, so the two
- * traces can be read side by side:
- *
- *	sub_D3280(1)  cs42_state_park		analog config, then clock off
- *	sub_D2EFC     cs42_user_key		0x9901 key, once per boot
- *	sub_D3280(3)  cs42_state_run		divider, clock on, unfreeze
- *	sub_D3280(4)  cs42_state_analog_on
- *	sub_D2D2C     cs42_output_path_on/off
- *	sub_D2F64     cs42_path_mode
- *	sub_D34C0     cs42_set_rate		three-way dispatch on mode38
- *	sub_183138    cs42_set_rate_183138
- *	sub_42D364    cs42_transport_start/stop
- *	sub_F141C     cs42_analog_mute
- *	sub_F1444     cs42_fifo_strobe
- *	sub_570620    cs42_play_graph
- *	sub_5707D8    cs42_play_graph_static
- *	sub_165BD4    cs42_slot_map
- *	sub_400330    cs42_dac_gain		gain + 2v5 backpower rail
- *	sub_3C36A4    cs42_channel_gain
- *	sub_D2F2C     cs42_apply_gains		right channel, then left
- *
- * Deliberate deviations from stock, and only these:
- *
- *  - Every poll is bounded. Stock spins on 0x002F bit 7 with no escape,
- *    which an RTOS owning the machine can afford and a kernel cannot.
- *  - The play graph and the mode-18 path config run in .prepare rather than
- *    in the transport trigger. Between them they carry a 100 ms and a 60 ms
- *    settle; run from the trigger that delay lands between the application
- *    asking for playback and the DMA being armed, and the stream underruns
- *    before it starts. ALSA calls .prepare before every start, xrun recovery
- *    included, so the ordering relative to stock is preserved.
+ * Where this driver deliberately departs from stock -- bounded polls, and
+ * running the graph and path configuration from .prepare rather than the
+ * transport trigger -- the reasons are in section 7 of that document.
  */
 #include <linux/crc16.h>
 #include <linux/delay.h>
@@ -59,17 +33,45 @@
 
 #include "n31-audio-rates.h"
 
-/* Output gain, 0x0227. sub_D2C98 maps dB to the code the register carries. */
+/* Output gain, 0x0227. cs42_db_to_code() maps dB to the code it carries. */
 #define CS42_DB_MIN		(-76)
 #define CS42_DB_MAX		12
 #define CS42_DB_KNEE		(-50)
 #define CS42_VOL_MAX		(CS42_DB_MAX - CS42_DB_MIN)
 #define CS42_VOL_DEFAULT	(CS42_VOL_MAX - 32)	/* -20 dB */
 
-/* sub_400330 moves the 2v5 backpower rail across this gain threshold. */
+/* The 2.5 V backpower rail moves across this gain threshold. */
 #define CS42_RAIL_DB		(-8)
 
 /* Bounded replacement for stock's unbounded readiness poll. */
+/*
+ * Per-transfer tracing off by default.
+ *
+ * printk to a serial console is synchronous: the console is on ttySAC0 at
+ * 115200, and one of these lines is on the order of ten milliseconds on the
+ * wire. Emitting them from hw_params, trigger and the re-arm path put that
+ * delay inside the window that re-arms audio DMA, which underran, which
+ * logged, which delayed the next re-arm. The stream then start-stopped about
+ * twice a second until printk's own rate limiter silenced it and playback
+ * recovered on its own.
+ *
+ * So these are dev_dbg unless asked for: available through dyndbg, and
+ * through cs42_vinfo=1 when a whole subsystem's trace is wanted at once. Probe,
+ * removal and anything at warning or above are unaffected.
+ */
+static bool verbose;
+module_param(verbose, bool, 0644);
+MODULE_PARM_DESC(verbose,
+		 "Log per-transfer audio activity (default N)");
+
+#define cs42_vinfo(dev, fmt, ...) \
+	do { \
+		if (verbose) \
+			dev_info((dev), fmt, ##__VA_ARGS__); \
+		else \
+			dev_dbg((dev), fmt, ##__VA_ARGS__); \
+	} while (0)
+
 #define CS42_READY_POLLS	50
 
 static bool trace_spi;
@@ -81,84 +83,59 @@ module_param(debug_regs, bool, 0644);
 MODULE_PARM_DESC(debug_regs, "dump codec state at each lifecycle transition");
 
 /*
- * sub_570620's graph selector.
+ * Mixer graph selection.
  *
- * The branch is not on a magic variable. Disassembled at 0x08570644:
+ * Stock picks between a fixed graph image and a computed one on a runtime
+ * configuration word that neither firmware image initialises, and which this
+ * driver has no source for. Unset, that word selects the computed path, so
+ * that is the faithful default. The fixed image stays reachable because it
+ * is what stock emits when the word is set, and the two agree.
  *
- *	ldr   r0, [pc, #0xa4]	; r0 = 0x08A8F9DC
- *	ldr.w r0, [r0, #0x17c]	; r0 = config[0x17C / 4 = 95]
- *	cbz   r0, dynamic	; zero selects the dynamic path
- *	bl    sub_5707D8	; non-zero passes the blob pointer
- *
- * 0x08A8F9DC is the same runtime config table sub_149E98 reads at indices
- * 126 and 127 from sub_D34C0, so the selector is config entry 95. Neither
- * the table nor the entry is initialised by either firmware image -- both
- * addresses sit past the end of the image -- so it is populated at runtime
- * from configuration this driver does not have.
- *
- * With no config word, the value stock would read is zero, and zero selects
- * the dynamic path. That is therefore the faithful default here. The static
- * image stays reachable, because it is what stock emits when the entry is
- * set, and the two agree: the blob's taps (9, 8) are exactly what
- * sub_174E7C computes for the state sub_5706F4 installs.
- *
- *	0 = static sub_5707D8	(config entry 95 non-zero)
- *	1 = dynamic, route 1	(config entry 95 zero -- the default)
- *	3, 4 = dynamic, routes 3 and 4
+ *	0    fixed image
+ *	1    computed, route 1 (default)
+ *	3, 4 computed, routes 3 and 4
  */
 /*
- * Sample-rate-converter selection in cs42_set_rate_long(). 0 follows the
- * stock condition; 1 forces it on; 2 forces it off. See the comment there.
+ * Sample-rate-converter override for cs42_set_rate_long().
+ *
+ *	0  follow stock, which converts at 32 kHz and at no other rate
+ *	1  force the converter on
+ *	2  force it off
+ *
+ * A bench handle for A/B comparison, not a tuning knob. Leave it at 0.
  */
 static int src_mode;
 module_param(src_mode, int, 0644);
 MODULE_PARM_DESC(src_mode,
-	"0=stock condition, 1=force codec SRC on, 2=force it off");
+	"0=stock condition (SRC at 32k only), 1=force codec SRC on, 2=force it off");
 
 static int graph_mode = 1;
 module_param(graph_mode, int, 0644);
 MODULE_PARM_DESC(graph_mode,
-		 "sub_570620 graph: 1=dynamic route 1 (default), 0=static, 3/4=dynamic");
+		 "mixer graph: 1=computed route 1 (default), 0=fixed image, 3/4=computed");
 
 /*
- * MEMORY[0x892A02C], the MCLK in kHz. sub_D3280(3) selects clock divider 2
- * when this reads 12000 and 4 otherwise, and sub_D34C0 halves every entry of
- * the rate-divider table when it reads 6000.
+ * Codec master clock, in kHz.
  *
- * This has never been measured on the hardware -- every divider in the rate
- * table is 12000000/rate, which is consistent with 12 MHz but does not prove
- * it. It is a parameter rather than a constant so the assumption is visible
- * and can be moved in one place when it is measured.
+ * The codec clock divider and the whole rate-divider table are derived from
+ * this. It has never been measured on the hardware: every divider stock uses
+ * is 12000000/rate, which is consistent with 12 MHz but does not prove it.
+ * It is a parameter rather than a constant so the assumption stays visible
+ * and can be corrected in one place once it is measured.
  */
 static unsigned int mclk_khz = 12000;
 module_param(mclk_khz, uint, 0644);
 MODULE_PARM_DESC(mclk_khz,
-		 "MEMORY[0x892A02C], codec MCLK in kHz (12000 or 6000); UNMEASURED");
+		 "codec master clock in kHz (12000 or 6000); UNMEASURED");
 
 /*
- * sub_174E7C's inputs, read out of the image at 0x0892A05C..0x0892A06C.
+ * Per-slot gain and tap values for the computed graph.
  *
- * This block is initialised data, not BSS -- the bytes are present in
- * osos.dec.bin and 0x0892A000..0x0892A100 carries 88 non-zero bytes:
- *
- *	0x0892A05C count_l  = 2	   0x0892A05F count_r  = 0
- *	0x0892A05D idx_l_lo = 2	   0x0892A060 idx_r_lo = 2
- *	0x0892A05E idx_l_hi = 12   0x0892A061 idx_r_hi = 12
- *	0x0892A062 base_l   = 160  0x0892A064 base_r   = 160
- *
- * and the dword table at 0x0892A068 is
- *
- *	0, 27, 37, 37, 40, 54, 74, 74, 80, 107, 147, 148, 160
- *
- * so the per-slot gain sub_174E7C derives is
- *
- *	accum = (idx_lo + 1) * table[idx_hi] = 3 * 160 = 480 = 0x01E0
- *
- * which is exactly the gain sub_5707D8's static image writes into each
- * active slot, and feeding it back through the tap formula with
- * count_l = count_r = 2 and base 160 gives 9 and 8 -- the 0x0403 and 0x0404
- * that image writes. The static and dynamic paths agree exactly, and the
- * gain is derived here rather than assumed.
+ * Stock derives these from an initialised data block rather than hardcoding
+ * them, and the derivation is reproduced here rather than the result being
+ * assumed. It yields a slot gain of 480 and taps of 9 and 8, which are
+ * exactly the values stock's fixed graph image writes -- the two paths agree
+ * to the byte. The source block and the arithmetic are in the stock map.
  */
 static const u32 cs42_graph_table[] = {
 	0, 27, 37, 37, 40, 54, 74, 74, 80, 107, 147, 148, 160,
@@ -167,7 +144,7 @@ static const u32 cs42_graph_table[] = {
 #define CS42_IDX_LO		2
 #define CS42_IDX_HI		12
 
-/* sub_440AA4 is a plain unsigned divide. */
+/* Stock uses a plain unsigned divide here. */
 static u32 cs42_graph_accum(void)
 {
 	if (CS42_IDX_HI >= ARRAY_SIZE(cs42_graph_table))
@@ -197,16 +174,18 @@ struct cs42l81 {
 	unsigned int rate;		/* rate the codec is configured for */
 	unsigned int user_vol;		/* 0..CS42_VOL_MAX */
 	bool dai_mute;
-	bool key_done;			/* MEMORY[0x892A028] */
+	bool key_done;			/* unlock key already sent this boot */
 	bool graph_built;
 
 	/*
-	 * MEMORY[0x892A038]: shadow of 0x0220 bits 0x28, set by state 3 and
-	 * recomputed by sub_D2F64. sub_D34C0 dispatches on it.
+	 * Shadow of the two per-path hold bits in 0x0220. State 3 sets it
+	 * and cs42_path_mode() recomputes it; cs42_set_rate() dispatches on
+	 * it, because it says which output path is live and therefore which
+	 * one to program.
 	 */
-	u8 mode38;
+	u8 path_shadow;
 
-	/* MEMORY[0x892A044] / [0x892A048]: cached left/right gain, in dB. */
+	/* Cached left and right gain, in dB. */
 	int gain_l_db;
 	int gain_r_db;
 };
@@ -223,8 +202,8 @@ static struct cs42l81 *cs42l81_dev;
 /* ------------------------------------------------------------------ */
 
 /*
- * Two write frames. sub_43CDB4 sends five bytes and is used for everything
- * except a small set of registers; sub_3FA0E0 sends six and writes the
+ * Two write frames. The narrow one sends five bytes and is used for
+ * everything except a small set of registers; the wide one sends six and writes the
  * addressed register *and the one above it* -- the left/right pair of an
  * analog control. Dispatch is by register number so no call site can get it
  * wrong.
@@ -257,7 +236,7 @@ static int cs42_xfer(struct cs42l81 *c, const u8 *tx, u8 *rx, size_t len)
 	return ret;
 }
 
-/* sub_43CDB4 */
+/* Narrow write: one register. */
 static int cs42_wr8(struct cs42l81 *c, u16 reg, u8 val)
 {
 	u8 tx[5] = { 0x6c, reg >> 8, reg & 0xff, 0x00, val };
@@ -265,7 +244,7 @@ static int cs42_wr8(struct cs42l81 *c, u16 reg, u8 val)
 	return cs42_xfer(c, tx, NULL, sizeof(tx));
 }
 
-/* sub_3FA0E0 -- writes reg and reg+1 */
+/* Wide write: reg and reg+1. */
 static int cs42_wr16(struct cs42l81 *c, u16 reg, u8 val)
 {
 	u8 tx[6] = { 0x6c, reg >> 8, (reg & 0xff) | 0x80, 0x01, val, val };
@@ -273,7 +252,7 @@ static int cs42_wr16(struct cs42l81 *c, u16 reg, u8 val)
 	return cs42_xfer(c, tx, NULL, sizeof(tx));
 }
 
-/* sub_43CDFA */
+/* Register read. */
 static int cs42_rd(struct cs42l81 *c, u16 reg, u8 *val)
 {
 	u8 tx[5] = { 0x6d, reg >> 8, reg & 0xff, 0x00, 0xff };
@@ -287,8 +266,10 @@ static int cs42_rd(struct cs42l81 *c, u16 reg, u8 *val)
 }
 
 /*
- * sub_42A5D6. The mask narrows the value, not the transaction: a zero mask
- * still performs a read and a write, and stock relies on that in sub_D2F64.
+ * Masked read-modify-write.
+ *
+ * The mask narrows the value, not the transaction: a zero mask still
+ * performs a read and a write, and the path mode sequence relies on that.
  * Do not optimise it away.
  */
 static int cs42_rmw(struct cs42l81 *c, u16 reg, u8 mask, u8 val)
@@ -316,15 +297,17 @@ static int cs42_write_table(struct cs42l81 *c, const struct cs42_reg *t,
 }
 
 /* ------------------------------------------------------------------ */
-/* Message mailbox -- sub_15A50C / sub_19A838				*/
+/* Message mailbox							*/
 /* ------------------------------------------------------------------ */
 
 /*
- * 0x051E..0x0525 is a byte-oriented message FIFO, not the "coherent level
- * sampling" an earlier version of this driver described:
+ * Accessory and headphone-remote message channel.
+ *
+ * 0x051E..0x0525 is a byte-oriented message FIFO that shares the 0x05xx page
+ * with the audio graph registers but has nothing to do with audio:
  *
  *	0x051E	write-side control; bit 0 latches the level pair, bit 5
- *		strobes a reset (sub_F1444 pulses it)
+ *		strobes a reset
  *	0x051F	write-side status, bit 1 = full
  *	0x0520	free space, less one
  *	0x0521	write data port
@@ -332,23 +315,19 @@ static int cs42_write_table(struct cs42l81 *c, const struct cs42_reg *t,
  *	0x0524	read-side status
  *	0x0525	read data port
  *
- * The payload is framed by sub_19A838, which appends a CRC-16 over the first
- * len+5 bytes using a table at MEMORY[0x892A0C8]. That table is in ROM and is
- * bit-exact CRC-16/ARC (reflected polynomial 0xA001), which is what the
- * kernel's crc16() computes, so nothing here is invented.
+ * Frames carry a CRC-16 over the first len+5 bytes. Stock computes it from a
+ * ROM table that is bit-exact CRC-16/ARC, so the kernel's crc16() is a drop-in
+ * and nothing here is invented.
  *
- * Nothing in the audio path sends a message: sub_15A50C's only callers are
- * sub_131B84 and sub_1757B0, neither of which is reachable from sub_D3280,
- * sub_D2F64, sub_D34C0, sub_570620 or sub_42D364. This is the accessory /
- * headphone-remote channel. It is implemented and exported so the MikeyBus
- * side has the transport, and so that the audio path's *absence* of mailbox
- * traffic is a deliberate, documented match with stock rather than a gap.
+ * No part of the audio path sends a message. This is implemented and exported
+ * so the MikeyBus side has a transport, and so that the audio path's absence
+ * of mailbox traffic reads as a deliberate match with stock rather than a gap.
  */
 #define CS42_MBOX_LEN_OFF	1	/* payload length lives in byte 1 */
 #define CS42_MBOX_OVERHEAD	7	/* header + the two CRC bytes */
 #define CS42_MBOX_MAX		64	/* bound on the prepare-time FIFO drain */
 
-/* sub_19A838: append the CRC-16 and return the full frame length. */
+/* Append the CRC-16 and return the full frame length. */
 static size_t cs42_mbox_frame(u8 *buf, size_t buf_size)
 {
 	size_t len = buf[CS42_MBOX_LEN_OFF];
@@ -363,8 +342,8 @@ static size_t cs42_mbox_frame(u8 *buf, size_t buf_size)
 }
 
 /*
- * sub_15A50C: check the free space, then push the frame a byte at a time.
- * Stock returns 33 when the frame does not fit; -ENOSPC is the equivalent.
+ * Check the free space, then push the frame a byte at a time. Stock reports
+ * a distinct error when the frame does not fit; -ENOSPC is the equivalent.
  */
 static int cs42_mbox_send_locked(struct cs42l81 *c, const u8 *frame, size_t len)
 {
@@ -457,11 +436,10 @@ static void cs42_soc_clk_gate(struct cs42l81 *c, bool on)
 }
 
 /*
- * sub_345D28(9, 0, div), the first thing state 3 does -- before the clock
- * gate is opened. The divider follows MEMORY[0x892A02C], the MCLK in kHz:
- * 2 when it reads 12000, otherwise 4. Every divider in the rate table is
- * 12000000/rate, so 12 MHz is the case this board runs and 2 is the value
- * stock selects.
+ * Codec clock divider, the first thing state 3 does -- before the clock gate
+ * is opened. It follows the master clock: 2 at 12 MHz, otherwise 4. Every
+ * divider in the rate table is 12000000/rate, so 12 MHz is the case this
+ * board runs and 2 is the value stock selects.
  */
 static void cs42_soc_clk_divider(struct cs42l81 *c)
 {
@@ -482,7 +460,7 @@ static void cs42_soc_clk_divider(struct cs42l81 *c)
 /* Gain									*/
 /* ------------------------------------------------------------------ */
 
-/* sub_D2C98: dB to register code. 1 dB per step to -50, 2 dB below it. */
+/* dB to register code: 1 dB per step down to -50, 2 dB below that. */
 static int cs42_db_to_code(int db)
 {
 	if (db > CS42_DB_MAX)
@@ -496,7 +474,7 @@ static int cs42_db_to_code(int db)
 	return CS42_DB_KNEE + (db - CS42_DB_KNEE) / 2;
 }
 
-/* sub_3C6244: register code back to dB. Code -64 is the mute entry. */
+/* Register code back to dB. Code -64 is the mute entry. */
 static int cs42_code_to_db(u8 raw)
 {
 	int code = (s8)((raw & 0x40) ? (raw | 0x80) : (raw & 0x7f));
@@ -509,11 +487,11 @@ static int cs42_code_to_db(u8 raw)
 }
 
 /*
- * sub_400330: write the DAC gain, and move the 2.5 V backpower rail across
- * the -8 dB threshold.
+ * Write the DAC gain, and move the 2.5 V backpower rail across the -8 dB
+ * threshold.
  *
- * The rail is the class-H supply for the headphone amplifier. Stock raises
- * it when the gain comes up through -8 dB and, going the other way, arms a
+ * The rail is the class-H supply for the headphone amplifier. Stock raises it
+ * when the gain comes up through -8 dB and, going the other way, arms a
  * 601 ms timer and drops it when that expires. The delayed drop is not
  * implemented: leaving the rail up is the safe direction, and the timer only
  * saves idle current.
@@ -537,10 +515,10 @@ static int cs42_dac_gain(struct cs42l81 *c, int code)
 			cs42_wr8(c, 0xc96f, 0x0e);
 			cs42_rmw(c, 0x0219, 0x07, 0x01);
 			/*
-			 * sub_345D58(155). Both delay helpers call the same
-			 * primitive; sub_345D48 multiplies its argument by
-			 * 1000 first, so the primitive's unit is microseconds
-			 * and this settle is 155 us, not milliseconds.
+			 * 155 us, not milliseconds. Stock reaches this
+			 * through a delay helper whose argument is scaled
+			 * by 1000 relative to the one used elsewhere in
+			 * this file; the underlying unit is microseconds.
 			 */
 			usleep_range(155, 200);
 			cs42_wr8(c, 0xc96f, 0x1e);
@@ -549,18 +527,17 @@ static int cs42_dac_gain(struct cs42l81 *c, int code)
 		u8 rail = 0, comp = 0;
 
 		/*
-		 * The other half of the pair, sub_1883A8: drop the 2.5 V
-		 * backpower and clear the compensation bits.
+		 * The other half of the pair: drop the 2.5 V backpower and
+		 * clear the compensation bits.
 		 *
-		 * Stock gates it on its own shadow, MEMORY[0x892A024], which
-		 * is set when the rail was raised and cleared here. This
-		 * driver has no such shadow, so it reads the two registers
-		 * instead and only acts when they are in the raised state --
-		 * the same test the raise above uses, inverted.
+		 * Stock gates this on a shadow it sets when the rail was
+		 * raised. This driver keeps no such shadow, so it reads the
+		 * two registers and acts only when they are in the raised
+		 * state -- the same test the raise above uses, inverted.
 		 *
-		 * Without this the rail stays at 0x1E and 0x0219[2:0] stays
-		 * at 1 for the life of the part once any gain has crossed
-		 * the threshold, because nothing else ever writes them down.
+		 * Without it the rail stays at 0x1E and 0x0219[2:0] at 1 for
+		 * the life of the part once any gain has crossed the
+		 * threshold, because nothing else writes them down.
 		 */
 		if (!cs42_rd(c, 0xc96f, &rail) &&
 		    !cs42_rd(c, 0x0219, &comp) &&
@@ -574,9 +551,9 @@ static int cs42_dac_gain(struct cs42l81 *c, int code)
 }
 
 /*
- * sub_3C36A4(sel, 3, dB) for the two selectors this driver uses. Selector 0
- * is the DAC pair at 0x0227 and always routes through sub_400330; selector 1
- * is the pair at 0x0229 and is a plain wide write.
+ * Per-channel gain, for the two selectors this driver uses. Selector 0 is the
+ * DAC pair at 0x0227 and always routes through cs42_dac_gain(); selector 1 is
+ * the pair at 0x0229 and is a plain wide write.
  */
 static int cs42_channel_gain(struct cs42l81 *c, int sel, int db)
 {
@@ -586,9 +563,9 @@ static int cs42_channel_gain(struct cs42l81 *c, int sel, int db)
 }
 
 /*
- * sub_D2F2C, the gain re-apply the playback engine runs before it submits
- * its first buffer: right channel first, then left. This is why 0x0229
- * carries a real gain in stock rather than the constant its power-up leaves.
+ * Gain re-apply, right channel first and then left. The playback engine runs
+ * this before it submits its first buffer, which is why 0x0229 carries a real
+ * gain rather than the constant power-up leaves there.
  */
 static int cs42_apply_gains(struct cs42l81 *c)
 {
@@ -607,10 +584,10 @@ static int cs42_apply_user_vol(struct cs42l81 *c)
 }
 
 /* ------------------------------------------------------------------ */
-/* Power states -- sub_D3280						*/
+/* Power states								*/
 /* ------------------------------------------------------------------ */
 
-/* sub_D2EFC: the 0x9901 key, once per boot, from inside state 3. */
+/* The 0x9901 unlock key, once per boot. */
 static void cs42_user_key(struct cs42l81 *c)
 {
 	if (c->key_done)
@@ -621,8 +598,8 @@ static void cs42_user_key(struct cs42l81 *c)
 }
 
 /*
- * sub_D3280(1). Configures the analog block, waits for it to report ready,
- * raises the freeze latch and drops the codec clock. State 3 is the matching
+ * Park. Configures the analog block, waits for it to report ready, raises the
+ * freeze latch and drops the codec clock. cs42_state_run() is the matching
  * half; stock never runs one without the other.
  */
 static int cs42_state_park(struct cs42l81 *c)
@@ -634,23 +611,17 @@ static int cs42_state_park(struct cs42l81 *c)
 	/*
 	 * The codec clock has to be running before any of this is written.
 	 *
-	 * sub_D3280(a1 == 1) does not enable the clock -- it *ends* by
-	 * dropping it, via sub_41CBD8(v6, 0), and simply assumes it was on
-	 * when it was entered. Stock always satisfies that: the bootloader's
-	 * own analog power-up (sub_1310) runs with the clock on, and every
-	 * later entry comes from state 3, which leaves it on.
+	 * Park does not enable the clock -- it ends by dropping it, and
+	 * assumes it was on at entry. Stock always satisfies that, because
+	 * every entry to park follows either the bootloader's analog
+	 * power-up or state 3, both of which leave the clock on.
 	 *
-	 * Nothing in this driver satisfied it. State 3 was the only place
-	 * that ever turned the clock on, and it runs *after* this, so every
-	 * park wrote its whole sequence into a gated bus. The writes were
-	 * issued, the SPI transfers completed, and nothing landed: 0x0225
-	 * stayed 0x00 instead of 0x33 and 0x0220 kept none of the 0x78 --
-	 * which is the analog output block never being powered up at all,
-	 * while the codec still answered reads and every register state 3
-	 * touches looked perfect.
-	 *
-	 * Establish the precondition here rather than in the caller, so it
-	 * holds for every entry to park, not just the one through prepare.
+	 * Nothing in this driver's own flow satisfies it, since cs42_prepare()
+	 * parks first. Writes into a gated bus complete normally at the SPI
+	 * layer and land nowhere, which leaves the analog output block
+	 * unpowered while the codec still answers reads and every register
+	 * state 3 touches looks correct. Establish the precondition here
+	 * rather than in the caller, so it holds for every entry to park.
 	 */
 	cs42_soc_clk_divider(c);
 	cs42_soc_clk_gate(c, true);
@@ -659,26 +630,15 @@ static int cs42_state_park(struct cs42l81 *c)
 	 * The 0x9901 key has to be in before the 0x02xx writes below, or the
 	 * codec discards them.
 	 *
-	 * sub_D2EFC applies it once per boot and records that in
-	 * MEMORY[0x892A028]; stock issues it from state 3, which in its flow
-	 * has already run long before any state 1. This driver enters park
-	 * first, so the key was still outstanding and every 0x02xx write in
-	 * this function was rejected -- silently, because the SPI transfer
-	 * itself completes normally.
+	 * The key is applied once per boot. Stock issues it from state 3,
+	 * which in its flow has always run long before any park. This driver
+	 * enters park first, so without the call here every 0x02xx write in
+	 * this function is rejected -- silently, because the SPI transfer
+	 * itself completes normally, and page 0x00 writes in the same
+	 * sequence still land.
 	 *
-	 * The evidence is in a trace_spi capture: park issues
-	 *   6c 02 a5 01 33 33      0x0225 = 0x33
-	 *   6c 02 20 00 78         0x0220 = 0x78
-	 * and state 3's very next read-modify-write of 0x0220 stores 0x28,
-	 * which is (0x00 & ~0x28) | 0x28 -- so the read came back 0x00 and
-	 * neither write had taken. Page 0x00 writes in the same sequence
-	 * (0x0075, 0x0006, 0x0007) all landed, and everything after the key
-	 * landed. 0x0225 is the analog output register, so what this cost was
-	 * the analog block never powering up, with the codec still answering
-	 * reads and every register state 3 touches looking correct.
-	 *
-	 * cs42_user_key() is idempotent via c->key_done, so state 3's call
-	 * stays where stock has it and simply becomes a no-op after this.
+	 * cs42_user_key() is idempotent, so state 3's call stays where stock
+	 * has it and becomes a no-op after this.
 	 */
 	cs42_user_key(c);
 
@@ -702,23 +662,18 @@ static int cs42_state_park(struct cs42l81 *c)
 		return ret;
 
 	/*
-	 * Stock spins here forever. sub_D3280 at EA 0x0D347C is
+	 * Bounded, unlike stock.
 	 *
-	 *	delay(1); read(0x002F); if (!(v & 0x80)) goto back;
+	 * Stock spins on this bit with no counter, no deadline and no error
+	 * arm. That is affordable for an RTOS that owns the machine and not
+	 * for a kernel, where it would wedge whichever thread ALSA called us
+	 * on. The 1 ms per iteration follows stock's delay; the iteration
+	 * count is ours and has no stock basis.
 	 *
-	 * with no counter, no deadline and no error arm -- the bpl is the
-	 * only way out. That is the one comment in this driver the decomp
-	 * actually backs.
-	 *
-	 * We cannot copy it: an unbounded spin here wedges whichever thread
-	 * ALSA called us on. The 1 ms per iteration matches stock's delay(1)
-	 * argument; the count of 50 is OURS and has no stock basis.
-	 *
-	 * What we must not do is carry on. This used to warn and fall
-	 * through into the 0x0006 and 0x0007 writes below -- writes stock
-	 * can never reach without bit 7 set, because it is still in the
-	 * loop. Continuing puts the codec in a state stock never produces,
-	 * which is worse than failing. Fail instead.
+	 * On timeout, fail rather than continue. The writes below are ones
+	 * stock cannot reach without this bit set, because it is still in the
+	 * loop; issuing them anyway puts the codec in a state stock never
+	 * produces.
 	 */
 	for (i = 0; i < CS42_READY_POLLS; i++) {
 		usleep_range(1000, 1500);
@@ -751,9 +706,9 @@ static int cs42_state_park(struct cs42l81 *c)
 }
 
 /*
- * sub_D3280(3). Selects the codec clock divider, turns the clock back on,
- * sends the key once, releases the freeze latch and reads the two trim bytes
- * stock caches at MEMORY[0x892A054].
+ * Run. Selects the codec clock divider, turns the clock back on, sends the
+ * key once, releases the freeze latch and reads the two trim bytes stock
+ * caches for later use.
  */
 static int cs42_state_run(struct cs42l81 *c)
 {
@@ -770,7 +725,7 @@ static int cs42_state_run(struct cs42l81 *c)
 	ret = cs42_rmw(c, 0x0006, 0x40, 0x00);
 	if (ret)
 		return ret;
-	c->mode38 = 0x28;
+	c->path_shadow = 0x28;
 	ret = cs42_rmw(c, 0x0220, 0x28, 0x28);
 	if (ret)
 		return ret;
@@ -796,16 +751,16 @@ static int cs42_state_run(struct cs42l81 *c)
 }
 
 /* ------------------------------------------------------------------ */
-/* Path mode -- sub_D2F64 / sub_D2D2C					*/
+/* Path mode and output path						*/
 /* ------------------------------------------------------------------ */
 
 /*
- * sub_D2F64 evaluated for the three modes this driver uses. The skeleton is
- * fixed and only the values and two conditional blocks differ, so the shape
- * is written once and the per-mode values come from a table.
+ * Path mode, for the three modes this driver uses. The sequence is fixed and
+ * only the values and two conditional blocks differ, so the shape is written
+ * once and the per-mode values come from a table.
  *
  * 0x0204 and 0x0203 are issued even when their mask is zero, because stock
- * issues them: sub_42A5D6 is a read and a write regardless of the mask.
+ * issues them and a masked write is still a read and a write.
  */
 struct cs42_path_mode {
 	u8 r06;			/* 0x0006 mask 0x04 */
@@ -820,10 +775,10 @@ struct cs42_path_mode {
 	u8 r203;		/* 0x0203 mask 0xC0 */
 	bool has_eq;		/* 0x000E / 0x011F / 0x0120 / 0x012E block */
 	unsigned int settle_ms;
-	u8 mode38;		/* MEMORY[0x892A038] afterwards */
+	u8 path_shadow;		/* 0x0220 hold bits this mode leaves behind */
 };
 
-/* sub_D2F64(271), reached through sub_D2D2C(1). */
+/* Mode 271, installed by the output path enable. */
 static const struct cs42_path_mode cs42_mode_271 = {
 	.r06 = 0x00, .r220 = 0x00,
 	.has_r0d = false,
@@ -833,10 +788,10 @@ static const struct cs42_path_mode cs42_mode_271 = {
 	.r203 = 0x00,
 	.has_eq = true,
 	.settle_ms = 105,
-	.mode38 = 0x00,
+	.path_shadow = 0x00,
 };
 
-/* sub_D2F64(18), applied by the playback engine before its first buffer. */
+/* Mode 18, applied by the playback engine before its first buffer. */
 static const struct cs42_path_mode cs42_mode_18 = {
 	.r06 = 0x04, .r220 = 0x08,
 	.has_r0d = true, .r0d = 0x00,
@@ -846,10 +801,10 @@ static const struct cs42_path_mode cs42_mode_18 = {
 	.r203 = 0xc0,
 	.has_eq = false,
 	.settle_ms = 60,
-	.mode38 = 0x08,
+	.path_shadow = 0x08,
 };
 
-/* sub_D2F64(6), the companion of sub_D2D2C(0). */
+/* Mode 6, the companion of the output path disable. */
 static const struct cs42_path_mode cs42_mode_6 = {
 	.r06 = 0x04, .r220 = 0x00,
 	.has_r0d = true, .r0d = 0x00,
@@ -859,10 +814,12 @@ static const struct cs42_path_mode cs42_mode_6 = {
 	.r203 = 0xc0,
 	.has_eq = false,
 	.settle_ms = 60,
-	.mode38 = 0x00,
+	.path_shadow = 0x00,
 };
 
 static int cs42_set_rate(struct cs42l81 *c, unsigned int rate);
+static int cs42_src_bypass(struct cs42l81 *c);
+static int cs42_hp_mute(struct cs42l81 *c, bool mute);
 
 static int cs42_path_mode(struct cs42l81 *c, const struct cs42_path_mode *m)
 {
@@ -871,10 +828,16 @@ static int cs42_path_mode(struct cs42l81 *c, const struct cs42_path_mode *m)
 	ret = cs42_rmw(c, 0x0006, 0x04, m->r06);
 	if (ret)
 		return ret;
-	ret = cs42_rmw(c, 0x0220, 0x28, m->r220);
+	/*
+	 * Every mode but the bring-up one leaves the headphone hold clear.
+	 * Keep it raised when the user has muted, so applying a mode -- which
+	 * happens on every stream start -- does not undo the control.
+	 */
+	ret = cs42_rmw(c, 0x0220, 0x28,
+		       c->dai_mute ? (u8)(m->r220 | 0x20) : m->r220);
 	if (ret)
 		return ret;
-	c->mode38 = m->mode38;
+	c->path_shadow = m->path_shadow;
 	if (m->has_r0d) {
 		ret = cs42_rmw(c, 0x000d, 0x03, m->r0d);
 		if (ret)
@@ -921,31 +884,22 @@ static int cs42_path_mode(struct cs42l81 *c, const struct cs42_path_mode *m)
 	/*
 	 * Re-apply the rate against the shadow this call just installed.
 	 *
-	 * sub_D2F64 ends with a BL to sub_18311C at EA 0x000D31F2 -- found
-	 * by scanning the image for Thumb BL targets, because the .c export
-	 * lists no call site. sub_18311C saves MEMORY[0x892A034], clears it,
-	 * calls sub_D34C0 and restores it: re-run the rate programming.
+	 * The rate program picks which output path to configure from the
+	 * shadow, so a mode change that moves the shadow invalidates it.
+	 * Stock re-applies from the output-enable op, and only when the
+	 * shadow selects a path -- not from the path mode itself.
 	 *
-	 * It matters because sub_D34C0 picks its arm on the shadow this
-	 * function writes. 0x28 takes the short arm, which programs only the
-	 * mute bracket, 0x000F and 0x012F; 0x08 takes the long arm, the only
-	 * one that writes 0x0121, 0x0122, 0x0130, 0x0131, 0x0223, 0x0224 and
-	 * 0x0222. cs42_state_run() sets the shadow to 0x28 at the top of
-	 * every prepare, so without this second pass the converter registers
-	 * keep their bring-up values -- the 48 kHz ones -- at every rate.
-	 *
-	 * Measured on a freshly power-cycled part playing 44.1 kHz without
-	 * it: 0x0222 = 0x0c, 0x0130 = 0xcc, 0x0131 = 0x01, i.e. the codec
-	 * configured for 48 kHz while the serialiser clocked 44117.65 Hz --
-	 * 2900/4900 Hz spurs at -33 dBc and 0.102% THD. With it, and the
-	 * converter engaged, -55 dBc and 0.0067%.
+	 * Gating on the shadow reproduces that. Re-applying unconditionally
+	 * would additionally run the 0x010x sink's program from mode 271's
+	 * shadow of zero, which writes 0x010B and 0x010C; a live stock dump
+	 * shows both still holding their reset values.
 	 */
-	if (c->rate)
+	if (c->rate && (m->path_shadow & 0x08))
 		return cs42_set_rate(c, c->rate);
 	return 0;
 }
 
-/* sub_D2D2C(1) */
+/* Output path enable. */
 static int cs42_output_path_on(struct cs42l81 *c)
 {
 	int ret = cs42_rmw(c, 0x0206, 0x3f, 0x08);
@@ -958,11 +912,20 @@ static int cs42_output_path_on(struct cs42l81 *c)
 	return cs42_path_mode(c, &cs42_mode_271);
 }
 
-/* sub_D2D2C(0): the mode runs first, then the path is taken down. */
+/* Output path disable: the mode runs first, then the path is taken down. */
 static int cs42_output_path_off(struct cs42l81 *c)
 {
-	int ret = cs42_path_mode(c, &cs42_mode_6);
+	int ret;
 
+	/*
+	 * Stock's output-path disable puts the converter back in bypass
+	 * before it takes the rest of the path down, which is why a live
+	 * stock dump reads 0x0131 bit 0 set between streams.
+	 */
+	ret = cs42_src_bypass(c);
+	if (ret)
+		return ret;
+	ret = cs42_path_mode(c, &cs42_mode_6);
 	if (ret)
 		return ret;
 	ret = cs42_rmw(c, 0x0206, 0x3f, 0x00);
@@ -972,39 +935,16 @@ static int cs42_output_path_off(struct cs42l81 *c)
 }
 
 /*
- * sub_D3280(4) -- the ANALOG BRING-UP, not a power-down.
+ * Analog bring-up: power the output stage.
  *
- * This was called cs42_state_standby and described as "a power-down:
- * analog enable off, rail down, gain to the mute code". The register
- * sequence below is a byte-exact transliteration and always was; only the
- * name and the call site were wrong, and the name is what kept it off the
- * playback path.
+ * This is a climb, not a power-down. Stock's state applier stages this state
+ * through the run state when the current state is below it, which is not
+ * something anything does to reach a power-down, and the sequence itself
+ * powers the analog block, raises the 2.5 V backpower and applies gain.
  *
- * What settles it is the state applier sub_D3700, which IDA omits, read out
- * of the raw image at 0x000D3752:
- *
- *	d3756  cmp  r1, #4       ; target mode
- *	d3758  bne  0xd3768
- *	d375a  cmp  r0, #3       ; current mode
- *	d375c  bcs  0xd3768      ; skip when current >= 3
- *	d375e  movs r0, #3
- *	d3760  bl   0xd3280      ; sub_D3280(3) FIRST
- *	d3768  ldrb r0, [r5, #4]
- *	d376a  bl   0xd3280      ; then sub_D3280(target)
- *
- * Mode 4 is staged THROUGH mode 3. Nothing stages through the run state to
- * reach a power-down; 1 (park) -> 3 (run) -> 4 is a climb.
- *
- * The body agrees. From osos.dec.bin.ida.c, decimal register numbers
- * decoded: 0x219 |= 0x78, 0x201[7:5] = 0x40, 0xC81F = 0xFF, 0xC85F = 0x0F,
- * 0xC96F = 0x0E (the 2.5 V backpower), 0x223 = 0x08, 0x224 = 0x09, then
- * sub_400330(64)/(65) applying gain, 0x229/0x22A = 0x41, and finally
- * 0x00E[7:6] = 0x40 closing the config guard. That is an output stage being
- * powered and gained, not torn down.
- *
- * Corroborated by measurement: our live codec dump read 0x0219 = 0x00,
- * i.e. that 0x78 was never set, and the device produces no plop on reboot
- * -- nothing to discharge, because the analog stage never came up.
+ * A live dump of this driver before the state was reached read 0x0219 as
+ * zero, so the analog stage had never come up, which also explains the
+ * absence of any discharge plop on reboot.
  */
 static int cs42_state_analog_on(struct cs42l81 *c)
 {
@@ -1045,10 +985,37 @@ static int cs42_state_analog_on(struct cs42l81 *c)
 }
 
 /* ------------------------------------------------------------------ */
-/* Sample rate -- sub_D34C0 / sub_183138				*/
+/* Sample rate								*/
 /* ------------------------------------------------------------------ */
 
-/* sub_183138(code, 1). Ends muted with the 0x0220 bit-5 hold raised. */
+/*
+ * Put the converter back in bypass.
+ *
+ * This is the whole of stock's rate program when its second argument is
+ * zero: the argument gates the function at its first instruction, and a zero
+ * skips everything and issues this single write. The output-path disable
+ * calls it that way.
+ */
+static int cs42_src_bypass(struct cs42l81 *c)
+{
+	return cs42_rmw(c, 0x0131, 0x01, 0x01);
+}
+
+/*
+ * Rate program for the 0x010x sink. Ends muted, with the 0x0220 bit-5 hold
+ * raised.
+ *
+ * Stock guards the body with an accessory-route test that has no counterpart
+ * here -- see section 3 of the stock map. The gate can only suppress writes,
+ * so this programs unconditionally rather than substituting a test of our
+ * own.
+ *
+ * The converter test below is against rate code 12 and is written directly
+ * into stock's instruction stream. It is not the test cs42_set_rate_long()
+ * uses; the two functions genuinely differ. 0x010B and 0x010C belong to a
+ * different sink than the 0x022x headphone path, and this function never
+ * touches 0x0222, 0x0223 or 0x0224.
+ */
 static int cs42_set_rate_183138(struct cs42l81 *c, u8 code)
 {
 	int ret;
@@ -1085,7 +1052,9 @@ static int cs42_set_rate_183138(struct cs42l81 *c, u8 code)
 	return cs42_rmw(c, 0x0220, 0x20, 0x20);
 }
 
-/* sub_D34C0, short branch: mode38 carries both 0x08 and 0x20. */
+/*
+ * Rate program when both paths are held: the rate alone, with no routing.
+ */
 static int cs42_set_rate_short(struct cs42l81 *c, u8 code)
 {
 	int ret = cs42_rmw(c, 0x000e, 0xc0, 0xc0);
@@ -1103,90 +1072,40 @@ static int cs42_set_rate_short(struct cs42l81 *c, u8 code)
 }
 
 /*
- * sub_D34C0, long branch: mode38 carries 0x08 but not 0x20. Mutes, raises
- * the hold, programs the rate inside the 0x000E bracket, drops the hold and
- * restores the cached gain.
+ * Rate program for the 0x022x headphone path, taken when the shadow carries
+ * 0x08 but not 0x20. Mutes, raises the hold, programs the rate and the path
+ * routing inside the 0x000E configuration guard, drops the hold and restores
+ * the gain.
  *
- * Stock chooses between the native and converted arms with two config-flag
- * lookups crossed with the rate. Without that config the native case is
- * taken to be rate code 12 exactly, which is the test sub_183138 uses.
+ * This is the only function that writes 0x0222, 0x0223 and 0x0224, so it is
+ * the only one that configures the headphone path at all.
+ *
+ * On a retail device stock's converter condition reduces to rate == 32000,
+ * and a live stock dump at 44.1 kHz confirms it: 0x0222 = 0x0a (the DAC
+ * running natively at 44.1), 0x0223/0x0224 = 0x08/0x09 (the direct feed) and
+ * 0x0131 = 0x01 (converter bypassed).
+ *
+ * The reason stock bypasses at 44.1 is that 12 MHz has no integer divider
+ * for that family. The IIS divider is 12e6/rate truncated, so the serialiser
+ * really clocks 44117.65 Hz at "44100", 22058.82 at "22050" and 11029.41 at
+ * "11025" -- each 400 ppm fast. Through the converter, which is told its
+ * input arrives at the tabled rate, that mismatch slips a sample about
+ * eighteen times a second and is plainly audible. Clocking the DAC straight
+ * off LRCK leaves the same 400 ppm as a pitch offset of a fifteenth of a
+ * semitone. 32 kHz, the one rate stock does convert, divides exactly.
+ *
+ * Full derivation and the dump are in section 3 of the stock map.
  */
 static int cs42_set_rate_long(struct cs42l81 *c, u8 code)
 {
-	/*
-	 * Stock's condition is
-	 *
-	 *	(sub_149E98(126) && rate != 48000) ||
-	 *	(rate == 32000 && !sub_149E98(127))
-	 *
-	 * where sub_149E98(n) is *(u32 *)(0x8A8F9DC + 4n) != 0.
-	 *
-	 * That table is resolvable. Its initialiser zeroes all 0xBB entries
-	 * and then populates them only when sub_16297C("_enable_options", ..)
-	 * succeeds and reports the file present -- an Apple diagnostic options
-	 * file under iPod_Control\Device\. When it is absent the function
-	 * returns with the table still entirely zero, which is the retail
-	 * case.
-	 *
-	 * With entries 126 and 127 zero the first clause is false and the
-	 * second reduces to rate == 32000, i.e. rate code 9. Every other rate
-	 * takes the native arm here.
-	 *
-	 * Note this is the opposite sense to sub_183138, which tests its rate
-	 * code against 12 directly in the instruction stream. The two
-	 * functions genuinely differ; they are not two spellings of one test.
-	 */
-	/*
-	 * src_mode: 0 = stock condition (default), 1 = force SRC on,
-	 * 2 = force SRC off. An experiment handle, not a feature.
-	 *
-	 * The stock condition above reduces to "rate == 32000" only if
-	 * sub_149E98(126) is zero, which is what we concluded from the
-	 * _enable_options file being absent on a retail device. That
-	 * conclusion is worth testing, because 44.1 kHz is measurably
-	 * distorted and 48 kHz is not, and the difference between them is
-	 * exactly the thing an SRC would absorb:
-	 *
-	 *	48000 -> clkdiv 250, 12 MHz / 250 = 48000.00 exactly
-	 *	44100 -> clkdiv 272, 12 MHz / 272 = 44117.65
-	 *
-	 * No integer divider off a 12 MHz reference produces 44100, so at
-	 * "44.1" the serialiser really clocks 44117.6 while the codec is
-	 * told rate code 10. If sub_149E98(126) is in fact non-zero on real
-	 * hardware, stock's condition is true for every rate but 48000 and
-	 * stock engages the SRC exactly where we do not.
-	 */
-	/*
-	 * Sample-rate-converter selection, stock's condition.
-	 *
-	 * src_mode overrides it for comparison: 1 forces on, 2 forces off.
-	 */
-	/*
-	 * Engage the converter for every rate except 48 kHz.
-	 *
-	 * Stock's test is
-	 *
-	 *	sub_149E98(126) && rate != 48000 || rate == 32000 && !sub_149E98(127)
-	 *
-	 * and it was implemented here as "rate == 32000", which is what it
-	 * reduces to only if sub_149E98(126) is zero. Measured at the jack,
-	 * that assumption is wrong: with the converter bypassed a 1 kHz tone
-	 * at 44.1 kHz shows 2900/4900 Hz spurs at -33 dBc and 0.102% THD,
-	 * and with it engaged the same tone gives -55 dBc and 0.0067% --
-	 * better THD than the 48 kHz control. So sub_149E98(126) is
-	 * non-zero on this hardware and the condition is "not 48 kHz".
-	 *
-	 * 48 kHz is the one rate a 12 MHz reference divides exactly
-	 * (12e6/250), so it is also the one rate with nothing for the
-	 * converter to correct.
-	 */
-	bool src = code != 12;
+	/* Stock's condition on a retail device: rate == 32000, code 9. */
+	bool src = code == 9;
+	int ret;
 
 	if (src_mode == 1)
 		src = true;
 	else if (src_mode == 2)
 		src = false;
-	int ret;
 
 	ret = cs42_dac_gain(c, 0x40);
 	if (ret)
@@ -1210,7 +1129,6 @@ static int cs42_set_rate_long(struct cs42l81 *c, u8 code)
 		cs42_wr8(c, 0x0223, 0x04);
 		cs42_wr8(c, 0x0224, 0x33);
 	} else {
-		/* src_mode=2 only: bypass, for comparison against the above. */
 		cs42_rmw(c, 0x0131, 0x01, 0x01);
 		cs42_wr8(c, 0x0223, 0x08);
 		cs42_wr8(c, 0x0224, 0x09);
@@ -1220,15 +1138,22 @@ static int cs42_set_rate_long(struct cs42l81 *c, u8 code)
 	ret = cs42_rmw(c, 0x000e, 0xc0, 0x40);
 	if (ret)
 		return ret;
-	ret = cs42_rmw(c, 0x0220, 0x20, 0x00);
+	ret = cs42_hp_mute(c, c->dai_mute);
 	if (ret)
 		return ret;
 	msleep(60);
 
-	return cs42_apply_gains(c);
+	/*
+	 * Restore the gain: the volume is summed into the gain accumulator,
+	 * mapped to a code and written. One call, and deliberately not
+	 * cs42_apply_gains() -- stock does not touch 0x0229 here, because
+	 * the right-channel write belongs to the separate gain re-apply the
+	 * playback engine runs.
+	 */
+	return cs42_dac_gain(c, cs42_db_to_code(c->gain_l_db));
 }
 
-/* sub_D34C0's three-way dispatch, on the shadow stock maintains. */
+/* Rate dispatch: which path is live decides which program to run. */
 static int cs42_set_rate(struct cs42l81 *c, unsigned int rate)
 {
 	const struct n31_rate_cfg *r = n31_find_rate(rate);
@@ -1237,9 +1162,9 @@ static int cs42_set_rate(struct cs42l81 *c, unsigned int rate)
 	if (!r)
 		return -EINVAL;
 
-	if (!(c->mode38 & 0x08))
+	if (!(c->path_shadow & 0x08))
 		ret = cs42_set_rate_183138(c, r->cs42_rate_code);
-	else if (c->mode38 & 0x20)
+	else if (c->path_shadow & 0x20)
 		ret = cs42_set_rate_short(c, r->cs42_rate_code);
 	else
 		ret = cs42_set_rate_long(c, r->cs42_rate_code);
@@ -1250,10 +1175,10 @@ static int cs42_set_rate(struct cs42l81 *c, unsigned int rate)
 }
 
 /* ------------------------------------------------------------------ */
-/* Play graph -- sub_570620 / sub_5707D8 / sub_165BD4			*/
+/* Mixer graph								*/
 /* ------------------------------------------------------------------ */
 
-/* sub_5707D8, the static image, verbatim. */
+/* The fixed graph image, verbatim. */
 static const struct cs42_reg cs42_graph_static[] = {
 	{ 0x0006, 0x24 },
 	{ 0x0529, 0x2c }, { 0x052a, 0x2c }, { 0x0533, 0x2c }, { 0x0534, 0x2c },
@@ -1299,19 +1224,12 @@ static int cs42_play_graph_static(struct cs42l81 *c)
 		return ret;
 	msleep(100);
 	/*
-	 * No 0x0500 write here. This used to do cs42_wr8(c, 0x0500, 0x05)
-	 * and it was ours, not stock's.
+	 * No 0x0500 write here.
 	 *
-	 * Stock writes 0x0500 exactly once in the whole image, at EA
-	 * 0x00570AF4 inside sub_5707D8 -- an override branch reached only
-	 * when MEMORY[0x8A8FB58] is non-zero, sitting between a 0x401 = 0x12
-	 * write and a 0x528 status read. It is not on the audio path and it
-	 * is not a sample-rate or bit-depth setting.
-	 *
-	 * The 0x400/0x500/0x51E-0x534 space on this part is the DSP and
-	 * write-sequencer subsystem, not the serial audio port. This write
-	 * was put here on the assumption that 0x0500 was AIF1_BCLK_Ctrl.
-	 * That assumption is unsupported.
+	 * The 0x0400/0x0500 space on this part is the DSP and write-sequencer
+	 * subsystem, not the serial audio port, and stock writes 0x0500 once
+	 * in the whole image from an override branch that is not on the audio
+	 * path. Nothing here should be setting a sample rate or bit depth.
 	 */
 	cs42_rd(c, 0x0528, &status);
 	if (debug_regs)
@@ -1320,9 +1238,9 @@ static int cs42_play_graph_static(struct cs42l81 *c)
 }
 
 /*
- * sub_165BD4(side): eleven slots of three registers each. The source index
- * runs from 0 on the left and 10 on the right; the terminator marks the slot
- * that carries the tail value.
+ * Slot map: eleven slots of three registers each. The source index runs from
+ * 0 on the left and 10 on the right; the terminator marks the slot that
+ * carries the tail value.
  */
 static int cs42_slot_map(struct cs42l81 *c, int side, u8 count, u16 base_val,
 			 u16 gain)
@@ -1368,29 +1286,27 @@ static int cs42_slot_map(struct cs42l81 *c, int side, u8 count, u16 base_val,
 }
 
 /*
- * sub_570620's dynamic branch.
+ * Computed mixer graph.
  *
- * sub_5706F4 installs the per-side counts and bases, transcribed from its
- * switch:
+ * Per-side counts and bases by route:
  *
  *	route 1	count_l 0, count_r 0, base_l 0,   base_r 0
  *	route 3	count_l 0, count_r 0, base_l 160, base_r 160
  *	route 4	count_l 2, count_r 0, base_l 160, base_r 160
  *
- * sub_174E7C then derives the tap indices. Its accumulators are only
- * refreshed when the matching count is non-zero, and the count multiplies
- * the accumulator in the tap term, so a zero count drops the gain out:
+ * The tap indices follow. The accumulators are only refreshed when the
+ * matching count is non-zero, and the count multiplies the accumulator in the
+ * tap term, so a zero count drops the gain out:
  *
  *	if (count_l) accum_l = (idx_l_lo + 1) * table[idx_l_hi]
  *	tap_l = (base_l + accum_l * count_l + 159) / 160 + 2
  *	if (count_r) accum_r = (idx_r_lo + 1) * table[idx_r_hi]
  *	tap_r = (base_r + accum_r * count_r + 159) / 160 + 1
  *
- * With sub_5706F4's count_r of 0 this yields tap_r = 2 on route 4, where
- * sub_5707D8's static image writes 8. That is not a defect in either
- * transcription: 8 requires count_r = 2, which sub_5706F4 never installs, so
- * the static image was baked from a state this function does not produce.
- * The left side matches exactly (9).
+ * On route 4 this yields tap_r = 2 where the fixed graph image writes 8.
+ * That is not a defect in either transcription: 8 requires count_r = 2,
+ * which stock never installs here, so the fixed image was baked from a state
+ * this path does not produce. The left side matches exactly.
  */
 static int cs42_play_graph_dynamic(struct cs42l81 *c, int mode)
 {
@@ -1404,7 +1320,7 @@ static int cs42_play_graph_dynamic(struct cs42l81 *c, int mode)
 	u8 status = 0;
 	int i, ret;
 
-	/* sub_174E38(side): the packed index nibbles, per active slot. */
+	/* The packed index nibbles, per active slot. */
 	for (i = 0; i < count_l; i++) {
 		ret = cs42_rmw(c, 0x0529 + i, 0x3f,
 			       CS42_IDX_HI | (CS42_IDX_LO << 4));
@@ -1442,7 +1358,7 @@ static int cs42_play_graph_dynamic(struct cs42l81 *c, int mode)
 	msleep(100);
 	cs42_rd(c, 0x0528, &status);
 	if (debug_regs)
-		dev_info(&c->spi->dev,
+		cs42_vinfo(&c->spi->dev,
 			 "graph: mode=%d taps=%u/%u 0x528=0x%02x\n",
 			 mode, tap_l, tap_r, status);
 	return 0;
@@ -1456,16 +1372,35 @@ static int cs42_play_graph(struct cs42l81 *c)
 }
 
 /* ------------------------------------------------------------------ */
-/* Transport -- sub_42D364 / sub_F141C / sub_F1444			*/
+/* Transport								*/
 /* ------------------------------------------------------------------ */
 
-/* sub_F141C */
+/* Analog mute. Stock drives this from the transport, not from a user control. */
 static int cs42_analog_mute(struct cs42l81 *c, bool mute)
 {
 	return cs42_wr8(c, 0x0527, mute ? 0xff : 0x60);
 }
 
-/* sub_F1444: bit-5 strobes on both mailbox FIFO control registers. */
+/*
+ * Headphone output mute: the 0x0220 bit-5 hold.
+ *
+ * This is what stock's own mute op writes for this path -- it takes a path
+ * selector, resolves it to bit 5 for the headphone output and bit 3 for the
+ * other sink, and sets or clears that one bit. It is the same hold the rate
+ * program raises around a reprogram and the output-path disable leaves
+ * raised, so it silences the output stage itself rather than the source
+ * feeding it, and it does so without a power transient.
+ *
+ * The path shadow is deliberately not updated. Stock's mute op does not
+ * touch it either, and the shadow is what selects which output path the rate
+ * program configures -- a user mute must not change that.
+ */
+static int cs42_hp_mute(struct cs42l81 *c, bool mute)
+{
+	return cs42_rmw(c, 0x0220, 0x20, mute ? 0x20 : 0x00);
+}
+
+/* Bit-5 strobes on both mailbox FIFO control registers. */
 static void cs42_fifo_strobe(struct cs42l81 *c)
 {
 	cs42_rmw(c, 0x051e, 0x20, 0x20);
@@ -1475,10 +1410,9 @@ static void cs42_fifo_strobe(struct cs42l81 *c)
 }
 
 /*
- * sub_42D364(1). The graph is already built by .prepare, so this is the
- * unmute and the latch: bit 0 cleared and bit 1 set, which is what
- * sub_570620 does around its own graph write. Bit 0 has to be cleared here
- * because sub_42D364(0) sets it on every stop and nothing else takes it down.
+ * Transport start, stage 1. The graph is already built by .prepare, so this
+ * is the unmute and the latch: bit 0 cleared and bit 1 set. Bit 0 has to be
+ * cleared here because the stop path sets it and nothing else takes it down.
  */
 static int cs42_transport_start(struct cs42l81 *c)
 {
@@ -1503,47 +1437,37 @@ static int cs42_transport_start(struct cs42l81 *c)
 	}
 
 	/*
-	 * sub_42D364(2) -- the second transport call, which this driver never
-	 * made.
+	 * Transport start, stage 2.
 	 *
-	 * Starting playback is two steps in stock, not one:
+	 * Starting playback is two steps, not one. Stage 1 unmutes and
+	 * latches route 1; stage 2 installs route 3 or 4, chosen by the path
+	 * shadow -- 3 when the headphone path is the live one, 4 otherwise.
 	 *
-	 *	sub_42D364(1): 0x892A058 = 1, sub_F141C(1) (the 0x0527 analog
-	 *	               unmute), then sub_570620(1)
-	 *	sub_42D364(2): resolves to 3 or 4, then sub_570620(3 or 4)
+	 * It matters because route 1 carries a count and a tail of zero,
+	 * which makes the slot map come out at gain 0 all the way down.
+	 * Stopping after stage 1 leaves the mixer programmed to silence.
+	 * Routes 3 and 4 both carry a tail of 160, and 4 additionally
+	 * carries two live slots.
 	 *
-	 * and the resolution is
-	 *
-	 *	a1 = (MEMORY[0x892A038] & 8) ? 3 : 4;
-	 *
-	 * where 0x892A038 is the shadow of 0x0220 & 0x28 -- so the mode-18
-	 * path leaves it 0x08 and selects 3, while 271 and 6 select 4.
-	 *
-	 * This matters because sub_5706F4 gives mode 1 a count and a tail of
-	 * zero, which makes sub_165BD4 emit a slot map that is gain 0 all the
-	 * way down. Stopping after step 1, as this function did, therefore
-	 * left the mixer programmed to silence. Modes 3 and 4 both carry a
-	 * tail of 160, and 4 additionally carries two live slots.
-	 *
-	 * Only the dynamic path takes this step: stock's static-blob branch
-	 * calls sub_5707D8 and returns without going near sub_5706F4.
+	 * Only the computed path takes this step; the fixed image is
+	 * complete on its own.
 	 */
 	if (graph_mode != 0) {
-		int mode2 = (c->mode38 & 0x08) ? 3 : 4;
+		int mode2 = (c->path_shadow & 0x08) ? 3 : 4;
 
 		ret = cs42_play_graph_dynamic(c, mode2);
 		if (ret)
 			return ret;
 		dev_dbg(&c->spi->dev,
-			"transport: stage 2 graph mode=%d (mode38=0x%02x)\n",
-			mode2, c->mode38);
+			"transport: stage 2 graph mode=%d (path_shadow=0x%02x)\n",
+			mode2, c->path_shadow);
 	}
 
 	c->state = CS42_PLAYING;
 	return 0;
 }
 
-/* sub_42D364(0) */
+/* Transport stop. */
 static int cs42_transport_stop(struct cs42l81 *c)
 {
 	int ret = cs42_analog_mute(c, true);
@@ -1578,57 +1502,57 @@ static void cs42_log_state(struct cs42l81 *c, const char *tag)
 	cs42_rd(c, 0x0219, &r219);
 	cs42_rd(c, 0xc96f, &rc96f);
 	cs42_rd(c, 0x000f, &r0f);
-	dev_info(&c->spi->dev,
-		 "%s: vol=%u (%d dB) mute=%d 2F=%02x 401=%02x 527=%02x 219=%02x C96F=%02x 0F=%02x mode38=%02x\n",
+	cs42_vinfo(&c->spi->dev,
+		 "%s: vol=%u (%d dB) mute=%d 2F=%02x 401=%02x 527=%02x 219=%02x C96F=%02x 0F=%02x path_shadow=%02x\n",
 		 tag, c->user_vol, c->gain_l_db, c->dai_mute,
-		 r2f, r401, r527, r219, rc96f, r0f, c->mode38);
+		 r2f, r401, r527, r219, rc96f, r0f, c->path_shadow);
 }
 
 /*
- * The configuration stock performs between "a route exists" and "the first
+ * Bring the codec up and configure it for @rate.
+ *
+ * This is everything stock does between "a route exists" and "the first
  * buffer is submitted", in stock's order:
  *
- *	sub_D3280(1)	analog config, clock off
- *	sub_D3280(3)	divider, clock on, unfreeze
- *	sub_D2D2C(1)	output path, which runs sub_D2F64(271)
- *	sub_D34C0	rate -- dispatches on the shadow D2F64 just wrote
- *	sub_F141C(1)	analog unmute
- *	sub_570620	play graph
- *	sub_D2F64(18)	the playback engine's path mode
- *	sub_D2F2C	gain re-apply, right channel then left
+ *	park		analog config, clock off
+ *	run		divider, clock on, unfreeze
+ *	analog on	power the output stage
+ *	rate
+ *	output path	which runs path mode 271
+ *	analog unmute
+ *	play graph
  *
- * The rate call comes after the path mode because it dispatches on the
- * shadow the path mode maintains; running it first takes a branch stock
- * would never take.
+ * The path mode is left to cs42l81_play_start(), which is where the playback
+ * engine applies it in stock.
  */
+
+static bool rate_only_change = true;
+module_param(rate_only_change, bool, 0644);
+MODULE_PARM_DESC(rate_only_change,
+		 "Change rate without re-running the bring-up (default Y)");
 
 static int cs42_prepare(struct cs42l81 *c, unsigned int rate)
 {
 	int ret;
 
 	/*
-	 * One line per bring-up. This is the sequence that plops -- the
-	 * clock gate goes ON/OFF/ON and the analog stage powers -- so it
-	 * needs to be visible when it happens more than once per boot,
-	 * which is exactly the bug this caught.
+	 * One line per bring-up. This sequence cycles the clock gate and
+	 * powers the analog stage, both of which are audible, so it has to
+	 * be visible when it runs more than once per boot.
 	 */
-	dev_info(&c->spi->dev, "prepare entry: state=%s rate=%u want=%u\n",
+	cs42_vinfo(&c->spi->dev, "prepare entry: state=%s rate=%u want=%u\n",
 		 cs42_state_names[c->state], c->rate, rate);
 
 	/*
 	 * Already up at this rate: nothing to do.
 	 *
-	 * CS42_PLAYING used to fall through here, so a second hw_params on a
-	 * running stream re-ran the whole bring-up underneath it -- park,
-	 * clock gate off, run, clock gate on, analog stage on -- on a part
-	 * that was already playing. Every one of those steps is a transient
-	 * on the output, which is the "plop plop plop" before a track starts:
-	 * measured as "prepare entry: state=playing" immediately followed by
-	 * a clock gate OFF, once per mpg123 invocation.
+	 * A playing stream must not fall through. Re-running the bring-up
+	 * underneath a part that is already playing -- park, clock gate off,
+	 * run, clock gate on, analog stage on -- puts a transient on the
+	 * output at every step, which is audible as a series of plops before
+	 * a track starts. Stock brings the codec up once and leaves it up.
 	 *
-	 * Stock brings the codec up once and leaves it up; there is no path
-	 * in the image that re-parks a playing part to prepare it again. A
-	 * genuine rate change still falls through, because the rate is part
+	 * A genuine rate change still falls through, because the rate is part
 	 * of the test.
 	 */
 	if ((c->state == CS42_PREPARED || c->state == CS42_PLAYING) &&
@@ -1636,77 +1560,65 @@ static int cs42_prepare(struct cs42l81 *c, unsigned int rate)
 		return 0;
 
 	/*
-	 * Two stages that are not codec register writes, and which a
-	 * previous refactor of this file dropped entirely.
+	 * Already up, only the rate differs.
 	 *
-	 * The PMIC half trims the sibling LDOs the analog headphone path
-	 * runs from (gpio-d1830.c, sub_23EC in the stock *bootloader* --
-	 * so nothing in our boot chain performs it). The tristar half
-	 * reports the accessory routing. Both are weak references: these
-	 * drivers are separate modules and either may be absent, so a
-	 * missing symbol is logged and playback continues rather than
-	 * failing.
+	 * cs42_set_rate() writes the rate code and nothing else, so a codec
+	 * that is running does not need parking, re-running, the analog stage
+	 * brought up again, the graph reapplied or the volume rewritten just
+	 * to move between rates. Doing all of that is what makes a rate change
+	 * audible, and a player that probes a rate before settling on the
+	 * track's own -- 44100 to 8000 and back, in the case that prompted
+	 * this -- pays for it twice before a note is played.
+	 *
+	 * The divider still steps, on both the codec and the IIS side, so the
+	 * headphone hold goes up across the write and comes back down after.
+	 * A stream muted by the user stays muted: dai_mute is the control and
+	 * this must not clear it.
+	 */
+	if (rate_only_change && c->rate && c->rate != rate &&
+	    (c->state == CS42_PREPARED || c->state == CS42_PLAYING)) {
+		bool held = c->dai_mute;
+
+		if (!held)
+			cs42_hp_mute(c, true);
+		ret = cs42_set_rate(c, rate);
+		if (!held)
+			cs42_hp_mute(c, false);
+
+		if (!ret) {
+			cs42_vinfo(&c->spi->dev,
+				 "prepare: rate only, %u without a re-bring-up\n",
+				 rate);
+			return 0;
+		}
+		/*
+		 * It did not take. Fall through and do the whole thing, which
+		 * is the path that is known to work.
+		 */
+		dev_warn(&c->spi->dev,
+			 "prepare: rate-only change failed (%d), full bring-up\n",
+			 ret);
+	}
+
+	/*
+	 * Log the accessory routing, if the tristar driver is loaded. It is a
+	 * separate module and may be absent, so a missing symbol is not an
+	 * error -- playback continues without the log.
+	 *
+	 * No PMIC work happens here. The rail trim the analog headphone path
+	 * depends on is performed once by the bootloader, before the OS image
+	 * is even loaded, and stock's audio path issues no PMIC transactions
+	 * at all. Replaying it from here disturbs rails the display is using.
 	 */
 	{
-		int (*rails)(void);
-		void (*ts_path)(struct device *);
-
-		/*
-		 * No PMIC call here.
-		 *
-		 * This used to __symbol_get("d1830_audio_rails") and run the whole
-		 * board rail trim on every codec prepare, on the belief that it
-		 * "trims the sibling LDOs the analog headphone path runs from".
-		 * That belief has no support in the decomp, and the sequence it was
-		 * replaying does not exist in the OS image at all.
-		 *
-		 * sub_23EC and sub_27F4 are BOOTLOADER functions. sub_23EC has one
-		 * caller, sub_27F4 at EA 0x29DC; sub_27F4 has one caller, the C
-		 * entry sub_E2C at EA 0x0E48 -- before DRAM init, before the OS
-		 * image is loaded. The rewrite it performs, "bic r0,#0xd0 / orr
-		 * r0,#0x10", occurs exactly once in the whole firmware, at
-		 * bootloader offset 0x24F8. It occurs ZERO times in osos.dec.bin.
-		 *
-		 * The OS cannot write registers 0x14-0x17 even if it wanted to: its
-		 * only path to them is sub_2D404 cases 1-4, whose sole caller
-		 * sub_2A120 maps consumer ids 1..10 to rail indices 6..15, so those
-		 * cases are dead code. Stock's audio path issues no PMIC
-		 * transactions at all, and stock's own codec driver
-		 * (sphwDACCS42L81.c, sub_400330) touches no rail -- it handles the
-		 * 2.5 V back-power concern with a timestamp and a timer.
-		 *
-		 * And the trim has already run on this device: the as-found probe
-		 * dump reads 0x14=0x0b 0x15=0x09 0x16=0x09 0x17=0x09, which are
-		 * exactly the codes sub_23EC computes for fuse index 0. Replaying it
-		 * from here re-cleared ACTIVE1 bits 6 and 7 with the panel live,
-		 * which is the white screen, and it is what the guards in
-		 * d1830_sec_trim_seq() were patching over.
-		 */
-
-		ts_path = (void (*)(struct device *))
+		void (*ts_path)(struct device *) = (void (*)(struct device *))
 			__symbol_get("apple_tristar_log_audio_path");
+
 		if (ts_path) {
 			ts_path(&c->spi->dev);
 			__symbol_put("apple_tristar_log_audio_path");
 		}
 	}
-
-	/*
-	 * graph_built is NOT cleared here any more.
-	 *
-	 * sub_570620, the play graph, is not on the streaming path in stock at
-	 * all. Its only caller is sub_42D364, and sub_42D364 has exactly four
-	 * call sites: three in the route-event task at 0x08587E60, one in
-	 * sub_500E54, and the codec output-enable op at 0x000D314C. None of
-	 * them is the buffer/DMA path, and the MeCCAOutputTask preamble does
-	 * not touch it.
-	 *
-	 * Clearing the flag here forced a full graph rebuild, and its 100 ms
-	 * settle, on every .prepare -- which ALSA calls before every start and
-	 * every xrun recovery. Stock pays that cost on a route change, not per
-	 * stream.
-	 */
-
 	ret = cs42_state_park(c);
 	if (ret)
 		return ret;
@@ -1715,37 +1627,17 @@ static int cs42_prepare(struct cs42l81 *c, unsigned int rate)
 		return ret;
 
 	/*
-	 * sub_D3280(4), which sub_D3700 reaches only after mode 3. We stopped
-	 * at mode 3 and never ran this, so the analog output stage was never
-	 * powered -- 0x0219 read 0x00 instead of 0x78 on a live device.
+	 * The analog output stage. Stock reaches this only after the run
+	 * state, and stopping at run leaves the stage unpowered.
 	 */
 	ret = cs42_state_analog_on(c);
 	if (ret)
 		return ret;
 
 	/*
-	 * cs42_mailbox_drain() used to run here. Removed: stock's audio path
-	 * does not drain the mailbox.
-	 *
-	 * 0x051E..0x0525 is the MikeyBus accessory message channel, not an
-	 * audio block -- it just shares the 0x05xx page with the audio graph
-	 * registers. Its users are sub_15A50C (latch/sample), sub_1326D2
-	 * (read-and-discard ack), sub_155D74 (the consumer of the
-	 * _mikeybus_bulk_debug option), sub_14DD16, sub_15409C and sub_19A07C,
-	 * and **none of them is reachable from the audio call closure** (94
-	 * functions, depth 4).
-	 *
-	 * What the audio path *does* touch there is sub_F1444, which strobes
-	 * bit 5 of 0x051E and 0x0523 -- and that is implemented faithfully in
-	 * cs42_fifo_strobe(). Draining the FIFO as well was this driver's own
-	 * invention, carried over from a pre-refactor stage list.
-	 */
-
-	/*
-	 * Rate before the output path, which is the order stock uses and the
-	 * reverse of what this function did. The path configuration depends
-	 * on the rate that is already programmed, so enabling it first
-	 * configures it against the previous rate.
+	 * Rate before the output path, which is the order stock uses. The
+	 * path configuration depends on the rate already being programmed,
+	 * so enabling it first configures it against the previous rate.
 	 */
 	ret = cs42_set_rate(c, rate);
 	if (ret)
@@ -1762,75 +1654,6 @@ static int cs42_prepare(struct cs42l81 *c, unsigned int rate)
 		return ret;
 	c->graph_built = true;
 
-	/*
-	 * cs42_mode_18 used to be applied here. It is removed, and the reason
-	 * matters because it changes which graph the transport builds.
-	 *
-	 * sub_D2F64's argument decides the path shadow MEMORY[0x892A038]:
-	 *
-	 *	if (a1 & 0x200) { ... }
-	 *	else {
-	 *		if (a1 & 2) {...} else v3 |= 0x20;
-	 *		if (a1 & 4) {...} else v3 |= 0x08;
-	 *		MEMORY[0x892A038] = v3 & 0x28;
-	 *	}
-	 *
-	 * with v3 = 0 on entry. So the shadow only becomes 0x08 for an
-	 * argument with **bit 2 clear**, and 18 is such a value while 271 and
-	 * 6 are not -- both of those leave it 0x00.
-	 *
-	 * That shadow is what sub_42D364(2) resolves on:
-	 *
-	 *	a1 = (MEMORY[0x892A038] & 8) ? 3 : 4;
-	 *
-	 * so mode 18 steered the transport to graph mode 3, whose slot map
-	 * carries a tail of 160 and **no per-slot gain at all**. Mode 4
-	 * carries two live slots at gain 480 -- and mode 4's output is
-	 * byte-identical to the fixed-constant path in sub_5707D8, which is
-	 * strong corroboration that mode 4 is the real playback graph.
-	 *
-	 * REFUTED, 2026-09-01. The paragraph that stood here claimed the only
-	 * literal sub_D2F64 arguments in the image were 271 and 6, that the
-	 * sole other call site only restored a saved mode from a struct field
-	 * (ldrh r0, [r5, #0xe]), and therefore that "nothing applies 18".
-	 *
-	 * sub_D2F64 has THREE wrappers, not two: sub_D2D2C, the state applier
-	 * at 0x000D3700 (which is the ldrh site, at EA 0x080D37B0), and
-	 * sub_4142D0. sub_4142D0 dispatches slot +8 of the codec op table at
-	 * 0x0891DE74, which is 0x080D2F65 -- so sub_4142D0(x) IS sub_D2F64(x).
-	 *
-	 * And it is called with the literal 18, at EA 0x080B5B1C, in the
-	 * preamble of the MeCCAOutputTask -- the playback task itself, whose
-	 * body is the unnamed function at 0x000B5AE0 reached through the
-	 * thunk at 0x080A8E52. Two further literals exist on the record
-	 * paths: 0x601 at 0x0826DE3E and 0xA01 at 0x0826DE50.
-	 *
-	 * So stock DOES apply 18, on the playback path, once per stream in
-	 * the task preamble, immediately before the producer fills the first
-	 * buffer and the PL080 channel is enabled.
-	 *
-	 * The consequence for the paragraph above is direct: with 18 applied,
-	 * MEMORY[0x892A038] is 0x08, so sub_42D364(2) resolves to mode 3, not
-	 * mode 4. The preference for mode 4 recorded above rests entirely on
-	 * the refuted claim and must be re-derived before it is trusted.
-	 * Left as it is for now rather than changed blind -- it is an audio
-	 * path change and belongs in its own flash.
-	 *
-	 * cs42_output_path_on() already performs sub_D2D2C(1) -- 0x0206/0x0207
-	 * masked to 8, then mode 271 -- which leaves the shadow at 0. Dropping
-	 * this call lets that stand, so the transport resolves to mode 4.
-	 *
-	 * Which argument sub_D2D2C takes on the music path is NOT established:
-	 * it is reached only through a vtable and has no direct callers. It
-	 * does not matter for this, because 271 and 6 both leave the shadow 0.
-	 */
-	/*
-	 * A second 0x054F RMW used to sit here. Stock issues that register
-	 * exactly once in the whole image -- sub_42A5D6(1359, 240, 0), as
-	 * step 1 of sub_570620 -- which cs42_play_graph() already does. This
-	 * one was ours, and repeating a masked write after the path mode is
-	 * not something stock ever does.
-	 */
 	ret = cs42_apply_user_vol(c);
 	if (ret)
 		return ret;
@@ -1872,22 +1695,13 @@ int cs42l81_play_start(void)
 		goto out;
 	}
 	/*
-	 * sub_D2F64(18), where stock has it: the MeCCAOutputTask preamble,
-	 * at EA 0x080B5B1C, immediately before the producer callback fills
-	 * the first buffer and the PL080 channel is enabled. sub_D2F2C
-	 * (gains) follows at 0x080B5B20, which cs42_transport_start does.
+	 * Path mode 18, where stock applies it: in the playback task's
+	 * preamble, immediately before the producer fills the first buffer
+	 * and the DMA channel is enabled. Gain re-apply follows, which
+	 * cs42_transport_start() does.
 	 *
-	 * This driver applied no 18 at all, on a claim that nothing in the
-	 * image applies it. That was refuted: sub_4142D0 is a third wrapper
-	 * for sub_D2F64 -- it dispatches slot +8 of the codec op table at
-	 * 0x0891DE74, which is 0x080D2F65 -- and it is called with the
-	 * literal 18 on the playback path.
-	 *
-	 * Applying it sets the path shadow MEMORY[0x892A038] to 0x08, which
-	 * is what the stage-2 graph resolves on: sub_42D364(2) computes
-	 * (shadow & 8) ? 3 : 4. So this also moves that graph from 4 to 3
-	 * without a separate change -- cs42_transport_start already derives
-	 * its mode from c->mode38.
+	 * It sets the path shadow to 0x08, which selects the headphone path
+	 * for the rate program and route 3 for the stage-2 graph.
 	 *
 	 * Once per stream start, like stock: the preamble runs once and the
 	 * steady-state loop re-enters below it.
@@ -1923,7 +1737,7 @@ EXPORT_SYMBOL_GPL(cs42l81_play_stop);
 
 /*
  * The IIS driver drives the codec's clock role from its mastership profile.
- * Stock sets 0x000F bit 7 once, in state 3, and never clears it.
+ * Stock sets 0x000F bit 7 once, in the run state, and never clears it.
  */
 int cs42l81_set_clock_role(bool drive)
 {
@@ -1933,19 +1747,14 @@ int cs42l81_set_clock_role(bool drive)
 	if (!c)
 		return -ENODEV;
 	mutex_lock(&c->lock);
-	/*
-	 * Stock SETS 0x000F bit 7 exactly once, at EA 0x080D3312 inside
-	 * the sub_D3280(3) transition, and NEVER clears it anywhere in
-	 * the image. Those are the only writes to bit 7 that exist.
-	 *
-	 * So clearing it, which this used to do whenever drive was
-	 * false, has no counterpart in stock at all. Nothing in the
-	 * decomp ties this bit to a clock role either -- that reading
-	 * was ours. Set it or leave it; never clear it.
-	 *
-	 * Note 0x000F[3:0] in the same register is the sample-rate
-	 * index, which is why this must stay a masked RMW.
-	 */
+		/*
+		 * Stock sets this bit once, during the run transition, and
+		 * never clears it anywhere. Set it or leave it alone; do not
+		 * clear it.
+		 *
+		 * 0x000F[3:0] in the same register is the sample-rate index,
+		 * which is why this has to stay a masked read-modify-write.
+		 */
 	if (!drive) {
 		mutex_unlock(&c->lock);
 		return 0;
@@ -1963,9 +1772,9 @@ int cs42l81_pre_iis_start(void)
 EXPORT_SYMBOL_GPL(cs42l81_pre_iis_start);
 
 /*
- * Runs after the IIS transmitter is kicked. sub_183138 leaves the part muted
- * at -90 dB by design, so the cached gain has to come back; stock does that
- * from sub_D2F2C on the same edge.
+ * Runs after the IIS transmitter is kicked. The rate program leaves the part
+ * muted at -90 dB by design, so the cached gain has to come back; stock does
+ * that from its gain re-apply on the same edge.
  */
 int cs42l81_post_iis_start(void)
 {
@@ -2002,8 +1811,8 @@ EXPORT_SYMBOL_GPL(cs42l81_schedule_post_iis);
 
 /*
  * Called from the IIS stop path, which must not block: the work item takes
- * c->lock and the caller may already hold it. The synchronous form belongs
- * at remove, where the work genuinely must be over.
+ * c->lock and the caller may already hold it. The synchronous form belongs at
+ * remove, where the work genuinely must be over.
  */
 void cs42l81_cancel_post_iis(void)
 {
@@ -2163,8 +1972,20 @@ static int cs42_sw_put(struct snd_kcontrol *kcontrol,
 	mutex_lock(&c->lock);
 	changed = mute != c->dai_mute;
 	c->dai_mute = mute;
-	if (changed)
-		cs42_analog_mute(c, mute);
+	if (changed) {
+		/*
+		 * Hold outermost, so the output stage is already silenced
+		 * before the source is cut and is released only once the
+		 * source is back.
+		 */
+		if (mute) {
+			cs42_hp_mute(c, true);
+			cs42_analog_mute(c, true);
+		} else {
+			cs42_analog_mute(c, false);
+			cs42_hp_mute(c, false);
+		}
+	}
 	mutex_unlock(&c->lock);
 	return changed;
 }
@@ -2215,19 +2036,15 @@ static struct snd_soc_dai_driver cs42_dai = {
 		.channels_max = 2,
 		/*
 		 * Both DAIs on the link have to allow a rate before ALSA will
-		 * offer it, and this is the codec half. It carried the base
-		 * mask while the CPU DAI carried the hi-res one, so 88.2 and
-		 * 96 kHz were refused at open with hires=1 set and the i2s
-		 * hw_params callback never even ran.
-		 *
-		 * The real gate stays in s5l8740-i2s.c: its component open
-		 * only widens the runtime rates when hires is on, so with the
-		 * default this mask being wider changes nothing.
+		 * offer it, and this is the codec half. The effective gate
+		 * stays in s5l8740-i2s.c, whose component open only widens
+		 * the runtime rates when hires is on, so a wider mask here
+		 * changes nothing by itself.
 		 */
 		/*
 		 * The codec side advertises the superset, including 44.1 kHz,
-		 * which it has a rate code for (10). Whether 44.1 is offered
-		 * to applications is decided by the CPU DAI, because the
+		 * which it has a rate code for. Whether 44.1 reaches
+		 * applications is decided by the CPU DAI, because the
 		 * limitation is the 12 MHz reference rather than the codec:
 		 * no integer divider yields 44100. ASoC intersects the two,
 		 * so keeping the gate in one place keeps allow_44100
@@ -2295,10 +2112,10 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr,
 	mutex_unlock(&c->lock);
 
 	return sysfs_emit(buf,
-			  "state=%s rate=%u vol=%u/%u (%d dB) mute=%d mode38=0x%02x\n"
+			  "state=%s rate=%u vol=%u/%u (%d dB) mute=%d path_shadow=0x%02x\n"
 			  "0x002F=0x%02x 0x0401=0x%02x 0x0527=0x%02x 0x000F=0x%02x 0xC96F=0x%02x\n",
 			  cs42_state_names[c->state], c->rate, c->user_vol,
-			  CS42_VOL_MAX, c->gain_l_db, c->dai_mute, c->mode38,
+			  CS42_VOL_MAX, c->gain_l_db, c->dai_mute, c->path_shadow,
 			  r2f, r401, r527, r0f, rc96f);
 }
 static DEVICE_ATTR_RO(state);
@@ -2330,14 +2147,14 @@ ATTRIBUTE_GROUPS(cs42);
 /* ------------------------------------------------------------------ */
 
 /*
- * Log the analog/backpower state exactly as the bootloader left it, before
- * this driver writes anything.
+ * Log the analog and backpower state exactly as the bootloader left it,
+ * before this driver writes anything.
  *
  * 0x002F carries the analog-ready and ASP-sync status bits; 0x0219 is the
- * analog/backpower companion whose low three bits cs42_dac_gain drives to 1;
- * 0xC96F is the 2.5 V backpower rail (0x0E during the settle, 0x1E when up).
- * Reading them here is what tells us whether the codec arrives powered or
- * whether our own prepare is the only thing that brings it up.
+ * analog and backpower companion whose low three bits cs42_dac_gain() drives
+ * to 1; 0xC96F is the 2.5 V backpower rail, 0x0E during the settle and 0x1E
+ * when up. Reading them here is what says whether the codec arrives powered
+ * or whether our own prepare is the only thing that brings it up.
  */
 static void cs42_dump_analog(struct cs42l81 *c, const char *tag)
 {
@@ -2449,23 +2266,20 @@ static const struct spi_device_id cs42l81_spi_ids[] = {
 MODULE_DEVICE_TABLE(spi, cs42l81_spi_ids);
 
 /*
- * Suspend / resume.
+ * Suspend and resume.
  *
- * On S3, stock's codec analog block is brought back by the *bootloader*
- * (sub_1314, on the hibernate arm), not by RetailOS. Our boot chain never
- * runs that bootloader, so on resume nothing would power the analog block
- * and playback would come back silent in exactly the way it did before the
- * 0x9901 key ordering was fixed.
+ * Across S3, stock's codec analog block is brought back by the bootloader,
+ * not by the OS. This boot chain never runs that bootloader, so nothing would
+ * power the analog block on resume and playback would come back silent.
  *
- * Rather than replay a sequence from here, invalidate the cached state so
- * the next .prepare runs the whole bring-up in stock's order -- park (which
- * now issues the key first), run, mailbox, rate, path, graph, gains. That is
- * the sequence that is already known correct; duplicating it in a resume
- * path would be a second copy to keep in step.
+ * Rather than replay a sequence from here, invalidate the cached state so the
+ * next .prepare runs the whole bring-up in stock's order. That sequence is
+ * already known correct, and duplicating it in a resume path would be a
+ * second copy to keep in step.
  *
  * key_done is cleared because the codec loses the 0x9901 unlock across a
- * power cycle. If it did not, re-issuing it is harmless -- sub_D2EFC is
- * idempotent in stock too, guarded by MEMORY[0x892A028].
+ * power cycle. If it did not, re-issuing it is harmless -- it is idempotent
+ * in stock too.
  */
 static int cs42l81_pm_suspend(struct device *dev)
 {

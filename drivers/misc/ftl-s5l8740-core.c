@@ -242,6 +242,28 @@ MODULE_PARM_DESC(scan_blocks,
  * open-META rebuild remains the bulk authority. 0 = unlimited (raise only
  * after correctness passes; stage with scan_blocks).
  */
+/*
+ * Take a BTOC entry at its word, the way stock does.
+ *
+ * s_cxt_diff.c adopts a span with sub_3F8958(lba, span, vba), which is
+ * L2V_Update.c: it splits the span on 0x8000 boundaries and updates the
+ * map in memory. It reads nothing. The entry already carries the LBA and
+ * the span, and the superblock's VBA offset carries the address.
+ *
+ * Confirming instead CS-reads every data page a span covers to recover
+ * meta_lba and uses that as the key, which discards the field the entry
+ * was written to carry and costs a page read per four VBAs -- about 512
+ * for a full superblock. That is a different algorithm from stock's, not
+ * a slower one, and it is most of why our mount took thirty seconds
+ * against stock's ten.
+ *
+ * Clear this to go back to reading the pages.
+ */
+static bool btoc_trust_bte = true;
+module_param(btoc_trust_bte, bool, 0644);
+MODULE_PARM_DESC(btoc_trust_bte,
+		 "Apply BTOC entries from their own lba/span, as stock does (default Y)");
+
 static bool btoc_meta_confirm = true;
 module_param(btoc_meta_confirm, bool, 0644);
 MODULE_PARM_DESC(btoc_meta_confirm,
@@ -676,6 +698,41 @@ module_param(l2v_trace_lba, uint, 0644);
 MODULE_PARM_DESC(l2v_trace_lba,
 		 "Log L2V winner old/new for this fmss_lba (0=off)");
 
+/*
+ * Where the checkpoint stops being believed.
+ *
+ * The window between the checkpoint's base weave and its top is the
+ * span it reserves for its own superblock writes: s_cxt.c:81 sets the
+ * next write weave to base + num_sb * vbas_per_sb + 1, and on this
+ * volume that is 6655367 + 2 * 2048 + 1 = 6659464, exactly the top the
+ * driver reports. Skipping everything below the top assumes nothing a
+ * user wrote can land inside that window.
+ *
+ * On this unit something does. The newest page for the volume's BPB
+ * carries weave 6655367 -- the base itself -- so its superblock is
+ * skipped as covered, while the checkpoint's own extent for that LBA
+ * carries weave 2069460, about 4.6M older. The sector one above it,
+ * FSInfo, is not in the checkpoint at all, and a mount that cannot read
+ * FSInfo fails its critical set and never registers the disk.
+ *
+ * Skipping below the base instead replays that window. It costs the
+ * superblocks bounded there, which is the cost the top test was chosen
+ * to avoid; set this to restore it and compare.
+ */
+static bool cxt_skip_below_top;
+module_param(cxt_skip_below_top, bool, 0644);
+MODULE_PARM_DESC(cxt_skip_below_top,
+		 "Trust the checkpoint up to its top weave rather than its base (default N)");
+
+/*
+ * The weave below which the checkpoint is taken to describe a
+ * superblock already. Above it, replay.
+ */
+static u64 whimory_cxt_trust_weave(const struct whimory *w)
+{
+	return cxt_skip_below_top ? w->cxt_top_weave : w->cxt_base_weave;
+}
+
 /* Apply BTOC FFFF0001 LIST unmaps during recover (default Y). */
 static bool btoc_apply_list = true;
 module_param(btoc_apply_list, bool, 0644);
@@ -937,11 +994,11 @@ static int whimory_prefetch_slot0(struct whimory *w, unsigned int ce,
 				  u8 *meta0)
 {
 	struct whimory_sftl *s = &w->sftl;
-	u16 blocks[WHIMORY_PF_SLOTS];
+	u16 *blocks = s->pf_blocks;
 	unsigned int i, n, idx;
 	int ret;
 
-	if (!batch_classify || !s->pf_data)
+	if (!batch_classify || !s->pf_data || !blocks)
 		goto fallback;
 
 	if (!(s->pf_valid && ce == s->pf_ce && cau == s->pf_cau &&
@@ -5526,6 +5583,15 @@ static bool whimory_btoc_parse_bte(struct whimory *w, const u8 *page,
 	 */
 	u32 sb_vbas = whimory_sb_vbas(w, vblock);
 	u32 sb_data_vbas = whimory_sb_data_vbas(w, vblock);
+	u32 sb_idx = whimory_sb_index(w, ce, cau, vblock);
+	/*
+	 * The caller sets claim_weave to the superblock's own weave before
+	 * ingesting, and weaveSeqAdd is a forward delta from it: s_btoc.c
+	 * asserts (bte->weaveSeqAdd & 0x80000000) == 0 when it writes one.
+	 * An entry's absolute weave is therefore the superblock's plus its
+	 * own delta, and entries within one BTOC do not share a weave.
+	 */
+	u64 btoc_base_weave = w->sftl.claim_weave;
 
 	if (len < sizeof(struct whimory_bte) || whimory_page_blank(page, 64))
 		return false;
@@ -5588,6 +5654,36 @@ static bool whimory_btoc_parse_bte(struct whimory *w, const u8 *page,
 			vba_ofs += span;
 			continue;
 		}
+		if (btoc_trust_bte) {
+			u64 wv = btoc_base_weave +
+				 le32_to_cpu(bte->weave_seq_add);
+			u32 vba = whimory_sb_ofs_to_vba(w, sb_idx, vba_ofs);
+			int uret;
+
+			/*
+			 * Stock's rule, per entry rather than per superblock: an
+			 * entry at or below the checkpoint's base weave is one the
+			 * checkpoint already describes, and s_cxt_diff.c asserts it
+			 * produces no update (:244).
+			 */
+			if (w->sftl.cxt_loaded && w->cxt_base_weave &&
+			    wv <= w->cxt_base_weave) {
+				w->sftl.btoc_below_base++;
+				vba_ofs += span;
+				continue;
+			}
+
+			w->sftl.claim_weave = wv;
+			uret = whimory_l2v_update(w, lba, span, vba);
+			w->sftl.claim_weave = btoc_base_weave;
+			if (uret)
+				return hit > 0;
+			w->sftl.btoc_l2v_updates++;
+			hit += span;
+			vba_ofs += span;
+			continue;
+		}
+
 		for (s = 0; s < span; s++) {
 			unsigned int bce, bcau, pg, sl;
 			u32 key;
@@ -7857,6 +7953,58 @@ static int whimory_cxt_seed_l2v(struct whimory *w)
 			continue;
 		}
 
+		/*
+		 * The seeding loop is where a checkpoint-only recovery builds
+		 * the entire map, and it was the one path the winner audit did
+		 * not cover: the other two hooks sit in the open-superblock
+		 * rebuild and in BTOC confirm, and a recovery that skips every
+		 * superblock by checkpoint runs neither. An extent carrying a
+		 * stale weave, or a span that stops short of an LBA the volume
+		 * needs, produced no line anywhere.
+		 *
+		 * Audit on coverage rather than on the start LBA. Extents
+		 * describe a range, so the LBA that goes missing is usually not
+		 * the one the extent begins at -- FSInfo sits one sector above
+		 * the BPB, and an extent that starts on the BPB and stops short
+		 * leaves it unmapped without either LBA looking unusual.
+		 */
+		if (audit_lba_winners || l2v_trace_lba) {
+			static const u32 watch[] = { 49279u, 49280u, 49285u,
+						     49286u, 49311u, 49317u };
+			u32 probe = 0;
+			unsigned int wi;
+			bool hit = false;
+
+			if (l2v_trace_lba && l2v_trace_lba >= e->lba &&
+			    l2v_trace_lba - e->lba < e->span) {
+				probe = l2v_trace_lba;
+				hit = true;
+			}
+			for (wi = 0; !hit && audit_lba_winners &&
+				     wi < ARRAY_SIZE(watch); wi++) {
+				if (watch[wi] >= e->lba &&
+				    watch[wi] - e->lba < e->span) {
+					probe = watch[wi];
+					hit = true;
+				}
+			}
+			if (hit) {
+				struct whimory_range *prev =
+					whimory_range_find(&w->ranges, probe);
+
+				dev_info(w->dev,
+					 "LBA_WINNER fmss_lba=%u candidate vba=%u "
+					 "ext_lba=%u span=%u weave=%012llx "
+					 "prev_vba=%u prev_weave=%012llx "
+					 "source=CXT_SEED\n",
+					 probe, e->vba, e->lba, e->span,
+					 (unsigned long long)e->weave,
+					 prev ? prev->vba : ~0u,
+					 prev ? (unsigned long long)prev->weave :
+						0ull);
+			}
+		}
+
 		w->sftl.claim_weave = e->weave;
 		ret = whimory_l2v_update(w, e->lba, e->span, e->vba);
 		w->sftl.claim_weave = 0;
@@ -9270,7 +9418,7 @@ classify_done:
 				 (unsigned long long)w->cxt_base_weave);
 		} else if (use_cxt && s->cxt_loaded && cxt_fast &&
 			   sb->weave_max &&
-			   sb->weave_max < w->cxt_top_weave) {
+			   sb->weave_max < whimory_cxt_trust_weave(w)) {
 			/*
 			 * Skip only what the checkpoint provably covers.
 			 *
@@ -9293,7 +9441,8 @@ classify_done:
 			s->diff_skipped_sbs++;
 			continue;
 		} else if (use_cxt && s->cxt_loaded && sb->weave_max_p127 &&
-			   sb->weave_max && sb->weave_max < w->cxt_top_weave) {
+			   sb->weave_max &&
+			   sb->weave_max < whimory_cxt_trust_weave(w)) {
 			s->diff_skipped_sbs++;
 			continue;
 		}
@@ -9592,11 +9741,15 @@ static int whimory_sftl_alloc(struct whimory *w)
 			      S5L8740_NAND_SLOT_DATA, GFP_KERNEL);
 	s->pf_meta = kvmalloc((size_t)WHIMORY_PF_SLOTS *
 			      S5L8740_NAND_BATCH_META_SIZE, GFP_KERNEL);
-	if (!s->pf_data || !s->pf_meta) {
+	s->pf_blocks = kvmalloc(array_size(WHIMORY_PF_SLOTS, sizeof(u16)),
+				GFP_KERNEL);
+	if (!s->pf_data || !s->pf_meta || !s->pf_blocks) {
 		kvfree(s->pf_data);
 		kvfree(s->pf_meta);
+		kvfree(s->pf_blocks);
 		s->pf_data = NULL;
 		s->pf_meta = NULL;
+		s->pf_blocks = NULL;
 	}
 	s->pf_valid = false;
 	s->pf_failed = false;
@@ -10675,8 +10828,10 @@ static void whimory_free(struct whimory *w)
 	w->sftl.pf_valid = false;
 	kvfree(w->sftl.pf_data);
 	kvfree(w->sftl.pf_meta);
+	kvfree(w->sftl.pf_blocks);
 	w->sftl.pf_data = NULL;
 	w->sftl.pf_meta = NULL;
+	w->sftl.pf_blocks = NULL;
 	w->sftl.rc_count = 0;
 	kvfree(w->sftl.rc_data);
 	kvfree(w->sftl.rc_meta);

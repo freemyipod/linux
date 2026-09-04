@@ -161,7 +161,13 @@ static int xfer_width = 1;
 module_param(xfer_width, int, 0644);
 MODULE_PARM_DESC(xfer_width, "PL080 src/dst width 0=8 1=16 2=32");
 /* RetailOS music SBSIZE/DBSIZE enc = 1 (4-beat? enc1) — CTL 0x84249000. */
-static bool start_verbose = true;
+/*
+ * Off by default: this is a ~160 character line on every DMA start, and
+ * with the console on a 115200 UART that is milliseconds inside the audio
+ * re-arm path. It is the line that made playback start-stop until printk
+ * rate limiting silenced it.
+ */
+static bool start_verbose;
 module_param(start_verbose, bool, 0644);
 MODULE_PARM_DESC(start_verbose,
 		 "Log channel CFG write and read-back at every start");

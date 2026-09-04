@@ -66,7 +66,16 @@ struct whimory_fpart {
 #define WHIMORY_RC_SLOTS		8
 
 /* Legacy per-block classify prefetch window, in 4 KiB slots. */
-#define WHIMORY_PF_SLOTS		16
+/*
+ * Superblocks per sequencer kick during the classify scan.
+ *
+ * s_cxt_diff.c walks the same metadata at boot and bounds its window at
+ * 0x100, which is also FMSS_DMA_BATCH_MAX -- the controller will take
+ * 256 descriptors in one go. At 16 this volume's 8110 superblocks cost
+ * 507 kicks where stock pays 32, and the scan took 5.5s of a mount whose
+ * checkpoint work is under a second.
+ */
+#define WHIMORY_PF_SLOTS		256
 #define WHIMORY_NUM_CE_MAX		2
 #define WHIMORY_VBAS_PER_PAGE		4
 #define WHIMORY_PAGES_PER_SB		128
@@ -542,6 +551,8 @@ struct whimory_sftl {
 	u32 btoc_pages_valid;
 	u32 btoc_entries_seen;
 	u32 btoc_l2v_updates;
+	u32 btoc_below_base;
+	u16 *pf_blocks;
 	u32 btoc_token_ffff0000;
 	u32 btoc_token_ffffff00;
 	u32 btoc_token_ffffffff;
