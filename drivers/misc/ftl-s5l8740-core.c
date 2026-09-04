@@ -257,7 +257,23 @@ MODULE_PARM_DESC(scan_blocks,
  * a slower one, and it is most of why our mount took thirty seconds
  * against stock's ten.
  *
- * Clear this to go back to reading the pages.
+ * Off until the address arithmetic earns it.
+ *
+ * Taking the entry's word means taking its vba, and that only works if
+ * whimory_sb_ofs_to_vba() reproduces s_g_addr_to_vba(wr->sb,
+ * wr->nextVbaOfs) exactly. It does not, for at least some superblocks:
+ * with this on, LBAs replayed from BTOCs land on pages belonging to
+ * other LBAs -- want=0x38dfa3 against meta=0x2500ad on this volume --
+ * while every CXT-seeded extent stays correct. The give-away is the
+ * weave: the good mappings all carry the checkpoint's base, and only
+ * the ones replayed above it are wrong.
+ *
+ * Reading the page back and keying on its meta_lba is self-correcting,
+ * which is what hid the arithmetic fault in the first place. Measured
+ * either way on the same volume: off, 139 of 140 files read and no lba
+ * mismatch at all; on, I/O errors on tinypod, fbdoom and ffmpeg and 190
+ * mismatches. Stock's design is right and the cost is real, but the
+ * addressing has to be correct before the trust is worth anything.
  */
 static bool btoc_trust_bte = true;
 module_param(btoc_trust_bte, bool, 0644);
@@ -601,7 +617,34 @@ MODULE_PARM_DESC(use_cxt,
  *
  * Set sb_fold=1 to reproduce both halves of that measurement.
  */
-static bool sb_fold;
+/*
+ * A superblock is a virtual block striped over its banks, and it carries
+ * exactly one BTOC -- written to the last VBA it used, on whichever bank
+ * that landed on. Classify enumerates planes, so the bank holding the
+ * BTOC comes back closed and the other three come back looking open.
+ *
+ * On this volume that turned 2029 closed superblocks into 2029 closed
+ * and 6001 open, on a disk that is 91% full and cannot have six thousand
+ * partially written superblocks. Folding those banks back gives 8 open,
+ * which is what a volume actually looks like.
+ *
+ * This was measured before and left off, because folding made a read
+ * sweep worse -- the open rebuild it removes was quietly compensating
+ * for two other faults: a diff that skipped everything below the
+ * checkpoint's top weave rather than its base, and BTOC entries applied
+ * through a bank-major address helper. With both fixed the same
+ * measurement inverts:
+ *
+ *                    fold off   fold on
+ *     classified open    6001         8
+ *     recovery          19.0s     12.1s
+ *     lba mismatches       10         0
+ *     files read      159/160   159/160
+ *     mapped_lbas     3901881   3901881
+ *
+ * Same map, fewer superblocks to walk, and nothing left mismatching.
+ */
+static bool sb_fold = true;
 module_param(sb_fold, bool, 0644);
 MODULE_PARM_DESC(sb_fold,
 		 "Fold non-BTOC banks into their superblock instead of replaying each (default N)");
@@ -5599,7 +5642,6 @@ static bool whimory_btoc_parse_bte(struct whimory *w, const u8 *page,
 	 */
 	u32 sb_vbas = whimory_sb_vbas(w, vblock);
 	u32 sb_data_vbas = whimory_sb_data_vbas(w, vblock);
-	u32 sb_idx = whimory_sb_index(w, ce, cau, vblock);
 	/*
 	 * The caller sets claim_weave to the superblock's own weave before
 	 * ingesting, and weaveSeqAdd is a forward delta from it: s_btoc.c
@@ -5673,7 +5715,16 @@ static bool whimory_btoc_parse_bte(struct whimory *w, const u8 *page,
 		if (btoc_trust_bte) {
 			u64 wv = btoc_base_weave +
 				 le32_to_cpu(bte->weave_seq_add);
-			u32 vba = whimory_sb_ofs_to_vba(w, sb_idx, vba_ofs);
+			/*
+			 * A BTOC offset is a whole-superblock VBA offset --
+			 * s_btoc.c:230 asserts vba == s_g_addr_to_vba(wr->sb,
+			 * wr->nextVbaOfs) -- so the bank falls out of the offset
+			 * and must not come from whichever plane's page carried
+			 * the BTOC. whimory_sb_ofs_to_vba() is bank-major and
+			 * pins every address to one plane, which put replayed
+			 * LBAs on pages belonging to other LBAs.
+			 */
+			u32 vba = vblock * whimory_vbas_per_vblock(w) + vba_ofs;
 			int uret;
 
 			/*
