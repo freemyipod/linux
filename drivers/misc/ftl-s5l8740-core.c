@@ -649,7 +649,23 @@ MODULE_PARM_DESC(recover_force,
  * checkpoint is the newest thing on it. This turns it on for exactly the
  * case that needs it: at least one superblock written after the checkpoint.
  */
-static bool cxt_confirm_auto = true;
+/*
+ * Confirming every checkpoint extent against the page it names was a
+ * workaround for trusting the checkpoint too far. While the diff skipped
+ * everything below the checkpoint's *top* weave, writes made in the
+ * window between base and top were never replayed, and the only thing
+ * that caught the resulting stale extents was reading each one back.
+ *
+ * The diff replays from the base now, so those writes arrive on their
+ * own. Measured on a volume with 47 superblocks newer than its
+ * checkpoint: confirming found 18 stale extents in 5997 and cost 19.5s;
+ * without it the recovery maps 3901881 LBAs instead of 3901293, and the
+ * volume reads identically -- 1656 directory entries, 119 of 120 files,
+ * the one failure being unwritten clusters in RadioBuffer either way.
+ *
+ * Set it when a volume is suspect; it is a diagnostic, not a mount step.
+ */
+static bool cxt_confirm_auto;
 module_param(cxt_confirm_auto, bool, 0644);
 MODULE_PARM_DESC(cxt_confirm_auto,
 		 "Confirm CXT extents against their pages when any superblock is newer than the checkpoint (default Y)");

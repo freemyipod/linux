@@ -67,15 +67,13 @@ struct whimory_fpart {
 
 /* Legacy per-block classify prefetch window, in 4 KiB slots. */
 /*
- * Superblocks per sequencer kick during the classify scan.
- *
- * s_cxt_diff.c walks the same metadata at boot and bounds its window at
- * 0x100, which is also FMSS_DMA_BATCH_MAX -- the controller will take
- * 256 descriptors in one go. At 16 this volume's 8110 superblocks cost
- * 507 kicks where stock pays 32, and the scan took 5.5s of a mount whose
- * checkpoint work is under a second.
+ * Legacy per-block prefetch window. This is not the classify scan: that
+ * goes through whimory_scan_plane_meta(), which already kicks
+ * S5L8740_NAND_BATCH_MAX / 2 blocks at a time and reads two meta records
+ * for each, filling the controller's 256-descriptor batch exactly as
+ * stock's does. Widening this one only enlarges a fallback nobody takes.
  */
-#define WHIMORY_PF_SLOTS		256
+#define WHIMORY_PF_SLOTS		16
 #define WHIMORY_NUM_CE_MAX		2
 #define WHIMORY_VBAS_PER_PAGE		4
 #define WHIMORY_PAGES_PER_SB		128
