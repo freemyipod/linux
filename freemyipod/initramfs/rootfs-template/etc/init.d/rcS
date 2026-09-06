@@ -15,3 +15,6 @@ done
 
 # No-auth root shell over telnet for development.
 telnetd -l /bin/sh && (echo "telnetd listening on :23" | tee /dev/tty1)
+
+# FTP
+(tcpsvd -vE 0.0.0.0 21 ftpd -wASa root / && (echo "ftpd listening on :21" | tee /dev/tty1)) &
