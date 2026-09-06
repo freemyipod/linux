@@ -72,13 +72,15 @@ $(ROOTFS_BB_BINARY): $(BB_BINARY)
 	$(MAKE) -C $(BB) CONFIG_PREFIX=$(ROOTFS) install
 
 $(ROOTFS)/%: $(ROOTFS_TEMPLATE)/%
-	mkdir -p $(dir $@)
+	mkdir -p -m 755 $(dir $@)
 	cp -p $< $@
+	chmod g-w $@
 
 $(ROOTFS)/usr/bin/%: ../%.c
-	mkdir -p $(dir $@)
+	mkdir -p -m 755 $(dir $@)
 	$(APP_CROSS_COMPILE)gcc $(APP_CFLAGS) -o $@ $<
 	$(APP_CROSS_COMPILE)strip $@
+	chmod g-w $@
 
 $(ROOTFS_STAMP): $(ROOTFS_DEPS)
 	touch $@
