@@ -14,7 +14,7 @@ APP_CFLAGS := -mcpu=cortex-a5+nosimd -static -O2 -Wall
 THIS_MAKEFILE := $(abspath $(lastword $(MAKEFILE_LIST)))
 THIS_DIR := $(patsubst %/,%,$(dir $(THIS_MAKEFILE)))
 
-CONF := apple_$(BOARD)_defconfig
+BB_CONF := apple_$(BOARD)_defconfig
 BB_FILE := $(THIS_DIR)/$(BUSYBOX_FILENAME)
 BB_INITIAL_DIR := $(THIS_DIR)/$(BUSYBOX_DIR)
 BB := $(BB_INITIAL_DIR)-$(BOARD)
@@ -61,7 +61,7 @@ $(BB_EXTRACTED): $(BB_FILE)
 	mv $(BB_INITIAL_DIR) $(BB)
 	touch $@
 
-$(BB_CONFIG): $(CONF) $(BB_EXTRACTED)
+$(BB_CONFIG): $(BB_CONF) $(BB_EXTRACTED)
 	cp $< $@
 	yes '' | $(MAKE) -C $(BB) oldconfig
 
