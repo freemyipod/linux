@@ -395,17 +395,6 @@ out_clear_irq:
 	return ret;
 }
 
-static void s5l8702_aes_update_walk_iv(struct skcipher_walk *walk, unsigned int nbytes, bool encrypt)
-{
-    const u8 *src = walk->src.virt.addr;
-    const u8 *dst = walk->dst.virt.addr;
-
-    if (encrypt)
-        memcpy(walk->iv, dst + nbytes - AES_BLOCK_SIZE, AES_BLOCK_SIZE);
-    else
-        memcpy(walk->iv, src + nbytes - AES_BLOCK_SIZE, AES_BLOCK_SIZE);
-}
-
 static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 {
 	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
@@ -424,16 +413,28 @@ static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 
 	mutex_lock(&aes_dev->lock);
 
-	ret = s5l8702_aes_hw_init(ctx, encrypt);
-	if (ret)
-		goto out_unlock;
-
 	while (walk.nbytes) {
 		dma_addr_t src, dst;
+		u8 next_iv[AES_BLOCK_SIZE];
+
+		// TODO: skip peripheral re-init on each chunk
+		ret = s5l8702_aes_hw_init(ctx, encrypt);
+		if (ret)
+			break;
 
 		// set IV for the current operation if needed
 		if (ctx->cbc)
 			s5l8702_aes_write_iv(aes_dev, walk.iv);
+
+		// if decrypting with CBC, the last cyphertext block is the IV
+		// for the first block of the next chunk
+		if (ctx->cbc && !encrypt) {
+			if (walk.nbytes < AES_BLOCK_SIZE) {
+				ret = -EINVAL;
+				break;
+			}
+			memcpy(next_iv, walk.src.virt.addr + walk.nbytes - AES_BLOCK_SIZE, AES_BLOCK_SIZE);
+		}
 
 		// map addresses
 		src = dma_map_single(dev, walk.src.virt.addr, walk.nbytes, DMA_TO_DEVICE);
@@ -458,9 +459,15 @@ static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 		if (ret)
 			break;
 
-		// prepare IV for the next operation if needed
-		if (ctx->cbc)
-			s5l8702_aes_update_walk_iv(&walk, walk.nbytes, encrypt);
+		// prepare IV for the next operation if CBC
+		if (ctx->cbc) {
+			if (encrypt)
+				memcpy(walk.iv, walk.dst.virt.addr + walk.nbytes - AES_BLOCK_SIZE, AES_BLOCK_SIZE);
+			else
+				memcpy(walk.iv, next_iv, AES_BLOCK_SIZE);
+		}
+
+		s5l8702_aes_hw_exit(aes_dev);
 
 		// update remaining bytes and process next chunk
 		ret = skcipher_walk_done(&walk, 0);
@@ -468,9 +475,6 @@ static int s5l8702_aes_crypt(struct skcipher_request *req, bool encrypt)
 			break;
 	}
 
-	s5l8702_aes_hw_exit(aes_dev);
-
-out_unlock:
 	mutex_unlock(&aes_dev->lock);
 
 	return ret;
