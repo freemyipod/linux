@@ -81,6 +81,8 @@
 #define CFG_FLOW_SHIFT		11
 #define CFG_IE			BIT(14)	/* unmask error IRQ */
 #define CFG_ITC			BIT(15)	/* unmask TC IRQ */
+#define CFG_ACTIVE		BIT(17)	/* read-only: words still in the channel FIFO */
+#define CFG_HALT		BIT(18)	/* stop honouring requests; drain, then Active clears */
 #define FLOW_M2P		0x1
 #define FLOW_P2M		0x2
 #define CTL_PROT_PRIV		BIT(28)
@@ -140,9 +142,26 @@ MODULE_PARM_DESC(force_mem, "1 = M2M flow + soft req, dest still FIFO");
  *   DstPeri=10, FlowCntrl=1 (M2P DMA), ITC=1, IE=0.
  * Earlier misread of Active as Flow=5; keep Flow=1 per PL080-DECODE.md.
  */
-static int force_flow = 1;
+/*
+ * FlowCntrl override, and why it must not default to a value.
+ *
+ * This was pinned to 1 for the playback work, where memory-to-peripheral is
+ * the right direction, and it is applied to every channel regardless of which
+ * way the transfer goes. Capture is peripheral-to-memory and needs 2, so it
+ * was being armed as memory-to-peripheral: the controller then waits for a
+ * request from the destination, the destination is memory, memory never
+ * requests, and the channel sits enabled having moved nothing. That is the
+ * whole of the "IIS2 RX DMA never fires" symptom -- the raw transfer count
+ * stayed zero for every peripheral id and every burst size tried, because
+ * none of those was what was wrong.
+ *
+ * Read back from the live channel it is CFG 0x0002881B where RetailOS builds
+ * 0x0000901B: same source peripheral 13, same destination field 0, flow 1
+ * where stock has 2. Auto picks per direction and matches stock in both.
+ */
+static int force_flow = -1;
 module_param(force_flow, int, 0644);
-MODULE_PARM_DESC(force_flow, "PL080 FlowCntrl -1=auto M2P, 0=M2M+soft, 1=M2P (RetailOS), 5=M2P-peri");
+MODULE_PARM_DESC(force_flow, "PL080 FlowCntrl override: -1 = per direction (default), 0 = M2M+soft, 1 = M2P, 2 = P2M, 5 = M2P-peri");
 /* DDI0196 CxControl bits 24/25: 0=AHB1, 1=AHB2. Kitra memcpy uses AHB1. */
 /*
  * RetailOS music-playing CTL = 0x84249000:
@@ -259,6 +278,21 @@ struct s5l_pl080_chan {
 	 */
 	unsigned int		err_count;
 	bool			err_stuck;
+	/*
+	 * Drive this channel's transfers with software burst requests.
+	 *
+	 * A peripheral that never asserts its request line moves exactly the
+	 * PL080's FIFO prefetch and then stops, which is what the LCDIF does
+	 * here. A capture of a RetailOS that is drawing shows DMAC0's
+	 * SoftBReq holding 0x8 -- a pending burst request on line 3, the
+	 * LCDIF's -- with channel 3 disabled, so stock does put requests on
+	 * that line by hand rather than waiting for the peripheral.
+	 *
+	 * Per channel, because a peripheral that does assert its own request
+	 * must not get spurious extra bursts: an unwanted one on the IIS0
+	 * play channel is a click in somebody's music.
+	 */
+	bool			soft_req;
 	/*
 	 * Cyclic period callbacks are delivered from a workqueue, not from
 	 * virt-dma's tasklet. See s5l_pl080_cyc_workfn().
@@ -426,22 +460,47 @@ static int s5l_pl080_pump(void *data)
 	unsigned int i, n;
 
 	while (!kthread_should_stop()) {
-		if (!s5l_pl080_need_soft()) {
-			usleep_range(20000, 40000);
-			continue;
-		}
+		bool all = s5l_pl080_need_soft();
+
 		n = 0;
 		for (i = 0; i < PL080_CH_COUNT * 2; i++) {
 			struct s5l_pl080_chan *ch = &pl->chans[i];
 
 			if (!ch->base || !ch->running)
 				continue;
-			writel(BIT(ch->id % PL080_CH_COUNT),
-			       ch->base + PL080_SOFT_BREQ);
+			if (!all && !ch->soft_req)
+				continue;
+			/*
+			 * The peripheral request line, not the channel
+			 * number. SoftBReq is indexed by request line, and
+			 * this used to write BIT(ch->id): correct only when
+			 * a channel happens to carry the peripheral with the
+			 * same number, and a request aimed at somebody
+			 * else's peripheral otherwise.
+			 *
+			 * One request outstanding at a time, which is the
+			 * state the oracle was captured in: a drawing
+			 * RetailOS holds SoftBReq = 0x8, a single pending
+			 * burst on line 3, not a register being rewritten.
+			 * Software sets these bits and the DMAC clears each
+			 * one when it services that burst, so re-raising a
+			 * bit that has not cleared yet asks for a burst the
+			 * peripheral never requested. Left unthrottled this
+			 * loop issues them as fast as the CPU will go.
+			 */
+			/*
+			 * n counts channels still being driven, not writes
+			 * issued: a pending request means this channel is
+			 * mid-burst and wants the loop to keep spinning, not
+			 * to fall into the idle sleep below.
+			 */
 			n++;
+			if (readl(ch->base + PL080_SOFT_BREQ) & BIT(ch->peri))
+				continue;
+			writel(BIT(ch->peri), ch->base + PL080_SOFT_BREQ);
 		}
 		if (!n)
-			usleep_range(2000, 4000);
+			usleep_range(20000, 40000);
 		else
 			cond_resched();
 	}
@@ -506,6 +565,38 @@ static unsigned int s5l_pl080_unit(void)
 }
 
 /*
+ * Bytes per transfer unit for a specific channel.
+ *
+ * Stock derives this from the channel's own DWidth, not from a global.
+ * sub_B424C reads the CTL word it just built and shifts the byte count by
+ * that field:
+ *
+ *	b42c0  ldr.w r1, [r8]              ; CTL
+ *	b42c4  ubfx  r0, r1, #21, #3       ; DWidth, bits 23:21
+ *	b42ca  lsrs  r2, r0                ; transfers = bytes >> DWidth
+ *
+ * s5l_pl080_unit() above answers from the `xfer_width` module parameter and
+ * ignores the channel entirely, which is only correct while every client
+ * happens to want the same width. It stopped being correct the moment a
+ * 32-bit client appeared: build_ctl() would emit DWidth=2 while the
+ * descriptor arithmetic still divided by 2, so the hardware moved
+ * `words << DWidth` bytes per node while the source pointer advanced only
+ * `words << 1` -- the buffer read twice over through overlapping windows.
+ *
+ * DWidth rather than SWidth because that is the field stock shifts by, and
+ * because s5l_pl080_slave_config() mirrors one onto the other when a client
+ * leaves either unset, so the two agree for every real transfer.
+ *
+ * This is a no-op for the existing audio clients: I2S asks for
+ * DMA_SLAVE_BUSWIDTH_2_BYTES, which encodes to 1 and gives the same unit of
+ * 2 that the `xfer_width` default produced.
+ */
+static unsigned int s5l_pl080_unit_ch(struct s5l_pl080_chan *ch)
+{
+	return 1u << s5l_pl080_chan_width(ch, true);
+}
+
+/*
  * CTL template only — transfer count is NOT in CTL[11:0] on this SoC.
  * OSOS B424C / RetailOS music CTL (e.g. 0x84249000) keep size bits clear;
  * count is written to CONTROL2 and LLI ctrl2.
@@ -547,29 +638,115 @@ static u32 s5l_pl080_build_ctl(struct s5l_pl080_chan *ch, u32 words,
 	return ctl;
 }
 
-static void s5l_pl080_chan_disable(struct s5l_pl080_chan *ch)
+/*
+ * Release a channel the way stock does at the end of a transfer, sub_BCAE8:
+ *
+ *	*Cx_CFG(ch) &= ~1;
+ *	INT_TC_CLEAR = 1 << ch;
+ *
+ * Only E is cleared. ITC, the peripheral fields and the flow control stay,
+ * which is why an idle stock channel reads 0x88C0 in every oracle snapshot
+ * rather than 0. Clearing E tells the channel "no more work"; it then keeps
+ * draining whatever its FIFO still holds and drops out of EnbldChns by
+ * itself when the peripheral has taken the last word.
+ *
+ * That last part is the point. Terminal count fires when the DMAC has
+ * FETCHED the last source word, not when the peripheral has consumed it,
+ * and up to sixteen words can still be sitting in the channel FIFO at that
+ * moment. Nothing about a channel is safe to rewrite until they are gone.
+ */
+static void s5l_pl080_chan_release(struct s5l_pl080_chan *ch)
 {
 	u8 id = ch->id % PL080_CH_COUNT;
 	void __iomem *b = ch->base;
-	unsigned int i;
-	u32 en;
+	u32 cfg;
 
 	if (!b)
 		return;
-	writel(0, b + PL080_Cx_CFG(id));
-	/* Never spin forever on BUSY — bounded poll then force-clear IRQs. */
-	for (i = 0; i < PL080_TERM_POLL_MAX; i++) {
-		en = readl(b + PL080_ENBLD_CHNS);
-		if (!(en & BIT(id)))
-			break;
+	cfg = readl(b + PL080_Cx_CFG(id));
+	if (cfg & CFG_ENABLE)
+		writel(cfg & ~CFG_ENABLE, b + PL080_Cx_CFG(id));
+}
+
+/* True once the channel has left EnbldChns, i.e. its FIFO has drained. */
+static bool s5l_pl080_chan_drained(struct s5l_pl080_chan *ch, unsigned int max_us)
+{
+	u8 id = ch->id % PL080_CH_COUNT;
+	unsigned int waited = 0;
+
+	while (readl(ch->base + PL080_ENBLD_CHNS) & BIT(id)) {
+		if (waited >= max_us)
+			return false;
 		udelay(PL080_TERM_POLL_US);
+		waited += PL080_TERM_POLL_US;
 	}
-	if (en & BIT(id))
-		dev_warn(ch->host->dev,
-			 "ch%u still enabled en=0x%x after disable (no BUSY wait)\n",
-			 ch->id, en);
+	return true;
+}
+
+/*
+ * Stop a channel and make it safe to reprogram. Returns 0 when the channel
+ * is out of EnbldChns, -EBUSY when it is not and must not be touched.
+ *
+ * This used to write Cx_CFG = 0, poll EnbldChns for 100 us, warn "still
+ * enabled ... (no BUSY wait)" and carry on -- and s5l_pl080_start() then
+ * rewrote SRC, DST, LLI, CTL, C2 and CFG on top of a channel that was still
+ * Active with words in its FIFO. That is undefined on a PL080 and it is
+ * exactly how a channel ends up holding words its peripheral will never be
+ * asked for: the stale tail goes out at the head of the NEXT transfer,
+ * that transfer overruns the LCDIF's window by the same amount, and its own
+ * tail is now the words nobody wants. Measured 2026-09-07: ch3 stuck in
+ * EnbldChns with Config 0x00020001 (Active, E), Halt set and Active never
+ * clearing, every following frame start logging "still enabled" first, and
+ * the top of the panel carrying the previous frame's tail.
+ *
+ * Order now follows the TRM. Clear E and let the FIFO drain; that is the
+ * whole of stock's release and is normally instant. If the channel is
+ * still enabled, set Halt so it stops accepting requests, wait for Active
+ * to clear, and only then write the configuration to zero. If Active never
+ * clears the peripheral is not taking the words, and the only honest thing
+ * to do is refuse to touch the channel and say so.
+ *
+ * Callers hold vc.lock with interrupts off, so the waits are bounded spins.
+ */
+static int s5l_pl080_chan_disable(struct s5l_pl080_chan *ch)
+{
+	u8 id = ch->id % PL080_CH_COUNT;
+	void __iomem *b = ch->base;
+	u32 cfg;
+
+	if (!b)
+		return 0;
+
+	s5l_pl080_chan_release(ch);
+	if (s5l_pl080_chan_drained(ch, 300))
+		goto out;
+
+	cfg = readl(b + PL080_Cx_CFG(id));
+	writel(cfg | CFG_HALT, b + PL080_Cx_CFG(id));
+	{
+		unsigned int waited = 0;
+
+		while (readl(b + PL080_Cx_CFG(id)) & CFG_ACTIVE) {
+			if (waited >= 300) {
+				dev_warn_ratelimited(ch->host->dev,
+					"ch%u will not drain: cfg=0x%08x en=0x%x src=0x%08x -- peripheral is not taking its FIFO; channel left alone\n",
+					ch->id, readl(b + PL080_Cx_CFG(id)),
+					readl(b + PL080_ENBLD_CHNS),
+					readl(b + PL080_Cx_SRC(id)));
+				return -EBUSY;
+			}
+			udelay(PL080_TERM_POLL_US);
+			waited += PL080_TERM_POLL_US;
+		}
+	}
+	writel(0, b + PL080_Cx_CFG(id));
+	if (!s5l_pl080_chan_drained(ch, 100))
+		return -EBUSY;
+
+out:
 	writel(BIT(id), b + PL080_INT_TC_CLEAR);
 	writel(BIT(id), b + PL080_INT_ERR_CLEAR);
+	return 0;
 }
 
 /* SRAM window: 0x22000000..0x2202FFFF. */
@@ -712,13 +889,53 @@ static void s5l_pl080_start(struct s5l_pl080_chan *ch, struct s5l_pl080_desc *d)
 	struct pl080_lli *first = d->lli;
 
 	s5l_pl080_sync_buffer(ch, d);
-	s5l_pl080_chan_disable(ch);
+	/*
+	 * A channel that will not drain is not reprogrammed. Put the
+	 * descriptor back at the head of the issued list so the next
+	 * issue_pending retries it, and let the consumer's own timeout say
+	 * so; the LCD path counts the failure and falls back to PIO, which
+	 * is a slow correct frame instead of a fast corrupt one.
+	 */
+	if (s5l_pl080_chan_disable(ch)) {
+		ch->err_count++;
+		list_add(&d->vd.node, &ch->vc.desc_issued);
+		return;
+	}
 	s5l_pl080_cyc_drop(ch);
 	if (d->cyclic) {
 		ch->cyc_cb = d->vd.tx.callback;
 		ch->cyc_cb_param = d->vd.tx.callback_param;
 		ch->cyc_active = true;
 	}
+
+	/*
+	 * DMACConfiguration = 1 on every start, which is what sub_A4F94 does
+	 * on every channel acquire:
+	 *
+	 *	*(u32 *)0x38200030 = 1;
+	 *	*Cx_CTL(chan) = table[peri] | ... | 0x80000000;
+	 *
+	 * This driver wrote it once at probe and trusted it to stay set. It
+	 * does not. Measured 2026-09-07 on a running device: DMACConfig read
+	 * 0x00000000 with the DMAC0 gate open, every channel start on ch3
+	 * then timed out with "residue 16380 of 16380 (never started)", and a
+	 * channel enabled while the controller was off could never drain its
+	 * FIFO, which is the "ch3 still enabled en=0x8 after disable" that
+	 * followed. A write of 1 to the register took and held. Nothing in
+	 * this tree clears it between probe and shutdown, and what does is
+	 * not yet known -- so the read below is kept as the instrument that
+	 * will say when it happens, and the write matches stock regardless.
+	 */
+	{
+		u32 dmac_cfg = readl(b + PL080_CONFIG);
+
+		if (!(dmac_cfg & PL080_CONFIG_EN))
+			dev_warn_ratelimited(ch->host->dev,
+					     "DMACConfig read 0x%08x at ch%u start: controller was disabled since probe -- re-enabling as sub_A4F94 does per acquire\n",
+					     dmac_cfg, ch->id);
+		writel(PL080_CONFIG_EN, b + PL080_CONFIG);
+	}
+
 	writel(le32_to_cpu(first->src), b + PL080_Cx_SRC(id));
 	writel(le32_to_cpu(first->dst), b + PL080_Cx_DST(id));
 	/* Next LLI, not the first (already loaded into SRC/DST/CTL/C2). */
@@ -777,6 +994,11 @@ static void s5l_pl080_issue(struct dma_chan *c)
 	}
 	spin_unlock_irqrestore(&ch->vc.lock, flags);
 }
+
+static uint pos_margin = 64;
+module_param(pos_margin, uint, 0644);
+MODULE_PARM_DESC(pos_margin,
+		 "bytes to hold back when reporting cyclic position, so a reader cannot outrun the data");
 
 static enum dma_status s5l_pl080_tx_status(struct dma_chan *c,
 					   dma_cookie_t cookie,
@@ -838,6 +1060,25 @@ static enum dma_status s5l_pl080_tx_status(struct dma_chan *c,
 			 */
 			if (words && cnt <= words)
 				pos += ((words - cnt) * per_node) / words;
+			/*
+			 * Report slightly less progress than the count claims.
+			 *
+			 * COUNT decrements when a transfer is issued, not when it
+			 * has landed in memory, so a position taken straight from
+			 * it can sit a burst ahead of the data actually written.
+			 * A capture then hands the application a few samples the
+			 * controller has not filled in yet, which are zeroes, and
+			 * a handful of zero samples in the middle of audio is a
+			 * click. Measured on a ten second capture: twenty zero
+			 * samples, in runs of up to six, with the channel running
+			 * normally throughout and no overrun latched.
+			 *
+			 * Backing off costs latency equal to the margin -- half a
+			 * millisecond at 32 kHz for the default -- and nothing
+			 * else, since the reader simply waits that much longer for
+			 * data that is on its way.
+			 */
+			pos = (pos > pos_margin) ? pos - pos_margin : 0;
 			if (pos < d->buf_len)
 				state->residue = d->buf_len - pos;
 			else
@@ -948,7 +1189,7 @@ s5l_pl080_prep_slave_sg(struct dma_chan *c, struct scatterlist *sgl,
 			 sg_len);
 
 	/* One LLI node per <= PL080_MAX_XFER_WORDS transfer units */
-	nlli = DIV_ROUND_UP(total, PL080_MAX_XFER_WORDS * s5l_pl080_unit());
+	nlli = DIV_ROUND_UP(total, PL080_MAX_XFER_WORDS * s5l_pl080_unit_ch(ch));
 	if (nlli == 0)
 		return NULL;
 
@@ -971,19 +1212,32 @@ s5l_pl080_prep_slave_sg(struct dma_chan *c, struct scatterlist *sgl,
 		if (force_flow != 1 && force_flow != 5)
 			cfg |= CFG_IE;
 		if (dir == DMA_MEM_TO_DEV)
-			cfg |= (ch->peri & 0x1f) << CFG_DST_PERI_SHIFT;
+			cfg |= (ch->peri & 0xf) << CFG_DST_PERI_SHIFT;
 		else
-			cfg |= (ch->peri & 0x1f) << CFG_SRC_PERI_SHIFT;
+			cfg |= (ch->peri & 0xf) << CFG_SRC_PERI_SHIFT;
 	} else if (force_mem) {
 		cfg |= CFG_IE | CFG_ITC;
 	} else if (dir == DMA_MEM_TO_DEV) {
+		/*
+		 * Stock's config, built exactly as sub_B424C builds it:
+		 *
+		 *   flow | ((dst & 0xF) << 6) | ((src & 0xF) << 1) | 0x8001
+		 *
+		 * The base is 0x8001 -- terminal-count interrupt and enable --
+		 * and bit 14, the error-interrupt unmask, is not in it. The
+		 * peripheral fields are four bits wide, not five; a five-bit
+		 * mask puts request 16 or above into the neighbouring field.
+		 * The peripheral that is memory takes the value RetailOS keeps
+		 * per controller at 0x891DDB8, which is 0 for both of them, so
+		 * the unused side is left clear rather than filled in.
+		 */
 		cfg |= (FLOW_M2P << CFG_FLOW_SHIFT) |
-		       ((ch->peri & 0x1f) << CFG_DST_PERI_SHIFT) |
-		       CFG_IE | CFG_ITC;
+		       ((ch->peri & 0xf) << CFG_DST_PERI_SHIFT) |
+		       CFG_ITC;
 	} else {
 		cfg |= (FLOW_P2M << CFG_FLOW_SHIFT) |
-		       ((ch->peri & 0x1f) << CFG_SRC_PERI_SHIFT) |
-		       CFG_IE | CFG_ITC;
+		       ((ch->peri & 0xf) << CFG_SRC_PERI_SHIFT) |
+		       CFG_ITC;
 	}
 
 	{
@@ -996,7 +1250,7 @@ s5l_pl080_prep_slave_sg(struct dma_chan *c, struct scatterlist *sgl,
 			size_t sg_off = 0;
 
 			while (sg_left && idx < nlli) {
-				size_t unit = s5l_pl080_unit();
+				size_t unit = s5l_pl080_unit_ch(ch);
 				size_t chunk = min_t(size_t, sg_left,
 						     PL080_MAX_XFER_WORDS * unit);
 				u32 words = chunk / unit;
@@ -1070,7 +1324,7 @@ s5l_pl080_prep_dma_cyclic(struct dma_chan *c, dma_addr_t buf_addr,
 	}
 
 	periods = buf_len / period_len;
-	per_period = DIV_ROUND_UP(period_len, PL080_MAX_XFER_WORDS * s5l_pl080_unit());
+	per_period = DIV_ROUND_UP(period_len, PL080_MAX_XFER_WORDS * s5l_pl080_unit_ch(ch));
 	if (!per_period)
 		return NULL;
 	nlli = periods * per_period;
@@ -1094,19 +1348,32 @@ s5l_pl080_prep_dma_cyclic(struct dma_chan *c, dma_addr_t buf_addr,
 		if (force_flow != 1 && force_flow != 5)
 			cfg |= CFG_IE;
 		if (dir == DMA_MEM_TO_DEV)
-			cfg |= (ch->peri & 0x1f) << CFG_DST_PERI_SHIFT;
+			cfg |= (ch->peri & 0xf) << CFG_DST_PERI_SHIFT;
 		else
-			cfg |= (ch->peri & 0x1f) << CFG_SRC_PERI_SHIFT;
+			cfg |= (ch->peri & 0xf) << CFG_SRC_PERI_SHIFT;
 	} else if (force_mem) {
 		cfg |= CFG_IE | CFG_ITC;
 	} else if (dir == DMA_MEM_TO_DEV) {
+		/*
+		 * Stock's config, built exactly as sub_B424C builds it:
+		 *
+		 *   flow | ((dst & 0xF) << 6) | ((src & 0xF) << 1) | 0x8001
+		 *
+		 * The base is 0x8001 -- terminal-count interrupt and enable --
+		 * and bit 14, the error-interrupt unmask, is not in it. The
+		 * peripheral fields are four bits wide, not five; a five-bit
+		 * mask puts request 16 or above into the neighbouring field.
+		 * The peripheral that is memory takes the value RetailOS keeps
+		 * per controller at 0x891DDB8, which is 0 for both of them, so
+		 * the unused side is left clear rather than filled in.
+		 */
 		cfg |= (FLOW_M2P << CFG_FLOW_SHIFT) |
-		       ((ch->peri & 0x1f) << CFG_DST_PERI_SHIFT) |
-		       CFG_IE | CFG_ITC;
+		       ((ch->peri & 0xf) << CFG_DST_PERI_SHIFT) |
+		       CFG_ITC;
 	} else {
 		cfg |= (FLOW_P2M << CFG_FLOW_SHIFT) |
-		       ((ch->peri & 0x1f) << CFG_SRC_PERI_SHIFT) |
-		       CFG_IE | CFG_ITC;
+		       ((ch->peri & 0xf) << CFG_SRC_PERI_SHIFT) |
+		       CFG_ITC;
 	}
 
 	idx = 0;
@@ -1116,7 +1383,7 @@ s5l_pl080_prep_dma_cyclic(struct dma_chan *c, dma_addr_t buf_addr,
 		unsigned int chunk_i;
 
 		for (chunk_i = 0; chunk_i < per_period && sg_left; chunk_i++) {
-			size_t unit = s5l_pl080_unit();
+			size_t unit = s5l_pl080_unit_ch(ch);
 			size_t chunk = min_t(size_t, sg_left,
 					     PL080_MAX_XFER_WORDS * unit);
 			u32 words = chunk / unit;
@@ -1419,6 +1686,15 @@ static irqreturn_t s5l_pl080_irq(int irq, void *data)
 						continue;
 					}
 					ch->running = NULL;
+					/*
+					 * Stock's release, at stock's moment:
+					 * clear E now so the FIFO tail drains
+					 * into the peripheral while the
+					 * consumer is still waking up, and the
+					 * channel is empty by the time the next
+					 * segment is issued.
+					 */
+					s5l_pl080_chan_release(ch);
 					if (d)
 						vchan_cookie_complete(&d->vd);
 					{
@@ -1436,6 +1712,34 @@ static irqreturn_t s5l_pl080_irq(int irq, void *data)
 		}
 	} while (pending);
 	return serviced ? IRQ_HANDLED : IRQ_NONE;
+}
+
+/*
+ * Which physical channel a peripheral belongs on, from the RetailOS
+ * captures rather than from whatever the allocator hands out first.
+ *
+ * Channel identity is not cosmetic on this part. A drawing RetailOS runs
+ * the LCDIF on channel 3 -- artifacts/retailos-lcd-oracle, where ch3 holds
+ * DstAddr 0x38300040, Control 0x84489000 and Config 0x88C0 with DstPeri 3
+ * -- and music on channel 2, EnbldChns 0x4 with DstAddr 0x3ca00010. Audio
+ * was already pinned here for exactly that reason. The LCDIF never was, so
+ * it took whatever was free, which is channel 0, and its request line
+ * never asserted: every segment timed out having moved nothing at all.
+ *
+ * Returns -1 for peripherals with no captured placement, which leaves the
+ * first-free behaviour alone for them.
+ */
+static int s5l_pl080_preferred_ch(unsigned int peri)
+{
+	switch (peri) {
+	case 10:			/* IIS0 playback -- ch2 */
+		return (force_ch >= 0 && force_ch < PL080_CH_COUNT) ?
+			force_ch : 2;
+	case 3:				/* LCDIF pixels  -- ch3 */
+		return 3;
+	default:
+		return -1;
+	}
 }
 
 static struct dma_chan *s5l_pl080_xlate_args(struct s5l_pl080 *pl,
@@ -1461,8 +1765,8 @@ static struct dma_chan *s5l_pl080_xlate_args(struct s5l_pl080 *pl,
 	 * (ASoC often already holds ch2 — dma_tone must reuse via lookup_peri,
 	 * not allocate a second peri-10 channel on ch3.)
 	 */
-	if (force_ch >= 0 && force_ch < PL080_CH_COUNT && peri == 10) {
-		unsigned int prefer = eng_lo + force_ch;
+	if (s5l_pl080_preferred_ch(peri) >= 0) {
+		unsigned int prefer = eng_lo + s5l_pl080_preferred_ch(peri);
 
 		if (prefer < eng_hi) {
 			ch = &pl->chans[prefer];
@@ -1573,6 +1877,78 @@ struct dma_chan *s5l_pl080_lookup_peri(unsigned int peri)
 }
 EXPORT_SYMBOL_GPL(s5l_pl080_lookup_peri);
 
+/*
+ * Every register of the channel a peripheral is bound to, in the order
+ * SRC, DST, LLI, CTL, CFG, CONTROL2, RAW_TC, ENBLD.
+ *
+ * The receive path has been diagnosed for a long time from raw transfer
+ * counts alone, which say a channel moved nothing without saying what it was
+ * asked to do. Comparing the whole channel against the values RetailOS builds
+ * -- config 0x901B for a peripheral-to-memory transfer on request 13 -- is a
+ * different question, and a cheaper one to answer.
+ */
+int s5l_pl080_peri_regs(unsigned int peri, u32 *out, unsigned int n)
+{
+	struct dma_chan *chan;
+	struct s5l_pl080_chan *ch;
+	u8 id;
+
+	chan = s5l_pl080_lookup_peri(peri);
+	if (!chan)
+		return -ENODEV;
+	ch = to_s5l_chan(chan);
+	id = ch->id % PL080_CH_COUNT;
+	if (n > 0)
+		out[0] = readl(ch->base + PL080_Cx_SRC(id));
+	if (n > 1)
+		out[1] = readl(ch->base + PL080_Cx_DST(id));
+	if (n > 2)
+		out[2] = readl(ch->base + PL080_Cx_LLI(id));
+	if (n > 3)
+		out[3] = readl(ch->base + PL080_Cx_CTL(id));
+	if (n > 4)
+		out[4] = readl(ch->base + PL080_Cx_CFG(id));
+	if (n > 5)
+		out[5] = readl(ch->base + PL080S_Cx_CONTROL2(id));
+	if (n > 6)
+		out[6] = readl(ch->base + PL080_RAW_TC);
+	if (n > 7)
+		out[7] = readl(ch->base + PL080_ENBLD_CHNS);
+	return id;
+}
+EXPORT_SYMBOL_GPL(s5l_pl080_peri_regs);
+
+/**
+ * s5l_pl080_soft_req - drive this channel's bursts from software
+ * @chan: the slave channel
+ * @on: true to raise a burst request on the channel's peripheral line for as
+ *      long as a transfer is running
+ *
+ * For a peripheral that never asserts its own request. The LCDIF is one:
+ * its channel binds, its geometry is right and its CONTROL and CONFIG words
+ * match a working RetailOS register for register, and then exactly the
+ * PL080's FIFO prefetch moves. A capture taken while RetailOS was drawing
+ * shows DMAC0's SoftBReq holding 0x8 -- a pending burst request on line 3,
+ * which is the LCDIF's -- against a channel 3 that is disabled, so stock
+ * raises requests on that line itself instead of waiting for the part.
+ *
+ * Opt-in per channel. Every other peripheral on this SoC does assert, and a
+ * spurious burst on the IIS0 play channel is an audible click.
+ */
+void s5l_pl080_soft_req(struct dma_chan *chan, bool on)
+{
+	struct s5l_pl080_chan *ch;
+
+	if (!chan)
+		return;
+	ch = to_s5l_chan(chan);
+	ch->soft_req = on;
+	dev_info(chan->device->dev,
+		 "channel %u (peri %u): software burst requests %s\n",
+		 ch->id, ch->peri, on ? "on" : "off");
+}
+EXPORT_SYMBOL_GPL(s5l_pl080_soft_req);
+
 int s5l_pl080_peri_snapshot(unsigned int peri, u32 *src, u32 *dst, u32 *en)
 {
 	struct dma_chan *chan;
@@ -1651,7 +2027,7 @@ int s5l_pl080_rearm_set_src(struct dma_chan *c, dma_addr_t addr, size_t bytes)
 
 	d->lli[0].src = cpu_to_le32(lower_32_bits(addr));
 
-	words = (unsigned int)(bytes / s5l_pl080_unit());
+	words = (unsigned int)(bytes / s5l_pl080_unit_ch(ch));
 	if ((le32_to_cpu(d->lli[0].ctrl2) & PL080S_XFER_COUNT_MASK) != words)
 		d->lli[0].ctrl2 = cpu_to_le32(words & PL080S_XFER_COUNT_MASK);
 out:
@@ -1720,7 +2096,7 @@ int s5l_pl080_rearm_set_ring(struct dma_chan *c, dma_addr_t base, size_t bytes,
 	d->ring_off = (u32)period % (u32)bytes;
 	d->lli[0].src = cpu_to_le32(d->ring_base + d->ring_off);
 
-	words = (unsigned int)(period / s5l_pl080_unit());
+	words = (unsigned int)(period / s5l_pl080_unit_ch(ch));
 	if ((le32_to_cpu(d->lli[0].ctrl2) & PL080S_XFER_COUNT_MASK) != words)
 		d->lli[0].ctrl2 = cpu_to_le32(words & PL080S_XFER_COUNT_MASK);
 

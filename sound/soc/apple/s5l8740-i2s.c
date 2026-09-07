@@ -19,8 +19,13 @@
  * from. The IIS2 program below is from a capture of stock playing FM:
  *
  *   CLKCON +0x00 = 0x1        TXCON  +0x04 = 0x0b000099
- *   RXCON  +0x30 = 0x1000     RXCOM  +0x34 = 0x6 running, 0x2 idle
- *   CLKDIV +0x40 = 0x96       REG44  +0x44 = 0x00010007
+ *   RXCON  +0x30 = 0x1000     RXCOM  +0x34 = 0x6 running
+ *   CLKDIV +0x40 = 0x96
+ *
+ * +0x44 read 0x00010007 in that same capture and is not written here,
+ * because no code path in the stock image writes it -- the value is whatever
+ * reset and the bootloader leave, so re-storing it would be this driver's
+ * invention rather than stock's behaviour.
  */
 #include <linux/atomic.h>
 #include <linux/math64.h>
@@ -67,12 +72,55 @@
 #define I2SSTATUS	0x3c
 #define I2SCLKDIV	0x40	/* Stock writes the divider here, not at +0x24. */
 /* Readback from stock with music playing: 0x00010007. Never written. */
-#define I2SREG44	0x44
+#define I2SREG44	0x44	/* read-only here; see the file comment */
 /*
- * STATUS write-1-to-clear: the TX sticky bit. Leaving it set is why silent
- * dumps always read 0x8xxx.
+ * STATUS at +0x3C, as far as it is known. Measured on the device against the
+ * decompilation, and worth writing down because the obvious guess -- that there
+ * is a FIFO level or data-available flag in here -- is wrong.
+ *
+ * Bits 15 and 16 are a direction-indexed sticky pair, write-1-to-clear.
+ * sub_C093C (0xC093C) tests one with *(base + 60) & (1 << (dir + 15)) and
+ * sub_C095E (0xC095E) clears it by writing that bit back; sub_BB9F8 (0xBB9F8)
+ * wraps the two as a read-and-clear, which is the shape of an error latch and
+ * not of a level. Direction 0 is bit 15, which is the TX bit this driver already
+ * knew about, so direction 1 is bit 16 and belongs to receive.
+ *
+ * Bit 16 is observed clear on a fresh boot and set after any capture has run,
+ * and nothing in this driver clears it. That is an RX overrun: the FIFO fills
+ * because the DMA never drains it. It is a consequence of that failure and not
+ * its cause -- clearing it before a capture changes nothing.
+ *
+ * Bit 14 is set only while a capture is open, so it tracks the receive engine
+ * running.
+ *
+ * Bit 0 toggles continuously whether or not the FIFO is being read, so it is a
+ * frame or clock phase and carries no information about occupancy.
+ *
+ * Nothing here says whether a word is waiting. That matters for a PIO reader,
+ * which cannot ask before it reads -- though in practice it does not need to:
+ * with the tuner streaming at 32 kHz the FIFO is never empty for long, every
+ * read after the first few returns audio, and the sticky that latches is
+ * overrun rather than underrun.
  */
 #define I2SSTATUS_TX_W1C	0x8000u
+#define I2SSTATUS_RX_W1C	0x10000u	/* sub_C095E, direction 1 */
+/*
+ * Receive FIFO level, bits 14:11 -- how many words are waiting, 0 to 8.
+ *
+ * Measured on hardware with the port running and no capture open: at rest the
+ * field reads 8, each read of the FIFO decrements it by exactly one, and a read
+ * taken at 0 returns the oldest entry again rather than anything new. It is back
+ * to 8 within a millisecond. Bit 14 alone had been taken for a flag, which it is
+ * not -- it is this field's top bit, so it is set only while the FIFO is
+ * completely full, and gating on it takes one word per wake-up instead of the
+ * level's worth.
+ *
+ * This is the flow control the receive path never had. Reading exactly what the
+ * level reports needs no clock and no lead, so the pump cannot drift into
+ * reading past the end of the FIFO however far the two clocks diverge.
+ */
+#define I2SSTATUS_RX_LEVEL_SHIFT	11
+#define I2SSTATUS_RX_LEVEL_MASK		0xFu
 #define MCLK_ASSUME_HZ	12000000u
 /*
  * TXCON.
@@ -250,15 +298,58 @@ MODULE_PARM_DESC(fifo_prefill,
  */
 #define CLKCON_FM_GATE_MASK	0x8000u
 
-/* fm-playing oracle values for the IIS2 side. */
+/*
+ * IIS2 register program, from the stock FM power-on sub_15DD5C at 0x0015DD5C.
+ *
+ * Stock builds TXCON with a read-modify-write and then sets one more bit,
+ * rather than storing a constant:
+ *
+ *	sub_BCB60(2, 1, 0, 1, 16)  *(0x3D400004) = (old & 0x780) | 0x0b000019
+ *	                           *(0x3D400030) = 0x1000
+ *	sub_4F6DC(2, 1)            *(0x3D400004) |= 0x80
+ *
+ * With the preserved field clear that lands on 0x0b000099, which is what a
+ * capture of stock playing FM reads back. Doing it as stock does keeps bits
+ * 10:8 -- a field sub_4F6DC writes for its other argument values -- out of
+ * this driver's hands.
+ *
+ * RXCOM is armed and disarmed the same way the TX side is: sub_B6620(2, 1)
+ * sets bits 1 and 2, sub_5705DC(2, 1) clears bit 2 alone. Storing 0x2 on
+ * every stop, as this once did, also cleared bit 1.
+ */
 #define IIS2_CLKCON_ON		0x1u
-#define IIS2_TXCON_FM		0x0b000099u
+#define IIS2_TXCON_BASE		0x0b000019u	/* sub_BCB60, 16-bit samples */
+#define IIS2_TXCON_MASTER	0x80u		/* sub_4F6DC(port, 1) */
+#define IIS2_TXCON_FM		0x0b000099u	/* the two above, combined */
 #define IIS2_RXCON_FM		0x1000u
 #define IIS2_RXCOM_DMA		0x6u
-#define IIS2_RXCOM_IDLE		0x2u
-#define IIS2_CLKDIV_FM_ORACLE	0x96u
-#define IIS2_REG44_ORACLE	0x00010007u
-#define IIS2_REGS_LEN		0x48
+#define IIS2_RXCOM_RUN		BIT(2)		/* the bit stock drops on stop */
+#define IIS2_REGS_LEN		0x80
+
+/*
+ * The FM PCM clock, from stock's audio-route enable sub_42A8C at 0x00042A8C.
+ *
+ * That function is the whole of stock's FM-audio-on step, and it derives both
+ * dividers from one chosen bit-clock rate:
+ *
+ *	clk_set(11, 0, 24000000 / bitclk)   CLKCON+0x10 field 14:0
+ *	CLKDIV = bitclk / 32000             IIS2 +0x40
+ *
+ * so the frame rate is always 32 kHz and the bit clock is what varies. The
+ * SoC drives both -- there is no path in the stock image that configures the
+ * BCM2078 as PCM master, and 24 MHz / 5 / 150 is 32000 exactly, so nothing
+ * here needs the 12 MHz codec master clock.
+ *
+ * Three bit clocks exist, chosen per tuned station to keep the PCM clock's
+ * harmonics off the carrier; see bcm2078-bt.c, which owns the table and the
+ * frequency. 4.8 MHz is the default.
+ */
+#define IIS2_CLK_SRC_HZ		24000000u
+#define IIS2_FM_FS_HZ		32000u
+#define IIS2_BITCLK_DEFAULT_HZ	4800000u
+/* CLKCON+0x10 bits 14:0: source select at 13:12, divider-1 at 3:0. */
+#define CLKCON_FM_FIELD_MASK	0x7fffu
+#define CLKCON_FM_DIV_MASK	0xfu
 
 /*
  * IIS2 PCM pads.
@@ -3002,7 +3093,13 @@ static const struct snd_dmaengine_pcm_config s5l8740_iis2_dma_cfg = {
 
 static uint iis2_clkdiv;
 module_param(iis2_clkdiv, uint, 0644);
-MODULE_PARM_DESC(iis2_clkdiv, "IIS2 CLKDIV override; 0 = FM oracle 0x96");
+MODULE_PARM_DESC(iis2_clkdiv,
+		 "IIS2 CLKDIV override; 0 = derive from the FM bit clock");
+
+static uint iis2_bitclk = IIS2_BITCLK_DEFAULT_HZ;
+module_param(iis2_bitclk, uint, 0644);
+MODULE_PARM_DESC(iis2_bitclk,
+		 "IIS2 PCM bit clock in Hz; the tuner overrides this per station");
 
 struct s5l8740_iis2 {
 	void __iomem *base;
@@ -3019,26 +3116,66 @@ struct s5l8740_iis2 {
 	u32 fm_gate_saved;
 	bool fm_gate_held;
 	unsigned int rate;
+
+	/* PIO capture; see the block above iis2_pio_thread(). */
+	struct task_struct *pio_task;
+	bool pio_run;
+	struct snd_pcm_substream *pio_sub;
+	unsigned int pio_pos;
+	unsigned int pio_period;
+	unsigned int pio_buffer;
+	ktime_t pio_step;
+	unsigned int pio_filled;
+	/* Carried-over odd word, so the ring position stays frame-aligned. */
+	u16 pio_stash;
+	bool pio_stash_valid;
+	unsigned long pio_words;
+	unsigned long pio_wakes;
+	unsigned long pio_latches;
+	int pio_stalled;
+	unsigned long pio_periods;
 };
 
-static u32 iis2_pick_clkdiv(unsigned int rate)
+/*
+ * Both IIS2 dividers, from one bit-clock rate.
+ *
+ * This deliberately does not consult the IIS0 rate table. That table divides
+ * the 12 MHz codec master clock and is right for the headphone path; IIS2 runs
+ * off a 24 MHz source through CLKCON+0x10, which is why the same session shows
+ * CLKDIV 0x96 here and 0x177 there. Deriving one from the other produced a
+ * plausible-looking number and the wrong clock.
+ */
+static unsigned int iis2_bitclk_hz(void)
 {
-	const struct n31_rate_cfg *r;
+	unsigned int hz = READ_ONCE(iis2_bitclk);
 
+	if (!hz || IIS2_CLK_SRC_HZ / hz < 1 ||
+	    IIS2_CLK_SRC_HZ % hz || IIS2_CLK_SRC_HZ / hz > 16 ||
+	    hz % IIS2_FM_FS_HZ)
+		hz = IIS2_BITCLK_DEFAULT_HZ;
+	return hz;
+}
+
+/*
+ * Frame rate on the tuner link.
+ *
+ * Stock runs this port at 32 kHz and can afford to: it moves the FIFO by DMA.
+ * Reading it with the CPU cannot keep up with 64000 words a second here -- the
+ * pump tops out around 56000 with a reader on the same core -- so the stream
+ * starves and both ends xrun. Halving the frame rate halves the word rate and
+ * puts it comfortably inside what the CPU can carry, at the cost of audio
+ * bandwidth. 16 kHz is a rate the tuner's PCM port is expected to support;
+ * anything not in the DAI's rate list below will be refused.
+ */
+static uint iis2_fs = IIS2_FM_FS_HZ;
+module_param(iis2_fs, uint, 0644);
+MODULE_PARM_DESC(iis2_fs, "tuner link frame rate in Hz (32000 default, 16000)");
+
+static u32 iis2_pick_clkdiv(unsigned int bitclk)
+{
 	if (iis2_clkdiv)
 		return iis2_clkdiv;
-	/*
-	 * The FM capture uses 0x96 where IIS0 runs 0x177 in the same session,
-	 * so this divider is not derived from the IIS0 rate table.
-	 */
-	if (rate == 44100 || rate == 48000)
-		return IIS2_CLKDIV_FM_ORACLE;
-	r = n31_find_rate(rate);
-	if (r)
-		return r->clkdiv;
-	if (!rate)
-		rate = 44100;
-	return MCLK_ASSUME_HZ / rate;
+	return bitclk / (iis2_fs ? iis2_fs : IIS2_FM_FS_HZ);
 }
 
 static void iis2_pads(struct s5l8740_iis2 *iis2, bool claim)
@@ -3099,26 +3236,97 @@ static void iis2_fm_gate(struct s5l8740_iis2 *iis2, bool on)
 	}
 }
 
-/* Peri 13 must be armed by dmaengine before RXCOM is kicked. */
-static void iis2_program_rx(struct s5l8740_iis2 *iis2)
+/*
+ * CLKCON+0x10 bits 14:0, and nothing else.
+ *
+ * Stock reaches this register through an IRAM-resident clock setter that the
+ * static image only reaches through a veneer -- sub_345D28 at 0x00345D28 jumps
+ * to 0x22000930, which is copied there from 0x08982B00 at boot. Its case for
+ * clock id 11 clears bits 14:0, ORs the source select into 13:12 and
+ * divider - 1 into 3:0, then spins 100 us:
+ *
+ *	*(0x3C500010) = (old & ~0x7fff) | (src << 12) | ((div - 1) & 0xf)
+ *
+ * Source 0 is the one both FM callers pass. Bit 15 is the gate, handled by
+ * iis2_fm_gate(), and bits 30:16 are a second clock id's identical field --
+ * which is exactly why this is a read-modify-write of a 15-bit window and not
+ * a store. CLKCON packs unrelated peripherals into one word on this SoC.
+ */
+static void iis2_clk_program(struct s5l8740_iis2 *iis2, unsigned int bitclk)
 {
-	iis2_pads(iis2, true);
-	iis2_fm_gate(iis2, true);
-	s5l8740_audio_clk_set(iis2->clkcon, S5L8740_AUDIO_PORT_IIS2, true);
-	writel(IIS2_CLKCON_ON, iis2->base + I2SCLKCON);
-	writel(IIS2_TXCON_FM, iis2->base + I2STXCON);
-	writel(IIS2_RXCON_FM, iis2->base + I2SRXCON);
-	writel(iis2_pick_clkdiv(iis2->rate), iis2->base + I2SCLKDIV);
-	writel(IIS2_REG44_ORACLE, iis2->base + I2SREG44);
+	unsigned int div;
+	u32 cur;
+
+	if (!iis2->clkcon)
+		return;
+	div = IIS2_CLK_SRC_HZ / bitclk;
+	cur = readl(iis2->clkcon + CLKCON_FM_GATE);
+	/*
+	 * The divider field and nothing else.
+	 *
+	 * This used to clear bits 14:0 and put the divider back in 3:0, which
+	 * zeroes 14:4 on every FM program. CLKCON packs unrelated fields into
+	 * one word on this SoC, so whatever those bits carry -- the parent this
+	 * divider runs from, on the evidence -- was being wiped each time. The
+	 * port then ran about 14%% slow against a divider that is arithmetically
+	 * correct: 27.5 kHz where 150 and a 4.8 MHz bit clock give 32 kHz.
+	 */
+	writel((cur & ~CLKCON_FM_DIV_MASK) | ((div - 1) & CLKCON_FM_DIV_MASK),
+	       iis2->clkcon + CLKCON_FM_GATE);
+	dev_dbg(iis2->dev, "IIS2 clk+10 %08x -> %08x (divider %u)\n",
+		 cur, readl(iis2->clkcon + CLKCON_FM_GATE), div);
+	udelay(100);
 }
 
+/*
+ * Peri 13 must be armed by dmaengine before RXCOM is kicked.
+ *
+ * The order below is stock's, from sub_15DD5C: pads to function 2, the TXCON
+ * and RXCON pair, the CLKCON divider, TXCON's master bit, CLKDIV, and only
+ * then the gate. Programming a divider into a running clock and ungating
+ * afterwards is the sequence the hardware was shipped with.
+ */
+static void iis2_program_rx(struct s5l8740_iis2 *iis2)
+{
+	unsigned int bitclk = iis2_bitclk_hz();
+
+	iis2_pads(iis2, true);
+	/*
+	 * The tuner's bus slows down for as long as the radio is on. Stock does
+	 * this here, between the pads and the TXCON/RXCON pair -- sub_570590(1,
+	 * 7) -- and undoes it in the power-off sequence. -ENODEV only means the
+	 * I2C driver is not loaded, which is not a reason to refuse the port.
+	 */
+	s5l8702_i2c_set_clock_scale(S5L8702_I2C1_PHYS,
+				    S5L8702_I2C_SCALE_FM_ON);
+	s5l8740_audio_clk_set(iis2->clkcon, S5L8740_AUDIO_PORT_IIS2, true);
+	writel(IIS2_CLKCON_ON, iis2->base + I2SCLKCON);
+	writel((readl(iis2->base + I2STXCON) & I2STXCON_KEEP) | IIS2_TXCON_BASE,
+	       iis2->base + I2STXCON);
+	writel(IIS2_RXCON_FM, iis2->base + I2SRXCON);
+	iis2_clk_program(iis2, bitclk);
+	writel(readl(iis2->base + I2STXCON) | IIS2_TXCON_MASTER,
+	       iis2->base + I2STXCON);
+	writel(iis2_pick_clkdiv(bitclk), iis2->base + I2SCLKDIV);
+	iis2_fm_gate(iis2, true);
+}
+
+/*
+ * Stop, in stock's order: sub_157784 drops the route, then clears RXCOM bit 2
+ * (sub_5705DC), then gates the clock (sub_41CBD8(11, 0)). The route write is
+ * the tuner's and lives in bcm2078-bt.
+ */
 static void iis2_hw_stop(struct s5l8740_iis2 *iis2)
 {
 	if (!iis2 || !iis2->base)
 		return;
-	writel(IIS2_RXCOM_IDLE, iis2->base + I2SRXCOM);
+	writel(readl(iis2->base + I2SRXCOM) & ~IIS2_RXCOM_RUN,
+	       iis2->base + I2SRXCOM);
 	s5l8740_audio_clk_set(iis2->clkcon, S5L8740_AUDIO_PORT_IIS2, false);
 	iis2_fm_gate(iis2, false);
+	/* sub_570590(1, 2): the bus goes back to its normal prescaler. */
+	s5l8702_i2c_set_clock_scale(S5L8702_I2C1_PHYS,
+				    S5L8702_I2C_SCALE_DEFAULT);
 	iis2_pads(iis2, false);
 }
 
@@ -3132,8 +3340,12 @@ static int s5l8740_iis2_hw_params(struct snd_pcm_substream *substream,
 		return -ENODEV;
 	if (substream->stream != SNDRV_PCM_STREAM_CAPTURE)
 		return -EINVAL;
-	/* No SRAM pool, no capture -- see the probe. */
-	if (!iis2->sram_ok) {
+	/*
+	 * No SRAM pool, no capture -- see the probe. The PIO path is exempt: its
+	 * buffer is vmalloc and nothing but the CPU ever addresses it, so the
+	 * reason the DMA path insists on low SRAM does not apply to it.
+	 */
+	if (iis2->has_dma && !iis2->sram_ok) {
 		dev_err_ratelimited(dai->dev,
 			"capture refused: i2s2_sram did not bind, and DRAM is not a configuration stock uses\n");
 		return -ENODEV;
@@ -3141,9 +3353,11 @@ static int s5l8740_iis2_hw_params(struct snd_pcm_substream *substream,
 	iis2->rate = params_rate(params);
 	iis2_program_rx(iis2);
 	i2s_vinfo(dai->dev,
-		 "IIS2 hw_params rate=%u ch=%u clkdiv=0x%x reg44=0x%x status=0x%x\n",
-		 iis2->rate, params_channels(params),
-		 readl(iis2->base + I2SCLKDIV), readl(iis2->base + I2SREG44),
+		 "IIS2 hw_params rate=%u ch=%u bitclk=%u clkdiv=0x%x clkcon10=0x%x reg44=0x%x status=0x%x\n",
+		 iis2->rate, params_channels(params), iis2_bitclk_hz(),
+		 readl(iis2->base + I2SCLKDIV),
+		 iis2->clkcon ? readl(iis2->clkcon + CLKCON_FM_GATE) : 0,
+		 readl(iis2->base + I2SREG44),
 		 readl(iis2->base + I2SSTATUS));
 	return 0;
 }
@@ -3163,7 +3377,21 @@ static int s5l8740_iis2_trigger(struct snd_pcm_substream *substream, int cmd,
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 		iis2_program_rx(iis2);
-		writel(IIS2_RXCOM_DMA, iis2->base + I2SRXCOM);
+		/*
+		 * Acknowledge the receive condition latch before arming.
+		 *
+		 * Stock checks and clears it every cycle -- sub_BB9F8 reads
+		 * STATUS bit 15 or 16 by direction and stores the same bit back,
+		 * which is write-one-to-clear and touches nothing else. This
+		 * driver had never cleared the receive one at all, so the 0x10000
+		 * in every status reading taken from a running capture may be
+		 * nothing but the first overrun, still latched from whenever it
+		 * happened. A stream that starts with it clear is a stream whose
+		 * status can be read.
+		 */
+		writel(I2SSTATUS_RX_W1C, iis2->base + I2SSTATUS);
+		writel(readl(iis2->base + I2SRXCOM) | IIS2_RXCOM_DMA,
+		       iis2->base + I2SRXCOM);
 		i2s_vinfo(dai->dev,
 			 "IIS2 capture start rxcom=0x%x status=0x%x\n",
 			 readl(iis2->base + I2SRXCOM),
@@ -3188,6 +3416,686 @@ static int s5l8740_iis2_dai_probe(struct snd_soc_dai *dai)
 	return 0;
 }
 
+/*
+ * The tuner's half of the FM audio enable.
+ *
+ * Stock's sub_42A8C reprograms this port's two dividers on every tune, from a
+ * bit clock chosen by the station being tuned, and only then tells the BCM2078
+ * to put tuner audio on the PCM port. bcm2078-bt owns the frequency and the
+ * table; this owns the registers. Reprogramming while the port runs is what
+ * stock does -- it does not stop and restart the capture to change stations.
+ *
+ * Declared here rather than in apple-n31.h only because this driver does not
+ * own that header; the declaration belongs there next to the other hooks.
+ */
+void bcm2078_register_fm_pcm_clk(int (*fn)(unsigned int bitclk_hz));
+
+static struct s5l8740_iis2 *s5l8740_iis2_dev;
+
+static int s5l8740_iis2_set_fm_bitclk(unsigned int bitclk_hz)
+{
+	struct s5l8740_iis2 *iis2 = READ_ONCE(s5l8740_iis2_dev);
+
+	if (!iis2 || !iis2->base)
+		return -ENODEV;
+	if (!bitclk_hz || bitclk_hz % IIS2_FM_FS_HZ ||
+	    !(IIS2_CLK_SRC_HZ / bitclk_hz) ||
+	    IIS2_CLK_SRC_HZ % bitclk_hz ||
+	    IIS2_CLK_SRC_HZ / bitclk_hz > 16)
+		return -EINVAL;
+	WRITE_ONCE(iis2_bitclk, bitclk_hz);
+	/*
+	 * Only touch the hardware if this port already holds the FM gate.
+	 * Before the capture PCM opens there is nothing to reprogram, and the
+	 * stored rate is picked up by the next iis2_program_rx().
+	 */
+	if (!iis2->fm_gate_held)
+		return 0;
+	iis2_clk_program(iis2, bitclk_hz);
+	writel(iis2_pick_clkdiv(bitclk_hz), iis2->base + I2SCLKDIV);
+	dev_dbg(iis2->dev, "IIS2 FM bit clock %u Hz, clkdiv 0x%x\n",
+		bitclk_hz, readl(iis2->base + I2SCLKDIV));
+	return 0;
+}
+
+/*
+ * PIO capture, kept as a fallback. The DMA path is the one that runs.
+ *
+ * This existed because the receive DMA appeared never to fire: the raw transfer
+ * count stayed zero through peri ids 8, 9, 11, 12, 13, 14 and 15, both engines,
+ * and every burst size tried. None of that was what was wrong. The channel was
+ * being armed memory-to-peripheral for a peripheral-to-memory transfer, so it
+ * waited for a request from memory, which never comes; and the burst was one
+ * transfer per request against a FIFO eight deep. With the flow right and the
+ * burst at four it runs continuously at full rate. See the dma driver.
+ *
+ * RetailOS does move this port by DMA, and into memory: sub_BBA2C arms the
+ * transfer through sub_BFA50 and then calls sub_B6620, the RXCOM arm, and
+ * sub_B424C's peripheral-to-memory branch takes a peripheral index for the
+ * source and an address for the destination. What stock has no path for is
+ * moving it with the CPU -- across the whole image the only IIS2 offsets any
+ * code touches are +0x00, +0x04, +0x08, +0x30, +0x34, +0x3C and +0x40, and
+ * neither FIFO appears at any of them -- which is why this half has no oracle
+ * behind it and the DMA half does.
+ *
+ * A kernel thread, not a timer.
+ *
+ * The FM dai_link is nonatomic, which makes this PCM's stream lock a mutex
+ * rather than a spinlock, and that decides the whole shape of this code:
+ * snd_pcm_period_elapsed() and snd_pcm_stop_xrun() both take that lock, so
+ * both can sleep and neither may be called from a timer callback. An hrtimer
+ * was tried first, in HRTIMER_MODE_REL_SOFT, and it fails in exactly that way
+ * -- the pump ran, the FIFO reads landed, and the period call then blocked in
+ * __mutex_lock inside a softirq. No period was ever delivered, and the reader
+ * was left in uninterruptible sleep where SIGKILL does not reach it, holding
+ * the PCM open and pinning the module, so the only way back was a reboot.
+ * A thread can sleep, so it can call both, and it can be stopped.
+ */
+/*
+ * What STATUS bit 14 means, and why the pump is built around finding out.
+ *
+ * Two readings of that register exist. With a capture running it reads
+ * 0x00014004, and immediately after a burst that emptied the FIFO it reads
+ * 0x00000024 -- bit 14 gone, bit 5 latched. The first reading of that was that
+ * bit 14 says the receive engine is alive and draining the FIFO too hard kills
+ * it. But every observation of bit 14 set was taken with samples waiting, and
+ * every observation of it clear was taken just after they had been taken away,
+ * so the same two readings fit "the RX FIFO has something in it" exactly as
+ * well -- and under that reading the engine was never dying, it was running dry.
+ *
+ * Which it is decides whether PIO can work at all. Without a data-available
+ * indication the pump has to guess how many words have arrived from the clock,
+ * and it cannot: CLOCK_MONOTONIC and the port's 24 MHz-derived bit clock are
+ * different crystals, so a hundred parts per million of drift is enough to eat
+ * a four-word lead inside a second, after which every wake-up reads past the
+ * end of the FIFO. With it, the pump reads exactly what is there and drift
+ * stops mattering.
+ *
+ * So the gated read is the default and the arithmetic is the fallback, both
+ * selectable, and the rx_on attribute below runs the receive engine with no PCM
+ * attached so the bit can be watched directly.
+ */
+#define IIS2_PIO_DEPTH		8u	/* FIFO entries, measured */
+/*
+ * Reading the FIFO harder than it refills is what has to be avoided, whichever
+ * of the two readings above is right: it either stops the engine or returns
+ * stale entries. On the arithmetic path the only protection is to ask for fewer
+ * words than have arrived and let the difference sit in the FIFO as slack. Half
+ * the depth leaves room for the pump to wake late without overrunning and to
+ * wake early without reading past the end.
+ */
+#define IIS2_PIO_LEAD		(IIS2_PIO_DEPTH / 2)
+/* Most words one wake-up will take, and the staging array that holds them. */
+#define IIS2_PIO_BURST_MAX	256u
+/* Give up if no period has been delivered by here; a few are due by now. */
+#define IIS2_PIO_FIRST_MS	3000u
+/*
+ * How long the port gets to produce its first word. ASoC triggers the
+ * component before the DAI, and it is the DAI's trigger that arms RXCOM, so the
+ * pump is always waiting for the port briefly at the start of every stream.
+ */
+#define IIS2_PIO_ARM_MS		200u
+/* And how long a running stream may go without one before it is called dead. */
+#define IIS2_PIO_IDLE_MS	500u
+/* Slack allowed on each wake-up, so short sleeps do not need a hard deadline. */
+#define IIS2_PIO_SLACK_NS	(20 * NSEC_PER_USEC)
+
+static int iis2_pio;
+module_param(iis2_pio, int, 0444);
+MODULE_PARM_DESC(iis2_pio,
+		 "IIS2 capture by CPU reads of the RX FIFO (1) or by PL080 DMA (0, default)");
+
+static uint iis2_pio_step_ns;
+module_param(iis2_pio_step_ns, uint, 0644);
+MODULE_PARM_DESC(iis2_pio_step_ns,
+		 "wake-up interval in ns (0 = derive it from the lead and the rate)");
+
+/*
+ * Several FIFO-fulls per wake-up, with a short spin between them.
+ *
+ * The FIFO holds 125 us of audio and a sleep-and-wake cycle costs about 150 us
+ * on this core -- measured, and the same whether the pump asked for 62 us or
+ * 8 us, because what it costs is being scheduled rather than waiting. One
+ * FIFO-full per wake-up therefore cannot keep up: the capture came out at three
+ * quarters of realtime with the overrun latch setting thousands of times.
+ *
+ * So the expensive part is amortised. After draining, the pump spins briefly
+ * rather than sleeping, and drains again -- a word arrives every 15.6 us at
+ * 32 kHz stereo, so a handful of microseconds of busy-wait buys several more
+ * words without paying to be rescheduled. The spin is bounded, and the count
+ * asked for is still limited by what can have arrived, so an idle port falls
+ * straight through it rather than burning the budget.
+ */
+/*
+ * Realtime priority, which does not combine with the spin above.
+ *
+ * SCHED_FIFO gets the pump run on time when it sleeps between drains, but a
+ * realtime thread that busy-waits exceeds the group's runtime budget and is
+ * then parked for the rest of the period: with both enabled the wake-up rate
+ * collapsed from 6400 a second to 600 and the capture fell to a quarter of
+ * realtime. Use one or the other.
+ */
+/*
+ * Poll instead of sleeping between drains.
+ *
+ * Every sleep costs more than the FIFO can hold, so a pump that sleeps once
+ * per FIFO-full loses samples no matter how the interval is tuned -- the loss
+ * is the sleep itself, not its length. Polling removes it: the thread stays on
+ * the core, drains whenever the level is non-zero, and yields with
+ * cond_resched() when there is nothing there, so the reader still runs. It
+ * costs a core to receive 64000 words a second on a port with an eight-word
+ * FIFO and no interrupt wired, which is what this hardware asks for.
+ */
+static int iis2_pio_poll = 1;
+module_param(iis2_pio_poll, int, 0644);
+MODULE_PARM_DESC(iis2_pio_poll,
+		 "yield rather than sleep between drains (1, default) or sleep for the step interval (0)");
+
+static int iis2_pio_rt;
+module_param(iis2_pio_rt, int, 0644);
+MODULE_PARM_DESC(iis2_pio_rt,
+		 "run the pump at realtime priority (1) or as an ordinary thread (0, default)");
+
+static uint iis2_pio_spin_us = 16;
+module_param(iis2_pio_spin_us, uint, 0644);
+MODULE_PARM_DESC(iis2_pio_spin_us,
+		 "microseconds to spin on an empty FIFO before draining again");
+static uint iis2_pio_spins = 8;
+module_param(iis2_pio_spins, uint, 0644);
+MODULE_PARM_DESC(iis2_pio_spins,
+		 "how many times one wake-up may spin and drain again");
+
+static int iis2_pio_gate = 1;
+module_param(iis2_pio_gate, int, 0644);
+MODULE_PARM_DESC(iis2_pio_gate,
+		 "read the RX FIFO only while STATUS bit 14 is set (1, default) or on a count derived from elapsed time (0)");
+
+static const struct snd_pcm_hardware iis2_pio_hw = {
+	.info		  = SNDRV_PCM_INFO_INTERLEAVED |
+			    SNDRV_PCM_INFO_BLOCK_TRANSFER,
+	.formats	  = SNDRV_PCM_FMTBIT_S16_LE,
+	.rates		  = SNDRV_PCM_RATE_16000 | SNDRV_PCM_RATE_32000,
+	.rate_min	  = 16000,
+	.rate_max	  = IIS2_FM_FS_HZ,
+	.channels_min	  = 2,
+	.channels_max	  = 2,
+	.buffer_bytes_max = 64 * 1024,
+	.period_bytes_min = 512,
+	.period_bytes_max = 8192,
+	.periods_min	  = 2,
+	.periods_max	  = 32,
+};
+
+/* Words waiting in the receive FIFO, 0 to 8. */
+static unsigned int iis2_pio_level(struct s5l8740_iis2 *iis2)
+{
+	return (readl(iis2->base + I2SSTATUS) >> I2SSTATUS_RX_LEVEL_SHIFT) &
+	       I2SSTATUS_RX_LEVEL_MASK;
+}
+
+/*
+ * One 16-bit sample per FIFO read, in the low half of the word.
+ *
+ * The playback port's DMA runs at DMA_SLAVE_BUSWIDTH_2_BYTES and moves S16_LE
+ * stereo correctly, so an access to a FIFO on this controller carries one
+ * channel's sample and the channels arrive interleaved. A period of N frames is
+ * therefore 2N reads, and the words-per-second the pump has to keep up with is
+ * the frame rate times the channel count.
+ *
+ * Words are staged and then committed in pairs, with any odd one carried over to
+ * the next call. Committing an odd count would leave the buffer position half a
+ * frame from the start of a frame, and the frame that then straddles the end of
+ * the ring is delivered to the reader as two halves at opposite ends of it.
+ * Returns the number of words taken from the FIFO, which is what the arithmetic
+ * path has to account for, not the number committed.
+ */
+static unsigned int iis2_pio_take(struct s5l8740_iis2 *iis2, unsigned int want)
+{
+	struct snd_pcm_substream *sub = iis2->pio_sub;
+	u16 tmp[IIS2_PIO_BURST_MAX + 1];
+	unsigned int took = 0, staged = 0, commit, done = 0, spins = 0;
+
+	if (iis2->pio_stash_valid) {
+		tmp[staged++] = iis2->pio_stash;
+		iis2->pio_stash_valid = false;
+	}
+	if (want > IIS2_PIO_BURST_MAX)
+		want = IIS2_PIO_BURST_MAX;
+	while (took < want) {
+		unsigned int lvl = want - took, i;
+
+		/*
+		 * One status read per batch, not per word: the level says how
+		 * many are safe to take, so asking again between each of them
+		 * would double the bus traffic to learn nothing.
+		 */
+		if (iis2_pio_gate) {
+			unsigned int have =
+				(readl(iis2->base + I2SSTATUS) >>
+				 I2SSTATUS_RX_LEVEL_SHIFT) &
+				I2SSTATUS_RX_LEVEL_MASK;
+
+			if (!have) {
+				if (spins++ >= iis2_pio_spins)
+					break;
+				udelay(iis2_pio_spin_us);
+				continue;
+			}
+			if (have < lvl)
+				lvl = have;
+		}
+		for (i = 0; i < lvl; i++)
+			tmp[staged++] = (u16)readl(iis2->base + I2SRXFIFO);
+		took += lvl;
+		if (!iis2_pio_gate)
+			break;
+		if (took < want) {
+			if (spins++ >= iis2_pio_spins)
+				break;
+			udelay(iis2_pio_spin_us);
+		}
+	}
+
+	commit = staged & ~1u;
+	if (staged & 1u) {
+		iis2->pio_stash = tmp[staged - 1];
+		iis2->pio_stash_valid = true;
+	}
+
+	while (done < commit) {
+		unsigned int room = (iis2->pio_buffer - iis2->pio_pos) /
+				    sizeof(u16);
+		unsigned int n = min(commit - done, room);
+
+		memcpy(sub->runtime->dma_area + iis2->pio_pos, &tmp[done],
+		       n * sizeof(u16));
+		iis2->pio_pos += n * sizeof(u16);
+		if (iis2->pio_pos >= iis2->pio_buffer)
+			iis2->pio_pos = 0;
+		done += n;
+	}
+
+	iis2->pio_filled += commit * sizeof(u16);
+	iis2->pio_words += took;
+	return took;
+}
+
+/*
+ * The pump.
+ *
+ * On the gated path each wake-up takes whatever the FIFO says it is holding, so
+ * the sleep only has to be short enough that the FIFO does not overrun between
+ * wake-ups -- a late wake-up loses samples, which is a click, rather than
+ * reading past the end, which is not recoverable.
+ *
+ * On the arithmetic path the count is the number of words that have arrived
+ * since the stream started, less the lead kept in the FIFO, less what has
+ * already been read. Deriving it from elapsed time rather than using a fixed
+ * burst per wake-up means a late wake-up catches up and an early one takes
+ * nothing; what it cannot survive is the two clocks drifting apart.
+ */
+static int iis2_pio_thread(void *data)
+{
+	struct s5l8740_iis2 *iis2 = data;
+	unsigned int wps = 0;
+	ktime_t armed = 0, start = 0, last = 0;
+	/*
+	 * Words already taken when the clock was last started.
+	 *
+	 * The allowance below is derived from time elapsed since `start`, and
+	 * `start` is re-established whenever the stream is re-armed -- but the
+	 * running word count is not, because it belongs to the stream rather
+	 * than to this arming. Comparing a restarted allowance against a count
+	 * that never restarted makes the difference underflow to zero, and the
+	 * pump then asks for no words at all, for good: awake thousands of
+	 * times a second beside a completely full FIFO, taking nothing from it.
+	 */
+	unsigned long base_words = 0;
+	u64 first_deadline = 0;
+
+	/*
+	 * Realtime, because the deadline is set by an eight-word FIFO.
+	 *
+	 * At 32 kHz stereo the FIFO holds 125 us of audio, so the pump has to
+	 * be back inside that or it overruns and samples are lost. Measured as
+	 * an ordinary thread it managed about 6600 wake-ups a second -- 151 us
+	 * -- whatever interval it asked for, because it was competing with the
+	 * reader for the one core, and the capture came out at three quarters
+	 * of realtime with the overrun latch setting thousands of times.
+	 * Nothing about the sleep was wrong; it simply was not being run.
+	 *
+	 * The low band rather than the top of it: this must outrank the
+	 * application reading the stream, which is the whole point, but it has
+	 * no business above the kernel threads that keep the machine alive.
+	 */
+	if (iis2_pio_rt)
+		sched_set_fifo_low(current);
+
+	while (!kthread_should_stop()) {
+		struct snd_pcm_substream *sub = iis2->pio_sub;
+		ktime_t now, next;
+		u64 elapsed;
+		unsigned int want, took;
+
+		if (!READ_ONCE(iis2->pio_run) || !sub || !sub->runtime ||
+		    !sub->runtime->dma_area) {
+			armed = 0;
+			start = 0;
+			set_current_state(TASK_IDLE);
+			schedule_timeout(msecs_to_jiffies(20));
+			continue;
+		}
+
+		if (!armed) {
+			armed = ktime_get();
+			wps = sub->runtime->rate * sub->runtime->channels;
+			first_deadline = (u64)IIS2_PIO_FIRST_MS * NSEC_PER_MSEC;
+			iis2->pio_stash_valid = false;
+		}
+
+		/*
+		 * Wait for the port before starting the clock. The DAI's trigger
+		 * arms RXCOM after this component's, so at the start of a stream
+		 * there is briefly nothing to read, and on the gated path a
+		 * clear bit 14 then would be indistinguishable from a dead port.
+		 */
+		if (!start) {
+			if (!iis2_pio_level(iis2)) {
+				if (ktime_to_ns(ktime_sub(ktime_get(), armed)) >
+				    (u64)IIS2_PIO_ARM_MS * NSEC_PER_MSEC) {
+					dev_warn(iis2->dev,
+						 "IIS2 PIO: no data from the port after %u ms, status 0x%08x rxcom 0x%08x\n",
+						 IIS2_PIO_ARM_MS,
+						 readl(iis2->base + I2SSTATUS),
+						 readl(iis2->base + I2SRXCOM));
+					WRITE_ONCE(iis2->pio_run, false);
+					snd_pcm_stop_xrun(sub);
+					continue;
+				}
+				set_current_state(TASK_IDLE);
+				schedule_timeout(1);
+				continue;
+			}
+			start = ktime_get();
+			last = start;
+			base_words = iis2->pio_words;
+		}
+
+		now = ktime_get();
+		elapsed = ktime_to_ns(ktime_sub(now, start));
+
+		if (iis2_pio_gate) {
+			/*
+			 * Gated, but still capped by what can have arrived.
+			 *
+			 * If bit 14 turns out to mean the engine is alive rather
+			 * than the FIFO has data, it stays set and an ungated
+			 * drain reads sixteen times the arrival rate, which is
+			 * the over-read this is all trying to avoid. The cap
+			 * makes a wrong reading of the bit show up as a pump
+			 * that keeps up and nothing worse -- a whole FIFO's
+			 * slack above the arithmetic, so a right reading is not
+			 * held back by it.
+			 */
+			u64 due = div_u64(elapsed * wps, NSEC_PER_SEC) +
+				  IIS2_PIO_DEPTH + base_words;
+
+			want = (due > iis2->pio_words) ?
+			       (unsigned int)(due - iis2->pio_words) : 0;
+			if (want > IIS2_PIO_BURST_MAX)
+				want = IIS2_PIO_BURST_MAX;
+		} else {
+			u64 due = div_u64(elapsed * wps, NSEC_PER_SEC);
+
+			due = (due > IIS2_PIO_LEAD) ? due - IIS2_PIO_LEAD : 0;
+			due += base_words;
+			want = (due > iis2->pio_words) ?
+			       (unsigned int)(due - iis2->pio_words) : 0;
+			/*
+			 * Never ask for more than the FIFO can be holding,
+			 * however far behind the arithmetic says this is.
+			 * Falling behind loses samples; reading past the end
+			 * loses the engine.
+			 */
+			if (want >= IIS2_PIO_DEPTH)
+				want = IIS2_PIO_DEPTH - 1;
+		}
+
+		/*
+		 * A full FIFO beside a pump that is asking for nothing is the
+		 * signature of the allowance having gone wrong rather than the
+		 * port having stopped, and the two are indistinguishable from
+		 * the outside. Say which it is, once.
+		 */
+		if (!want && !iis2->pio_stalled) {
+			unsigned int lvl = iis2_pio_level(iis2);
+
+			if (lvl) {
+				iis2->pio_stalled = 1;
+				dev_info(iis2->dev,
+					 "IIS2 PIO stalled: level %u, want 0, words %lu, base %lu, elapsed %llu ms, wps %u\n",
+					 lvl, iis2->pio_words, base_words,
+					 div_u64(elapsed, NSEC_PER_MSEC), wps);
+			}
+		}
+		took = want ? iis2_pio_take(iis2, want) : 0;
+		if (took)
+			last = now;
+
+		/*
+		 * The receive condition latch, acknowledged on arm and reported
+		 * the first time it comes back. On a gated pump that has kept up
+		 * it should not, so it is the signal that the FIFO overran and
+		 * samples were lost -- which is audible as a click and worth
+		 * being able to attribute.
+		 */
+		if (readl(iis2->base + I2SSTATUS) & I2SSTATUS_RX_W1C) {
+			writel(I2SSTATUS_RX_W1C, iis2->base + I2SSTATUS);
+			if (!iis2->pio_latches++)
+				dev_info(iis2->dev,
+					 "IIS2 PIO: receive latch set after %lu words\n",
+					 iis2->pio_words);
+		}
+
+		if (!iis2->pio_wakes++)
+			dev_info(iis2->dev,
+				 "IIS2 PIO first read, %u words, sample 0x%04x, status 0x%08x\n",
+				 took, ((u16 *)sub->runtime->dma_area)[0],
+				 readl(iis2->base + I2SSTATUS));
+
+		/*
+		 * A stream that has stopped producing has to be ended rather
+		 * than waited out. The reader is blocked in the kernel where a
+		 * signal does not reach it, so as long as this keeps politely
+		 * waiting the PCM stays open and the module cannot be unloaded.
+		 * Reporting an xrun hands the application -EPIPE and lets
+		 * everything unwind.
+		 */
+		if (ktime_to_ns(ktime_sub(now, last)) >
+		    (u64)IIS2_PIO_IDLE_MS * NSEC_PER_MSEC) {
+			dev_warn(iis2->dev,
+				 "IIS2 PIO: nothing for %u ms after %lu words, status 0x%08x\n",
+				 IIS2_PIO_IDLE_MS, iis2->pio_words,
+				 readl(iis2->base + I2SSTATUS));
+			WRITE_ONCE(iis2->pio_run, false);
+			snd_pcm_stop_xrun(sub);
+			continue;
+		}
+
+		if (iis2->pio_filled >= iis2->pio_period) {
+			iis2->pio_filled -= iis2->pio_period;
+			iis2->pio_periods++;
+			snd_pcm_period_elapsed(sub);
+		}
+
+		/* Pumping without ever completing a period is its own failure. */
+		if (!iis2->pio_periods && elapsed > first_deadline) {
+			dev_warn(iis2->dev,
+				 "IIS2 PIO: no period after %u ms (%lu words, %lu wakes), status 0x%08x\n",
+				 IIS2_PIO_FIRST_MS, iis2->pio_words,
+				 iis2->pio_wakes,
+				 readl(iis2->base + I2SSTATUS));
+			WRITE_ONCE(iis2->pio_run, false);
+			snd_pcm_stop_xrun(sub);
+			continue;
+		}
+
+		if (iis2_pio_poll) {
+			cond_resched();
+			continue;
+		}
+		next = ktime_add(ktime_get(), iis2->pio_step);
+		set_current_state(TASK_IDLE);
+		schedule_hrtimeout_range(&next, IIS2_PIO_SLACK_NS,
+					 HRTIMER_MODE_ABS);
+	}
+	return 0;
+}
+
+/*
+ * Starting and stopping the thread, and where each may be done.
+ *
+ * .trigger runs with the stream lock held, so it must not wait for the thread:
+ * the thread takes that same lock inside snd_pcm_period_elapsed(), and waiting
+ * for it there would deadlock. So trigger only moves a flag, and the thread is
+ * created in .prepare and stopped in .close, neither of which holds the lock.
+ */
+static void iis2_pio_thread_stop(struct s5l8740_iis2 *iis2)
+{
+	struct task_struct *t = iis2->pio_task;
+
+	WRITE_ONCE(iis2->pio_run, false);
+	if (t) {
+		iis2->pio_task = NULL;
+		kthread_stop(t);
+	}
+}
+
+static int iis2_pio_open(struct snd_soc_component *c,
+			 struct snd_pcm_substream *sub)
+{
+	struct s5l8740_iis2 *iis2 = snd_soc_component_get_drvdata(c);
+
+	snd_soc_set_runtime_hwparams(sub, &iis2_pio_hw);
+	iis2->pio_sub = sub;
+	return 0;
+}
+
+static int iis2_pio_close(struct snd_soc_component *c,
+			  struct snd_pcm_substream *sub)
+{
+	struct s5l8740_iis2 *iis2 = snd_soc_component_get_drvdata(c);
+
+	iis2_pio_thread_stop(iis2);
+	dev_info(iis2->dev,
+		 "IIS2 PIO closed: %lu wakes, %lu words, %lu periods, %lu latches (%lu words/wake)\n",
+		 iis2->pio_wakes, iis2->pio_words, iis2->pio_periods,
+		 iis2->pio_latches,
+		 iis2->pio_wakes ? iis2->pio_words / iis2->pio_wakes : 0);
+	if (iis2->pio_sub == sub)
+		iis2->pio_sub = NULL;
+	return 0;
+}
+
+static int iis2_pio_prepare(struct snd_soc_component *c,
+			    struct snd_pcm_substream *sub)
+{
+	struct s5l8740_iis2 *iis2 = snd_soc_component_get_drvdata(c);
+	struct snd_pcm_runtime *rt = sub->runtime;
+	struct task_struct *t;
+
+	iis2_pio_thread_stop(iis2);
+
+	iis2->pio_pos = 0;
+	iis2->pio_period = snd_pcm_lib_period_bytes(sub);
+	iis2->pio_buffer = snd_pcm_lib_buffer_bytes(sub);
+	iis2->pio_filled = 0;
+	iis2->pio_words = 0;
+	iis2->pio_wakes = 0;
+	iis2->pio_latches = 0;
+	iis2->pio_stalled = 0;
+	iis2->pio_periods = 0;
+	/*
+	 * One wake-up per FIFO-load of slack: LEAD words is LEAD/channels
+	 * frames, and that many frames at the negotiated rate is how long the
+	 * port takes to produce them. Sleeping longer than that would let the
+	 * FIFO overrun between wake-ups; sleeping much shorter would spend the
+	 * core on wake-ups that have no words to collect.
+	 */
+	iis2->pio_step = iis2_pio_step_ns ?
+		ns_to_ktime(iis2_pio_step_ns) :
+		ns_to_ktime(div_u64((u64)IIS2_PIO_LEAD * NSEC_PER_SEC,
+				    (u64)rt->rate * rt->channels));
+
+	t = kthread_run(iis2_pio_thread, iis2, "n31-iis2-pump");
+	if (IS_ERR(t))
+		return PTR_ERR(t);
+	iis2->pio_task = t;
+
+	dev_info(iis2->dev,
+		"IIS2 PIO prepare rate=%u period=%lu frames (%u B) buffer=%u B step=%lluns lead=%u\n",
+		rt->rate, rt->period_size, iis2->pio_period, iis2->pio_buffer,
+		(unsigned long long)ktime_to_ns(iis2->pio_step),
+		IIS2_PIO_LEAD);
+	return 0;
+}
+
+static int iis2_pio_trigger(struct snd_soc_component *c,
+			    struct snd_pcm_substream *sub, int cmd)
+{
+	struct s5l8740_iis2 *iis2 = snd_soc_component_get_drvdata(c);
+
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+	case SNDRV_PCM_TRIGGER_RESUME:
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		if (!iis2->pio_step || !iis2->pio_task)
+			return -EINVAL;
+		WRITE_ONCE(iis2->pio_run, true);
+		wake_up_process(iis2->pio_task);
+		return 0;
+	case SNDRV_PCM_TRIGGER_STOP:
+	case SNDRV_PCM_TRIGGER_SUSPEND:
+	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		WRITE_ONCE(iis2->pio_run, false);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static snd_pcm_uframes_t iis2_pio_pointer(struct snd_soc_component *c,
+					  struct snd_pcm_substream *sub)
+{
+	struct s5l8740_iis2 *iis2 = snd_soc_component_get_drvdata(c);
+
+	return bytes_to_frames(sub->runtime, iis2->pio_pos);
+}
+
+static int iis2_pio_construct(struct snd_soc_component *c,
+			      struct snd_soc_pcm_runtime *rtd)
+{
+	/*
+	 * vmalloc, not the SRAM pool the DMA path uses: nothing but the CPU
+	 * touches this buffer, so it has no addressing requirement, and leaving
+	 * the 32 KiB of SRAM free matters on a machine with 192 KiB of it.
+	 */
+	snd_pcm_set_managed_buffer_all(rtd->pcm, SNDRV_DMA_TYPE_VMALLOC, NULL,
+				       0, iis2_pio_hw.buffer_bytes_max);
+	return 0;
+}
+
+static const struct snd_soc_component_driver s5l8740_iis2_pio_component = {
+	.name		 = "bcm2078-pcm",
+	.legacy_dai_naming = 1,
+	.open		 = iis2_pio_open,
+	.close		 = iis2_pio_close,
+	.prepare	 = iis2_pio_prepare,
+	.trigger	 = iis2_pio_trigger,
+	.pointer	 = iis2_pio_pointer,
+	.pcm_construct	 = iis2_pio_construct,
+};
+
 static const struct snd_soc_dai_ops s5l8740_iis2_dai_ops = {
 	.probe = s5l8740_iis2_dai_probe,
 	.hw_params = s5l8740_iis2_hw_params,
@@ -3201,11 +4109,17 @@ static struct snd_soc_dai_driver s5l8740_iis2_dai = {
 		.channels_min = 1,
 		.channels_max = 2,
 		/*
-		 * Base mask, never the hi-res one: this is IIS2 to the
-		 * BCM2078, the FM and Bluetooth port. It has nothing to do
-		 * with the headphone path and no reason to claim 88.2/96.
+		 * 32 kHz and nothing else.
+		 *
+		 * Stock's FM audio enable divides its chosen bit clock by a
+		 * literal 32000 to get CLKDIV, for every one of the three bit
+		 * clocks it picks between -- the frame rate on this port is a
+		 * constant. Advertising the headphone path's rate mask here
+		 * let a capture open at 44.1 or 48 kHz, which the port cannot
+		 * clock: the samples still arrived, at the wrong rate, and
+		 * were read as noise or as nothing.
 		 */
-		.rates = S5L8740_I2S_RATES,
+		.rates = SNDRV_PCM_RATE_16000 | SNDRV_PCM_RATE_32000,
 		.formats = S5L8740_I2S_FORMATS,
 	},
 	.ops = &s5l8740_iis2_dai_ops,
@@ -3227,6 +4141,15 @@ static ssize_t iis2_regs_show(struct device *dev,
 		return sysfs_emit(buf, "not mapped\n");
 
 	for (i = 0; i < IIS2_REGS_LEN; i += 4) {
+		/*
+		 * Never the FIFOs. A read of +0x38 takes a word out of the
+		 * receive FIFO and decrements its level, so dumping the window
+		 * while a capture runs steals that sample from the stream.
+		 */
+		if (i == I2STXFIFO || i == I2SRXFIFO) {
+			n += sysfs_emit_at(buf, n, "%02x: (fifo)\n", i);
+			continue;
+		}
 		n += sysfs_emit_at(buf, n, "%02x: %08x\n", i,
 				   readl(iis2->base + i));
 		if (n >= PAGE_SIZE - 32)
@@ -3240,6 +4163,240 @@ static ssize_t iis2_regs_show(struct device *dev,
 	}
 	return n;
 }
+/*
+ * rx_on -- run the receive engine with no PCM attached.
+ *
+ * There is no register on this port known to report how full the RX FIFO is,
+ * and the one candidate, STATUS bit 14, can only be told apart from an
+ * engine-alive bit by watching it while samples are arriving. Doing that
+ * through a capture stream is what made the earlier attempts expensive: a
+ * reader blocked in the kernel cannot be signalled out, so every failed guess
+ * left the PCM open and the module pinned, and the way back was a reboot.
+ *
+ * This runs the same ordered sequence the capture path runs -- iis2_program_rx()
+ * and the RXCOM arm, nothing hand-rolled -- with nothing reading, so the port
+ * can be watched from userspace over /dev/mem and turned off again by writing 0.
+ */
+static ssize_t iis2_rx_on_store(struct device *dev, struct device_attribute *a,
+				const char *buf, size_t len)
+{
+	struct s5l8740_iis2 *iis2 = dev_get_drvdata(dev);
+	bool on;
+	int ret;
+
+	if (!iis2 || !iis2->base)
+		return -ENODEV;
+	ret = kstrtobool(buf, &on);
+	if (ret)
+		return ret;
+	/*
+	 * Refuse while a stream owns the port. Reprogramming the dividers under
+	 * a running capture, or gating its clock, is not something the pump can
+	 * be expected to survive.
+	 */
+	if (iis2->pio_sub)
+		return -EBUSY;
+
+	if (on) {
+		iis2_program_rx(iis2);
+		/* Same acknowledge the capture path does; see the DAI trigger. */
+		writel(I2SSTATUS_RX_W1C, iis2->base + I2SSTATUS);
+		writel(readl(iis2->base + I2SRXCOM) | IIS2_RXCOM_DMA,
+		       iis2->base + I2SRXCOM);
+	} else {
+		iis2_hw_stop(iis2);
+	}
+	dev_info(dev, "rx_on=%d rxcom=0x%08x status=0x%08x\n", on,
+		 readl(iis2->base + I2SRXCOM),
+		 readl(iis2->base + I2SSTATUS));
+	return len;
+}
+static struct device_attribute dev_attr_iis2_rx_on =
+	__ATTR(rx_on, 0200, NULL, iis2_rx_on_store);
+
+/*
+ * rx_dma_test -- arm the receive DMA by hand and report what the channel did.
+ *
+ * The receive DMA has been declared dead for a long time on the strength of one
+ * number: the raw transfer count stayed zero. That says a channel moved nothing;
+ * it does not say what the channel was asked to do, and the two have never been
+ * compared side by side against the values RetailOS builds.
+ *
+ * Stock's programmer, sub_B424C, composes exactly one word:
+ *
+ *	Config = flow | ((dst & 0xF) << 6) | ((src & 0xF) << 1) | 0x8001
+ *
+ * and for this port -- peripheral 17 in the table at 0x891DC14, request 13 on
+ * the controller at 0x38200000, memory as the other side, which the table at
+ * 0x891DDB8 gives as 0 -- that is 0x0000901B. The count goes to the channel's
+ * CONTROL2 at +0x114 rather than into Control, and the descriptor is a single
+ * node linked to itself.
+ *
+ * This runs that transfer with no PCM attached and prints the whole channel
+ * beside the buffer it filled, so the next step is decided by a register diff
+ * rather than by another guess. Writing a number runs it for that many
+ * milliseconds; the port is programmed, its condition latch acknowledged and
+ * RXCOM armed in stock's order, and everything is torn down again afterwards.
+ */
+#define IIS2_DMA_PERI		13	/* request line, from stock's table */
+
+/*
+ * Burst and width for the test transfer.
+ *
+ * Stock builds Control as source width, destination width, source burst and
+ * destination burst ORed together with bit 31, from four tables at 0x891DB94,
+ * 0x891DBA0, 0x891DBAC and 0x891DBE0; sub_B424C then sets only the increment
+ * bits and leaves the rest alone. The widths are known -- both halfword, which
+ * is one sample -- but which burst the FM channel was opened with is not
+ * recorded anywhere reachable, so it is a parameter rather than a guess.
+ */
+static uint iis2_dma_burst = 1;
+module_param(iis2_dma_burst, uint, 0644);
+MODULE_PARM_DESC(iis2_dma_burst, "source burst in transfers for rx_dma_test");
+static uint iis2_dma_width = 2;
+module_param(iis2_dma_width, uint, 0644);
+MODULE_PARM_DESC(iis2_dma_width, "source width in bytes for rx_dma_test");
+#define IIS2_DMA_TEST_BYTES	8192
+
+static ssize_t iis2_rx_dma_test_store(struct device *dev,
+				      struct device_attribute *a,
+				      const char *buf, size_t len)
+{
+	struct s5l8740_iis2 *iis2 = dev_get_drvdata(dev);
+	struct dma_async_tx_descriptor *desc;
+	struct dma_slave_config cfg = {};
+	size_t sz = IIS2_DMA_TEST_BYTES;
+	unsigned int ms, i, words;
+	unsigned int nonzero = 0, changes = 0;
+	u32 regs[8] = {};
+	struct dma_chan *chan;
+	dma_cookie_t cookie;
+	dma_addr_t phys;
+	u16 *cpu, prev;
+	int ch, ret;
+
+	if (!iis2 || !iis2->base)
+		return -ENODEV;
+	if (iis2->pio_sub)
+		return -EBUSY;
+	if (kstrtouint(buf, 0, &ms))
+		return -EINVAL;
+	if (!ms)
+		ms = 200;
+	if (ms > 5000)
+		ms = 5000;
+	words = sz / sizeof(*cpu);
+
+	cpu = dma_alloc_coherent(dev, sz, &phys, GFP_KERNEL);
+	if (!cpu)
+		return -ENOMEM;
+	memset(cpu, 0, sz);
+
+	chan = dma_request_chan(dev, "rx");
+	if (IS_ERR(chan)) {
+		ret = PTR_ERR(chan);
+		dev_err(dev, "rx_dma_test: no rx channel: %d\n", ret);
+		dma_free_coherent(dev, sz, cpu, phys);
+		return ret;
+	}
+
+	cfg.direction = DMA_DEV_TO_MEM;
+	cfg.src_addr = iis2->cap_dma.addr;
+	cfg.src_addr_width = iis2_dma_width ? iis2_dma_width :
+			     iis2->cap_dma.addr_width;
+	cfg.src_maxburst = iis2_dma_burst ? iis2_dma_burst :
+			   iis2->cap_dma.maxburst;
+	ret = dmaengine_slave_config(chan, &cfg);
+	if (ret) {
+		dev_err(dev, "rx_dma_test: slave_config: %d\n", ret);
+		goto out;
+	}
+
+	desc = dmaengine_prep_dma_cyclic(chan, phys, sz, sz / 4,
+					 DMA_DEV_TO_MEM, DMA_PREP_INTERRUPT);
+	if (!desc) {
+		dev_err(dev, "rx_dma_test: prep_dma_cyclic refused\n");
+		ret = -EINVAL;
+		goto out;
+	}
+	cookie = dmaengine_submit(desc);
+	if (dma_submit_error(cookie)) {
+		dev_err(dev, "rx_dma_test: submit failed\n");
+		ret = -EIO;
+		goto out;
+	}
+	dma_async_issue_pending(chan);
+
+	/* The port, in stock's order: program, acknowledge the latch, arm. */
+	iis2_program_rx(iis2);
+	writel(I2SSTATUS_RX_W1C, iis2->base + I2SSTATUS);
+	writel(readl(iis2->base + I2SRXCOM) | IIS2_RXCOM_DMA,
+	       iis2->base + I2SRXCOM);
+
+	msleep(ms);
+
+	ch = s5l_pl080_peri_regs(IIS2_DMA_PERI, regs, ARRAY_SIZE(regs));
+
+	prev = cpu[0];
+	for (i = 0; i < words; i++) {
+		if (cpu[i])
+			nonzero++;
+		if (i && cpu[i] != prev)
+			changes++;
+		prev = cpu[i];
+	}
+
+	dev_info(dev,
+		 "rx_dma_test: %u ms on channel %d -- %u of %u words nonzero, %u changes, head %04x %04x %04x %04x\n",
+		 ms, ch, nonzero, words, changes,
+		 cpu[0], cpu[1], cpu[2], cpu[3]);
+	dev_info(dev,
+		 "rx_dma_test: SRC %08x DST %08x LLI %08x CTL %08x CFG %08x CNT %08x RAWTC %08x EN %08x\n",
+		 regs[0], regs[1], regs[2], regs[3], regs[4], regs[5],
+		 regs[6], regs[7]);
+	dev_info(dev,
+		 "rx_dma_test: port status %08x rxcom %08x; stock builds CFG 0x0000901b, SRC %08x\n",
+		 readl(iis2->base + I2SSTATUS), readl(iis2->base + I2SRXCOM),
+		 (u32)iis2->cap_dma.addr);
+	ret = len;
+out:
+	dmaengine_terminate_sync(chan);
+	dma_release_channel(chan);
+	dma_free_coherent(dev, sz, cpu, phys);
+	iis2_hw_stop(iis2);
+	return ret;
+}
+/*
+ * The receive channel, readable while a stream is running.
+ *
+ * rx_dma_test arms its own transfer and so cannot say anything about the one
+ * ALSA is running. This dumps the same registers for the live channel, which is
+ * what is needed when a capture starts correctly and then stops delivering:
+ * the destination pointer and the remaining count say whether the channel is
+ * still moving, still armed, or has quietly finished.
+ */
+static ssize_t iis2_rx_dma_regs_show(struct device *dev,
+				     struct device_attribute *a, char *buf)
+{
+	struct s5l8740_iis2 *iis2 = dev_get_drvdata(dev);
+	u32 r[8] = {};
+	int ch;
+
+	ch = s5l_pl080_peri_regs(IIS2_DMA_PERI, r, ARRAY_SIZE(r));
+	if (ch < 0)
+		return sysfs_emit(buf, "no channel for peri %u: %d\n",
+				  IIS2_DMA_PERI, ch);
+	return sysfs_emit(buf,
+		"ch %d SRC %08x DST %08x LLI %08x CTL %08x CFG %08x CNT %08x RAWTC %08x EN %08x status %08x rxcom %08x\n",
+		ch, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
+		iis2->base ? readl(iis2->base + I2SSTATUS) : 0,
+		iis2->base ? readl(iis2->base + I2SRXCOM) : 0);
+}
+static DEVICE_ATTR(rx_dma_regs, 0444, iis2_rx_dma_regs_show, NULL);
+
+static struct device_attribute dev_attr_iis2_rx_dma_test =
+	__ATTR(rx_dma_test, 0200, NULL, iis2_rx_dma_test_store);
+
 /* Same sysfs name as the IIS0 dump; different device, different symbol. */
 static struct device_attribute dev_attr_iis2_regs =
 	__ATTR(regs, 0444, iis2_regs_show, NULL);
@@ -3276,7 +4433,17 @@ static int s5l8740_iis2_probe(struct platform_device *pdev)
 	if (res) {
 		iis2->cap_dma.addr = res->start + I2SRXFIFO;
 		iis2->cap_dma.addr_width = DMA_SLAVE_BUSWIDTH_2_BYTES;
-		iis2->cap_dma.maxburst = 1;
+		/*
+		 * Four, not one. A burst of one sets the source burst field to
+		 * zero, which is a single transfer per request, and the port's
+		 * burst request then moves two words and stops with the FIFO
+		 * still full -- measured, and the whole of what looked for
+		 * months like a receive DMA that never fired. At four the same
+		 * channel runs continuously and the FIFO level sits at one
+		 * instead of eight. The FIFO is eight deep, so four leaves room
+		 * for the port to keep filling while a burst is in flight.
+		 */
+		iis2->cap_dma.maxburst = 4;
 	}
 
 	platform_set_drvdata(pdev, iis2);
@@ -3309,21 +4476,44 @@ static int s5l8740_iis2_probe(struct platform_device *pdev)
 		dev_err(dev,
 			"i2s2_sram pool did not bind -- capture disabled (DT needs the audio-dma@22012000 node)\n");
 
-	ret = devm_snd_dmaengine_pcm_register(dev, &s5l8740_iis2_dma_cfg, 0);
-	if (ret)
-		return dev_err_probe(dev, ret, "dmaengine_pcm\n");
-	iis2->has_dma = true;
+	if (iis2_pio) {
+		ret = devm_snd_soc_register_component(dev,
+						&s5l8740_iis2_pio_component,
+						&s5l8740_iis2_dai, 1);
+		if (ret)
+			return ret;
+	} else {
+		ret = devm_snd_dmaengine_pcm_register(dev,
+						&s5l8740_iis2_dma_cfg, 0);
+		if (ret)
+			return dev_err_probe(dev, ret, "dmaengine_pcm\n");
+		iis2->has_dma = true;
 
-	ret = devm_snd_soc_register_component(dev, &s5l8740_iis2_component,
-					      &s5l8740_iis2_dai, 1);
-	if (ret)
-		return ret;
+		ret = devm_snd_soc_register_component(dev,
+						&s5l8740_iis2_component,
+						&s5l8740_iis2_dai, 1);
+		if (ret)
+			return ret;
+	}
 
 	ret = device_create_file(dev, &dev_attr_iis2_regs);
 	if (ret)
 		dev_warn(dev, "regs sysfs: %d\n", ret);
+	ret = device_create_file(dev, &dev_attr_iis2_rx_on);
+	if (ret)
+		dev_warn(dev, "rx_on sysfs: %d\n", ret);
+	ret = device_create_file(dev, &dev_attr_iis2_rx_dma_test);
+	if (ret)
+		dev_warn(dev, "rx_dma_test sysfs: %d\n", ret);
+	ret = device_create_file(dev, &dev_attr_rx_dma_regs);
+	if (ret)
+		dev_warn(dev, "rx_dma_regs sysfs: %d\n", ret);
 
-	dev_info(dev, "BCM2078 PCM RX @%pR peri13 FIFO@+0x38\n", res);
+	WRITE_ONCE(s5l8740_iis2_dev, iis2);
+	bcm2078_register_fm_pcm_clk(s5l8740_iis2_set_fm_bitclk);
+
+	dev_info(dev, "BCM2078 PCM RX @%pR peri13 FIFO@+0x38 fs=32000 bitclk=%u\n",
+		 res, iis2_bitclk_hz());
 	return 0;
 }
 
@@ -3331,7 +4521,12 @@ static void s5l8740_iis2_remove(struct platform_device *pdev)
 {
 	struct s5l8740_iis2 *iis2 = platform_get_drvdata(pdev);
 
+	bcm2078_register_fm_pcm_clk(NULL);
+	WRITE_ONCE(s5l8740_iis2_dev, NULL);
 	device_remove_file(&pdev->dev, &dev_attr_iis2_regs);
+	device_remove_file(&pdev->dev, &dev_attr_iis2_rx_on);
+	device_remove_file(&pdev->dev, &dev_attr_iis2_rx_dma_test);
+	device_remove_file(&pdev->dev, &dev_attr_rx_dma_regs);
 	iis2_hw_stop(iis2);
 	if (iis2 && iis2->num_clks)
 		clk_bulk_disable_unprepare(iis2->num_clks, iis2->clks);

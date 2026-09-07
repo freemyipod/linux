@@ -17,6 +17,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/apple-n31.h>
 #include <sound/soc.h>
 
 SND_SOC_DAILINK_DEFS(playback,
@@ -28,6 +29,48 @@ SND_SOC_DAILINK_DEFS(fm_capture,
 	DAILINK_COMP_ARRAY(COMP_CPU("bcm2078-pcm")),
 	DAILINK_COMP_ARRAY(COMP_CODEC("snd-soc-dummy", "snd-soc-dummy-dai")),
 	DAILINK_COMP_ARRAY(COMP_PLATFORM("snd-soc-dummy")));
+
+/*
+ * Mixer controls.
+ *
+ * "FM Tuner Mute" is the tuner's own MANUAL_MUTE bit, sent to the BCM2078 as an
+ * 0xFC15 register write by bcm2078-bt. It belongs in the mixer rather than only
+ * in sysfs so the FM path can be unmuted the same way anything else on this card
+ * is, and it mutes at the source: the IIS2 side has no gain stage, and muting by
+ * closing the capture PCM would stop the port's clock and take RDS with it.
+ *
+ * There is deliberately no "FM Capture Volume". No FM volume register appears
+ * anywhere in the recovered FM_RDS_Command map, and the level on this path is
+ * the codec's playback volume once the audio reaches the headphones -- which is
+ * already a control on this card. A software gain here would be a second volume
+ * that does not correspond to anything in the hardware.
+ *
+ * The tuner may be absent (no bcm2078-bt, or it failed to bind), so both
+ * directions tolerate -ENODEV: get reports unmuted, put succeeds and does
+ * nothing. A mixer that errors on a control it advertises is worse than one
+ * whose control is inert.
+ */
+static int nano7_fm_mute_get(struct snd_kcontrol *kc,
+			     struct snd_ctl_elem_value *uc)
+{
+	int v = bcm2078_fm_mute_get();
+
+	uc->value.integer.value[0] = v > 0 ? 1 : 0;
+	return 0;
+}
+
+static int nano7_fm_mute_put(struct snd_kcontrol *kc,
+			     struct snd_ctl_elem_value *uc)
+{
+	int ret = bcm2078_fm_mute_set(!!uc->value.integer.value[0]);
+
+	return (ret == -ENODEV) ? 0 : ret;
+}
+
+static const struct snd_kcontrol_new nano7_controls[] = {
+	SOC_SINGLE_BOOL_EXT("FM Tuner Mute", 0,
+			    nano7_fm_mute_get, nano7_fm_mute_put),
+};
 
 static struct snd_soc_dai_link nano7_dais[] = {
 	{
@@ -64,6 +107,8 @@ static struct snd_soc_card nano7_card = {
 	.name = "nano7g-audio",
 	.owner = THIS_MODULE,
 	.dai_link = nano7_dais,
+	.controls = nano7_controls,
+	.num_controls = ARRAY_SIZE(nano7_controls),
 	.num_links = ARRAY_SIZE(nano7_dais),
 };
 

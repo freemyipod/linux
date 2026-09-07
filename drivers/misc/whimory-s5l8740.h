@@ -87,6 +87,17 @@ struct whimory_fpart {
 					 WHIMORY_VBAS_PER_PAGE)
 #define WHIMORY_DATA_VBAS_PER_SB	(WHIMORY_DATA_PAGES_PER_SB * \
 					 WHIMORY_VBAS_PER_PAGE)
+/*
+ * How many addresses a block table of contents may span.
+ *
+ * The BTOC is not one address. sub_5688C4 reads num_vba of them, taken from
+ * the superblock state byte the writer stamps into every BTOC meta, and
+ * num_vba grows as the superblock's address count does: it is 4 on a full
+ * four-bank superblock and 18 on the widest short one seen on this volume.
+ * The bound below is generous rather than exact, because a BTOC longer than
+ * this is a decode fault and should be rejected, not truncated.
+ */
+#define WHIMORY_BTOC_MAX_VBAS		64
 
 #define WHIMORY_META_TYPE_DATA		0x01
 #define WHIMORY_META_TYPE_DATA2		0x02
@@ -300,6 +311,14 @@ struct whimory_syscfg {
 	char sw_ver[24];	/* SwVr */
 	char cnt_b[24];	/* CNTB */
 	char mt_cl[24];	/* MtCl */
+	/*
+	 * MtCl's value is not text: it is a pair of little-endian words, a
+	 * length and an offset, pointing at the touch calibration elsewhere in
+	 * the same section. Reading it as a string yields nothing, which is
+	 * what it did.
+	 */
+	u32 mt_cl_len;
+	u32 mt_cl_off;
 	u8 mac[6];		/* BMac */
 	bool mac_ok;
 	u32 region;		/* Regn */
@@ -372,6 +391,16 @@ struct whimory_sftl {
 	u32 num_sb;
 	u32 user_blocks;
 	u8 *btoc_page;
+	u8 *btoc_buf;		/* the whole BTOC, num_vba addresses of it */
+	/*
+	 * Addresses of this superblock that carry data, i.e. maxVbaOfs less
+	 * the BTOC's own num_vba. Set by whimory_read_btoc() around the
+	 * parse and zero outside it, the same way claim_weave is. This is
+	 * the bound the record stream describes; the parser used to use the
+	 * whole data region, which is 12 addresses too many on a full
+	 * superblock and aborts the rest of the table when one straddles it.
+	 */
+	u32 btoc_used;
 	u8 *data_page;
 	u8 *meta_page;
 	/*
@@ -477,8 +506,12 @@ struct whimory_sftl {
 	u32 cxt_mismatch_older;	/* decode fault: page older than the checkpoint */
 	u32 btoc_slot_nonzero;	/* BTOC found in a slot other than 0 */
 	u32 btoc_slot_missing;	/* page had no slot with a BTOC meta */
+	u32 btoc_multi_vba;	/* BTOCs that spanned more than one address */
+	u32 btoc_num_vba_max;	/* widest num_vba seen */
+	u32 btoc_num_vba_bad;	/* num_vba out of range, or the read failed */
 	u8 *btoc_per_vblock;	/* BTOCs seen per virtual block */
 	u32 member_sbs;		/* banks folded into a superblock's BTOC */
+	u32 closed_folded;	/* second bank of a table that straddled two */
 
 	struct whimory_sb *sbs;
 	u32 mapped_roots;

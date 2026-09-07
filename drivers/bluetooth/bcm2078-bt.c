@@ -20,6 +20,7 @@
  * Phase 3: thin V4L2 radio (/dev/radio0). Sysfs fm_* remains debug.
  * Audio is IIS2 ALSA capture → userspace → IIS0 play. No FM→A2DP path.
  */
+#include <linux/apple-n31.h>
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/regulator/consumer.h>
@@ -78,6 +79,24 @@ void bcm2078_register_bt_rails(int (*fn)(bool on))
 EXPORT_SYMBOL_GPL(bcm2078_register_bt_rails);
 
 /*
+ * The enable line, which lives on the PMIC and not on a SoC pad.
+ *
+ * Same hook shape as the rails above and for the same reason, but with no
+ * deferred replay: the steps are ordered against pad writes and delays in
+ * bcm_power_seq(), so applying one late would put it in the wrong place.
+ * If the provider is not up yet the sequence is not run, and the caller is
+ * told, rather than half of it happening at the wrong time.
+ */
+static int (*bcm_bt_enable_fn)(unsigned int step);
+
+void bcm2078_register_bt_enable(int (*fn)(unsigned int step))
+{
+	bcm_bt_enable_fn = fn;
+}
+EXPORT_SYMBOL_GPL(bcm2078_register_bt_enable);
+
+
+/*
  * The rail, taken as a regulator.
  *
  * This is the ordering fix. The hook below can only report that no provider
@@ -91,6 +110,16 @@ EXPORT_SYMBOL_GPL(bcm2078_register_bt_rails);
  * which is not true on this one.
  */
 static struct regulator *bcm_bt_vreg;
+
+/*
+ * The one instance, for the exported mixer hooks.
+ *
+ * There is exactly one BCM2078 on this board and its node is a fixed
+ * soc:bcm2078-companion, so a singleton is honest rather than a shortcut --
+ * the alternative would be handing the machine driver a pointer it has no
+ * other use for. Cleared on remove so a mixer control cannot outlive it.
+ */
+static struct bcm2078_bt *bcm_bt_singleton;
 
 /*
  * Whether WE hold an enable on bcm_bt_vreg.
@@ -161,12 +190,21 @@ static int bcm_bt_rails(bool on)
  */
 #define BCM_GPIO_NOP		0xC8
 #define BCM_GPIO_PWR		0x46	/* 70 — power control, all variants */
-#define BCM_GPIO_UART		0x50	/* 80 — function 2 while the part is on */
+/*
+ * The UART pads, both of them. sub_177AE0 configures 80 with (1, 1) and
+ * 81 with (2, 0) plus a data write, so they are not interchangeable and
+ * the old single BCM_GPIO_UART hid that.
+ */
+#define BCM_GPIO_UART_TX	0x50	/* 80 */
+#define BCM_GPIO_UART_RX	0x51	/* 81 */
+#define BCM_GPIO_UART		BCM_GPIO_UART_TX
 #define BCM_GPIO_PWR_ALT	0xC8	/* 200 — variants 1 and 2 */
 #define BCM_MODE_POWER		2
 #define BCM_MODE_CLEAR		0xFFFE
 
 #define HCI_OP_FC15		0xFC15
+/* HCI_Write_BD_Addr. Occurs once in OSOS, so stock programs it too. */
+#define HCI_OP_WRITE_BD_ADDR_VS	0xFC01
 
 /*
  * FM_RDS_Command register map, from the BlueTool hcidef (COMMAND
@@ -196,8 +234,29 @@ static int bcm_bt_rails(bool on)
 #define FM_REG_RDS_PI_MASK	0x1c	/* 2 */
 #define FM_REG_RDS_BOOT		0x1e	/* 1 */
 #define FM_REG_RDS_TEST		0x1f	/* 1 */
+/*
+ * 0x29 is never written by the stock firmware.
+ *
+ * Every FM_RDS_Command the stock image can issue passes through one 16-byte
+ * queue entry builder, sub_4290C4 at 0x004290C4, whose first word packs
+ * data << 24 | rw << 16 | reg << 8 | param_len. There are eleven call sites
+ * image-wide and register 0x29 is not among them, so whatever this register
+ * governs -- PCM slave configuration, on the reading that named it -- the
+ * part is shipped with it already correct. It is kept named because a bare
+ * 0x29 in a future trace should be recognisable, not because anything here
+ * should write it.
+ */
 #define FM_REG_SLAVE_CONFIG	0x29
-#define FM_REG_ROUTE_PCM	0x4d	/* 1: tuner audio onto the PCM port */
+/*
+ * 0x4D is read, never written.
+ *
+ * sub_DD458 at 0x000DD458 issues 0x01014D03: reg 0x4D, rw 1, one byte. Stock
+ * calls it after every AUDIO_CTRL write and does nothing with the answer that
+ * this image reveals. This driver used to write 0x01 here, on the reading
+ * that it was the PCM route enable; it is not, and the route lives in
+ * AUDIO_CTRL below.
+ */
+#define FM_REG_ROUTE_PCM	0x4d
 #define FM_REG_RDS_DATA		0x80	/* n: RDS FIFO, caller-sized */
 #define FM_REG_BEST_TUNE	0x90	/* 1 */
 #define FM_REG_SMUTE_V3		0xda	/* 5 */
@@ -223,6 +282,31 @@ static int bcm_bt_rails(bool on)
 #define FM_TUNE_MODE_PRESET	1
 #define FM_TUNE_MODE_SEARCH	2
 
+/*
+ * RDS_FLAG bits, read-to-clear. Only the two this driver acts on are named,
+ * and both are inferred from live readings on 2026-09-04 rather than from a
+ * register document: the flag read 0x0261 on a freshly tuned station with an
+ * RDS group waiting, and 0x0000 with neither pending. Both bits are among the
+ * four stock arms in RDS_MASK = 0x1203.
+ */
+#define FM_FLAG_TUNE_COMPLETE	0x0001
+#define FM_FLAG_RDS_AVAIL	0x0200
+
+/* Tune settle: SEARCH_TUNE starts the retune, it does not finish it. */
+#define FM_TUNE_SETTLE_TRIES	40
+#define FM_TUNE_SETTLE_MS	25
+
+/*
+ * Raw group ring. 64 groups is about 5.5 s of a full RDS stream (11.4
+ * groups/s), which is long enough that a once-a-second reader never loses one
+ * and short enough to stay a rounding error in this struct.
+ */
+#define FM_RDS_RING	64
+
+struct bcm_rds_raw {
+	u16 a, b, c, d;
+};
+
 /* RDS_SYSTEM bits. */
 #define FM_SYSTEM_FM_ON		0x01
 #define FM_SYSTEM_RDS_ON	0x02
@@ -234,18 +318,39 @@ static int bcm_bt_rails(bool on)
 #define FM_CTRL_STEREO_BLEND	0x08
 #define FM_CTRL_INJECTION	0x10
 
-/* AUDIO_CTRL bits 6:0; 15:7 is the audio bandwidth select. */
-#define FM_AUDIO_RF_MUTE	0x0001
+/*
+ * AUDIO_CTRL, which is where the FM audio route actually lives.
+ *
+ * Stock never composes this register from bit names. sub_DD334 at 0x000DD334
+ * writes one of exactly two 16-bit values and nothing else:
+ *
+ *	route on   0x0060    (sub_42A8C, "BT_KEY_FM_RADIO_AUDIO_ROUTE" = "0N")
+ *	route off  0x0001    (sub_157784, the same key = "0F", and the value
+ *	                      the FM power-on in sub_DD136 leaves behind)
+ *
+ * They are alternatives, not a bitfield to be mixed: sub_DD334 is a single
+ * ternary, 96 or 1. This driver's default was 0x0061 -- the "on" value with
+ * the "off" value ORed into it -- assembled from bit names that came from a
+ * register map rather than from the firmware, and that is a configuration
+ * stock never writes.
+ *
+ * MANUAL_MUTE is kept as a bit because the ALSA mixer needs somewhere to put
+ * mute and the FM path has no gain stage of its own; it is ORed onto whichever
+ * of the two values is current, so the route is never disturbed by muting.
+ */
+/* Top of VOLUME_CTRL's own 0..256 range; the chip powers up above it. */
+#define FM_VOLUME_UNITY		0x0100
+#define FM_AUDIO_CTRL_ROUTE_OFF	0x0001
+#define FM_AUDIO_CTRL_ROUTE_PCM	0x0060
 #define FM_AUDIO_MANUAL_MUTE	0x0002
-#define FM_AUDIO_Z_MUTE_LEFT	0x0004
-#define FM_AUDIO_Z_MUTE_RIGHT	0x0008
-#define FM_AUDIO_ROUTE_DAC	0x0010
-#define FM_AUDIO_ROUTE_I2S	0x0020
-#define FM_AUDIO_DEEMPH_75US	0x0040
 
 /* Largest RDS read we will ask for in one go. */
 #define FM_RDS_READ_MAX		60
 #define FM_RDS_TEXT_MAX		64
+#define FM_RDS_PTYN_MAX		8
+/* RadioText+ application id, and "no group announced yet". */
+#define FM_RDS_AID_RTPLUS	0x4bd7
+#define FM_RDS_AGT_NONE		0xffff
 #define FM_RDS_PS_MAX		8
 
 /* Bounds for the raw HCI passthrough. */
@@ -260,44 +365,73 @@ static int bcm_bt_rails(bool on)
 #define BCM_FM_KHZ_DEFAULT	94700u	/* Canada test station */
 
 /*
- * RF_MUTE squelches the output as C/N falls, de-emphasis is 75 us for
- * North America (clear the bit for the 50 us regions), and ROUTE_I2S is
- * what puts tuner audio on the PCM port that IIS2 captures.
+ * The PCM bit clock, per tuned station.
+ *
+ * Stock's FM audio enable, sub_42A8C at 0x00042A8C, does not use one clock.
+ * It picks between three and programs the SoC's IIS2 dividers for whichever
+ * it chose, then turns the route on:
+ *
+ *	4.8 MHz   default
+ *	8.0 MHz   frequency exactly in the 18-entry table at 0x0891DAC8
+ *	1.6 MHz   95.9, 96.0 or 96.1 MHz
+ *
+ * all divided from the same 24 MHz source, and all divided again by a literal
+ * 32000 to reach CLKDIV. The selector is sub_3B82C at 0x0003B82C, called on
+ * every tune from sub_348B8, so the clock moves with the station rather than
+ * being set once.
+ *
+ * What the table is becomes obvious once it is written out: every entry is
+ * 4.8 MHz times an integer, plus or minus 100 kHz.
+ *
+ *	16 x 4.8 = 76.8    76.7  76.8  76.9
+ *	17 x 4.8 = 81.6    81.5  81.6  81.7
+ *	18 x 4.8 = 86.4    86.3  86.4  86.5
+ *	19 x 4.8 = 91.2    91.1  91.2  91.3
+ *	21 x 4.8 = 100.8  100.7 100.8 100.9
+ *	22 x 4.8 = 105.6  105.5 105.6 105.7
+ *
+ * These are the channels where the default PCM clock's own harmonic sits on
+ * the carrier, and stock moves the clock rather than accept the interference.
+ * 20 x 4.8 is 96.0, which is missing from the table because it gets the third
+ * rate instead.
+ *
+ * The table is stock's, in stock's units of 10 kHz.
  */
-#define BCM_FM_AUDIO_CTRL0_DEFAULT	(FM_AUDIO_RF_MUTE | \
-					 FM_AUDIO_DEEMPH_75US | \
-					 FM_AUDIO_ROUTE_I2S)
+#define BCM_FM_BITCLK_DEFAULT	4800000u
+#define BCM_FM_BITCLK_TABLE	8000000u
+#define BCM_FM_BITCLK_96MHZ	1600000u
+
+static const u16 bcm_fm_bitclk_8mhz[] = {
+	7670, 7680, 7690, 8150, 8160, 8170, 8630, 8640, 8650,
+	9110, 9120, 9130, 10070, 10080, 10090, 10550, 10560, 10570,
+};
 
 /*
- * Off by default: these pins belong to hci_bcm. See the file header.
+ * Off, because stock's Bluetooth power-on does not touch these pads.
+ *
+ * This was turned on under the reading that pad 97 is the controller's
+ * REG_ON and that "stock sets all three to mode 2 as part of its power
+ * sequence". Neither holds. The mode-2 trio 97/98/119 -- 0x61, 0x62, 0x77 --
+ * appears in exactly one function image-wide:
+ *
+ *	sub_15DD5C, keyed on "BT_KEY_FM_RADIO_POWER"
+ *	  a1 == 2 (FM on):   43D38C(0xC8, 0, 0), 428F70(0xC8, 1),
+ *			     43D38C(0x61, 2, 0), (0x62, 2, 0), (0x77, 2, 0)
+ *	  a1 == 1 (FM off):  43D38C(0xC8, 0xFFFE, 0), and the same three
+ *			     released to 0xFFFE
+ *
+ * That is the FM tuner claiming the IIS2 PCM pads, which is why
+ * s5l8740-i2s claims them too, and it is not reachable from
+ * sphwBluetooth_Init. The Bluetooth power-on is pad 70 plus the PMIC
+ * writes -- see bcm_bt_power_up() -- and the enable this driver was
+ * missing turned out to be PMIC register 0x4B, not pad 97.
+ *
+ * Driving them here also has a cost beyond being wrong: they are the
+ * capture bus, and one early attempt at it correlated with a reset back to
+ * RetailOS. gpio_poke=1 restores the old behaviour for bring-up
+ * comparisons.
  */
-/*
- * On. Without it the BCM part is never actually powered.
- *
- * hci_bcm drives shutdown-gpios, which the device tree points at GPIO 70 --
- * the power control pin. REG_ON is GPIO 97, and device-wake and host-wake
- * are 98 and 119. Stock sets all three to mode 2 as part of its power
- * sequence:
- *
- *   sub_43D38C(0x61u, 2, 0)   97   REG_ON
- *   sub_43D38C(0x62u, 2, 0)   98   device-wake
- *   sub_43D38C(0x77u, 2, 0)   119  host-wake
- *   sub_43D38C(0x46u, 1, 1)   70   power control, paired with 428F70
- *
- * With this off we did the rails and the +0x0C pad gate and then stopped,
- * so REG_ON was never asserted and the controller stayed in reset. The
- * symptom is unambiguous: vendor command 0xFC18 times out, hci_bcm reports
- * "failed to write update baudrate (-110)", and /proc/interrupts shows
- * zero interrupts on 3db00000.serial -- the chip has never sent a byte.
- *
- * It defaulted off because driving these pads early once correlated with a
- * reset back to RetailOS. That is a single observation against a sequence
- * the stock firmware performs on every power-on, and the cost of honouring
- * it is that Bluetooth cannot work at all. If the reset returns, the thing
- * to investigate is ordering against the rails, not whether to power the
- * part.
- */
-static bool gpio_poke = true;
+static bool gpio_poke;
 module_param(gpio_poke, bool, 0644);
 MODULE_PARM_DESC(gpio_poke,
 		 "Drive the BCM control pins directly (default N; hci_bcm owns them)");
@@ -306,15 +440,10 @@ static u8 rds_wline = 12;
 module_param(rds_wline, byte, 0644);
 MODULE_PARM_DESC(rds_wline, "RDS FIFO watermark in blocks (default 12)");
 
-static bool fm_route_pcm = true;
-module_param(fm_route_pcm, bool, 0644);
-MODULE_PARM_DESC(fm_route_pcm,
-		 "Write ROUTE_PCM on FM power-on so IIS2 receives audio");
-
-static u16 fm_audio_ctrl0 = BCM_FM_AUDIO_CTRL0_DEFAULT;
+static u16 fm_audio_ctrl0 = FM_AUDIO_CTRL_ROUTE_PCM;
 module_param(fm_audio_ctrl0, ushort, 0644);
 MODULE_PARM_DESC(fm_audio_ctrl0,
-		 "FC15 reg0x05 audio ctrl (default 0x61 = route+I2S+75us deemph)");
+		 "FC15 reg0x05 value for route-on (stock writes 0x0060)");
 
 struct bcm2078_bt {
 	struct device *dev;
@@ -323,6 +452,19 @@ struct bcm2078_bt {
 	bool powered;
 	bool fm_on;
 	bool rds_on;
+	/* AUDIO_CTRL state: which of stock's two values is currently written. */
+	bool fm_route_on;
+	bool fm_muted;
+	bool tune_settled;
+	bool bd_addr_done;
+	/* Serialises every HCI command; see bcm_hci_cmd(). */
+	struct mutex cmd_lock;
+	bool cmd_settle;
+	u16 rds_flag;
+	struct bcm_rds_raw rds_ring[FM_RDS_RING];
+	unsigned int rds_ring_head;
+	unsigned int rds_ring_used;
+	unsigned int rds_ring_drop;
 	unsigned int fm_khz;
 	/* Last decoded RDS. Guarded by lock along with everything else. */
 	char rds_ps[FM_RDS_PS_MAX + 1];
@@ -333,6 +475,21 @@ struct bcm2078_bt {
 	u8 rds_pty;
 	u8 rds_rt_ab;
 	unsigned int rds_groups;
+	/* 10A: programme type name, eight characters in two segments. */
+	char rds_ptyn[FM_RDS_PTYN_MAX + 1];
+	char rds_ptyn_build[FM_RDS_PTYN_MAX];
+	/*
+	 * RadioText+, which has no fixed group of its own: a 3A announcement
+	 * says which group carries it, so the group has to be learnt before
+	 * anything can be decoded from it. 0xffff until one arrives.
+	 */
+	u16 rds_rtp_agt;
+	u8 rds_rtp_type[2];
+	u8 rds_rtp_start[2];
+	u8 rds_rtp_len[2];
+	bool rds_rtp_valid;
+	bool rds_rtp_running;
+	u8 rds_rtp_toggle;
 	u8 reg_addr;
 	u8 reg_len;
 	u8 reg_data[FM_RDS_READ_MAX];
@@ -407,6 +564,23 @@ static void bcm_428F70(struct bcm2078_bt *bt, unsigned int gpio, int on)
  * enable on the power pad, so it is safe to run whenever the caller
  * asks for power, and hci_bcm cannot do it through gpiod.
  */
+static int bcm_bt_enable(struct bcm2078_bt *bt, unsigned int step)
+{
+	int ret;
+
+	if (!bcm_bt_enable_fn) {
+		dev_warn(bt->dev,
+			 "PMIC enable step %u skipped: gpio-d1830 not loaded yet -- the part stays held in reset\n",
+			 step);
+		return -ENODEV;
+	}
+	ret = bcm_bt_enable_fn(step);
+	if (ret)
+		dev_warn(bt->dev, "PMIC enable step %u failed: %d\n",
+			 step, ret);
+	return ret;
+}
+
 static void bcm_power_pad_gate(struct bcm2078_bt *bt, int on)
 {
 	bcm_428F70(bt, BCM_GPIO_PWR, on);
@@ -431,33 +605,105 @@ static void bcm_power_pins_off(struct bcm2078_bt *bt)
 
 /* ---------- FM 0xFC15 via hci0 (not raw UART) ---------- */
 
-static int bcm_fc15(struct bcm2078_bt *bt, const u8 *payload, u8 plen)
+/*
+ * Send one command to hci0 and discard the reply.
+ *
+ * The hci0-up guard is why this is shared rather than inlined per caller: the
+ * failure it catches is specific enough to be worth naming once. hci_bcm can
+ * have a fully initialised controller -- patched, identified, answering -- while
+ * the HCI device is still DOWN, because nothing has issued HCIDEVUP. There is no
+ * bluez in this initramfs, so that is the normal state after boot, and it is why
+ * n31-hciup exists.
+ */
+/*
+ * One command at a time, and a settling gap after any that times out.
+ *
+ * A timed-out FC15 does not merely fail, it poisons the link. The HCI core
+ * matches replies to waiters by opcode, so when __hci_cmd_sync gives up and the
+ * part answers a moment later, that late reply is handed to the *next* FC15's
+ * waiter. Every reply after it is then one behind, which is how a single
+ * hiccup turned into minutes of
+ *
+ *	Bluetooth: hci0: command 0xfc15 tx timeout
+ *	Bluetooth: hci0: Frame reassembly failed (-84)
+ *
+ * ending in a reboot. Two changes stop that.
+ *
+ * cmd_lock serialises every command this driver sends. Callers reach here from
+ * the FM sysfs attributes, the V4L2 radio, the RDS poll and an ALSA mixer
+ * handler, and those hold different locks or none -- the mute control is a
+ * kcontrol put, which shares nothing with the poll worker. Without this two of
+ * them can be in flight together, and the second is guaranteed to collect the
+ * first's reply.
+ *
+ * And after a timeout the next command waits out the in-flight answer instead
+ * of racing it. Nothing can be done about the reply that is already coming, but
+ * arriving with no waiter it is dropped by the core, which is exactly what
+ * should happen to it. The alternative -- pressing straight on -- is what
+ * shifted the stream.
+ */
+#define BCM_CMD_SETTLE_MS	300
+
+static int bcm_hci_cmd(struct bcm2078_bt *bt, u16 opcode,
+		       const u8 *payload, u8 plen)
 {
 	struct hci_dev *hdev;
 	struct sk_buff *skb;
+	int ret;
+
+	mutex_lock(&bt->cmd_lock);
+	if (bt->cmd_settle) {
+		msleep(BCM_CMD_SETTLE_MS);
+		bt->cmd_settle = false;
+	}
 
 	hdev = hci_dev_get(0);
 	if (!hdev) {
 		dev_warn_ratelimited(bt->dev,
-				     "FC15: no hci0 — bring up hci_bcm first\n");
+				     "0x%04x: no hci0 — bring up hci_bcm first\n",
+				     opcode);
+		mutex_unlock(&bt->cmd_lock);
 		return -ENODEV;
 	}
 	if (!test_bit(HCI_UP, &hdev->flags)) {
 		hci_dev_put(hdev);
 		dev_warn_ratelimited(bt->dev,
-				     "FC15: hci0 down — run n31-bt-up / HCIDEVUP\n");
+				     "0x%04x: hci0 down — run n31-hciup\n",
+				     opcode);
+		mutex_unlock(&bt->cmd_lock);
 		return -ENETDOWN;
 	}
 
-	skb = __hci_cmd_sync(hdev, HCI_OP_FC15, plen, payload, HCI_CMD_TIMEOUT);
+	skb = __hci_cmd_sync(hdev, opcode, plen, payload, HCI_CMD_TIMEOUT);
 	hci_dev_put(hdev);
 	if (IS_ERR(skb)) {
-		dev_dbg(bt->dev, "FC15 plen=%u → %ld\n", plen, PTR_ERR(skb));
-		return PTR_ERR(skb);
+		ret = PTR_ERR(skb);
+		/*
+		 * A timeout leaves an answer in flight. Make the next command
+		 * wait for it rather than collect it.
+		 */
+		if (ret == -ETIMEDOUT) {
+			bt->cmd_settle = true;
+			dev_warn_ratelimited(bt->dev,
+					     "0x%04x timed out; settling %u ms before the next command\n",
+					     opcode, BCM_CMD_SETTLE_MS);
+		} else {
+			dev_dbg(bt->dev, "0x%04x plen=%u → %d\n",
+				opcode, plen, ret);
+		}
+		mutex_unlock(&bt->cmd_lock);
+		return ret;
 	}
-	dev_dbg(bt->dev, "FC15 plen=%u → OK len=%u\n", plen, skb->len);
+	dev_dbg(bt->dev, "0x%04x plen=%u → OK len=%u\n",
+		opcode, plen, skb->len);
 	kfree_skb(skb);
+	mutex_unlock(&bt->cmd_lock);
 	return 0;
+}
+
+static int bcm_fc15(struct bcm2078_bt *bt, const u8 *payload, u8 plen)
+{
+	return bcm_hci_cmd(bt, HCI_OP_FC15, payload, plen);
 }
 
 static int bcm_fm_w8(struct bcm2078_bt *bt, u8 reg, u8 val)
@@ -508,7 +754,29 @@ static int bcm_fm_read(struct bcm2078_bt *bt, u8 reg, u8 *out, u8 len)
 	if (IS_ERR(skb))
 		return PTR_ERR(skb);
 
-	if (skb->len == 1u + len)
+	/*
+	 * Reply shapes.
+	 *
+	 * 1 + len and 3 + len were the two this knew about. The part also
+	 * answers 2 + len, which was rejected as -EPROTO -- and rejecting it is
+	 * worse than it sounds, because the caller then retries and the stream
+	 * drifts: measured on 2026-09-04, RSSI reads alternated between a value
+	 * and `command 0xfc15 tx timeout` for minutes, with 144 KB received on
+	 * UART1 for a few dozen register reads.
+	 *
+	 * The 2 + len form is one status byte, the payload, then one trailing
+	 * byte. Reading reg 0x0F (RSSI) for len 1 returned `00 10 00`, `00 0a 00`,
+	 * `00 01 00` and `00 09 00` across the band -- a zero status, a value
+	 * that moves, and a constant zero after it. So the payload is at offset
+	 * 1 and the tail is ignored, exactly as for 1 + len.
+	 *
+	 * Which also means the RSSI numbers this driver has been reporting were
+	 * not RSSI. 16, 10, 1 and 9 are plausible on this part's scale; the
+	 * 170-199 range that came out of a band sweep earlier was mis-framed
+	 * replies being read as data. A sweep taken with this fix in place is the
+	 * first one worth believing.
+	 */
+	if (skb->len == 1u + len || skb->len == 2u + len)
 		hdr = 1;
 	else if (skb->len == 3u + len)
 		hdr = 3;
@@ -520,6 +788,8 @@ static int bcm_fm_read(struct bcm2078_bt *bt, u8 reg, u8 *out, u8 len)
 		ret = -EPROTO;
 		goto out;
 	}
+	dev_dbg(bt->dev, "FC15 read reg 0x%02x len %u: %*ph\n",
+		reg, len, min_t(int, skb->len, 16), skb->data);
 	if (skb->data[0]) {
 		dev_dbg(bt->dev, "FC15 read reg 0x%02x status 0x%02x\n",
 			reg, skb->data[0]);
@@ -555,14 +825,47 @@ static int bcm_fm_r16(struct bcm2078_bt *bt, u8 reg, u16 *val)
  * whose upper bits flag correction/error. Four blocks make a group, and
  * only the well-formed ones are worth decoding.
  */
+/*
+ * The RDS FIFO record, derived from the bytes the chip actually returns.
+ *
+ * Three bytes per block, and the status comes FIRST, not last:
+ *
+ *	[status][value hi][value lo]
+ *
+ * with the block index in bits 5:4 and the low nibble zero on a clean
+ * block. A dump off a station transmitting its name reads
+ *
+ *	00 ce c4  10 00 0c  20 e0 cd  30 56 4f
+ *	00 ce c4  10 00 09  20 e0 cd  30 41 52
+ *	00 ce c4  10 00 0a  20 e0 cd  30 2d 46
+ *	00 ce c4  10 00 0f  20 e0 cd  30 4d 20
+ *
+ * which decodes as PI 0xCEC4, block B 0x000c/9/a/f -- group type 0,
+ * version A, segments 0 to 3 -- and block D carrying "VO", "AR", "-F",
+ * "M ": the Program Service name VOAR-FM, assembled in segment order.
+ *
+ * The previous reading of this had the status last and the block index in
+ * bits 2:0 with an error bit at 0x80. That turned every group into an
+ * identical bogus 1A with a PI of 0x304d -- which is two of the name's own
+ * characters, "0M", read as a block -- and no PS or RadioText ever
+ * appeared, because a station's 0A groups were never recognised as 0A.
+ */
 #define FM_RDS_REC_LEN		3
-#define FM_RDS_BLK_MASK		0x07
+#define FM_RDS_BLK_SHIFT	4
+/*
+ * A read always returns the full 60 bytes and pads the slots the FIFO could
+ * not fill with 7c ff ff -- status 0x7c, value 0xffff. Its block index is 7,
+ * outside the four that exist, so the padding identifies itself and there is
+ * no need to ask the chip how much it had. Masking the index to two bits
+ * instead would fold that 7 onto block D and feed 0xffff into the group.
+ */
+#define FM_RDS_BLK_EMPTY	7
 #define FM_RDS_BLK_A		0
 #define FM_RDS_BLK_B		1
 #define FM_RDS_BLK_C		2
-#define FM_RDS_BLK_CP		3
-#define FM_RDS_BLK_D		4
-#define FM_RDS_ERR_MASK		0x80
+#define FM_RDS_BLK_D		3
+/* Low nibble: nonzero means the chip flagged errors in that block. */
+#define FM_RDS_ERR_MASK		0x0f
 
 /* Printable-ASCII guard: RDS pads with 0x20 and terminates RT with 0x0D. */
 static char bcm_rds_char(u8 c)
@@ -575,6 +878,28 @@ static void bcm_rds_group(struct bcm2078_bt *bt, const u16 blk[4])
 	unsigned int type = blk[1] >> 12;
 	unsigned int ver = (blk[1] >> 11) & 1;
 	unsigned int i;
+
+	/*
+	 * Keep the group itself, not just what this decoder made of it.
+	 *
+	 * PS and RT are the two things worth decoding in the kernel and they
+	 * are also the two that stay empty longest -- PS needs all four
+	 * segments, RT up to sixteen -- so "nothing yet" and "nothing ever"
+	 * look identical from sysfs. A ring of the raw blocks distinguishes
+	 * them, and it is what a userspace tool wants anyway: group types this
+	 * driver ignores (1A, 3A, 4A clock-time, 8A TMC) are all in here.
+	 *
+	 * Oldest-dropped rather than newest-dropped: a reader that falls behind
+	 * should lose history, not the group that just arrived.
+	 */
+	bt->rds_ring[bt->rds_ring_head] = (struct bcm_rds_raw){
+		blk[0], blk[1], blk[2], blk[3]
+	};
+	bt->rds_ring_head = (bt->rds_ring_head + 1) % FM_RDS_RING;
+	if (bt->rds_ring_used < FM_RDS_RING)
+		bt->rds_ring_used++;
+	else
+		bt->rds_ring_drop++;
 
 	bt->rds_pi = blk[0];
 	bt->rds_pty = (blk[1] >> 5) & 0x1f;
@@ -627,6 +952,69 @@ static void bcm_rds_group(struct bcm2078_bt *bt, const u16 blk[4])
 				bt->rds_rt[i - 1] = 0;
 			}
 		}
+	} else if (type == 10 && !ver) {
+		/*
+		 * 10A: the Programme Type Name, eight characters that qualify
+		 * the numeric PTY -- "Rock" says less than "OZ ROCK". Four
+		 * characters per group in blocks C and D, two segments, and the
+		 * segment is the low bit of block B.
+		 */
+		unsigned int seg = blk[1] & 1;
+		unsigned int base = seg * 4;
+
+		bt->rds_ptyn_build[base] = bcm_rds_char(blk[2] >> 8);
+		bt->rds_ptyn_build[base + 1] = bcm_rds_char(blk[2] & 0xff);
+		bt->rds_ptyn_build[base + 2] = bcm_rds_char(blk[3] >> 8);
+		bt->rds_ptyn_build[base + 3] = bcm_rds_char(blk[3] & 0xff);
+		if (seg == 1) {
+			memcpy(bt->rds_ptyn, bt->rds_ptyn_build,
+			       FM_RDS_PTYN_MAX);
+			bt->rds_ptyn[FM_RDS_PTYN_MAX] = 0;
+		}
+	} else if (type == 3 && !ver) {
+		/*
+		 * 3A announces an Open Data Application: block D is the
+		 * application id and the low five bits of block B are the group
+		 * that will carry it, as a type in bits 4:1 and a version in
+		 * bit 0. RadioText+ is 0x4BD7 and it is not assigned a fixed
+		 * group, so this is the only way to know where to look for it;
+		 * on the station this was written against it lands on 11A, but
+		 * that is the station's choice rather than a constant.
+		 */
+		if (blk[3] == FM_RDS_AID_RTPLUS)
+			bt->rds_rtp_agt = blk[1] & 0x1f;
+	} else if (bt->rds_rtp_agt != FM_RDS_AGT_NONE &&
+		   ((type << 1) | ver) == bt->rds_rtp_agt) {
+		/*
+		 * RadioText+. Two tags per group, each naming a content type
+		 * and a run of characters inside the RadioText that is already
+		 * being assembled, so this stores offsets rather than text and
+		 * the reader slices the current RadioText with them.
+		 *
+		 *   B  bit 4    item toggle
+		 *      bit 3    item running
+		 *      bits 2:0 content type 1, high three bits of six
+		 *   C  bits 15:13  content type 1, low three
+		 *      bits 12:7   start of tag 1
+		 *      bits 6:1    length of tag 1
+		 *      bit 0       content type 2, high bit of six
+		 *   D  bits 15:11  content type 2, low five
+		 *      bits 10:5   start of tag 2
+		 *      bits 4:0    length of tag 2
+		 *
+		 * The lengths are character counts as they stand, not counts less
+		 * one: a group carrying "INTO THE GREAT WIDE OPEN" as its title
+		 * gives 24, which is exactly that string.
+		 */
+		bt->rds_rtp_toggle = (blk[1] >> 4) & 1;
+		bt->rds_rtp_running = (blk[1] >> 3) & 1;
+		bt->rds_rtp_type[0] = ((blk[1] & 0x07) << 3) | (blk[2] >> 13);
+		bt->rds_rtp_start[0] = (blk[2] >> 7) & 0x3f;
+		bt->rds_rtp_len[0] = (blk[2] >> 1) & 0x3f;
+		bt->rds_rtp_type[1] = ((blk[2] & 0x01) << 5) | (blk[3] >> 11);
+		bt->rds_rtp_start[1] = (blk[3] >> 5) & 0x3f;
+		bt->rds_rtp_len[1] = blk[3] & 0x1f;
+		bt->rds_rtp_valid = true;
 	}
 }
 
@@ -641,22 +1029,44 @@ static int bcm_rds_poll(struct bcm2078_bt *bt)
 	u16 blk[4];
 	bool have[4] = { false, false, false, false };
 	unsigned int i;
+	u16 flag = 0;
 	int ret;
+
+	/*
+	 * Ask the flag register before draining the FIFO.
+	 *
+	 * The FIFO read is a vendor command with a fixed-size reply, so an
+	 * empty FIFO does not come back short -- it does not come back at all,
+	 * and __hci_cmd_sync eats its full timeout. Measured 2026-09-04 on a
+	 * station whose RDS was decoding: the first poll returned a group and
+	 * flag=0x0261; the second returned -110 with flag=0x0000, having
+	 * blocked for two seconds to learn that nothing had arrived yet. A
+	 * poller on a timer would spend all its time in that timeout.
+	 *
+	 * Bit 9 is the RDS bit: it is set in 0x0261 when a group was waiting,
+	 * clear in 0x0000 when none was, and it is one of the four bits stock's
+	 * mask 0x1203 arms. Reading the flag also clears it, which is why this
+	 * happens once per poll and the value is passed on to the caller.
+	 */
+	if (bcm_fm_r16(bt, FM_REG_RDS_FLAG, &flag))
+		return -EIO;
+	bt->rds_flag = flag;
+	if (!(flag & FM_FLAG_RDS_AVAIL))
+		return 0;
 
 	ret = bcm_fm_read(bt, FM_REG_RDS_DATA, buf, sizeof(buf));
 	if (ret)
 		return ret;
 
 	for (i = 0; i + FM_RDS_REC_LEN <= sizeof(buf); i += FM_RDS_REC_LEN) {
-		u8 st = buf[i + 2];
-		unsigned int off = st & FM_RDS_BLK_MASK;
-		u16 val = ((u16)buf[i] << 8) | buf[i + 1];
+		u8 st = buf[i];
+		unsigned int off = st >> FM_RDS_BLK_SHIFT;
+		u16 val = ((u16)buf[i + 1] << 8) | buf[i + 2];
 
-		if (st & FM_RDS_ERR_MASK)
-			continue;
-		if (off == FM_RDS_BLK_CP)
-			off = FM_RDS_BLK_C;
+		/* Padding: everything from here on is empty slots. */
 		if (off > FM_RDS_BLK_D)
+			break;
+		if (st & FM_RDS_ERR_MASK)
 			continue;
 		if (off == FM_RDS_BLK_A) {
 			memset(have, 0, sizeof(have));
@@ -666,8 +1076,8 @@ static int bcm_rds_poll(struct bcm2078_bt *bt)
 		}
 		if (!have[0])
 			continue;
-		blk[off > FM_RDS_BLK_C ? 3 : off] = val;
-		have[off > FM_RDS_BLK_C ? 3 : off] = true;
+		blk[off] = val;
+		have[off] = true;
 		if (have[0] && have[1] && have[2] && have[3]) {
 			bcm_rds_group(bt, blk);
 			memset(have, 0, sizeof(have));
@@ -695,9 +1105,135 @@ static int bcm_rds_enable(struct bcm2078_bt *bt, bool on)
 	return 0;
 }
 
+/* Defined below; the radio reset needs them and they need the FM block. */
+static void bcm_power_off(struct bcm2078_bt *bt);
+static int bcm_power_on(struct bcm2078_bt *bt);
+static int bcm_fm_power_off(struct bcm2078_bt *bt);
+
+/* Defined with the rest of the BD-address handling, below the FM block. */
+static int bcm_write_bd_addr(struct bcm2078_bt *bt, const unsigned int m[6]);
+static int bcm_bd_addr_from_chosen(struct bcm2078_bt *bt, unsigned int m[6]);
+
+/*
+ * Program the BD address on the first command that finds hci0 up.
+ *
+ * Not in probe: at probe hci0 is registered but DOWN, and 0xFC01 needs it up.
+ * Not on every command either -- once is stock's behaviour and repeating it
+ * would be a write to the radio for no reason. Failure is logged and not fatal;
+ * a controller with a default address still works, it just is not this device.
+ */
+static void bcm_bd_addr_apply_once(struct bcm2078_bt *bt)
+{
+	unsigned int m[6];
+
+	if (bt->bd_addr_done)
+		return;
+	if (bcm_bd_addr_from_chosen(bt, m))
+		return;			/* no bootloader copy: sysfs override only */
+	bt->bd_addr_done = true;
+	if (bcm_write_bd_addr(bt, m))
+		return;
+	dev_info(bt->dev,
+		 "BD address %02x:%02x:%02x:%02x:%02x:%02x from /chosen\n",
+		 m[0], m[1], m[2], m[3], m[4], m[5]);
+}
+
+/*
+ * The IIS2 side of the FM audio enable, filled in by s5l8740-i2s.
+ *
+ * This driver is built into the kernel and s5l8740-i2s is a module, so the
+ * hook is published here and registered there -- the same shape as
+ * n31_backlight_register_wled(). The tuner has to be the one that calls it:
+ * the bit clock stock chooses depends on the station, and the station is here.
+ * A NULL hook is normal (no capture driver loaded) and is not an error; the
+ * route still goes on, at whatever bit clock the port was left with.
+ */
+static int (*bcm_fm_pcm_clk_hook)(unsigned int bitclk_hz);
+
+void bcm2078_register_fm_pcm_clk(int (*fn)(unsigned int bitclk_hz))
+{
+	WRITE_ONCE(bcm_fm_pcm_clk_hook, fn);
+}
+EXPORT_SYMBOL_GPL(bcm2078_register_fm_pcm_clk);
+
+/* khz -> stock's 10 kHz units, then stock's table. */
+static unsigned int bcm_fm_bitclk_for(unsigned int khz)
+{
+	unsigned int f10 = khz / 10;
+	unsigned int i;
+
+	if (f10 == 9590 || f10 == 9600 || f10 == 9610)
+		return BCM_FM_BITCLK_96MHZ;
+	for (i = 0; i < ARRAY_SIZE(bcm_fm_bitclk_8mhz); i++) {
+		if (bcm_fm_bitclk_8mhz[i] > f10)
+			break;
+		if (bcm_fm_bitclk_8mhz[i] == f10)
+			return BCM_FM_BITCLK_TABLE;
+	}
+	return BCM_FM_BITCLK_DEFAULT;
+}
+
+/* Stock's two AUDIO_CTRL values, plus mute, which is this driver's addition. */
+static u16 bcm_fm_audio_ctrl(struct bcm2078_bt *bt, bool route_on)
+{
+	u16 v = route_on ? fm_audio_ctrl0 : FM_AUDIO_CTRL_ROUTE_OFF;
+
+	return bt->fm_muted ? (v | FM_AUDIO_MANUAL_MUTE) : v;
+}
+
+/*
+ * sub_DD334 followed by sub_DD458: write AUDIO_CTRL, then read 0x4D.
+ *
+ * The read is stock's and is kept even though nothing is done with the byte,
+ * because it is the other half of a pair the part is always given. Its result
+ * is logged and never made fatal.
+ */
+static int bcm_fm_write_audio_ctrl(struct bcm2078_bt *bt, bool route_on)
+{
+	u8 dummy;
+	int ret;
+
+	ret = bcm_fm_w16(bt, FM_REG_AUDIO_CTRL, bcm_fm_audio_ctrl(bt, route_on));
+	if (ret)
+		return ret;
+	bt->fm_route_on = route_on;
+	if (bcm_fm_read(bt, FM_REG_ROUTE_PCM, &dummy, 1))
+		dev_dbg(bt->dev, "FC15 reg 0x4d readback failed\n");
+	return 0;
+}
+
+/*
+ * Stock's FM audio enable, sub_42A8C, in stock's order.
+ *
+ * The SoC's dividers are programmed first and the tuner is told to put audio
+ * on the port second, so the port is already clocking when data starts to
+ * arrive. Reversing it leaves the BCM2078 driving a bus whose frame sync is
+ * still at the previous station's rate.
+ */
+static int bcm_fm_audio_route(struct bcm2078_bt *bt, bool on)
+{
+	int (*clk)(unsigned int) = READ_ONCE(bcm_fm_pcm_clk_hook);
+	unsigned int bitclk = bcm_fm_bitclk_for(bt->fm_khz);
+	int ret;
+
+	if (on && clk) {
+		ret = clk(bitclk);
+		if (ret && ret != -ENODEV)
+			dev_warn(bt->dev, "IIS2 bit clock %u Hz: %d\n",
+				 bitclk, ret);
+	}
+	ret = bcm_fm_write_audio_ctrl(bt, on);
+	dev_info(bt->dev, "FM audio route %s bitclk=%u ctrl=0x%04x%s\n",
+		 on ? "on" : "off", on ? bitclk : 0,
+		 bcm_fm_audio_ctrl(bt, on), ret ? " FAIL" : "");
+	return ret;
+}
+
 static int bcm_fm_power_on(struct bcm2078_bt *bt)
 {
 	int ret;
+
+	bcm_bd_addr_apply_once(bt);
 
 	/* Tuner and RDS decoder on together; RDS costs nothing when idle. */
 	ret = bcm_fm_w8(bt, FM_REG_RDS_SYSTEM,
@@ -710,22 +1246,23 @@ static int bcm_fm_power_on(struct bcm2078_bt *bt)
 	ret = bcm_fm_w8(bt, FM_REG_RDS_CTRL, 0x02);
 	if (ret)
 		return ret;
-	ret = bcm_fm_w16(bt, FM_REG_AUDIO_CTRL, fm_audio_ctrl0);
+	/*
+	 * Power-on leaves the route OFF, which is stock's behaviour: sub_DD136
+	 * ends in sub_DD334(0), the 0x0001 arm. Audio is switched on later, by
+	 * bcm_fm_audio_route(), once a station is tuned and the SoC's dividers
+	 * have been set for it -- there is nothing to route before then.
+	 */
+	ret = bcm_fm_write_audio_ctrl(bt, false);
 	if (ret)
 		return ret;
 
 	/*
-	 * ROUTE_PCM is what actually puts tuner audio on the port IIS2
-	 * captures. The old code only read this register back and never
-	 * wrote it, leaving the route wherever the last owner left it.
+	 * Stereo blend and soft mute: nine data bytes, of which stock fills
+	 * two. sub_DD2FC packs 0x2100F90B and 0x14000000, which is the RSSI
+	 * threshold 33 at data[0] and the SNR threshold 20 at data[4]; the
+	 * defaults come from preference slots 166 and 167 and are what this
+	 * board ships with.
 	 */
-	if (fm_route_pcm) {
-		ret = bcm_fm_w8(bt, FM_REG_ROUTE_PCM, 0x01);
-		if (ret)
-			return ret;
-	}
-
-	/* Stereo blend and soft-mute curve; 8 data bytes per the register map. */
 	{
 		u8 p[11] = {
 			FM_REG_BLEND_SMUTE, FM_MODE_WRITE,
@@ -735,28 +1272,140 @@ static int bcm_fm_power_on(struct bcm2078_bt *bt)
 
 		ret = bcm_fc15(bt, p, sizeof(p));
 	}
+	if (ret)
+		return ret;
+
+	/*
+	 * Bring the receive volume down to unity, because the chip does not
+	 * power up there.
+	 *
+	 * VOLUME_CTRL is a 0..256 scale and it reads back 0x0169 -- 361, about
+	 * three decibels above the top of its own range -- until something sets
+	 * it, and nothing here ever did. The tuner therefore drove the PCM port
+	 * at digital full scale: captures peaked at 32764 of 32768 with dozens
+	 * of samples above 32000, and loud passages came out with broken samples
+	 * in them, audible as clicks that followed the music rather than the
+	 * clock. Measured on the headphone output: four such transients in
+	 * thirty seconds at the default, none at 256, and writing 448 instead
+	 * pins the capture at both rails, which is what fixes the scale.
+	 *
+	 * Unity rather than lower: it leaves three decibels of headroom, which
+	 * is enough, and every stage after this one has a volume of its own.
+	 */
+	ret = bcm_fm_w16(bt, FM_REG_VOLUME_CTRL, FM_VOLUME_UNITY);
 	bt->fm_on = !ret;
 	bt->rds_on = !ret;
 	memset(bt->rds_ps, 0, sizeof(bt->rds_ps));
 	memset(bt->rds_rt, 0, sizeof(bt->rds_rt));
 	memset(bt->rds_ps_build, ' ', sizeof(bt->rds_ps_build));
 	memset(bt->rds_rt_build, ' ', sizeof(bt->rds_rt_build));
+	memset(bt->rds_ptyn, 0, sizeof(bt->rds_ptyn));
+	memset(bt->rds_ptyn_build, ' ', sizeof(bt->rds_ptyn_build));
+	/* The RT+ group is announced per station, so forget the last one. */
+	bt->rds_rtp_agt = FM_RDS_AGT_NONE;
+	bt->rds_rtp_valid = false;
 	bt->rds_groups = 0;
 	dev_info(bt->dev,
-		 "FM power ON audio_ctrl=0x%04x route_pcm=%d wline=%u%s\n",
-		 fm_audio_ctrl0, fm_route_pcm, rds_wline,
+		 "FM power ON audio_ctrl=0x%04x (route off until tune) wline=%u%s\n",
+		 bcm_fm_audio_ctrl(bt, false), rds_wline,
 		 ret ? " FAIL" : "");
 	return ret;
 }
 
+/*
+ * FM mute, for the ALSA mixer.
+ *
+ * MANUAL_MUTE is the tuner's own mute bit in AUDIO_CTRL, so this squelches the
+ * audio at the source rather than after it has crossed to the SoC. That is the
+ * right place for it: the IIS2 side has no gain stage of its own, and muting by
+ * closing the capture PCM would also stop the clock and drop RDS with it.
+ *
+ * Exported because the machine driver owns the mixer and this driver owns the
+ * radio. bcm2078-bt is built in and nano7-audio is a module, so a plain export
+ * is enough -- no hook indirection like the PMIC rails need, because the
+ * dependency runs the other way.
+ *
+ * There is no FM volume register anywhere in the recovered FM_RDS_Command map,
+ * so level on the FM path is the codec's playback volume once the audio is
+ * looped to the headphones. Do not invent one here.
+ */
+int bcm2078_fm_mute_get(void)
+{
+	struct bcm2078_bt *bt = bcm_bt_singleton;
+
+	if (!bt)
+		return -ENODEV;
+	return bt->fm_muted ? 1 : 0;
+}
+EXPORT_SYMBOL_GPL(bcm2078_fm_mute_get);
+
+int bcm2078_fm_mute_set(bool mute)
+{
+	struct bcm2078_bt *bt = bcm_bt_singleton;
+	int ret;
+
+	if (!bt)
+		return -ENODEV;
+	mutex_lock(&bt->lock);
+	/*
+	 * Recorded even when the tuner is off, so unmuting before powering on
+	 * is not silently forgotten: every AUDIO_CTRL write folds this bit in.
+	 * The route half of the value is untouched, which is why mute cannot
+	 * knock the audio off the PCM port the way an ORed-together
+	 * fm_audio_ctrl0 could.
+	 */
+	bt->fm_muted = mute;
+	ret = bt->fm_on ?
+	      bcm_fm_write_audio_ctrl(bt, bt->fm_route_on) : 0;
+	mutex_unlock(&bt->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(bcm2078_fm_mute_set);
+
+/*
+ * Power off in stock's order, from sub_157784: drop the audio route first,
+ * then stop the tuner. The SoC's clock gate follows when the capture PCM
+ * closes, which is s5l8740-i2s's iis2_hw_stop().
+ */
 static int bcm_fm_power_off(struct bcm2078_bt *bt)
 {
-	int ret = bcm_fm_w8(bt, FM_REG_RDS_SYSTEM, 0x00);
+	int ret;
+
+	if (bt->fm_route_on)
+		bcm_fm_audio_route(bt, false);
+	ret = bcm_fm_w8(bt, FM_REG_RDS_SYSTEM, 0x00);
 
 	bt->fm_on = false;
 	bt->rds_on = false;
+	bt->fm_route_on = false;
 	dev_info(bt->dev, "FM power OFF%s\n", ret ? " FAIL" : "");
 	return ret;
+}
+
+/*
+ * Poll RDS_FLAG bit 0 until the tuner says the tune or search has landed.
+ *
+ * Shared by tune and seek because both end in a SEARCH_TUNE write and both
+ * have to be settled before the audio route is switched: routing to a station
+ * the front end has not reached yet puts noise on the PCM port and, for a
+ * seek, does it at the wrong bit clock as well.
+ */
+static void bcm_fm_wait_settle(struct bcm2078_bt *bt)
+{
+	unsigned int tries;
+
+	bt->tune_settled = false;
+	for (tries = 0; tries < FM_TUNE_SETTLE_TRIES; tries++) {
+		u16 flag = 0;
+
+		if (bcm_fm_r16(bt, FM_REG_RDS_FLAG, &flag))
+			return;
+		if (flag & FM_FLAG_TUNE_COMPLETE) {
+			bt->tune_settled = true;
+			return;
+		}
+		msleep(FM_TUNE_SETTLE_MS);
+	}
 }
 
 static int bcm_fm_tune_khz(struct bcm2078_bt *bt, unsigned int khz)
@@ -769,16 +1418,26 @@ static int bcm_fm_tune_khz(struct bcm2078_bt *bt, unsigned int khz)
 		if (ret)
 			return ret;
 	}
+	/*
+	 * Stock's order, from sub_DD26C at 0x000DD26C: RDS_MASK, then FM_CTRL
+	 * and FREQ together in sub_56DA94/sub_56DA98, then SEARCH_TUNE. The
+	 * mask has to be armed before the tune starts or the completion flag
+	 * this function polls for is not enabled when the tune completes.
+	 */
+	ret = bcm_fm_w16(bt, FM_REG_RDS_MASK, 0x1203);
+	if (ret)
+		return ret;
 	/* Band select is inverted: the Japan band is the one with the bit. */
 	ret = bcm_fm_w8(bt, FM_REG_FM_CTRL,
 			FM_CTRL_STEREO_AUTO |
 			(khz >= 87500 ? 0 : FM_CTRL_BAND_JAPAN));
 	if (ret)
 		return ret;
-	/* Arm the tune/search-complete and RDS flags we care about. */
-	ret = bcm_fm_w16(bt, FM_REG_RDS_MASK, 0x1203);
-	if (ret)
-		return ret;
+	/*
+	 * sub_56DA94 computes freq - 64000 in kHz, which is the same u16 as
+	 * khz + 1536: 65536 - 64000 is 1536. Written little-endian, low byte
+	 * in the first data slot.
+	 */
 	enc = (u16)((khz + 1536) & 0xffff);
 	ret = bcm_fm_w16(bt, FM_REG_FREQ, enc);
 	if (ret)
@@ -786,16 +1445,58 @@ static int bcm_fm_tune_khz(struct bcm2078_bt *bt, unsigned int khz)
 	ret = bcm_fm_w8(bt, FM_REG_SEARCH_TUNE, FM_TUNE_MODE_PRESET);
 	if (!ret)
 		bt->fm_khz = khz;
-	dev_info(bt->dev, "FM tune %u kHz enc=%04x%s\n",
-		 khz, enc, ret ? " FAIL" : "");
+	/*
+	 * Wait for the tuner to actually land before returning.
+	 *
+	 * Writing SEARCH_TUNE only starts the retune; RSSI and SNR keep
+	 * reporting the previous channel until it completes. Measured
+	 * 2026-09-04: a band sweep that read RSSI immediately after each tune
+	 * produced a usable RSSI curve but an SNR column that was noise --
+	 * 0 to 4 everywhere, including on strong stations. Tuning 96.7 MHz and
+	 * waiting three seconds gave rssi=223 snr=27 on the same channel. So
+	 * the RSSI path settles fast enough to look right and SNR does not,
+	 * which is the worst combination: it invites you to trust the reading.
+	 *
+	 * FM_REG_RDS_MASK was armed with 0x1203 just above, and bit 0 of
+	 * RDS_FLAG is search/tune-complete -- the flag read 0x0261 on a
+	 * freshly tuned station and 0x0000 with nothing pending, both with
+	 * bit 0 among the armed bits. Poll it rather than sleeping a fixed
+	 * time, and treat a timeout as advisory: the tune itself was accepted,
+	 * so failing the call would be wrong. Callers that need a trustworthy
+	 * SNR should check tune_settled.
+	 */
+	if (!ret)
+		bcm_fm_wait_settle(bt);
+	dev_info(bt->dev, "FM tune %u kHz enc=%04x settled=%d%s\n",
+		 khz, enc, bt->tune_settled, ret ? " FAIL" : "");
+	/*
+	 * And now the audio, which stock does on every completed tune rather
+	 * than once at power-on: sub_348B8 reads the tuned frequency back and
+	 * calls sub_3B82C, which picks this station's PCM bit clock and turns
+	 * the route on. Re-running it for a station that needs the same clock
+	 * as the last one costs one register write and keeps the one code path.
+	 */
+	if (!ret)
+		bcm_fm_audio_route(bt, true);
 	return ret;
 }
 
+/*
+ * Search, in the order of sub_DD374 at 0x000DD374.
+ *
+ * RDS_MASK first, then SEARCH_CTRL, SEARCH_CTRL1, PRESCAN_QUALITY,
+ * SEARCH_METHOD and finally SEARCH_TUNE = 2. The mask write was missing here,
+ * which left the completion flag unarmed for the whole search.
+ */
 static int bcm_fm_seek(struct bcm2078_bt *bt, int up, u8 rssi)
 {
 	u8 flags = 0x70 | (up ? 0x80 : 0);
+	u8 enc[2];
 	int ret;
 
+	ret = bcm_fm_w16(bt, FM_REG_RDS_MASK, 0x1203);
+	if (ret)
+		return ret;
 	ret = bcm_fm_w8(bt, FM_REG_SEARCH_CTRL, flags);
 	if (ret)
 		return ret;
@@ -809,9 +1510,25 @@ static int bcm_fm_seek(struct bcm2078_bt *bt, int up, u8 rssi)
 	if (ret)
 		return ret;
 	ret = bcm_fm_w8(bt, FM_REG_SEARCH_TUNE, FM_TUNE_MODE_SEARCH);
-	dev_info(bt->dev, "FM seek %s rssi=%u%s\n",
-		 up ? "up" : "down", rssi ? rssi : 33, ret ? " FAIL" : "");
-	return ret;
+	if (ret) {
+		dev_info(bt->dev, "FM seek %s rssi=%u FAIL\n",
+			 up ? "up" : "down", rssi ? rssi : 33);
+		return ret;
+	}
+	bcm_fm_wait_settle(bt);
+	/*
+	 * Where the search stopped is only known by asking. Stock does exactly
+	 * this on search-complete: sub_DD08C issues 0x02010A03, a two-byte read
+	 * of FREQ, and the value is the same freq - 64000 the write uses.
+	 */
+	if (!bcm_fm_read(bt, FM_REG_FREQ, enc, sizeof(enc)))
+		bt->fm_khz = ((unsigned int)enc[0] |
+			      ((unsigned int)enc[1] << 8)) + 64000u;
+	dev_info(bt->dev, "FM seek %s rssi=%u landed on %u kHz settled=%d\n",
+		 up ? "up" : "down", rssi ? rssi : 33, bt->fm_khz,
+		 bt->tune_settled);
+	bcm_fm_audio_route(bt, true);
+	return 0;
 }
 
 /*
@@ -853,9 +1570,25 @@ static int bcm_fm_seek(struct bcm2078_bt *bt, int up, u8 rssi)
  *
  * Which fits what the hardware says. Measured with this running: the UART
  * transmits cleanly (UTRSTAT 0x06, tx and shift register both empty, zero
- * errors), the rx FIFO stays empty, and UMSTAT reads 0x00 -- CTS never
- * asserts. hci_bcm gets -110 on 0xfc18. That is a part which is not
- * executing, and asserting its wake pin would not change that.
+ * errors), the rx FIFO stays empty, /proc/interrupts shows no interrupts on
+ * 3db00000.serial, and hci_bcm times out. Not one byte has ever come back,
+ * and asserting a wake pin would not change that.
+ *
+ * Which command times out says how far it got, so quote it precisely. The
+ * "command 0xfc18 tx timeout" readings date from before the command order
+ * was corrected on 2026-09-03; bcm_setup() returns early if
+ * btbcm_initialize() fails, so 0xFC18 is unreachable while HCI_Reset is
+ * failing. The current symptom is "command 0x0c03 tx timeout" followed by
+ * "BCM: Reset failed (-110)" -- the first command on the link, unanswered.
+ *
+ * UMSTAT read 0x00 at the same time. That part is not evidence of anything.
+ * Bit 4 of UMSTAT is DCTS -- delta-CTS, latched and read-clear -- not the
+ * CTS level. Read on a RetailOS 1.1.2 unit with Bluetooth on and connected,
+ * the same register returned 0x10 once in eight samples and 0x00 the other
+ * seven, so a sample finding it clear does not distinguish a working link
+ * from a dead one. Any argument anywhere in this driver, or in
+ * RCA-BLUETOOTH-PMIC-ENABLE.md, that starts from "CTS has never asserted"
+ * is void; the silence of the RX path is the observation that stands.
  *
  * The real power-on has not been found yet. The trail runs from
  * "BTLocalDeviceSetModulePower" through sub_429538(handle, 3, -1, ...),
@@ -885,18 +1618,58 @@ static void bcm_bt_power_up(struct bcm2078_bt *bt)
 	 * 200, which sub_43D38C and sub_57056C both discard on a pad == 200
 	 * test, so no second pin is reachable on this part.
 	 */
-	bcm_43D38C(bt, BCM_GPIO_UART, BCM_MODE_POWER, 0);
+	/*
+	 * Both UART pads, with stock's arguments on stock's pads.
+	 *
+	 * sub_177AE0 -- the UART open path, reached from sub_570360 as
+	 * sub_177AE0(port=1, 115200) -- does exactly this before it touches
+	 * the port:
+	 *
+	 *	177af4  movs r2,#1 ; movs r0,#80 ; mov r1,r2
+	 *	177afa  bl 0x43d38c          ; sub_43D38C(80, 1, 1)
+	 *	177afe  movs r2,#0 ; movs r1,#2 ; movs r0,#81
+	 *	177b04  bl 0x43d38c          ; sub_43D38C(81, 2, 0)
+	 *	177b08  movs r1,#1 ; movs r0,#81
+	 *	177b0c  bl 0x428f70          ; sub_428F70(81, 1)
+	 *
+	 * We had a single call, bcm_43D38C(80, 2, 0) -- which is pad 81's
+	 * arguments applied to pad 80, with pad 81 never configured at all.
+	 * A UART with one of its two pads unmuxed is a good way to transmit
+	 * into nothing and hear nothing back, which is the symptom.
+	 *
+	 * The Bluetooth RCA said pads 80/81 "appear only in sub_570000, the
+	 * close path". They appear in the open path too; it only looked at
+	 * the BT power code and this is in the UART code.
+	 *
+	 * (1, 1) on pad 80 is a GPIO output driven high, not the UART mux.
+	 * It idles the TX line while the port registers are programmed, and
+	 * sub_177AE0 hands the pad to the UART afterwards -- see the mode-2
+	 * write at the end of this function.
+	 */
+	bcm_43D38C(bt, BCM_GPIO_UART_TX, 1, 1);
+	bcm_43D38C(bt, BCM_GPIO_UART_RX, BCM_MODE_POWER, 0);
+	bcm_428F70(bt, BCM_GPIO_UART_RX, 1);
 
 	/* sub_17D4DC(5) */
 	bcm_43D38C(bt, BCM_GPIO_PWR, 1, 1);
 	bcm_428F70(bt, BCM_GPIO_PWR, 1);
 
 	/*
-	 * sub_51681C: three sub_345D40 and one sub_345D48, all thunks into
-	 * SRAM at 0x2200xxxx, which the image does not carry, so these
-	 * lengths are not recoverable. 50 ms is the one stock states.
+	 * sub_51681C, and this is where the sequence used to give up.
+	 *
+	 * Its three sub_345D40 calls were read as unrecoverable thunks into
+	 * SRAM the image does not carry, and replaced with a bare msleep(50).
+	 * The image does carry it: the SRAM block is copied from 0x08982B00
+	 * by a memcpy in the boot path, so the veneers disassemble, and what
+	 * they do is write the PMIC's GPIO block over I2C. The three writes
+	 * are 0x52 = 0xEA, 0x56 = 0x49 and 0x4B = 0x09, with sub_345D48(10)
+	 * -- ten milliseconds -- between the second and the third.
+	 *
+	 * 0x4B is the BCM2078's enable, and we have never written it. That
+	 * is why the controller has never answered: it was held in reset for
+	 * every HCI_Reset we have ever sent it.
 	 */
-	msleep(50);
+	bcm_bt_enable(bt, D1830_BT_STEP_PREP);
 
 	/* the second pad 70 write, which stock does unconditionally */
 	bcm_43D38C(bt, BCM_GPIO_PWR, 1, 1);
@@ -904,15 +1677,89 @@ static void bcm_bt_power_up(struct bcm2078_bt *bt)
 	/* delay(50) -- the argument the decompiled export drops */
 	msleep(50);
 
-	/* sub_5703EA(5) -> sub_5169A8: delay, sub_43E006(50, 0), delay */
-	msleep(50);
+	/*
+	 * sub_5703EA(5) -> sub_5169A8: 0x4B = 0x09, sub_43E006(50, 0), then
+	 * 0x4B = 0x0B. The part starts on that last write.
+	 */
+	bcm_bt_enable(bt, D1830_BT_STEP_RELEASE);
+
+	/*
+	 * Pad 80 to function 2, which is the write that actually connects
+	 * UART1's transmitter to the pin.
+	 *
+	 * sub_177AE0 does it last, on the success path of the port open:
+	 *
+	 *	8177b18  cbz  r0, 0x8177b22    ; sub_188FE0 returned 0
+	 *	8177b22  movs r2, #0
+	 *	8177b24  movs r1, #2
+	 *	8177b26  movs r0, #80
+	 *	8177b28  bl   0x843d38c        ; sub_43D38C(80, 2, 0)
+	 *
+	 * Only the failure arm skips it, and that arm goes to sub_570000 --
+	 * the close path -- instead. Pad 81 is muxed above and stays muxed;
+	 * pad 80 is the one that changes mode, from GPIO-high to the UART.
+	 *
+	 * Without this the pad remains a GPIO parked high, so every byte the
+	 * driver writes to UTXH is shifted out inside the peripheral and
+	 * never reaches the controller. Stock sequences it after the port
+	 * registers are programmed; here it has to be at the end of probe,
+	 * because serdev opens the port later.
+	 */
+	bcm_43D38C(bt, BCM_GPIO_UART_TX, BCM_MODE_POWER, 0);
 
 	dev_info(bt->dev,
-		 "BT power-on: pad 80 fn2, pad 70 high + gate, stock delays\n");
+		 "BT power-on: pad 80 fn2, pad 70 high + gate, PMIC 0x4B released\n");
+}
+
+/*
+ * Reset the radio, for hci_bcm's link-recovery ladder.
+ *
+ * hci_bcm calls this when a desynchronised receiver has not come back from a
+ * resync, and again at the top of every setup so that setup always meets a chip
+ * in its power-on state. It must leave the part where setup expects it:
+ * unpatched, at the initial baud.
+ *
+ * Called from the receive path, so it cannot sleep for long or take bt->lock --
+ * bcm_power_off/on already sleep tens of milliseconds between PMIC writes, which
+ * is why this hands off to a work item rather than doing it here.
+ */
+static int bcm_radio_reset(void)
+{
+	struct bcm2078_bt *bt = bcm_bt_singleton;
+
+	if (!bt)
+		return -ENODEV;
+
+	/*
+	 * Synchronous, and that is the whole point.
+	 *
+	 * This was a work item first, and it did not work: bcm_setup() called
+	 * the hook, schedule_work() returned immediately, and setup then talked
+	 * to a chip that was still mid-reset or had not started resetting. The
+	 * first HCIDEVUP after a cold boot failed with `command tx timeout` and
+	 * `BCM: Reset failed (-110)` while dmesg showed the reset had been
+	 * requested three times -- asked for and not waited for.
+	 *
+	 * Both callers can sleep. bcm_setup() runs from hci_dev_open() in
+	 * process context, and the recovery ladder runs from the serdev receive
+	 * path, which is the tty flip-buffer work -- also process context.
+	 * Blocking the receiver while resetting the part it feeds from is
+	 * exactly right; there is nothing worth reading until it is back.
+	 */
+	mutex_lock(&bt->lock);
+	dev_warn(bt->dev, "radio reset\n");
+	if (bt->fm_on)
+		bcm_fm_power_off(bt);
+	bcm_power_off(bt);
+	msleep(20);
+	bcm_power_on(bt);
+	mutex_unlock(&bt->lock);
+	return 0;
 }
 
 static int bcm_power_on(struct bcm2078_bt *bt)
 {
+	bool was_off = !bt->powered;
 	int ret;
 
 	bt->powered = true;
@@ -925,6 +1772,47 @@ static int bcm_power_on(struct bcm2078_bt *bt)
 	if (ret && ret != -ENODEV)
 		dev_warn(bt->dev, "bt rails on: %d\n", ret);
 	bcm_power_pad_gate(bt, 1);
+
+	/*
+	 * Release the chip's reset, which is what actually starts it.
+	 *
+	 * This used to stop at the rails and the pad gate, and with gpio_poke=0
+	 * -- the correct default -- it returned right here, so `power_on 1`
+	 * turned the supply back on and left the part held in reset. Measured
+	 * 2026-09-04: after `power_on 0; power_on 1`, hci0 still would not come
+	 * up, because bcm_power_off() had asserted the reset and nothing
+	 * un-asserted it.
+	 *
+	 * bcm_bt_power_up() is stock's sequence -- PREP, pad 70, 50 ms, RELEASE,
+	 * then pad 80 to function 2 -- and every write in it is an absolute
+	 * value rather than a toggle, so running it again is idempotent. Sharing
+	 * it is also the point: a second copy of a sequence this fiddly would
+	 * drift from the first.
+	 *
+	 * With this, `power_on 0; power_on 1; n31-hciup up` is a recovery path:
+	 * the chip comes back unpatched at 115200, where a re-run setup expects
+	 * it.
+	 *
+	 * Only when it was actually off, though, and that qualifier is the whole
+	 * point. Most callers of this function are not asking for a power cycle
+	 * -- opening /dev/radio0 and the fm_* sysfs writes call it to make sure
+	 * the part is powered before they talk to it. Running the reset
+	 * unconditionally turned every one of those into a reset of a working
+	 * controller. Measured on 2026-09-04: the chip patched cleanly at boot
+	 * (build 0000 -> 0122 at t=14.7s), then something opened the radio at
+	 * t=19.0s, this ran, and 0xFC15 timed out from t=21s onward with
+	 * `fe:7 brk:7` on UART1 -- the framing damage of a host at 2.4 Mbaud
+	 * talking to a chip that had just been reset back to 115200 and
+	 * unpatched. FM had been working before that change.
+	 *
+	 * hci_bcm cannot re-patch on its own here, because
+	 * HCI_QUIRK_NON_PERSISTENT_SETUP is held back (see the comment on the
+	 * patch script), so a reset outside a deliberate power cycle is
+	 * unrecoverable without a reboot.
+	 */
+	if (was_off)
+		bcm_bt_power_up(bt);
+
 	if (!gpio_poke) {
 		dev_dbg(bt->dev,
 			"control pins left to hci_bcm (gpio_poke=0)\n");
@@ -954,6 +1842,38 @@ static void bcm_power_off(struct bcm2078_bt *bt)
 		bcm_power_pins_off(bt);
 	msleep(2);
 	bcm_power_pad_gate(bt, 0);
+
+	/*
+	 * Assert the chip's reset before the rail goes, which is stock's own
+	 * step -- sub_516700(0), PMIC 0x4B back to the held value.
+	 *
+	 * This path used to drop the rail and the pad gate and leave reset
+	 * released, which has two costs.
+	 *
+	 * Power: a part held out of reset with its supply removed is not off in
+	 * any useful sense, and when the rail is shared it is not off at all.
+	 * If the user has Bluetooth disabled we should be spending nothing on
+	 * it.
+	 *
+	 * And kexec, which is the sharper one. hci_bcm runs its setup exactly
+	 * once, at probe: patchram, then the 0xFC18 baud change to 2.4 Mbaud.
+	 * A kexec into a second kernel re-probes a chip that is still patched
+	 * and still at 2.4 Mbaud, while the new host opens the port at 115200 --
+	 * every frame after that is garbage. It is the same failure a plain
+	 * hci0 down/up produces:
+	 *
+	 *	Bluetooth: hci0: Frame reassembly failed (-84)
+	 *	Bluetooth: hci0: Opcode 0x0c03 failed: -110
+	 *
+	 * Resetting the part here means the next kernel finds it where
+	 * hci_bcm expects to find it: unpatched, at 115200. Reset first, then
+	 * remove power, so the part is quiescent before its supply goes rather
+	 * than being asked to hold state through a rail transition.
+	 */
+	ret = bcm_bt_enable(bt, D1830_BT_STEP_HOLD);
+	if (ret && ret != -ENODEV)
+		dev_warn(bt->dev, "bt reset assert: %d\n", ret);
+
 	ret = bcm_bt_rails(false);
 	if (ret && ret != -ENODEV)
 		dev_warn(bt->dev, "bt rails off: %d\n", ret);
@@ -1313,25 +2233,240 @@ static ssize_t fm_snr_show(struct device *dev, struct device_attribute *a,
 static DEVICE_ATTR_RO(fm_snr);
 
 /* Drain the FIFO, then report whatever has been decoded so far. */
+/*
+ * Drain the raw group ring. One group per line:
+ *
+ *	<type><ver> pi=XXXX a=XXXX b=XXXX c=XXXX d=XXXX
+ *
+ * A read consumes what it reports, so two readers race and that is fine -- this
+ * is a diagnostic, and the alternative (a per-open cursor) would need a
+ * character device. The trailing line reports drops so a reader can tell "I am
+ * keeping up" from "I am not".
+ */
+static ssize_t fm_rds_groups_show(struct device *dev,
+				  struct device_attribute *a, char *buf)
+{
+	struct bcm2078_bt *bt = dev_get_drvdata(dev);
+	unsigned int i, n, tail, drop;
+	int len = 0;
+
+	mutex_lock(&bt->lock);
+	if (bt->fm_on)
+		bcm_rds_poll(bt);
+	n = bt->rds_ring_used;
+	drop = bt->rds_ring_drop;
+	tail = (bt->rds_ring_head + FM_RDS_RING - n) % FM_RDS_RING;
+	for (i = 0; i < n; i++) {
+		const struct bcm_rds_raw *g =
+			&bt->rds_ring[(tail + i) % FM_RDS_RING];
+		unsigned int type = g->b >> 12, ver = (g->b >> 11) & 1;
+
+		/* Leave room for the summary line rather than truncating it. */
+		if (len > PAGE_SIZE - 96)
+			break;
+		len += sysfs_emit_at(buf, len,
+				     "%u%c pi=%04x a=%04x b=%04x c=%04x d=%04x\n",
+				     type, ver ? 'B' : 'A',
+				     g->a, g->a, g->b, g->c, g->d);
+	}
+	bt->rds_ring_used = 0;
+	bt->rds_ring_drop = 0;
+	len += sysfs_emit_at(buf, len, "groups=%u dropped=%u total=%u\n",
+			     i, drop, bt->rds_groups);
+	mutex_unlock(&bt->lock);
+	return len;
+}
+static DEVICE_ATTR_RO(fm_rds_groups);
+
+/*
+ * Program the controller's Bluetooth address, HCI_Write_BD_Addr (0xFC01).
+ *
+ * Without this the part answers as whatever the patchram left behind -- this
+ * unit reported 20:78:a0:0a:aa:aa, whose 0a:aa:aa tail is a Broadcom default,
+ * not an assigned address. The real one is in SysCfg, which the FTL already
+ * parses and prints as bt_mac; on this device 40:b3:95:b7:ae:48, and 40:B3:95
+ * is an Apple OUI. 0xFC01 occurs exactly once in OSOS, so stock programs it
+ * too.
+ *
+ * This does NOT need storage, and an earlier note here claiming it did was
+ * wrong. The bootloader hands the identity over in RAM: Apple's loader leaves an
+ * "IsyS" struct whose +0x158 is the address and whose +0x350 is the Grape
+ * calibration, and U-Boot copies the whole 0x560-byte object into the reserved
+ * region at n31-touch_cal@9dff000, advertised on /chosen as
+ * apple,n31-touch_cal-addr / -size. Those property names are historical -- the
+ * calibration was the first field with a consumer -- and the region is the whole
+ * object, so no U-Boot change was needed to reach the address.
+ *
+ * That handoff is read in the patched hci_bcm, not here, and the reason is
+ * ordering. HCI_QUIRK_NON_PERSISTENT_SETUP re-runs setup on every open and the
+ * patchram reinstalls its placeholder each time, so a one-shot write from this
+ * driver gets undone; and the write has to land before the core issues
+ * HCI_Read_BD_Addr, or hdev->bdaddr keeps the placeholder and every bond -- which
+ * is keyed on the address -- names an address the controller no longer has. See
+ * patch-hci-bcm-bd-addr.py.
+ *
+ * What stays here is the manual override: a write to the bd_addr attribute, for
+ * trying an address without a rebuild. It goes to a live hci0, so it happens on
+ * an FM/HCI use rather than in probe -- see bcm_hci_cmd(), and see
+ * bcm_power_off() for what cycling the device costs.
+ */
+static int bcm_write_bd_addr(struct bcm2078_bt *bt, const unsigned int m[6])
+{
+	u8 p[6];
+	int i;
+
+	for (i = 0; i < 6; i++) {
+		if (m[i] > 0xff)
+			return -EINVAL;
+		/* The command takes the address little-endian. */
+		p[i] = (u8)m[5 - i];
+	}
+	return bcm_hci_cmd(bt, HCI_OP_WRITE_BD_ADDR_VS, p, sizeof(p));
+}
+
+/*
+ * The bootloader's copy, if it left one. Absent today -- the U-Boot side of the
+ * SysCfg handoff described above is not written yet -- so this is the hook that
+ * makes it work the moment it is, and its absence is not an error.
+ */
+static int bcm_bd_addr_from_chosen(struct bcm2078_bt *bt, unsigned int m[6])
+{
+	struct device_node *chosen;
+	const char *s;
+	int ret = -ENOENT;
+
+	chosen = of_find_node_by_path("/chosen");
+	if (!chosen)
+		return -ENOENT;
+	if (!of_property_read_string(chosen, "apple,n31-bt_mac", &s) &&
+	    sscanf(s, "%x:%x:%x:%x:%x:%x",
+		   &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6)
+		ret = 0;
+	of_node_put(chosen);
+	return ret;
+}
+
+static ssize_t bd_addr_store(struct device *dev, struct device_attribute *a,
+			     const char *buf, size_t count)
+{
+	struct bcm2078_bt *bt = dev_get_drvdata(dev);
+	unsigned int m[6];
+	int ret;
+
+	if (sscanf(buf, "%x:%x:%x:%x:%x:%x",
+		   &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != 6)
+		return -EINVAL;
+	mutex_lock(&bt->lock);
+	ret = bcm_write_bd_addr(bt, m);
+	mutex_unlock(&bt->lock);
+	dev_info(bt->dev, "BD address %02x:%02x:%02x:%02x:%02x:%02x%s\n",
+		 m[0], m[1], m[2], m[3], m[4], m[5], ret ? " FAIL" : "");
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(bd_addr);
+
+/*
+ * Render the RadioText+ tags as text.
+ *
+ * A tag is not text: it is a content type and a run of characters inside the
+ * RadioText that is already being assembled, so what it means depends on the
+ * RadioText current at the time it is read. Slicing here rather than copying
+ * when the group arrives keeps the two in step -- a tag whose RadioText has
+ * since been replaced slices the new one, which is what a station intends when
+ * it changes both together.
+ *
+ * Only the classes worth naming are named; the rest print as their number,
+ * because the table runs to sixty-four entries and a reader that cares about
+ * the others can look them up.
+ */
+static const char *bcm_rtplus_class(u8 t)
+{
+	switch (t) {
+	case 1:  return "title";
+	case 2:  return "album";
+	case 3:  return "track";
+	case 4:  return "artist";
+	case 5:  return "composition";
+	case 7:  return "conductor";
+	case 8:  return "composer";
+	case 9:  return "band";
+	case 11: return "genre";
+	case 12: return "news";
+	case 15: return "sport";
+	case 28: return "stationname";
+	case 30: return "programme";
+	case 31: return "programme.now";
+	default: return NULL;
+	}
+}
+
+static void bcm_rds_rtplus_text(struct bcm2078_bt *bt, char *out, size_t max)
+{
+	size_t rtlen = strlen(bt->rds_rt);
+	int n = 0;
+	unsigned int i;
+
+	out[0] = 0;
+	if (!bt->rds_rtp_valid) {
+		scnprintf(out, max,
+			  bt->rds_rtp_agt == FM_RDS_AGT_NONE ?
+			  "(no 3A announcement yet)" : "(announced, no tag yet)");
+		return;
+	}
+	if (!bt->rds_rtp_running)
+		n += scnprintf(out + n, max - n, "[stopped] ");
+	for (i = 0; i < 2; i++) {
+		const char *name = bcm_rtplus_class(bt->rds_rtp_type[i]);
+		unsigned int start = bt->rds_rtp_start[i];
+		unsigned int len = bt->rds_rtp_len[i];
+
+		/* Class 0 is the dummy, used when only one tag is carried. */
+		if (!bt->rds_rtp_type[i])
+			continue;
+		if (start >= rtlen)
+			continue;
+		if (start + len > rtlen)
+			len = rtlen - start;
+		if (name)
+			n += scnprintf(out + n, max - n, "%s=", name);
+		else
+			n += scnprintf(out + n, max - n, "class%u=",
+				       bt->rds_rtp_type[i]);
+		n += scnprintf(out + n, max - n, "%.*s ", (int)len,
+			       bt->rds_rt + start);
+	}
+	if (n > 0 && out[n - 1] == ' ')
+		out[n - 1] = 0;
+}
+
 static ssize_t fm_rds_show(struct device *dev, struct device_attribute *a,
 			   char *buf)
 {
 	struct bcm2078_bt *bt = dev_get_drvdata(dev);
-	u16 flag = 0;
+	char rtp[160];
+	u16 flag;
 	int ret;
 
 	mutex_lock(&bt->lock);
 	ret = bt->fm_on ? bcm_rds_poll(bt) : -ENODEV;
-	if (bt->fm_on && bcm_fm_r16(bt, FM_REG_RDS_FLAG, &flag))
-		flag = 0;
+	/*
+	 * RDS_FLAG is read-to-clear, and bcm_rds_poll() has already read it to
+	 * decide whether to drain the FIFO. Reading it again here reported
+	 * 0x0000 for the poll that had just consumed a group, which read as
+	 * "nothing arrived" on the one call where something had. Report what
+	 * the poll saw.
+	 */
+	flag = bt->fm_on ? bt->rds_flag : 0;
+	bcm_rds_rtplus_text(bt, rtp, sizeof(rtp));
 	ret = sysfs_emit(buf,
 			 "on=%d poll=%d groups=%u flag=0x%04x\n"
-			 "pi=0x%04x pty=%u\n"
+			 "pi=0x%04x pty=%u ptyn=%s\n"
 			 "ps=%s\n"
-			 "rt=%s\n",
+			 "rt=%s\n"
+			 "rt+=%s\n",
 			 bt->rds_on, ret, bt->rds_groups, flag,
-			 bt->rds_pi, bt->rds_pty,
-			 bt->rds_ps, bt->rds_rt);
+			 bt->rds_pi, bt->rds_pty, bt->rds_ptyn,
+			 bt->rds_ps, bt->rds_rt, rtp);
 	mutex_unlock(&bt->lock);
 	return ret;
 }
@@ -1476,6 +2611,8 @@ static struct attribute *bcm_attrs[] = {
 	&dev_attr_patchram.attr,
 	&dev_attr_patchram_info.attr,
 	&dev_attr_fm_power.attr,
+	&dev_attr_fm_rds_groups.attr,
+	&dev_attr_bd_addr.attr,
 	&dev_attr_fm_tune.attr,
 	&dev_attr_fm_seek.attr,
 	&dev_attr_fm_rssi.attr,
@@ -1528,7 +2665,9 @@ static int bcm2078_probe(struct platform_device *pdev)
 	bt->dev = dev;
 	bt->fm_khz = BCM_FM_KHZ_DEFAULT;
 	mutex_init(&bt->lock);
+	mutex_init(&bt->cmd_lock);
 	platform_set_drvdata(pdev, bt);
+	bcm_bt_singleton = bt;
 
 	bt->gpio = devm_ioremap(dev, BCM_GPIO_PHYS, 0x400);
 	if (!bt->gpio)
@@ -1558,7 +2697,21 @@ static int bcm2078_probe(struct platform_device *pdev)
 	 * not part of sub_57045C. What is left is pad 80 to function 2 and
 	 * pad 70 high, which is the whole of stock Bluetooth power-on.
 	 */
+	/*
+	 * Hand hci_bcm the reset it needs for link recovery, and for the top of
+	 * every setup run. Registered before the power-up so a setup triggered
+	 * by the serdev probe can already use it.
+	 */
+	n31_bcm_register_radio_reset(bcm_radio_reset);
+
 	bcm_bt_power_up(bt);
+	/*
+	 * Record that the part is up, so the first bcm_power_on() -- which comes
+	 * from opening /dev/radio0 or writing an fm_* attribute, not from anyone
+	 * asking for a power cycle -- does not read a zeroed `powered` as "it was
+	 * off" and reset a controller hci_bcm has just finished patching.
+	 */
+	bt->powered = true;
 	dev_info(dev,
 		 "BCM2078 companion (GPIO+FM+V4L2) — UART1 owned by hci_bcm\n");
 	return 0;
@@ -1570,6 +2723,15 @@ static int bcm2078_probe(struct platform_device *pdev)
  * the companion kept its rails across a reboot, so the part came up in
  * whatever state the previous kernel left it rather than from reset.
  */
+/*
+ * Reboot, poweroff and kexec all land here, and kexec is the one that makes it
+ * load-bearing rather than tidy: see bcm_power_off() for why a chip left
+ * patched and at 2.4 Mbaud breaks the next kernel's probe.
+ *
+ * The tuner goes first. FM keeps the radio's audio path routed to the PCM port,
+ * and there is no reason to carry that into a reset -- or into whatever boots
+ * next, which may not know the route exists.
+ */
 static void bcm2078_shutdown(struct platform_device *pdev)
 {
 	struct bcm2078_bt *bt = platform_get_drvdata(pdev);
@@ -1577,6 +2739,8 @@ static void bcm2078_shutdown(struct platform_device *pdev)
 	if (!bt)
 		return;
 	mutex_lock(&bt->lock);
+	if (bt->fm_on)
+		bcm_fm_power_off(bt);
 	bcm_power_off(bt);
 	mutex_unlock(&bt->lock);
 }
@@ -1584,6 +2748,8 @@ static void bcm2078_shutdown(struct platform_device *pdev)
 static void bcm2078_remove(struct platform_device *pdev)
 {
 	struct bcm2078_bt *bt = platform_get_drvdata(pdev);
+
+	bcm_bt_singleton = NULL;
 
 	bcm_radio_unregister(bt);
 	sysfs_remove_groups(&pdev->dev.kobj, bcm_groups);

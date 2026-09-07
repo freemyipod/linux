@@ -280,6 +280,19 @@ module_param(btoc_trust_bte, bool, 0644);
 MODULE_PARM_DESC(btoc_trust_bte,
 		 "Apply BTOC entries from their own lba/span, as stock does (default Y)");
 
+/*
+ * A BTOC whose first record does not start the stream.
+ *
+ * s_btoc.c's writer sets the stream base weave from record 0, so record
+ * 0's weaveSeqAdd is 0 by construction; a non-zero one means the array we
+ * are reading does not begin where we think it does. Counted here because
+ * struct whimory_sftl lives in a header this change does not own.
+ */
+static unsigned int btoc_bad_first_weave;
+module_param(btoc_bad_first_weave, uint, 0444);
+MODULE_PARM_DESC(btoc_bad_first_weave,
+		 "BTOC pages rejected because record 0's weaveSeqAdd was not 0");
+
 static bool btoc_meta_confirm = true;
 module_param(btoc_meta_confirm, bool, 0644);
 MODULE_PARM_DESC(btoc_meta_confirm,
@@ -4391,10 +4404,22 @@ static void whimory_syscfg_parse(struct whimory *w, const u8 *p,
 			whimory_syscfg_str(w->syscfg.cnt_b,
 					   sizeof(w->syscfg.cnt_b),
 					   p + vstart, vend - vstart);
-		else if (!strcmp(tags[i], "MtCl"))
+		else if (!strcmp(tags[i], "MtCl")) {
 			whimory_syscfg_str(w->syscfg.mt_cl,
 					   sizeof(w->syscfg.mt_cl),
 					   p + vstart, vend - vstart);
+			/*
+			 * And the part that matters: a length and an offset,
+			 * not a string. On this unit they read 0x2c0 and
+			 * 0x1d40 -- 704 bytes at 7488, ending exactly on 8192.
+			 */
+			if (vend - vstart >= 8) {
+				w->syscfg.mt_cl_len =
+					get_unaligned_le32(p + vstart);
+				w->syscfg.mt_cl_off =
+					get_unaligned_le32(p + vstart + 4);
+			}
+		}
 		else if (!strcmp(tags[i], "BMac") && vend - vstart >= 6) {
 			memcpy(w->syscfg.mac, p + vstart, 6);
 			w->syscfg.mac_ok = true;
@@ -4481,6 +4506,59 @@ static void whimory_syscfg_parse(struct whimory *w, const u8 *p,
 			dev_warn(w->dev,
 				 "SysCfg touch calibration too short for the touch calibration window (need %u, have %u)\n",
 				 N31_TOUCH_CAL_CAL_OFF + N31_TOUCH_CAL_CAL_LEN, n);
+	} else if (w->syscfg.mt_cl_len &&
+		   w->syscfg.mt_cl_off + w->syscfg.mt_cl_len <= len &&
+		   w->syscfg.mt_cl_len >= N31_TOUCH_CAL_CAL_LEN) {
+		/*
+		 * No IsyS container in this page, but MtCl points at the
+		 * calibration itself, so build the container the consumer
+		 * expects around it.
+		 *
+		 * apple-grape wants 0x560 bytes with the calibration at +350,
+		 * because that is the shape stock hands it: Apple's loader
+		 * reads MtCl and places the payload at that offset in the IsyS
+		 * object it leaves in RAM. U-Boot republishes that object but
+		 * does not fill this part of it, so on a Linux boot the window
+		 * is zeros and the touch controller is handed a calibration of
+		 * nothing -- which it refuses, staying in its bootloader with
+		 * runtime never ready. The bytes were in the section the whole
+		 * time, one indirection away.
+		 *
+		 * Synthesised rather than found: everything outside the window
+		 * is zero here, where a real handoff carries the rest of the
+		 * IsyS fields. Only the window is read by the consumer.
+		 */
+		unsigned int n = min_t(unsigned int, w->syscfg.mt_cl_len,
+				       N31_TOUCH_CAL_LEN -
+				       N31_TOUCH_CAL_CAL_OFF);
+
+		unsigned int j;
+
+		memset(w->syscfg.touch_cal, 0, sizeof(w->syscfg.touch_cal));
+		/*
+		 * Byte-reverse each word on the way in.
+		 *
+		 * The section stores this word-swapped -- the same reason the
+		 * record tags read backwards in a raw dump -- and the consumer
+		 * expects the form Apple's loader leaves in RAM, which it then
+		 * swaps again before handing to the controller. On this unit
+		 * the payload begins 01 02 49 4e and the documented RetailOS
+		 * window is 4e 49 02 01, so the two differ by exactly this.
+		 */
+		for (j = 0; j + 4 <= n; j += 4) {
+			const u8 *src = p + w->syscfg.mt_cl_off + j;
+			u8 *dst = w->syscfg.touch_cal +
+				  N31_TOUCH_CAL_CAL_OFF + j;
+
+			dst[0] = src[3];
+			dst[1] = src[2];
+			dst[2] = src[1];
+			dst[3] = src[0];
+		}
+		w->syscfg.touch_cal_len = N31_TOUCH_CAL_LEN;
+		dev_info(w->dev,
+			 "SysCfg MtCl -> touch calibration: %u bytes from +0x%x placed at +%u\n",
+			 n, w->syscfg.mt_cl_off, N31_TOUCH_CAL_CAL_OFF);
 	} else {
 		/*
 		 * No magic: this page does not carry the blob, so do not
@@ -5548,7 +5626,20 @@ static bool whimory_btoc_parse_be_bte(struct whimory *w, const u8 *page,
 	 * walk a quarter of the way into a four-bank superblock.
 	 */
 	u32 sb_vbas = whimory_sb_vbas(w, vblock);
-	u32 sb_data_vbas = whimory_sb_data_vbas(w, vblock);
+	/*
+	 * The record stream describes exactly the addresses below the BTOC,
+	 * so its bound is maxVbaOfs - num_vba, not the whole data region.
+	 * whimory_read_btoc() has that number; the paths that do not go
+	 * through it fall back to the data region, which is what this always
+	 * used.
+	 *
+	 * The difference is not academic. On a full four-bank superblock the
+	 * data region is 2032 and `used` is 2044, so the last twelve
+	 * addresses are data that this called out of range -- and a record
+	 * straddling 2032 aborted the remainder of the table.
+	 */
+	u32 sb_data_vbas = w->sftl.btoc_used ? w->sftl.btoc_used :
+			   whimory_sb_data_vbas(w, vblock);
 
 	recs = len / 16;
 	for (i = 0; i < recs; i++) {
@@ -5641,7 +5732,20 @@ static bool whimory_btoc_parse_bte(struct whimory *w, const u8 *page,
 	 * walk a quarter of the way into a four-bank superblock.
 	 */
 	u32 sb_vbas = whimory_sb_vbas(w, vblock);
-	u32 sb_data_vbas = whimory_sb_data_vbas(w, vblock);
+	/*
+	 * The record stream describes exactly the addresses below the BTOC,
+	 * so its bound is maxVbaOfs - num_vba, not the whole data region.
+	 * whimory_read_btoc() has that number; the paths that do not go
+	 * through it fall back to the data region, which is what this always
+	 * used.
+	 *
+	 * The difference is not academic. On a full four-bank superblock the
+	 * data region is 2032 and `used` is 2044, so the last twelve
+	 * addresses are data that this called out of range -- and a record
+	 * straddling 2032 aborted the remainder of the table.
+	 */
+	u32 sb_data_vbas = w->sftl.btoc_used ? w->sftl.btoc_used :
+			   whimory_sb_data_vbas(w, vblock);
 	/*
 	 * The caller sets claim_weave to the superblock's own weave before
 	 * ingesting, and weaveSeqAdd is a forward delta from it: s_btoc.c
@@ -5655,8 +5759,49 @@ static bool whimory_btoc_parse_bte(struct whimory *w, const u8 *page,
 		return false;
 
 	recs = len / sizeof(struct whimory_bte);
-	if (le32_to_cpu(((const struct whimory_bte *)page)->weave_seq_add))
-		dev_dbg(w->dev, "BTOC weaveSeqAdd[0] != 0\n");
+	/*
+	 * Record 0's weaveSeqAdd must be 0, and that is a test, not a hint.
+	 *
+	 * s_btoc.c's writer (sub_567E3C at 0x08567E3C) sets the stream's
+	 * base weave from the first entry it appends and derives every
+	 * weaveSeqAdd from it:
+	 *
+	 *	if (!wr->BTOCidx) {			// first entry
+	 *		wr->streamBaseWeave = weave;	// 0x8D0E2D8
+	 *		...
+	 *	}
+	 *	*bte = weave - wr->streamBaseWeave;	// 0 for that entry
+	 *	assert((bte->weaveSeqAdd & 0x80000000) == 0);
+	 *
+	 * so a non-zero first delta means we are not looking at record 0 --
+	 * we are somewhere in the middle of the table, or at something that
+	 * is not a table at all. Reading on from there produces plausible
+	 * LBAs at wrong addresses, which is the failure mode the BTOC
+	 * truncation produced and which nothing caught because this was a
+	 * dev_dbg.
+	 *
+	 * It also retires the LE_BTE_HDR8 fallback in practice: that path
+	 * re-parses from page+8, whose first word is the real record 0's
+	 * weaveSeqAdd only if the eight bytes really were a header. On the
+	 * dump that motivated it they are not -- shifted, record 0 reads
+	 * weaveSeqAdd=0xc30d -- so this rejects the misparse rather than
+	 * letting it claim the superblock.
+	 *
+	 * The count lives in a module parameter rather than in struct
+	 * whimory_sftl because that struct is in whimory-s5l8740.h, which is
+	 * not this change's to touch; read it back from
+	 * /sys/module/ftl_s5l8740/parameters/btoc_bad_first_weave. A page
+	 * rejected here still lands in btoc_unclaimed like any other page no
+	 * parser claimed.
+	 */
+	if (le32_to_cpu(((const struct whimory_bte *)page)->weave_seq_add)) {
+		btoc_bad_first_weave++;
+		dev_warn_ratelimited(w->dev,
+			"BTOC weaveSeqAdd[0]=%u != 0: not record 0, rejecting ce%u/cau%u/vblk%u\n",
+			le32_to_cpu(((const struct whimory_bte *)page)->weave_seq_add),
+			ce, cau, vblock);
+		return false;
+	}
 
 	for (i = 0; i < recs; i++) {
 		const struct whimory_bte *bte =
@@ -5875,6 +6020,103 @@ static void whimory_btoc_verify(struct whimory *w, struct whimory_sb *sb,
 			 vbas, n, agree, disagree, nodata,
 			 first_hint, first_meta);
 	}
+}
+
+/*
+ * Read a superblock's whole block table of contents.
+ *
+ * The BTOC is not one address, and reading it as one was dropping most of
+ * every table on this volume.
+ *
+ * sub_5688C4 takes num_vba from the superblock state byte, reads the
+ * superblock's last address, and works backwards:
+ *
+ *	r6 = 12*sb + 1
+ *	r0 = sbState[r6]		; the state byte
+ *	r5 = r0 >> 1			; num_vba
+ *	r1 = s_g_sb_max_vba_ofs(sb) - r5
+ *	r9 = s_g_addr_to_vba(sb, r1)	; first address of the BTOC
+ *	... r2 = r5, r1 = r9, blx vtbl+0x58	; read num_vba addresses
+ *	meta[0] must be 0x1C
+ *
+ * so the table occupies [maxVbaOfs - num_vba, maxVbaOfs), contiguously, and
+ * the writer stamps the same num_vba into every one of those metas --
+ * sub_567C08 stores meta[0] = 28 and meta[1] = (flags & 1) | (num_vba << 1)
+ * across num_vba records. That gives two independent ways to recover it,
+ * and this reads it from the meta, which is what we already have in hand.
+ *
+ * On this volume num_vba is 4 on a full four-bank superblock and as high as
+ * 18 on a short one, so reading a single 4 KiB address covered between a
+ * quarter and a twentieth of the records. Everything past record 255 was
+ * silently dropped -- including every entry that was supposed to override a
+ * stale checkpoint extent, which is what left LBAs pointing at pages whose
+ * metadata belongs to somebody else.
+ *
+ * It also explains the 15 virtual blocks that classify reports with two
+ * BTOC-bearing banks: those are superblocks whose num_vba is large enough
+ * that the table straddles the last two banks' page 127. There is still one
+ * table; it just does not fit in one bank.
+ *
+ * Returns the byte length assembled at s->btoc_buf, or 0 if this superblock
+ * has no readable BTOC. Sets s->btoc_used to the address count the records
+ * describe, which is the same maxVbaOfs - num_vba.
+ */
+static unsigned int whimory_read_btoc(struct whimory *w, u32 vblock,
+				      const u8 *spare127)
+{
+	struct whimory_sftl *s = &w->sftl;
+	u32 per_vb = whimory_vbas_per_vblock(w);
+	u32 sb_vbas = whimory_sb_vbas(w, vblock);
+	unsigned int slot, num_vba, i;
+	u32 first_ofs;
+
+	s->btoc_used = 0;
+	if (!s->btoc_buf || !spare127)
+		return 0;
+
+	for (slot = 0; slot < WHIMORY_VBAS_PER_PAGE; slot++)
+		if (spare127[slot * WHIMORY_META_SIZE] ==
+		    WHIMORY_META_TYPE_BTOC)
+			break;
+	if (slot >= WHIMORY_VBAS_PER_PAGE)
+		return 0;
+
+	num_vba = spare127[slot * WHIMORY_META_SIZE + 1] >> 1;
+	if (!num_vba || num_vba > WHIMORY_BTOC_MAX_VBAS || num_vba >= sb_vbas) {
+		s->btoc_num_vba_bad++;
+		return 0;
+	}
+	if (num_vba > s->btoc_num_vba_max)
+		s->btoc_num_vba_max = num_vba;
+	if (num_vba > 1)
+		s->btoc_multi_vba++;
+
+	first_ofs = sb_vbas - num_vba;
+
+	for (i = 0; i < num_vba; i++) {
+		u32 ce, cau, vb, page, sl, pblock;
+		u8 meta[S5L8740_NAND_META_SIZE];
+
+		if (whimory_unpack_vba(w, vblock * per_vb + first_ofs + i,
+				       &ce, &cau, &vb, &page, &sl)) {
+			s->btoc_num_vba_bad++;
+			return 0;
+		}
+		whimory_vfl_resolve(w, vb, &cau, &pblock);
+		if (whimory_cs_read_page(w, ce, cau, pblock, page,
+					 s->btoc_page, S5L8740_NAND_PAGE_SIZE,
+					 meta, sizeof(meta))) {
+			s->btoc_num_vba_bad++;
+			return 0;
+		}
+		s->btoc_pages_read++;
+		memcpy(s->btoc_buf + (size_t)i * WHIMORY_LBA_SIZE,
+		       s->btoc_page + (size_t)sl * WHIMORY_LBA_SIZE,
+		       WHIMORY_LBA_SIZE);
+	}
+
+	s->btoc_used = first_ofs;
+	return num_vba * WHIMORY_LBA_SIZE;
 }
 
 /*
@@ -9246,31 +9488,57 @@ classify_done:
 	 * whole-superblock offsets through whimory_btoc_ofs_to_page(), so one
 	 * BTOC already resolves addresses on every bank of its superblock.
 	 *
-	 * Two BTOCs are seen on 15 of 2025 virtual blocks and are not yet
-	 * explained; the later one wins, and both are kept out of MEMBER so
-	 * neither is silently dropped.
+	 * Two BTOCs are seen on 15 of 2025 virtual blocks, and that is a
+	 * table too long to fit in one bank rather than two tables. The BTOC
+	 * spans num_vba addresses ending at the superblock's last one, so
+	 * once num_vba passes the four addresses in a page it reaches back
+	 * into the previous bank's page 127, and both banks' metas are
+	 * stamped as BTOC because sub_567C08 stamps every one of them.
+	 *
+	 * There is still exactly one table per superblock, so exactly one
+	 * bank is left CLOSED to read it. The rest become MEMBER like any
+	 * other bank. whimory_read_btoc() anchors on the superblock's own
+	 * address range rather than on whichever bank's page carried the
+	 * meta, so which one is kept does not change what is read.
 	 */
 	if (sb_fold && s->btoc_per_vblock) {
 		u32 folded = 0;
+		u8 *closed_kept = kcalloc(s->sb_bank_blocks, 1, GFP_KERNEL);
 
 		for (i = 0; i < nsb; i++) {
 			struct whimory_sb *sb = &s->sbs[i];
 			u32 vb;
 
-			if (sb->kind != WHIMORY_SB_OPEN)
+			if (sb->kind != WHIMORY_SB_OPEN &&
+			    sb->kind != WHIMORY_SB_CLOSED)
 				continue;
 			vb = whimory_vfl_virt(w, sb->cau, sb->block);
 			if (vb >= s->sb_bank_blocks ||
 			    !s->btoc_per_vblock[vb])
 				continue;
+			if (sb->kind == WHIMORY_SB_CLOSED) {
+				/*
+				 * Without the array we cannot tell a repeat
+				 * from the first, so keep every closed bank
+				 * rather than risk folding away the only one.
+				 */
+				if (!closed_kept || !closed_kept[vb]) {
+					if (closed_kept)
+						closed_kept[vb] = 1;
+					continue;
+				}
+				s->closed_folded++;
+			}
 			sb->kind = WHIMORY_SB_MEMBER;
 			folded++;
 		}
-		s->open_sbs -= folded;
+		kfree(closed_kept);
+		s->open_sbs -= folded - s->closed_folded;
+		s->btoc_sbs -= s->closed_folded;
 		s->member_sbs = folded;
 		dev_info(w->dev,
-			 "SFTL folded %u banks into their superblock's BTOC (open now %u)\n",
-			 folded, s->open_sbs);
+			 "SFTL folded %u banks into their superblock's BTOC, %u of them a straddled table's second bank (open now %u, closed now %u)\n",
+			 folded, s->closed_folded, s->open_sbs, s->btoc_sbs);
 	}
 
 	/*
@@ -9518,6 +9786,7 @@ classify_done:
 			s->diff_open_kept++;
 		s->diff_replayed_sbs++;
 		if (sb->kind == WHIMORY_SB_CLOSED) {
+			unsigned int btoc_len;
 			int ingested;
 
 			ret = whimory_cs_read_page(w, sb->ce, sb->cau, sb->block,
@@ -9540,14 +9809,34 @@ classify_done:
 						       s->btoc_page, meta127);
 				s->btoc_dumps_left--;
 			}
+			/*
+			 * Assemble the whole table before parsing it. The
+			 * reader slices the BTOC out of each page it spans,
+			 * so the buffer it returns is already the record
+			 * array -- pass no spare, or the ingest would slice a
+			 * second time from a buffer that is not a NAND page.
+			 *
+			 * Falling back to the page keeps the old behaviour
+			 * for a superblock whose meta does not carry a usable
+			 * num_vba, rather than dropping its table entirely.
+			 */
+			btoc_len = whimory_read_btoc(w, vblock, meta127);
 			s->claim_weave = sb->weave;
 			s->claim_source = 1;
-			ingested = whimory_ingest_btoc_page(w, sb->ce, sb->cau,
-							    vblock, s->btoc_page,
+			if (btoc_len)
+				ingested = whimory_ingest_btoc_page(w, sb->ce,
+							    sb->cau, vblock,
+							    s->btoc_buf,
+							    btoc_len, NULL);
+			else
+				ingested = whimory_ingest_btoc_page(w, sb->ce,
+							    sb->cau, vblock,
+							    s->btoc_page,
 							    S5L8740_NAND_PAGE_SIZE,
 							    meta127);
 			s->claim_weave = 0;
 			s->claim_source = 0;
+			s->btoc_used = 0;
 			if (ingested) {
 				s->btoc_pages_valid++;
 			} else {
@@ -9786,6 +10075,12 @@ static int whimory_sftl_alloc(struct whimory *w)
 	s->nodepool_bytes = WHIMORY_MIN_NODEPOOL_BYTES;
 
 	s->btoc_page = kvmalloc(S5L8740_NAND_PAGE_SIZE, GFP_KERNEL);
+	/*
+	 * Somewhere to assemble a whole block table of contents, which spans
+	 * num_vba addresses and not one. 256 KiB at the bound above.
+	 */
+	s->btoc_buf = kvmalloc((size_t)WHIMORY_BTOC_MAX_VBAS *
+			       WHIMORY_LBA_SIZE, GFP_KERNEL);
 	/*
 	 * Cross-call NAND page cache; see the fields in struct whimory_sftl.
 	 * Not fatal if it fails -- n31_vfl_read_vba() falls back to reading
@@ -10211,6 +10506,9 @@ static void whimory_explain_bad_map(struct whimory *w, u32 lba, u32 meta_lba,
 	char dw[64];
 	u32 vba2 = 0, span2 = 0;
 	int r2;
+	struct whimory_range *r;
+	const char *src;
+	unsigned long long rweave;
 
 	if (w->sftl.bad_map_logged >= 8)
 		return;
@@ -10219,27 +10517,39 @@ static void whimory_explain_bad_map(struct whimory *w, u32 lba, u32 meta_lba,
 	whimory_vba_describe(w, vba, dw, sizeof(dw));
 	r2 = whimory_l2v_search(w, meta_lba, &vba2, &span2);
 
+	/*
+	 * Where the mapping came from, on BOTH branches.
+	 *
+	 * This used to be printed only when the meta LBA was itself mapped,
+	 * and every observed failure took the other branch -- so `src=` was
+	 * never once printed, and the origin of the mapping that started
+	 * this whole investigation is still unknown as a direct result. It
+	 * is a red-black tree lookup on a path that has already failed a
+	 * NAND read; there is no reason to skip it.
+	 *
+	 * It is also the disambiguator that matters: a bad mapping from the
+	 * CXT seed means a stale checkpoint extent nothing overrode, and one
+	 * from a BTOC means the table itself was misread.
+	 */
+	r = whimory_range_find(&w->ranges, lba);
+	src = !r ? "?" :
+	      r->src == 1 ? "BTOC" :
+	      r->src == 2 ? "open" :
+	      r->src == 3 ? "CXT" :
+	      r->src == 4 ? "LIST" : "seed";
+	rweave = r ? (unsigned long long)r->weave : 0ULL;
+
 	if (r2) {
 		dev_err(w->dev,
-			"  lba=%u -> vba=%u span=%u (%s); meta lba=%u is NOT mapped (%d), delta_lba=%d\n",
-			lba, vba, span, dw, meta_lba, r2,
+			"  lba=%u -> vba=%u span=%u (%s) src=%s weave=%llu; meta lba=%u is NOT mapped (%d), delta_lba=%d\n",
+			lba, vba, span, dw, src, rweave, meta_lba, r2,
 			(int)meta_lba - (int)lba);
 		return;
 	}
 
-	{
-		struct whimory_range *r = whimory_range_find(&w->ranges, lba);
-
-		dev_err(w->dev,
-			"  lba=%u -> vba=%u span=%u (%s) src=%s weave=%llu\n",
-			lba, vba, span, dw,
-			!r ? "?" :
-			r->src == 1 ? "BTOC" :
-			r->src == 2 ? "open" :
-			r->src == 3 ? "CXT" :
-			r->src == 4 ? "LIST" : "seed",
-			r ? (unsigned long long)r->weave : 0ULL);
-	}
+	dev_err(w->dev,
+		"  lba=%u -> vba=%u span=%u (%s) src=%s weave=%llu\n",
+		lba, vba, span, dw, src, rweave);
 	whimory_vba_describe(w, vba2, dw, sizeof(dw));
 	dev_err(w->dev,
 		"  meta lba=%u -> vba=%u span=%u (%s) | delta_lba=%d delta_vba=%d%s\n",
@@ -10698,6 +11008,7 @@ static ssize_t whimory_status_show(struct device *dev,
 			  "disk_gate=%s\n"
 			  "mapped_roots=%u mapped_lbas=%u btoc_sbs=%u open_sbs=%u cxt_sbs=%u empty=%u recs=%u cxt_loaded=%d packed=%d\n"
 			  "lba0_vba=%u cap=%llu vbas_per_sb=%u hole=%u list=%u\n"
+			  "btoc num_vba_max=%u multi_vba=%u num_vba_bad=%u straddled=%u l2v_updates=%u below_base=%u\n"
 			  "spare_applied=%u bitmap=%u frag=%u/%u gc_zone=%u btoc_pages=%u updates=%u gen=%u free=%u list_unmapped=%u\n"
 			  "search_cache hits=%u misses=%u recovery=%s\n%s\n",
 			  w->fil_ok, w->sig_ok, w->vfl_ok, w->ftl_ok,
@@ -10712,6 +11023,9 @@ static ssize_t whimory_status_show(struct device *dev,
 			  w->sftl.cxt_loaded, w->sftl.packed_ok,
 			  w->lba0_vba, w->total_4k_sectors, w->sftl.vbas_per_sb,
 			  w->sftl.token_hole, w->sftl.token_list,
+			  w->sftl.btoc_num_vba_max, w->sftl.btoc_multi_vba,
+			  w->sftl.btoc_num_vba_bad, w->sftl.closed_folded,
+			  w->sftl.btoc_l2v_updates, w->sftl.btoc_below_base,
 			  w->vfl.spare_applied, w->vfl.bitmap_loaded,
 			  w->l2v.frag_count, w->l2v.frag_max,
 			  w->sftl.gc_zone_size, w->sftl.max_pages_per_btoc,
@@ -10889,6 +11203,7 @@ static void whimory_free(struct whimory *w)
 	kvfree(w->syscfg.raw);
 	w->syscfg.raw = NULL;
 	kvfree(w->sftl.btoc_page);
+	kvfree(w->sftl.btoc_buf);
 	w->sftl.page_cache_valid = false;
 	kvfree(w->sftl.page_cache);
 	w->sftl.page_cache = NULL;

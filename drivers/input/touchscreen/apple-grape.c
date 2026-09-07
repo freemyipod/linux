@@ -12,6 +12,31 @@
  *   bootload cmd sub_20848(6593): 6593 = 0x19C1 = HBPP ENTER (not a
  *                firmware byte count). TX 19 C1 + (18 E1)* pad.
  *
+ * The bring-up above is 1.0.2's. 1.1.2 runs the identical sequence:
+ * sub_801937C is sub_1A5AC instruction for instruction --  same eight-slot
+ * clear, 801F2D2(1)/8401404(5), 801F2DE(1)/8401404(15), 801F208(1)/
+ * 8401404(5), 8010BEC(2,0x1A,0x2EE0,1), 801F390(6593)/8401404(15),
+ * 801F2D2(0)/8401404(30), 801F9DC(), 801F008(1). So the 1.0.2 model is
+ * valid for the build this unit actually runs, and 8401404's single
+ * argument settles sub_410522 as a delay rather than a clock-gate id.
+ *
+ * Cross-checked against upstream apple_z2 (Asahi, drivers/input/
+ * touchscreen/apple_z2.c), which drives the same HBPP on later silicon.
+ * Its apple_z2_build_cal_blob agrees with grape_build_upload_frame field
+ * for field: cmd 0x3001, length in 32-bit words, a 16-bit sum over the
+ * length and address bytes only, payload, then a 32-bit byte-sum. Its
+ * B1 B0 B3 B2 packing is not a swizzle there at all -- it sends a
+ * little-endian buffer with bits_per_word 16, which puts the same bytes
+ * on the wire that this driver produces by swizzling and sending at 8.
+ *
+ * Where z2 differs it is not a divergence to copy. It appends its 1A A1
+ * inside the blob's own spi_message, so payload and handshake share one
+ * chip select; sub_40F770 brackets each call with sub_4045D4(2,0) and
+ * (2,1), so stock takes two, which is what grape_send_chunk_ex and
+ * grape_status_poll do. z2 also waits on the controller's interrupt
+ * before uploading, where sub_20490(1) arms ATTN only after sub_20E94
+ * reports success.
+ *
  * Firmware (SPI → controller @ dest=offset, start 0) — 1A640 / 204E0 / 2D640:
  *   Full "8740" GrapeFirmware-style container on disk:
  *     0x000..0x3ff  Apple/N31 header (NOT sent over SPI)
@@ -19,8 +44,40 @@
  *     rev 3: GID-CBC IV=0 decrypt of ARM body before send
  *   ARM-only cut (no 8740 magic, e.g. 18 F0 9F E5…): whole file = body
  *   Chunks: max 0x1FF0. Upload = sub_3B9D0 envelope (see below). ACK 0x4BC1.
- *   Callsite 2D640: r1 = firmware offset (NOT 0x00100000). EXEC 0x00100018
- *   is the bootloader-mapped app PC, not the upload destination.
+ *   Callsite 2D640: r1 = firmware offset, so the destination base is 0.
+ *   (0802D6CC `mov r1, r4` with r4 = offset and no base added.)
+ *
+ * HBPP wire protocol, as the part actually answers it.
+ *
+ *   Every command is a 16-bit opcode sent high byte first, followed by a
+ *   fixed-shape payload and a byte-sum. Addresses and 32-bit values are
+ *   packed B1 B0 B3 B2 everywhere -- upload destination, MEMRD address,
+ *   MEMWR address/mask/value and the two words of 2D54C alike.
+ *
+ *     18 E1  DATA        sub_3B9D0 envelope, payload_len + 16 bytes
+ *     19 C1  ENTER       sub_20848, 16 bytes, reply ignored
+ *     1A A1  STATUS      2 bytes; reply is the status word, big-endian
+ *     1C 73  MEMRD       addr + sum16; value arrives in the next frame
+ *     1D 53  WRITE       addr + value + sum16   (no mask)
+ *     1E 33  WRITE_MASK  addr + mask + value + sum16
+ *     1F 01  FINALISE    2 bytes, end of sub_2D5B0
+ *
+ *   Replies, read back through 1A A1:
+ *
+ *     48 79  idle, no command outstanding
+ *     49 69  after 1F 01
+ *     4A D1  write accepted (1D 53 and 1E 33)
+ *     4B C1  DATA chunk accepted
+ *     4C 39  MEMRD result follows: value B1 B0 B3 B2 then its sum16
+ *     4F 81  rejected -- unknown opcode or bad checksum
+ *
+ *   Grape address map, mapped with MEMRD/WRITE:
+ *     0x00000000  64 KB RAM, the app image; aliases every 64 KB up to 0x00400000
+ *     0x00400000  RAM: calibration at +0x200, app RW data at +0x400,
+ *                 app BSS at +0x3F70, stacks below 0x00410000
+ *     0x10000000  registers, aliased at 0x20000000. 0x10003000 is the clock
+ *                 block (resets to 0x10003000=8, 0x1000300C=0xD2)
+ *     0x10001808  writing 1 soft-resets the part back into HBPP
  *
  * Calibration (SPI → controller @ 0x00400200) — 2D7A4 / 273A0:
  *   Per-device touch calibration comes from the A34 handoff, not a host file:
@@ -45,8 +102,35 @@
  *   First FW prefix (dest=0,len=0x1FF0): 18 E1 30 01 07 FC 00 00 00 00 01 03
  *   Cal prefix (dest=0x400200,len=0x200): 18 E1 30 01 00 80 02 00 00 40 00 C2
  *
- *   After cal: 2D5B0 RequestCal → 2D54C EXEC → 40 ms → runtime ping.
- *   Register input only after runtime ping. runtime_ready = ping csum.
+ *   After cal: 2D5B0 RequestCal → 2D54C → 40 ms → runtime ping.
+ *   ATTN is armed on the download's own result, as sub_1A5AC does it:
+ *   sub_20E94 non-zero → sub_20490(1). The runtime ping is recorded but
+ *   gates nothing, because ATTN is the only way a running application
+ *   announces itself.
+ *
+ * What sub_2D54C is.
+ *
+ *   It has been called EXEC here since the beginning, on the reading that
+ *   its first word is an entry address. It is not. 0802D54C builds
+ *   1D 53 | 18 00 10 00 | 00 01 00 00 | sum16, and sending that same
+ *   opcode with the first word pointing at controller RAM writes the
+ *   second word there: `1D 53 00 00 00 00 00 01 00 00` puts 1 at address
+ *   0. So 1D 53 is a plain 32-bit store with the same B1 B0 B3 B2 packing
+ *   as 1E 33 and without its mask, and stock's payload means
+ *
+ *       *(u32 *)0x10001800 = 1
+ *
+ *   which is a register poke, not a jump. The two module parameters below
+ *   keep their names and their wire bytes, so nothing about what we send
+ *   changes; only the account of what it does.
+ *
+ *   The store lands -- the part answers 4A D1 for it exactly as it does
+ *   for 1E 33 -- and the application still does not start. Measured after
+ *   the byte-exact stock sequence: RAM written through HBPP is unchanged,
+ *   an ARM stub reached through the reset vector never runs, no register
+ *   in 0x10000000..0x1000A000 moves, and the first word of the app's own
+ *   RW image never appears at 0x00400400. Whatever else RetailOS gives
+ *   this part is outside the SPI protocol.
  *
  * Firmware host file: request_firmware("apple/grape.bin") and/or
  * FTL gpfw/8740 when fw_prefer_ftl=1. That is the ARM app, not cal.
@@ -153,6 +237,30 @@
  * This driver used to reprogram the same registers afterwards with a much
  * larger divider, quietly running the bus eight times too slow.
  */
+/*
+ * Read the firmware and calibration back after uploading them.
+ *
+ * Off, because sub_273A0 does not do it and it puts seven multi-kilobyte
+ * reads on the bus between the upload and the store. It is the check that
+ * proved the upload lands correctly, so it stays available -- but proving
+ * that again is a deliberate act, not something the bring-up does every
+ * time it runs.
+ */
+static bool fw_readback;
+module_param(fw_readback, bool, 0644);
+MODULE_PARM_DESC(fw_readback,
+		 "Read FW and cal back after upload (off: stock sends no such reads)");
+
+/*
+ * Byte offset of one word to invert in the uploaded image, or ~0 for off.
+ * See the note at the call site: this exists to ask whether the controller
+ * validates what it is given, and it uploads a deliberately broken image.
+ */
+static unsigned int corrupt_word_at = ~0u;
+module_param(corrupt_word_at, uint, 0644);
+MODULE_PARM_DESC(corrupt_word_at,
+		 "Invert the image word at this byte offset before upload (~0 = off)");
+
 static int spi_clkdiv;
 module_param(spi_clkdiv, int, 0644);
 MODULE_PARM_DESC(spi_clkdiv,
@@ -189,8 +297,9 @@ MODULE_PARM_DESC(go_spi_setup, "SPI2 SETUP override for 2D54C GO (0=11B70)");
  * Read a report whenever ATTN is asserted, without requiring the ping
  * to checksum first. Off restores the ping-gated behaviour.
  */
-static bool attn_read = true;
+static bool attn_read;
 module_param(attn_read, bool, 0644);
+/* Off by default since 2026-09-07: an idle application's wakeups are not failures worth 16 bytes each. */
 MODULE_PARM_DESC(attn_read,
 		 "Read a frame when ATTN asserts even if the ping fails");
 
@@ -224,7 +333,20 @@ MODULE_PARM_DESC(post_poke_strict,
  * Masking after a ceiling keeps the failure visible without letting it
  * spin. Write attn_rearm to try again once something has changed.
  */
-static unsigned int irq_fail_max = 20;
+/*
+ * Three, not twenty.
+ *
+ * ATTN is level-triggered and the part holds it until a report is read
+ * out, so a service that cannot decode the report leaves the line
+ * asserted and the handler is re-entered immediately. Twenty failures is
+ * far past genirq's own spurious-interrupt threshold: measured
+ * 2026-09-07, the line reached "irq 81: nobody cared" and genirq called
+ * "Disabling IRQ #81" before this counter got anywhere near its limit,
+ * which takes ATTN away for the rest of the boot and takes the decision
+ * out of this driver's hands. Masking earlier keeps it here, where
+ * attn_rearm can undo it.
+ */
+static unsigned int irq_fail_max;	/* 0: a live application's idle wakeups are not failures */
 module_param(irq_fail_max, uint, 0644);
 MODULE_PARM_DESC(irq_fail_max,
 		 "Consecutive failed services before ATTN is masked (0 = never)");
@@ -233,6 +355,18 @@ static bool no_park;
 module_param(no_park, bool, 0644);
 MODULE_PARM_DESC(no_park,
 		 "Keep servicing after a failed bring-up instead of parking");
+
+/*
+ * The watchdog re-downloads after ten failed pings. On 2026-09-07 that
+ * reset a part whose application had just come up for the first time
+ * (runtime ping answered, ATTN released) because the report reads that
+ * followed were not yet understood. This holds the recycle so the live
+ * application can be examined from raw_xfer.
+ */
+static bool no_recycle;
+module_param(no_recycle, bool, 0644);
+MODULE_PARM_DESC(no_recycle,
+		 "Never re-download from the watchdog; leave a running application alone");
 
 static bool park_power_down = true;
 module_param(park_power_down, bool, 0644);
@@ -247,9 +381,18 @@ MODULE_PARM_DESC(go_xfer,
 static int prepend_z2_hdr;
 module_param(prepend_z2_hdr, int, 0644);
 MODULE_PARM_DESC(prepend_z2_hdr, "0=none (N31 default) 1=5A5A+BE len+CRC32 2=c3f5 hdr");
-static int chunk_spi;
+/*
+ * Chunks go through the same one transport as everything else.
+ *
+ * sub_2D640 sends every chunk as sub_40F770(buf, chunk + 16, 0, 0) at
+ * 0x2D6A0, and sub_40F770 asserts CS at 0x40F78C and releases it at
+ * 0x40F7C2 around that one call. That is GRAPE_CS_BEGIN | GRAPE_CS_END, so
+ * chunk_spi=1 is the stock shape and is now the default; 0 restores the
+ * caller-supplied cs_flags path this driver used to take.
+ */
+static int chunk_spi = 1;
 module_param(chunk_spi, int, 0644);
-MODULE_PARM_DESC(chunk_spi, "1=spi_sync chunk xfers (apple_z2-style atomic CS)");
+MODULE_PARM_DESC(chunk_spi, "1=spi_sync chunk xfers, CS around the whole frame (default, sub_2D640); 0=legacy caller cs_flags");
 /* Default quiet: bring-up spam off; set quiet=0 or verbose=1 for detail. */
 static int quiet = 1;
 module_param(quiet, int, 0644);
@@ -301,10 +444,10 @@ MODULE_PARM_DESC(require_runtime,
 		 "Require a runtime ping after EXEC before registering input "
 		 "(stock does not; default N)");
 
-static unsigned int exec_wait_ms = 40;
+static unsigned int exec_wait_ms = 4000;
 module_param(exec_wait_ms, uint, 0644);
 MODULE_PARM_DESC(exec_wait_ms,
-		 "ms after EXEC before runtime ping (OSOS 2D54C success wait = 40)");
+		 "longest wait after EXEC for the application to assert ATTN before the first ping (default 4000)");
 
 static unsigned int cal_ftl_start;
 module_param(cal_ftl_start, uint, 0644);
@@ -363,13 +506,21 @@ module_param(fw_dest, uint, 0644);
 MODULE_PARM_DESC(fw_dest,
 		 "2D640 ARM upload base dest (OSOS offset 0; cal stays 0x400200)");
 
+/*
+ * The two words of the 1D 53 store. They are an address and a value, not
+ * an entry point and an argument -- see the note on sub_2D54C above -- but
+ * the names are what every log line and script in this tree already uses,
+ * and the numbers here are the little-endian view of stock's wire bytes,
+ * so the frame is unchanged.
+ */
 static unsigned int exec_addr = 0x00100018;
 module_param(exec_addr, uint, 0644);
 MODULE_PARM_DESC(exec_addr,
-		 "2D54C EXEC word0 (OSOS 0x00100018; bootloader-mapped PC)");
+		 "2D54C word0 (OSOS 0x00100018 = the bytes for address 0x10001800)");
 static unsigned int exec_word1 = 0x00000100;
 module_param(exec_word1, uint, 0644);
-MODULE_PARM_DESC(exec_word1, "2D54C EXEC word1 (OSOS 0x00000100)");
+MODULE_PARM_DESC(exec_word1,
+		 "2D54C word1 (OSOS 0x00000100 = the bytes for the value 1)");
 
 
 static bool grape_verbose;
@@ -404,6 +555,33 @@ struct grape {
 	bool cal_uploaded;
 	bool requestcal_done;	/* 2D5B0 / 1F01 path done */
 	bool exec_sent;		/* 2D54C SPI xfer completed — not runtime */
+	/*
+	 * Receive evidence for the last grape_status_poll, from
+	 * spi-s5l8702. poll_rx_valid says whether the controller could
+	 * answer at all; poll_rx_short is the count of requested bytes
+	 * that never left the FIFO, and poll_rx_silent counts the polls
+	 * where none of them did.
+	 */
+	bool csum_reported;	/* the 16-byte dump is identical every time */
+	bool swept;		/* the ping/clock sweep runs once per probe */
+	bool ping_reported;	/* the 0x4F81 line is identical every time */
+	/*
+	 * Last 16 bytes the part clocked back at a ping, and a small budget
+	 * of ATTN-driven dumps.
+	 *
+	 * Whether the application is running has been argued from replies
+	 * that only say a responder answered. ATTN settles it by experiment
+	 * instead: the line is asserted by the part, so if touching the
+	 * panel changes these bytes, something is reacting to the panel.
+	 * Bounded because this is a console at 115200.
+	 */
+	u8 ping_rx[GRAPE_FRAME_LEN];
+	unsigned int attn_probe_left;
+	u32 poll_rx_status;
+	u32 poll_rx_wait_status;
+	unsigned int poll_rx_short;
+	unsigned int poll_rx_silent;
+	bool poll_rx_valid;
 	u8 *raw_rx;		/* last raw_xfer response */
 	unsigned int raw_n;
 	unsigned int attn_fails;
@@ -518,100 +696,91 @@ static void grape_power_down(struct grape *n)
 	grape_gpiocmd_mode(n, GRAPE_GPIO_IRQ, 0xFFFE, 0);
 	grape_gpiocmd_mode(n, GRAPE_GPIO_RST, 1, 0);
 	grape_spi2_pinmux(n, false);
+	/* sub_439B00(1, 0): the rail off, then PMU_GPIO_8 to its off value. */
 	d1830_grape_rail(false);
+	d1830_touch_gpio8(false);
 	grape_gpiocmd_mode(n, GRAPE_GPIO_EN, 1, 0);
 	grape_vinfo(n, "1A878 power-cut (RST hold, rail off, EN mode 1)\n");
 }
 
 /*
- * CLKCON oracle replay.
+ * SPI2's clock gate, as sub_11B70 actually performs it.
  *
- * Deliberately not named after any peripheral. Nothing in the extracted
- * Grape boot path -- sub_13A20, sub_1A5AC and the 2075A/20766/20690/
- * 11B70/20848/20E94/20490 chain -- writes CLKCON or calls sub_41CBD8 at
- * all, so there is no evidence naming any of these bits as a touch
- * clock. What is established is narrower and still worth replaying:
- * Linux is missing global CLKCON state that both the Apple bootloader
- * and the running stock system have.
+ * This used to be a "CLKCON oracle replay": two recorded sets of whole
+ * words for 0x3C500000 +0x08/+0x0C/+0x10/+0x14, chosen by a module
+ * parameter, written wholesale and restored on unload. It was written
+ * when nothing was known about how this SoC gates a clock, and it was the
+ * wrong shape in the way that has cost this tree the most -- each of those
+ * registers packs several peripherals, so writing a whole word moves bits
+ * that belong to the NAND, the codec and the display along with whatever
+ * was being aimed at.
  *
- * The N31 bootloader sets, at 0x3C500000:
+ * The mechanism is now known, and it is a single-bit read-modify-write.
+ * sub_11B70 opens with a call the Hex-Rays export renders as
+ * "if (a1 < 4) sub_345D70();", dropping all three arguments. The real code
+ * selects a per-port id -- 43, 34, 30, 52 for SPI0..3 -- and calls the IRAM
+ * veneer at 0x22000350 with (id, 0, 1). That veneer indexes a 32-byte
+ * table at 0x08929360 and, for each non-zero mask in the entry, clears
+ * those bits in one CLKCON register to enable and sets them to disable:
  *
- *   +0x08 = 0x2009200A   we inherit this unchanged
- *   +0x0C = 0x80008000   we have 0x00000000
- *   +0x10 = 0x00008000   we have 0x00000000
- *   +0x14 = 0x80008000   we have 0x00002200
- *   +0x18 = 0x20012001   we inherit this unchanged
+ *	entry+0x04 -> CLKCON+0x48    entry+0x10 -> CLKCON+0x68
+ *	entry+0x08 -> CLKCON+0x4C    entry+0x14 -> CLKCON+0x6C
+ *	entry+0x0C -> CLKCON+0x58
  *
- * so something between DFU, u-boot and Linux clears two of them and
- * rewrites a third, while leaving their neighbours alone.
+ * SPI2 is id 30, whose entry is 0x08929720 and whose only masks are bit 15
+ * of +0x4C and bit 15 of +0x6C. Both read clear on this device, so this is
+ * a no-op here today; it is done anyway because the sequence has to be
+ * right on a boot that lands the other way, and because doing it is how
+ * the driver stops depending on inheriting somebody else's clock state.
  *
- * Polarity is inverted -- sub_41CBD8 clears a bit to enable and sets it
- * to disable -- so our zeroes mean more clocks running than stock, not
- * fewer. And the low nibble of +0x10 is a divider, not a flag: the rate
- * decoder reads (MEMORY[0x3C500010] & 0xF) + 1. The stock live-touch
- * 0x8000 -> 0x8004 delta is therefore a divider change, not an enable.
+ * Stock brackets the read-modify-writes with svc 70 / ip = 0 and ip = 1,
+ * an interrupt-disable pair. A raw spinlock is the equivalent here.
  *
- *   clkcon_oracle=1  replay stock's live-touch values
- *   clkcon_oracle=2  replay the bootloader's post-init values
- *
- * Values are restored on unload so a failed experiment does not leave
- * the clock tree in a state the rest of the kernel did not ask for.
+ * The full table is in docs/N31-CLKCON-GATE-TABLE.md.
  */
 #define N31_CLKCON_PHYS		0x3c500000UL
+#define N31_CLKCON_4C		0x4c
+#define N31_CLKCON_6C		0x6c
+#define N31_SPI2_GATE_4C	BIT(15)
+#define N31_SPI2_GATE_6C	BIT(15)
 
-static int clkcon_oracle;
-module_param(clkcon_oracle, int, 0644);
-MODULE_PARM_DESC(clkcon_oracle,
-		 "Replay observed CLKCON state: 1=stock touch, 2=bootloader");
+static DEFINE_RAW_SPINLOCK(n31_clkcon_lock);
 
-static const unsigned int n31_clkcon_off[] = { 0x08, 0x0c, 0x10, 0x14 };
-static const u32 n31_clkcon_touch[] = {
-	0xa009200a, 0x80000001, 0x00008004, 0x80002200,
-};
-static const u32 n31_clkcon_boot[] = {
-	0x2009200a, 0x80008000, 0x00008000, 0x80008000,
-};
-static u32 n31_clkcon_saved[ARRAY_SIZE(n31_clkcon_off)];
-static bool n31_clkcon_applied;
-
-static void grape_clkcon_replay(struct grape *n)
+static void grape_clkcon_clear(void __iomem *ck, unsigned int off, u32 mask,
+				struct grape *n)
 {
-	const u32 *want;
-	void __iomem *ck;
-	unsigned int i;
+	unsigned long flags;
+	u32 before, after;
 
-	if (!clkcon_oracle || n31_clkcon_applied)
-		return;
-	want = (clkcon_oracle == 2) ? n31_clkcon_boot : n31_clkcon_touch;
+	raw_spin_lock_irqsave(&n31_clkcon_lock, flags);
+	before = readl(ck + off);
+	after = before & ~mask;
+	if (after != before)
+		writel(after, ck + off);
+	raw_spin_unlock_irqrestore(&n31_clkcon_lock, flags);
 
-	ck = ioremap(N31_CLKCON_PHYS, 0x80);
-	if (!ck)
-		return;
-	for (i = 0; i < ARRAY_SIZE(n31_clkcon_off); i++) {
-		n31_clkcon_saved[i] = readl(ck + n31_clkcon_off[i]);
-		writel(want[i], ck + n31_clkcon_off[i]);
+	if (after != before)
 		dev_info(&n->spi->dev,
-			 "ORACLE_REPLAY clkcon+0x%02x %08x -> %08x\n",
-			 n31_clkcon_off[i], n31_clkcon_saved[i],
-			 readl(ck + n31_clkcon_off[i]));
-	}
-	n31_clkcon_applied = true;
-	iounmap(ck);
+			 "11B70 clock gate: clkcon+0x%02x %08x -> %08x (mask %08x)\n",
+			 off, before, after, mask);
+	else
+		grape_vinfo(n,
+			 "11B70 clock gate: clkcon+0x%02x already %08x (mask %08x)\n",
+			 off, before, mask);
 }
 
-static void grape_clkcon_restore(void)
+/* sub_345D70(30, 0, 1) — SPI2 on. Clearing enables; nothing else moves. */
+static void grape_spi2_clock_gate(struct grape *n)
 {
 	void __iomem *ck;
-	unsigned int i;
 
-	if (!n31_clkcon_applied)
-		return;
 	ck = ioremap(N31_CLKCON_PHYS, 0x80);
-	if (!ck)
+	if (!ck) {
+		dev_warn(&n->spi->dev, "11B70 clock gate: ioremap failed\n");
 		return;
-	for (i = 0; i < ARRAY_SIZE(n31_clkcon_off); i++)
-		writel(n31_clkcon_saved[i], ck + n31_clkcon_off[i]);
-	n31_clkcon_applied = false;
+	}
+	grape_clkcon_clear(ck, N31_CLKCON_4C, N31_SPI2_GATE_4C, n);
+	grape_clkcon_clear(ck, N31_CLKCON_6C, N31_SPI2_GATE_6C, n);
 	iounmap(ck);
 }
 
@@ -628,6 +797,8 @@ static void grape_spi2_11b70(struct grape *n)
 
 	if (!n->spi2)
 		return;
+	/* The clock gate is the first thing 0x11B70 does, before any of this. */
+	grape_spi2_clock_gate(n);
 	reinit = (void (*)(void))__symbol_get("s5l8702_spi2_reinit");
 	if (reinit) {
 		reinit();
@@ -640,7 +811,14 @@ static void grape_spi2_11b70(struct grape *n)
 		writel(10, n->spi2 + 0x44);
 		writel(24, n->spi2 + 0x38);	/* 24 * a4=1 */
 		writel(255, n->spi2 + 0x40);
-		writel(144, n->spi2 + 0x3c);	/* 3 * 24 * (1+1) */
+		/*
+		 * 0x11C24: +0x3c = 3 * (clk4 / 1000) * (a4 + 1), and +0x3c
+		 * takes clock id 4 (ldr r0,[sp,#4] at 0x11C1A), not id 5.
+		 * Solving against the captured RetailOS value 0x18c with
+		 * a4 = 1 gives clk4 = 66 MHz: 3 * 66 * 2 = 396 = 0x18c. The
+		 * 144 that used to be here assumed id 4 was 24 MHz.
+		 */
+		writel(396, n->spi2 + 0x3c);	/* 3 * 66 * (1+1) = 0x18c */
 		writel(2, n->spi2 + SPI2_CLKDIV);	/* 24000/12000 */
 		writel(SPI2_SETUP_11B70, n->spi2 + SPI2_SETUP);
 		writel(readl(n->spi2 + SPI2_CTRL) | SPI2_CTRL_FIFO_RST,
@@ -669,9 +847,14 @@ static void grape_spi2_cs(struct grape *n, bool assert)
 }
 
 /*
- * Tight 4043D0 PIO for 16-byte app frames. OSOS 11B70 leaves SETUP
- * bit5 set so 40F770 takes the DMA path — continuous clocks. Linux
- * per-byte spi_sync gaps are fine for the bootloader, not the app.
+ * sub_4043D0's FIFO reset, 0x40448E / 0x4044CE: SPICTRL |= 0xC.
+ *
+ * sub_11B70 leaves SETUP bit 5 set (0x403E), so sub_40F770 takes the block
+ * arm at 0x4044C0. That arm is not DMA and not the PL080: it hands the
+ * buffers to the SPI interrupt handler sub_103C through the global at
+ * 0x08929BE0, and sub_103C keeps a 16-deep FIFO topped up. So the wire
+ * difference against a polled byte loop is a continuous SCLK across each
+ * FIFO-full window, not one uninterrupted burst of the whole frame.
  */
 static void grape_spi2_fifo_flush(struct grape *n)
 {
@@ -709,7 +892,6 @@ static void grape_spi2_fifo_flush(struct grape *n)
 #define GRAPE_SPI_GUARD	100000u
 
 #define GRAPE_TXBUSY_ROS	0x7c0u
-#define GRAPE_TXBUSY_RESIDUE	0x40u	/* stays set after 11B70 setup */
 #define GRAPE_TXLVL_CLASSIC	0x1f0u
 #define GRAPE_RXRDY_ROS	0xf800u
 #define GRAPE_RXLVL_CLASSIC	0x3e00u
@@ -743,6 +925,30 @@ static void grape_latch_fam(struct grape *n, int fam, u32 st)
 		 fam == 1 ? "ROS(0x7C0/0xF800)" : "Classic(0x1F0/0x3E00)", st);
 }
 
+/*
+ * A literal `while (STATUS & mask)` spin, matching stock's drain loops.
+ *
+ * No encoding-family logic here: sub_4043D0 tests the literal constants
+ * 0x7C0 and 0xF800, and sub_103C settles the layout (TX level bits 10:6,
+ * RX level bits 15:11). Stock spins unbounded; we keep a guard.
+ */
+static int grape_drain_fifo(struct grape *n, u32 mask)
+{
+	unsigned int guard = GRAPE_SPI_GUARD;
+	u32 st = 0;
+
+	while (guard--) {
+		st = readl(n->spi2 + SPI2_STATUS);
+		if ((st & mask) == 0)
+			return 0;
+		cpu_relax();
+	}
+	dev_warn_ratelimited(&n->spi->dev,
+			     "SPI2 FIFO never drained (mask=0x%x STATUS=0x%08x)\n",
+			     mask, st);
+	return -ETIMEDOUT;
+}
+
 /* Wait for the transmit side to accept another word. */
 static int grape_wait_tx(struct grape *n)
 {
@@ -752,13 +958,18 @@ static int grape_wait_tx(struct grape *n)
 	while (guard--) {
 		st = readl(n->spi2 + SPI2_STATUS);
 
-		if (n->spi_fam != 2) {
-			u32 b = st & GRAPE_TXBUSY_ROS;
-
-			if (b == 0 || b == GRAPE_TXBUSY_RESIDUE) {
-				grape_latch_fam(n, 1, st);
-				return 0;
-			}
+		/*
+		 * 0x40 is no longer accepted as "idle enough".
+		 *
+		 * STATUS bits 10:6 are the TX FIFO level -- sub_103C reads
+		 * them with `ubfx r1, r1, #6, #5` at 0x10AE and compares
+		 * against the 16-entry depth -- so 0x40 means one byte is
+		 * still queued. Stock's three drain loops (0x404496,
+		 * 0x40457A, 0x4045AA) all require the whole field to be zero.
+		 */
+		if (n->spi_fam != 2 && (st & GRAPE_TXBUSY_ROS) == 0) {
+			grape_latch_fam(n, 1, st);
+			return 0;
 		}
 		if (n->spi_fam != 1 && (st & GRAPE_TXLVL_CLASSIC) == 0) {
 			grape_latch_fam(n, 2, st);
@@ -818,10 +1029,33 @@ static int grape_wait_rx(struct grape *n)
  * The legacy path is kept behind grape_use_spi=0 purely so the two can be
  * compared on hardware; it is not the supported route.
  */
-static bool grape_use_spi;	/* opt-in until proven on glass */
+static bool grape_use_spi = true;
 module_param(grape_use_spi, bool, 0644);
 MODULE_PARM_DESC(grape_use_spi,
 		 "1=transfer via the SPI core (default); 0=legacy direct SPI2 register PIO");
+
+/*
+ * sub_40F770 does delay(10) at 0x40F782 immediately before its CS assert
+ * (sub_4045D4(2, 0) at 0x40F78C) -- the minimum CS-high gap between frames.
+ *
+ * The units are established, and 10 us is right. sub_345D58 is an ARM
+ * veneer to 0x2200104B, which IS in this image: the IRAM module is
+ * memcpy(0x22000000, 0x08982B00, 0x3A60), so it reads at file offset
+ * 0x983B4A. It spins on the counter at 0x3C700084 until
+ * sub_983AE6(start, 10) reports the delta has reached 10.
+ *
+ * A tick is one microsecond. The sibling helper at 0x8983AFA takes
+ * milliseconds and converts them for the same counter as
+ * (125 * ms) << 3, which is 1000 ticks per millisecond, and caps its
+ * argument at 0x00418937 = 4295479 ms -- 2^32 microseconds, the point at
+ * which a 32-bit microsecond counter wraps.
+ * This applies only to the legacy direct register path; the SPI-core path
+ * gets the same delay from spi-s5l8702's own cs_delay_us.
+ */
+static unsigned int grape_cs_delay_us = 10;
+module_param(grape_cs_delay_us, uint, 0644);
+MODULE_PARM_DESC(grape_cs_delay_us,
+		 "legacy register path: delay before CS assert, microseconds (0x40F782; default 10)");
 
 /*
  * One HBPP burst as a single spi_message.
@@ -878,9 +1112,16 @@ static int grape_burst_ex(struct grape *n, const u8 *tx, u8 *rx,
 	if (!n->spi2)
 		return -ENODEV;
 	if (cs_flags & GRAPE_CS_BEGIN) {
+		/*
+		 * 0x40F782: movs r0, #10 / blx sub_345D58, immediately
+		 * before sub_4045D4(2, 0) at 0x40F78C. The comment that used
+		 * to sit here -- "No delay: sub_40F770 clocks the first byte
+		 * straight after sub_4045D4(2, 0)" -- is refuted by the
+		 * disassembly.
+		 */
+		if (grape_cs_delay_us)
+			udelay(grape_cs_delay_us);
 		grape_spi2_cs(n, true);
-		/* No delay: sub_40F770 clocks the first byte straight
-		 * after sub_4045D4(2, 0). */
 		/*
 		 * Read CS back rather than trusting the write. A MISO that
 		 * floats for a whole frame looks identical to a part that
@@ -895,6 +1136,24 @@ static int grape_burst_ex(struct grape *n, const u8 *tx, u8 *rx,
 			      readl(n->spi2 + SPI2_SETUP),
 			      readl(n->spi2 + SPI2_STATUS));
 		grape_spi2_fifo_flush(n);
+		/*
+		 * The two pre-loop drains both arms of sub_4043D0 perform
+		 * before any data moves:
+		 *
+		 *   0x404496  while (STATUS & 0x7C0)   TX FIFO not empty
+		 *   0x40449E  while (STATUS & 0xF800)  RX FIFO not empty
+		 *
+		 * (the block arm has the identical pair at 0x4044D6 and
+		 * 0x4044DE). This path had neither, so a frame could start
+		 * with the previous frame's bytes still in either FIFO.
+		 */
+		ret = grape_drain_fifo(n, GRAPE_TXBUSY_ROS);
+		if (ret)
+			goto out;
+		ret = grape_drain_fifo(n, GRAPE_RXRDY_ROS);
+		if (ret)
+			goto out;
+
 		writel(readl(n->spi2 + SPI2_SETUP) & ~BIT(0), n->spi2 + SPI2_SETUP);
 		writel(readl(n->spi2 + SPI2_STATUS) | 0x400000u, n->spi2 + SPI2_STATUS);
 	}
@@ -930,8 +1189,13 @@ static int grape_burst_ex(struct grape *n, const u8 *tx, u8 *rx,
 		}
 	}
 
+	/* 0x4045AA: while (STATUS & 0x7C0) before the epilogue. */
+	if (!ret)
+		ret = grape_drain_fifo(n, GRAPE_TXBUSY_ROS);
+
 out:
 	if (cs_flags & GRAPE_CS_END) {
+		/* 0x4045B2: SETUP &= 0xFFBFFFFE */
 		writel(readl(n->spi2 + SPI2_SETUP) & ~0x400001u, n->spi2 + SPI2_SETUP);
 		grape_spi2_cs(n, false);
 	}
@@ -1050,11 +1314,39 @@ static bool grape_opcode_known(u16 w)
  * rx[14..15], and the pending length is then rx[1..2]. That is
  * exactly grape_ping, and sub_188FFC drives it with five retries.
  *
- * So a failed ping here means the checksum did not verify, not that
- * the part is in the bootloader. Where stock differs is what it does
- * with the result: sub_188FFC only reads a report when the pending
- * length is non-zero, and nothing gates registering the input device
- * on a ping at all -- sub_20490(1) simply arms ATTN on pad 38.
+ * A failed checksum on its own would say only that; what the reply
+ * bytes say is more specific. 4F 81 is what this part answers to any
+ * frame whose opcode it does not know or whose sum is wrong -- send it
+ * junk, or a 1E 33 with a deliberately bad checksum, and 4F 81 comes
+ * back either way. So a ping that reads 4F 81 is the HBPP responder
+ * refusing 01 EA, which means the part never left the bootloader.
+ * The other words in this set are ordinary HBPP replies that happen to
+ * still be latched when the ping goes out.
+ *
+ * Where stock differs is what it does with the result: sub_188FFC only
+ * reads a report when the pending length is non-zero, and nothing gates
+ * registering the input device on a ping at all -- sub_20490(1) simply
+ * arms ATTN on pad 38.
+ *
+ * 0x4879 is the one entry in this set that must not be read as an answer.
+ *
+ * The SPI2 capture from a working RetailOS (artifacts/retailos-touch-oracle,
+ * spi2-grape-3d200000.bin) has SPISTATUS at +0x08 reading 0x00000002. The
+ * receive-level field is zero under both candidate masks, 0x3e00 and the
+ * block arm's 0xf800, and STATUS is sampled ahead of RXDATA in the same
+ * linear block read, so the receive FIFO was empty before anything could pop
+ * it. SPIRXDATA at +0x20 still read 0x48484848 79797979 48484848 79797979.
+ *
+ * So an empty receive FIFO reads out as the 0x48/0x79 pattern on this block,
+ * and a 0x4879 returned by grape_status_poll is indistinguishable from the
+ * part having said nothing at all.
+ *
+ * That does not make the word illegal -- sub_2C87E lists 18553 -- and this
+ * function still names it, because naming what came back is useful. What it
+ * rules out is the inference: a 0x4879 is not evidence that the part
+ * answered, and no caller may treat it as evidence that the bootloader is
+ * still resident. Distinguishing the two needs the receive level read out of
+ * SPISTATUS at the time of the transfer, which nothing here does yet.
  */
 static bool grape_status_is_bootloader(u16 w)
 {
@@ -1101,16 +1393,51 @@ static int grape_probe_26494(struct grape *n, const char *tag)
 	return 0;
 }
 
-/* sub_3D5706 — TX 1A A1, RX 2, byteswap */
+/*
+ * sub_3D5706 — TX 1A A1, RX 2, byteswap.
+ *
+ * The two bytes on their own do not establish that the part answered.
+ * SPIRXDATA reads out the 0x48/0x79 pattern on an empty receive FIFO --
+ * measured on a working RetailOS, SPISTATUS 0x00000002 with both level
+ * fields clear -- so a 0x4879 here is exactly what silence looks like.
+ *
+ * s5l8702_spi_last_rx reports how many of the requested bytes actually
+ * came out of the FIFO. A full shortfall means nothing was received, and
+ * this returns -ENODATA rather than handing the caller two bytes that no
+ * device put there. Anything less is reported through the fields below
+ * and left to the caller, so a partial read still surfaces rather than
+ * silently deciding an ACK.
+ *
+ * The evidence is only meaningful on the SPI-core path: the legacy
+ * register path never enters spi-s5l8702, so what it would report
+ * belongs to some earlier transfer.
+ */
 static int grape_status_poll(struct grape *n, u16 *status)
 {
 	u8 tx[2] = { 0x1a, 0xa1 };
 	u8 rx[2] = { 0 };
+	unsigned int shortfall = 0;
+	u32 st = 0, waitst = 0;
 	int ret;
+
+	n->poll_rx_valid = false;
 
 	ret = grape_xfer(n, tx, rx, 2);
 	if (ret)
 		return ret;
+
+	if (grape_use_spi && n->spi &&
+	    s5l8702_spi_last_rx(n->spi, &st, &shortfall, &waitst) == 0) {
+		n->poll_rx_wait_status = waitst;
+		n->poll_rx_status = st;
+		n->poll_rx_short = shortfall;
+		n->poll_rx_valid = true;
+		if (shortfall >= sizeof(rx)) {
+			n->poll_rx_silent++;
+			return -ENODATA;
+		}
+	}
+
 	if (status)
 		*status = (u16)((rx[0] << 8) | rx[1]); /* __rev16 of LE word */
 	return 0;
@@ -1155,8 +1482,8 @@ static void grape_fwfile_classify(struct grape *n, const u8 *data, size_t size)
 		 size > 14 ? data[14] : 0, size > 15 ? data[15] : 0,
 		 h8740, rev, le0c, arm0, arm400, hz2);
 	if (!h8740 && arm0)
-		dev_warn(&n->spi->dev,
-			 "FWFILE is ARM-only cut — grape file +350 is not touch calibration cal\n");
+		grape_vinfo(n,
+			 "firmware file is a bare ARM image; its +350 window is not a calibration source\n");
 }
 
 static void __maybe_unused grape_log_calcand(struct grape *n, const char *name,
@@ -1258,7 +1585,27 @@ static u8 *grape_maybe_prepend_z2_hdr(struct grape *n, const u8 *body,
 	return buf;
 }
 
-static int grape_wait_ack(struct grape *n, u16 expect, int retries)
+/*
+ * @retries:  status polls before giving up.
+ * @delay_ms: gap between polls. Stock has none anywhere in sub_2D640.
+ *
+ * sub_2D640's chunk loop, 0x2D698..0x2D6D6, is:
+ *
+ *   for (try = 0; try < 5; try++) {
+ *           if (sub_40F770(buf, chunk + 16, 0, 0))  continue;   0x2D6A0
+ *           if (sub_3D5706(&st))                    continue;   0x2D6B0
+ *           if (st != 0x4BC1)                       continue;   0x2D6BA
+ *           break;                                              // accepted
+ *   }
+ *
+ * -- one status poll per attempt, no sleep, and a failed poll re-sends the
+ * whole frame rather than polling the same silent part again. This driver
+ * polled eight times with msleep(2) between, so a chunk the part had already
+ * refused was given 16 ms of re-asking before the frame was resent, and only
+ * five frames were ever sent in the 40 attempts.
+ */
+static int grape_wait_ack_ex(struct grape *n, u16 expect, int retries,
+			     unsigned int delay_ms)
 {
 	int i;
 	u16 st = 0;
@@ -1266,11 +1613,24 @@ static int grape_wait_ack(struct grape *n, u16 expect, int retries)
 	for (i = 0; i < retries; i++) {
 		if (grape_status_poll(n, &st) == 0 && st == expect)
 			return 0;
-		msleep(2);
+		if (delay_ms)
+			msleep(delay_ms);
 	}
-	dev_warn(&n->spi->dev, "ACK wait fail (want 0x%04x got 0x%04x)\n",
-		 expect, st);
+	dev_warn(&n->spi->dev,
+		 "ACK wait fail (want 0x%04x got 0x%04x) [rx %s short=%u status=0x%08x]\n",
+		 expect, st, n->poll_rx_valid ? "measured" : "unmeasured",
+		 n->poll_rx_short, n->poll_rx_status);
 	return -ETIMEDOUT;
+}
+
+/*
+ * The non-chunk callers keep the old 8 x 2 ms shape: their stock
+ * counterparts have not been read out of the disassembly, so changing them
+ * would be a guess rather than a match.
+ */
+static int grape_wait_ack(struct grape *n, u16 expect, int retries)
+{
+	return grape_wait_ack_ex(n, expect, retries, 2);
 }
 
 /*
@@ -1301,6 +1661,24 @@ static int grape_rdreg(struct grape *n, u32 addr, u32 *val)
 	ret = grape_xfer(n, atn_tx, atn_rx, 8);
 	if (ret)
 		return ret;
+	/*
+	 * A MEMRD result frame opens with 4C 39. Anything else means the read
+	 * did not complete, and the bytes after it are whatever the part was
+	 * idling out -- 48 79 repeated, most often.
+	 *
+	 * This used to skip the check and hand those bytes back as a value,
+	 * so a failed read returned 0x48794879 and every caller believed it.
+	 * That is how the app-start check came to report a BSS region "not
+	 * zeroed" while reading nothing at all, and why any peek in this
+	 * driver's logs showing 0x4879-patterned data should be read as a
+	 * failed transaction rather than as memory contents.
+	 */
+	if (atn_rx[0] != 0x4c || atn_rx[1] != 0x39) {
+		dev_dbg(&n->spi->dev,
+			"RDREG 0x%08x: no 4C 39 result (got %02x %02x)\n",
+			addr, atn_rx[0], atn_rx[1]);
+		return -EIO;
+	}
 	if (val)
 		*val = ((u32)atn_rx[2] << 8) | atn_rx[3] |
 		       ((((u32)atn_rx[4] << 8) | atn_rx[5]) << 16);
@@ -1361,10 +1739,22 @@ static void grape_fw_readback(struct grape *n, const char *tag)
 	unsigned int i;
 
 	/*
-	 * Six 4 KB reads in the middle of the download sequence. Harmless to
-	 * look at, but not something to put on the bus by default.
+	 * Six 4 KB reads, and the cal readback below is a seventh, in the
+	 * middle of sub_273A0. Stock sends none of them.
+	 *
+	 * "Harmless to look at" is what this used to say, and it is the same
+	 * reasoning that kept an LLI chain in the display path and seven
+	 * RDREGs inside the EXEC transition: traffic the part was not told to
+	 * expect, excused because no mechanism for it to matter had been
+	 * imagined. Gating it on a parameter does not fix that -- verbose is
+	 * on for every bring-up anyone actually debugs, so in practice this
+	 * always ran.
+	 *
+	 * The readbacks are how the upload was proven correct, so they stay
+	 * reachable, but they do not run inside the sequence. Call them from
+	 * outside it, or read the same addresses through raw_xfer.
 	 */
-	if (!verbose)
+	if (!fw_readback)
 		return;
 
 	buf = kmalloc(0x1000, GFP_KERNEL);
@@ -1394,7 +1784,7 @@ static void grape_cal_readback(struct grape *n, const u8 *upload)
 	u8 *buf;
 	u32 crc_chip, crc_host;
 
-	if (!verbose)
+	if (!fw_readback)
 		return;
 
 	buf = kmalloc(GRAPE_FW_HDR_LEN, GFP_KERNEL);
@@ -1520,8 +1910,9 @@ static int grape_prepare_cal_from_touch_cal(struct grape *n, const u8 *touch_cal
 		 "Grape touch calibration cal prepared: off=%u len=0x%x sum32=0x%08x upload_first32=%32ph\n",
 		 GRAPE_FW_HDR_OFF, GRAPE_FW_HDR_LEN, sum, n->cal_upload);
 	if (!sum) {
-		dev_err(&n->spi->dev,
-			"touch calibration +350 window is all zeros — not a usable cal\n");
+		/* One candidate source rejected; the callers try the next. */
+		grape_vinfo(n,
+			"calibration candidate +350 window is all zeros; skipping this source\n");
 		n->have_cal = false;
 		return -EINVAL;
 	}
@@ -1653,6 +2044,45 @@ out:
 	return ret;
 }
 
+/*
+ * Third source: the SysCfg object the FTL has already parsed.
+ *
+ * Stock never needs this. On a RetailOS boot the calibration is already in
+ * SRAM at the A34 descriptor because the loader put it there, and neither of
+ * the two sources above survives a Linux boot on this unit: that SRAM has
+ * been overwritten by the time this driver probes, and U-Boot republishes the
+ * IsyS object without filling the calibration window, so the DT copy is 512
+ * bytes of zeros at +350.
+ *
+ * The bytes are in NAND either way. SysCfg carries an MtCl record whose value
+ * is a length and an offset rather than a string -- 704 bytes at 0x1d40 on
+ * this unit -- pointing at the calibration inside the same section, which is
+ * what the loader copies to +350 of the object it hands on. The FTL follows
+ * that pointer and presents the same 0x560 shape, so this is the same data
+ * by a different road rather than a substitute for it.
+ */
+static size_t (*grape_syscfg_cal_fn)(const u8 **out);
+static bool grape_syscfg_cal_inited;
+
+static int grape_load_touch_cal_from_syscfg(struct grape *n)
+{
+	const u8 *cal = NULL;
+	size_t len;
+
+	if (!grape_syscfg_cal_inited) {
+		grape_syscfg_cal_inited = true;
+		grape_syscfg_cal_fn = symbol_get(whimory_syscfg_touch_cal);
+	}
+	if (!grape_syscfg_cal_fn)
+		return -ENOENT;
+
+	len = grape_syscfg_cal_fn(&cal);
+	if (!cal || len != GRAPE_TOUCH_CAL_LEN)
+		return -ENOENT;
+
+	return grape_prepare_cal_from_touch_cal(n, cal, len);
+}
+
 static int grape_acquire_touch_cal_cal(struct grape *n)
 {
 	int ret;
@@ -1660,14 +2090,35 @@ static int grape_acquire_touch_cal_cal(struct grape *n)
 	if (n->have_cal)
 		return 0;
 
+	/*
+	 * A34 first, because that is where stock reads it.
+	 *
+	 * sub_564 takes the descriptor at sub_A34(24) -- and sub_A34 is just
+	 * `return 0x2202FE00 + idx`, so the descriptor is at 0x2202FE18 in
+	 * SRAM, magic 0x53797349 with the payload pointer at +4. The boot
+	 * chain puts it there and RetailOS reads it live; it never consults
+	 * storage for calibration.
+	 *
+	 * The /chosen copy is our own U-Boot invention. It is a fine
+	 * fallback for a boot chain that has already clobbered SRAM, but
+	 * preferring it meant the driver's primary source was one stock does
+	 * not have, which is the wrong way round.
+	 */
+	ret = grape_load_touch_cal_from_a34(n);
+	if (!ret)
+		return 0;
+
+	grape_vinfo(n, "A34 touch_cal unavailable: %d; trying the DT copy\n",
+		 ret);
+
 	ret = grape_load_touch_cal_from_dt(n);
 	if (!ret)
 		return 0;
 
-	grape_vinfo(n, "DT touch_cal unavailable: %d; trying A34 live\n",
+	grape_vinfo(n, "DT touch_cal unusable: %d; trying SysCfg via the FTL\n",
 		 ret);
 
-	ret = grape_load_touch_cal_from_a34(n);
+	ret = grape_load_touch_cal_from_syscfg(n);
 	if (!ret)
 		return 0;
 
@@ -1855,9 +2306,9 @@ static int grape_acquire_fw(struct device *dev, const u8 **data,
 		    !(cert_off & 0xf) && entry <= aligned &&
 		    *size >= GRAPE_IMG1_BODY_OFF + body) {
 			dev_info(dev,
-				 "IMG1 8740 v%c.%c fmt %u: body %u at +%u, entry 0x%08x, of %zu\n",
+				 "firmware: IMG1 8740 v%c.%c fmt %u container, %u-byte application at +%u (file %zu bytes)\n",
 				 (*data)[4], (*data)[6], (*data)[7], body,
-				 GRAPE_IMG1_BODY_OFF, entry, *size);
+				 GRAPE_IMG1_BODY_OFF, *size);
 			*data += GRAPE_IMG1_BODY_OFF;
 			*size = body;
 		} else {
@@ -2053,8 +2504,12 @@ static int grape_send_chunk_ex(struct grape *n, const u8 *data,
 			ret = grape_burst_ex(n, buf, NULL, xfer_len, cs_flags);
 		if (ret)
 			continue;
-		/* 1A A1 → 2 bytes → rev16; expect 0x4BC1 */
-		ack_ret = grape_wait_ack(n, GRAPE_ACK_CHUNK, 8);
+		/*
+		 * 0x2D6B0: one sub_3D5706 poll per attempt, no sleep. The
+		 * retry is this loop resending the frame, which is what
+		 * 0x2D6D6's `blt 0x2D698` does.
+		 */
+		ack_ret = grape_wait_ack_ex(n, GRAPE_ACK_CHUNK, 1, 0);
 		if (ack_ret == 0) {
 			ack = GRAPE_ACK_CHUNK;
 			if (dump)
@@ -2222,7 +2677,7 @@ static int grape_post_download(struct grape *n)
 	if (ret)
 		return ret;
 	st = (u16)((rx[0] << 8) | rx[1]);
-	dev_info(&n->spi->dev,
+	grape_vinfo(n,
 		 "011F reply %02x %02x (0x%04x)%s\n",
 		 rx[0], rx[1], st,
 		 grape_opcode_known(st) ? " known" : " UNKNOWN");
@@ -2232,7 +2687,7 @@ static int grape_post_download(struct grape *n)
 	if (grape_status_poll(n, &st) != 0)
 		return -EIO;
 
-	dev_info(&n->spi->dev, "post-poke 1AA1 status 0x%04x%s\n",
+	grape_vinfo(n, "post-poke 1AA1 status 0x%04x%s\n",
 		 st, grape_opcode_known(st) ? " known" : " UNKNOWN");
 
 	/*
@@ -2264,7 +2719,7 @@ static void grape_spi2_dump(struct grape *n, const char *when)
 {
 	if (!n->spi2)
 		return;
-	dev_info(&n->spi->dev,
+	grape_vinfo(n,
 		 "SPI2 %-6s ctrl=%08x setup=%08x status=%08x pin=%08x clkdiv=%08x\n",
 		 when,
 		 readl(n->spi2 + SPI2_CTRL),
@@ -2331,43 +2786,110 @@ static void __maybe_unused grape_drain(struct grape *n, unsigned int bytes)
 	grape_burst(n, tx, rx, nxf);
 }
 
-static void grape_pre_exec_verify(struct grape *n)
-{
-	static const u32 addrs[] = {
-		0x00000000, 0x00000004, 0x00000008, 0x00000020,
-		0x00400200, 0x00400204, 0x004003fc,
-	};
-	unsigned int i;
-
-	if (!verbose)
-		return;
-
-	for (i = 0; i < ARRAY_SIZE(addrs); i++) {
-		u32 v = 0;
-
-		if (grape_rdreg(n, addrs[i], &v) == 0)
-			grape_vinfo(n, "pre-EXEC RDREG 0x%08x=0x%08x\n",
-				 addrs[i], v);
-	}
-}
-
 /*
- * sub_2D54C — one-shot EXEC packet only.
- * Do NOT poll 1A A1 / drain after EXEC: that keeps speaking HBPP across the
- * bootloader→runtime boundary. Success is proven only by 182590 ping csum.
+ * sub_2D54C — the single 1D 53 store, and nothing else.
+ *
+ * grape_pre_exec_verify used to run seven RDREGs here whenever verbose was
+ * set. sub_273A0 sends no such traffic between its status read and this
+ * store, and the whole point of this driver is that the part sees what
+ * RetailOS sends, so it is gone from the path. It made no measurable
+ * difference -- the same sequence sent with nothing in between behaves
+ * identically -- but "it did not matter" is not a reason to keep a
+ * divergence inside a state transition.
  */
 static int grape_cmd_2d54c(struct grape *n)
 {
 	int ret;
 
-	grape_pre_exec_verify(n);
 	ret = grape_cmd_2d54c_raw(n, exec_addr, exec_word1);
 	if (!ret) {
 		n->exec_sent = true;
 		/* Stock waits 40 ms here before touching the part again. */
 		msleep(GRAPE_EXEC_SETTLE_MS);
+		grape_vinfo(n, "attn after store: %d\n",
+			 n->attn ? gpiod_get_value_cansleep(n->attn) : -1);
 	}
 	return ret;
+}
+
+/*
+ * Did the application actually run?
+ *
+ * The image is armlink output. Its reset handler sets up the mode stacks
+ * and branches to __scatterload, which walks a table of
+ * {src, dst, len, fn} entries and copies or zeroes each region before
+ * main() is reached. The table's bounds are the two words at +0x8C and
+ * +0x90, each stored relative to +0x8C -- which is exactly how the code at
+ * +0x5C reads them.
+ *
+ * Which entry to look at matters, and the first one is the wrong one. Its
+ * fn field is 0x94, which thunks straight to Thumb at 0x9C -- armlink's
+ * decompressor, not a copy -- and its src + len (0xD728 + 0x3B70) runs past
+ * the end of a 0xE960 image, which is only possible because the source is
+ * compressed. Comparing the destination against image[src] therefore
+ * compares decompressed output against compressed input, and reports
+ * "never executed" no matter what the part did. This check did exactly
+ * that when it was first written, so its verdict was worth nothing.
+ *
+ * The second entry is the zero-fill, and that one is deterministic:
+ * whatever the application does afterwards, __scatterload_zeroinit clears
+ * that whole region before main() is reached, and before the upload it
+ * holds uninitialised SRAM. Sampling it answers "did the CPU run"
+ * outright, which a failed runtime ping cannot -- that looks the same
+ * whether the application never started or started and is merely not
+ * answering 01 EA.
+ */
+static void grape_report_app_start(struct grape *n, const u8 *body,
+				    size_t body_len)
+{
+	u32 tbl_start, tbl_end, dst, len, got = 0;
+	unsigned int i, checked = 0, zero = 0;
+
+	if (!body || body_len < 0x100)
+		return;
+	tbl_start = 0x8c + get_unaligned_le32(body + 0x8c);
+	tbl_end = 0x8c + get_unaligned_le32(body + 0x90);
+	if (tbl_end <= tbl_start || tbl_end > body_len ||
+	    (tbl_end - tbl_start) % 16 || tbl_end - tbl_start > 0x200) {
+		dev_info(&n->spi->dev,
+			 "no scatter table at +0x8c — cannot tell whether the app ran\n");
+		return;
+	}
+	/* Second entry: the zero-fill. The first is a decompress; see above. */
+	if (tbl_end - tbl_start < 32)
+		return;
+	dst = get_unaligned_le32(body + tbl_start + 16 + 4);
+	len = get_unaligned_le32(body + tbl_start + 16 + 8);
+	if (!len)
+		return;
+
+	for (i = 0; i < 4; i++) {
+		u32 at = dst + i * (len / 4);
+
+		if (grape_rdreg(n, at, &got)) {
+			/*
+			 * Once the application has taken over, the HBPP ROM
+			 * no longer answers reads. This is the expected
+			 * outcome, not a failure.
+			 */
+			grape_vinfo(n,
+				 "HBPP read of 0x%08x unanswered after exec: application in control\n",
+				 at);
+			return;
+		}
+		checked++;
+		if (!got)
+			zero++;
+	}
+
+	if (zero == checked)
+		dev_info(&n->spi->dev,
+			 "application ran: BSS at 0x%08x+0x%x reads zero (%u/%u)\n",
+			 dst, len, zero, checked);
+	else
+		dev_warn(&n->spi->dev,
+			 "application never executed: BSS at 0x%08x+0x%x not zeroed (%u/%u zero, last 0x%08x)\n",
+			 dst, len, zero, checked, got);
 }
 
 
@@ -2806,7 +3328,8 @@ send:
 		 * Host cal source ≠ controller address.
 		 * 2D640 ARM → dest = fw_dest + offset (OSOS fw_dest=0).
 		 * 2D7A4 cal → dest = 0x00400200 + offset.
-		 * EXEC 0x00100018 is mapped app PC — not upload dest.
+		 * 2D54C writes 1 to controller register 0x10001800 and
+		 * uploads nothing.
 		 */
 		cal = grape_load_cal_window(n, win);
 		if (cal < 0) {
@@ -2831,6 +3354,47 @@ send:
 		grape_vinfo(n,
 			 "expect CAL prefix: 18 e1 30 01 00 80 02 00 00 40 00 c2\n");
 
+		/*
+		 * Does the part check what it was given?
+		 *
+		 * Everything the bring-up sends is acknowledged -- every DATA
+		 * chunk with 0x4BC1, the four register writes with 0x4AD1,
+		 * the 1F 01 finalise with 0x4969, the 1D 53 store with
+		 * 0x4AD1 -- and then nothing executes. One explanation fits
+		 * all of that at once: the ROM validates the image, rejects
+		 * it, and declines to start it. sub_2D5B0 reads a status
+		 * after 1F 01 and throws the value away, so stock would never
+		 * notice; 0x4969 would just be what a good image scores.
+		 *
+		 * The way to find out is to change the image and watch that
+		 * status. Corrupting the source before the frame is built
+		 * keeps every transport checksum correct -- sub_3B9D0
+		 * computes the per-chunk sums over whatever it is handed --
+		 * so the part still receives a well-formed download whose
+		 * *content* differs by one word. If 0x4969 moves, the ROM is
+		 * checking; if it does not, it is not, and image validity is
+		 * off the table for good.
+		 *
+		 * Off by default. This deliberately uploads a broken image.
+		 */
+		if (corrupt_word_at != ~0u && corrupt_word_at + 4 <= dl_len) {
+			u8 *bad = kmemdup(dl_body, dl_len, GFP_KERNEL);
+
+			if (bad) {
+				u32 was = get_unaligned_le32(bad +
+							     corrupt_word_at);
+
+				put_unaligned_le32(was ^ 0xffffffffu,
+						   bad + corrupt_word_at);
+				dev_info(&n->spi->dev,
+					 "corrupt_word_at 0x%x: 0x%08x -> 0x%08x (chunk sums stay valid)\n",
+					 corrupt_word_at, was, was ^ 0xffffffffu);
+				kfree(z2_prep);
+				z2_prep = bad;
+				dl_body = bad;
+			}
+		}
+
 		/* 20E94: 273A0 up to 3 times, no 1A878 between. */
 		for (try = 0; try < 3; try++) {
 			ret = grape_send_blob(n, dl_body, dl_len, fw_dest);
@@ -2854,6 +3418,8 @@ send:
 			grape_vinfo(n,
 				 "2D7A4 512B cal @0x%08x ACK (transport only)\n",
 				 GRAPE_CAL_DEST);
+			grape_vinfo(n, "attn after cal: %d\n",
+				 n->attn ? gpiod_get_value_cansleep(n->attn) : -1);
 			grape_cal_readback(n, win);
 			ret = grape_post_download(n);
 			if (ret) {
@@ -2866,6 +3432,7 @@ send:
 				grape_vinfo(n,
 					 "2D54C EXEC sent (try %d) — await runtime ping\n",
 					 try);
+				grape_report_app_start(n, dl_body, dl_len);
 				break;
 			}
 			dev_warn(&n->spi->dev, "2D54C try %d: %d\n", try, ret);
@@ -2901,28 +3468,69 @@ static int grape_ping(struct grape *n, u16 *status_out)
 		if (ret)
 			return ret;
 
+		memcpy(n->ping_rx, rx, GRAPE_FRAME_LEN);
 		rx_csum = get_unaligned_le16(rx + 14);
 		if (!rx_csum && !grape_sum16(rx, 14)) {
-			dev_warn(&n->spi->dev, "ping rx all-zero (MISO dead)\n");
+			/* An idle application answers this way; not MISO dead. */
+			grape_vinfo(n, "ping rx all-zero (nothing pending)\n");
 			return -EIO;
 		}
 		if (grape_sum16(rx, 14) == rx_csum)
 			break;
-		/* One dump per call; MultitouchTask rate-limits via ping_fails. */
-		if (tries == 0 && n->ping_fails == 0)
+		/*
+		 * Once per probe, not once per call.
+		 *
+		 * The guard used to be ping_fails == 0, which stays true for
+		 * the whole of the probe loop because nothing increments it
+		 * until grape_service runs. Measured 2026-09-07: this fired
+		 * every ~75 ms for the length of the boot. At 115200 a
+		 * sixteen-byte dump is milliseconds of console lock each
+		 * time, which is what the init script means by "touch
+		 * skipped ... it floods the console", and it takes the
+		 * console and the network down with it.
+		 */
+		if (tries == 0 && !n->csum_reported) {
+			n->csum_reported = true;
 			dev_warn(&n->spi->dev,
 				 "ping csum fail rx %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
 				 rx[0], rx[1], rx[2], rx[3], rx[4],
 				 rx[5], rx[6], rx[7], rx[8], rx[9],
 				 rx[10], rx[11], rx[12], rx[13],
 				 rx[14], rx[15]);
+		}
 		{
 			u16 w0 = get_unaligned_be16(rx);
 
-			if (grape_status_is_bootloader(w0))
+			/*
+			 * Once per call and rate-limited, not once per retry.
+			 *
+			 * This fired on all six retries of every ping, and the
+			 * ping is polled continuously. At 115200 with a
+			 * synchronous console each ~110-character line costs
+			 * about 10 ms, so six per ping is more than the poll
+			 * interval and the CPU never leaves printk -- the box
+			 * wedges with the network still answering from
+			 * interrupt context. It is the same starvation that
+			 * cost a day of phantom audio underruns; the fix is
+			 * the same one.
+			 */
+			if (tries == 0 && grape_status_is_bootloader(w0) &&
+			    !n->ping_reported) {
+				n->ping_reported = true;
 				dev_warn(&n->spi->dev,
-					 "bootloader status 0x%04x: answering 0x4F81, which is not a word sub_2C87E accepts\n",
-					 w0);
+					 "ping got 0x%04x%s [rx %s short=%u status=0x%08x wait=0x%08x lvl(wait) classic=%u ros=%u]\n",
+					 w0,
+					 w0 == 0x4f81 ?
+					 " (EA 01 not recognised: unknown opcode or bad sum -- says a responder answered, not which one)" :
+					 w0 == 0x4879 ?
+					 " (an empty RX FIFO also reads out as 0x4879 on this block)" :
+					 " (a known protocol word)",
+					 n->poll_rx_valid ? "measured" : "unmeasured",
+					 n->poll_rx_short, n->poll_rx_status,
+					 n->poll_rx_wait_status,
+					 (n->poll_rx_wait_status & 0x3e00u) >> 9,
+					 (n->poll_rx_wait_status & 0xf800u) >> 11);
+			}
 		}
 		if (tries == 5)
 			return -EIO;
@@ -3026,8 +3634,8 @@ static void grape_parse_D(struct grape *n, const u8 *payload, unsigned int len)
 		if (st1) {
 			input_report_abs(n->input, ABS_MT_POSITION_X, x);
 			input_report_abs(n->input, ABS_MT_POSITION_Y, y);
-			pr_warn_ratelimited(
-				"grape touch slot%d id=%u s1=%u s2=%u raw=%d,%d -> %d,%d\n",
+			grape_vinfo(n,
+				"touch slot%d id=%u s1=%u s2=%u raw=%d,%d -> %d,%d\n",
 				slot, id, st1, st2, rawx, rawy, x, y);
 		}
 		rec += stride;
@@ -3150,6 +3758,79 @@ out:
  * did from the ATTN path with a hardcoded zero, puts a frame on the bus
  * that stock would never send.
  */
+/*
+ * One bounded experiment, run once when the runtime ping first fails.
+ *
+ * Whether the application is running has been argued from replies that
+ * only say a responder answered and did not like what it was sent. The
+ * two standing explanations -- that the frame goes out byte-swapped, and
+ * that the link runs at the wrong rate once the bootloader hands over --
+ * are both cheap to test, so test them rather than argue about them.
+ *
+ * Each row sends one 16-byte frame and prints the first four bytes that
+ * come back. sub_182590's own frame is row 0, so anything differing from
+ * row 0 is a difference the part made, not one this driver made.
+ *
+ * SPICLKDIV is read back rather than assumed and restored at the end, so
+ * a row that fails part-way cannot leave the port retuned.
+ */
+static void grape_ping_sweep(struct grape *n)
+{
+	static const struct {
+		const char *what;
+		u8 b0, b1;
+	} frames[] = {
+		{ "182590 EA 01 (stock)", 0xea, 0x01 },
+		{ "byte-swapped 01 EA",   0x01, 0xea },
+		{ "apple_z2 EB 01",       0xeb, 0x01 },
+		{ "apple_z2 EB 02",       0xeb, 0x02 },
+	};
+	static const u32 divs[] = { 1, 2, 4, 8, 16 };
+	u8 tx[GRAPE_FRAME_LEN], rx[GRAPE_FRAME_LEN];
+	u32 saved_div;
+	unsigned int i, d;
+	u16 sum;
+
+	if (!n->spi2)
+		return;
+	saved_div = readl(n->spi2 + SPI2_CLKDIV);
+
+	for (i = 0; i < ARRAY_SIZE(frames); i++) {
+		memset(tx, 0, sizeof(tx));
+		tx[0] = frames[i].b0;
+		tx[1] = frames[i].b1;
+		sum = grape_sum16(tx, 14);
+		put_unaligned_le16(sum, tx + 14);
+
+		memset(rx, 0, sizeof(rx));
+		if (grape_burst16(n, tx, rx))
+			continue;
+		dev_warn(&n->spi->dev,
+			 "sweep clkdiv=%u %-22s -> %02x %02x %02x %02x\n",
+			 saved_div, frames[i].what, rx[0], rx[1], rx[2], rx[3]);
+	}
+
+	memset(tx, 0, sizeof(tx));
+	tx[0] = 0xea;
+	tx[1] = 0x01;
+	sum = grape_sum16(tx, 14);
+	put_unaligned_le16(sum, tx + 14);
+
+	for (d = 0; d < ARRAY_SIZE(divs); d++) {
+		if (divs[d] == saved_div)
+			continue;
+		writel(divs[d], n->spi2 + SPI2_CLKDIV);
+		memset(rx, 0, sizeof(rx));
+		if (!grape_burst16(n, tx, rx))
+			dev_warn(&n->spi->dev,
+				 "sweep clkdiv=%-2u 182590 EA 01 (stock)    -> %02x %02x %02x %02x\n",
+				 divs[d], rx[0], rx[1], rx[2], rx[3]);
+	}
+	writel(saved_div, n->spi2 + SPI2_CLKDIV);
+	dev_warn(&n->spi->dev, "sweep done; SPICLKDIV restored to %u\n",
+		 saved_div);
+}
+
 static int grape_service_once(struct grape *n, unsigned int retries)
 {
 	u16 pending = 0;
@@ -3210,8 +3891,6 @@ static void grape_gpio_bringup(struct grape *n)
 {
 	int rail;
 
-	grape_clkcon_replay(n);
-
 	/* GPIOCMD only — gpiod set_value fights polarity on RST. */
 	grape_gpiocmd_mode(n, GRAPE_GPIO_RST, 1, 0);
 	msleep(5);
@@ -3223,7 +3902,21 @@ static void grape_gpio_bringup(struct grape *n)
 	if (rail)
 		dev_warn(&n->spi->dev, "20766 PMIC rail: %d\n", rail);
 	else {
-		/* 66A8(8) is 345D40 thunk (0x220002B2), not an 8ms sleep */
+		/*
+		 * sub_20766 writes PMU_GPIO_8 here -- PMIC register 0x51,
+		 * 0x51 on -- between the rail and the 3 ms. It is what makes
+		 * the ROM hand over to the application after the store: with
+		 * 0x11 the part stays in HBPP forever, with 0x51 set before
+		 * the reset release the download still works and the exec
+		 * starts the application (2026-09-07, first touch reports).
+		 *
+		 * The 2026-09-06 lockup blamed on this write was the ATTN
+		 * level interrupt storming once the application asserted the
+		 * line; that is fixed in grape_irq_thread().
+		 */
+		rail = d1830_touch_gpio8(true);
+		if (rail)
+			dev_warn(&n->spi->dev, "20766 PMU_GPIO_8 on: %d\n", rail);
 		msleep(3);
 	}
 	/* 20766(1): EN mode 0, val 0. Do not cmd-15 the latch. */
@@ -3287,6 +3980,27 @@ static int grape_1a5ac_and_download(struct grape *n, const u8 *data,
 		return -EIO;
 	}
 	/*
+	 * sub_20E94 reads PMIC 0x51 here -- after the 26494 probe and before
+	 * the 273A0 loop -- and throws the value away.
+	 *
+	 * Hand-disassembling 0x20E94 puts it exactly between those two calls.
+	 * That is not where this driver had it: it ran once before the whole
+	 * bring-up, so the part saw the read at a different point in the
+	 * sequence than stock's does. A register read is still a bus
+	 * transaction, and this one is on the same PMU_GPIO_8 that the touch
+	 * power path writes.
+	 */
+	{
+		int (*pmic_read)(void);
+
+		pmic_read = (int (*)(void))
+			__symbol_get("d1830_touch_bringup_read");
+		if (pmic_read) {
+			pmic_read();
+			__symbol_put("d1830_touch_bringup_read");
+		}
+	}
+	/*
 	 * Retry the transfer before escalating. The caller's retry re-runs the
 	 * whole rail/reset/HBPP bring-up, which is a lot of disruption for what
 	 * is usually a transient bus error; the stock code retries just this.
@@ -3299,6 +4013,8 @@ static int grape_1a5ac_and_download(struct grape *n, const u8 *data,
 			 tag, attempt + 1, err);
 	}
 	n->fw_tried = true;
+	grape_vinfo(n, "attn after download (%d): %d\n", err,
+		 n->attn ? gpiod_get_value_cansleep(n->attn) : -1);
 	return err;
 }
 
@@ -3517,7 +4233,7 @@ static int grape_service(struct grape *n)
 
 	n->ping_fails++;
 	if (n->ping_fails <= 3 || n->ping_fails == 10)
-		dev_info(&n->spi->dev,
+		grape_vinfo(n,
 			 "188FFC failed (%d), attempt %u, attn=%d\n",
 			 ret, n->ping_fails,
 			 n->attn ? gpiod_get_value_cansleep(n->attn) : -1);
@@ -3531,19 +4247,49 @@ static irqreturn_t grape_irq_thread(int irq, void *data)
 
 	WRITE_ONCE(n->irq_count, n->irq_count + 1);
 	mutex_lock(&n->lock);
-	if (!n->stopped) {
-		if (grape_service(n))
+	if (n->stopped) {
+		/*
+		 * Parked or going away: nothing here will clear ATTN, and
+		 * this is a level line the part holds low. Returning with it
+		 * asserted re-fires it at thread round-trip speed -- 22.9
+		 * million interrupts on 2026-09-07, RNDIS starved dead. Mask
+		 * it; attn_rearm brings it back.
+		 */
+		if (!n->irq_masked) {
+			n->irq_masked = true;
+			mask = true;
+		}
+	} else {
+		if (grape_service(n)) {
 			n->irq_fails++;
-		else
+			/*
+			 * ATTN fired and the service did not decode it. Show
+			 * the bytes rather than a verdict: the part raised
+			 * this line itself, so what it clocks back here is
+			 * the one piece of evidence that does not depend on
+			 * guessing which protocol is answering.
+			 */
+			if (attn_read && n->attn_probe_left) {
+				n->attn_probe_left--;
+				dev_warn(&n->spi->dev,
+					 "ATTN #%u service failed; part sent %16ph\n",
+					 READ_ONCE(n->irq_count), n->ping_rx);
+			}
+		} else {
 			n->irq_fails = 0;
+		}
 
 		/*
-		 * Re-arm ATN after every service. The stock ATN thread at
-		 * EA 0x000F1B74 calls sub_20490(1) at 0x000F1BAE on each
-		 * pass round its loop; this driver armed once in probe and
-		 * never again.
+		 * Stock's ATN thread (EA 0x000F1B74) re-arms with sub_20490(1)
+		 * on every pass. Under Linux that re-arm is IRQF_ONESHOT's
+		 * unmask when this thread returns. Doing it here as well --
+		 * writing INTEN back on while genirq still holds the line
+		 * masked for this thread -- let a level line the ROM holds
+		 * low re-enter handle_level_irq with the thread already
+		 * running: "irq 81: nobody cared", the line disabled by the
+		 * kernel, and RNDIS dead with it (2026-09-07, three boots).
+		 * So no re-arm from inside the handler.
 		 */
-		grape_irq_enable(n);
 	}
 	/*
 	 * ATTN is only released when a report is actually read, so a
@@ -3642,14 +4388,19 @@ static int grape_poll_thread(void *data)
 		if (do_poll && n->use_irq) {
 			unsigned int c = READ_ONCE(n->irq_count);
 
-			if (c != n->irq_seen) {
-				n->irq_seen = c;
-				do_poll = false;
-			}
+			/*
+			 * IRQ-driven: never ping an idle application. Stock's
+			 * task only asks for the pending count on ATTN; a ping
+			 * with nothing pending comes back all-zero, and ten of
+			 * those used to be taken as a dead part and re-download
+			 * over a running one (2026-09-07).
+			 */
+			n->irq_seen = c;
+			do_poll = false;
 		}
 		if (do_poll) {
 			grape_service(n);
-			if (n->ping_fails >= 10)
+			if (n->ping_fails >= 10 && !no_recycle)
 				grape_recycle(n);
 			fail_backoff_ms = n->spi_ok ? 50 :
 				min(fail_backoff_ms * 2, 2000);
@@ -3976,6 +4727,7 @@ static int grape_probe(struct spi_device *spi)
 	if (!n)
 		return -ENOMEM;
 	n->spi = spi;
+	n->attn_probe_left = 8;
 	/*
 	 * 8-bit only. This used to arm a 16-bit blob transport.
 	 *
@@ -4045,22 +4797,6 @@ static int grape_probe(struct spi_device *spi)
 		 * only after a failed 1A5AC, max 3. remove() already
 		 * 1A878s on reload.
 		 */
-		/*
-		 * sub_20E94 reads PMIC 0x51 here, between the 26494 probe and
-		 * the download loop, and discards the value. Do the same: the
-		 * read itself may be the point.
-		 */
-		{
-			int (*pmic_read)(void);
-
-			pmic_read = (int (*)(void))
-				__symbol_get("d1830_touch_bringup_read");
-			if (pmic_read) {
-				pmic_read();
-				__symbol_put("d1830_touch_bringup_read");
-			}
-		}
-
 		for (attempt = 0; attempt < 3; attempt++) {
 			if (attempt) {
 				grape_power_down(n);
@@ -4091,6 +4827,40 @@ static int grape_probe(struct spi_device *spi)
 				 */
 				if (!n->exec_sent)
 					msleep(2);
+				/*
+				 * Stock does not ping here at all: after the 40 ms
+				 * settle it arms ATTN and waits for the application
+				 * to assert it. This driver's ping 65 ms after the
+				 * store landed inside the application's own start-up
+				 * on 2026-09-07 -- it answered "ready", released ATTN,
+				 * and was silent 60 ms later. exec_wait_ms lets the
+				 * first ping be held off past that.
+				 */
+				if (n->exec_sent && n->attn) {
+					unsigned int waited = 0;
+
+					/*
+					 * The application pulses ATTN on its own
+					 * once it is up (~2.3 s after the store on
+					 * 2026-09-07); the first ping then carries a
+					 * pending count. Wait for that rather than
+					 * ping into its start-up.
+					 */
+					while (waited < exec_wait_ms &&
+					       !gpiod_get_value_cansleep(n->attn)) {
+						msleep(10);
+						waited += 10;
+					}
+					/*
+					 * The ROM holds ATTN low all through HBPP, so
+					 * this usually returns at once; it only waits
+					 * if the line was released across the exec.
+					 */
+					grape_vinfo(n,
+						 "ATTN %s %u ms after exec\n",
+						 gpiod_get_value_cansleep(n->attn) ?
+						 "asserted" : "still released", waited);
+				}
 				err = grape_ping(n, &ping_st);
 				if (!err) {
 					n->spi_ok = true;
@@ -4103,6 +4873,10 @@ static int grape_probe(struct spi_device *spi)
 					dev_warn(&spi->dev,
 						 "runtime ping fail attempt %d (exec_sent=%d)\n",
 						 attempt, n->exec_sent);
+					if (!n->swept) {
+						n->swept = true;
+						grape_ping_sweep(n);
+					}
 					grape_peek(n, "post-go-fail");
 					/* Diagnostics only after runtime fail. */
 					if (grape_status_poll(n, &st) == 0)
@@ -4147,14 +4921,26 @@ static int grape_probe(struct spi_device *spi)
 		return -ENOMEM;
 	}
 	n->input = input;
-	input->name = "Apple Grape";
+	/* "Touch" in the name: Radio+'s find_touch() matches on it. */
+	input->name = "Apple Grape Touchscreen";
 	input->phys = "grape/input0";
 	input->id.bustype = BUS_SPI;
 	__set_bit(INPUT_PROP_DIRECT, input->propbit);
 	__set_bit(BTN_TOUCH, input->keybit);
 	input_set_abs_params(input, ABS_MT_POSITION_X, 0, GRAPE_ABS_X_MAX, 0, 0);
 	input_set_abs_params(input, ABS_MT_POSITION_Y, 0, GRAPE_ABS_Y_MAX, 0, 0);
-	err = input_mt_init_slots(input, GRAPE_SLOTS, INPUT_MT_DIRECT);
+	/*
+	 * Slots are keyed by the part's contact id (input_mt_get_slot_by_key),
+	 * and a lifted finger simply stops appearing in the report. Without
+	 * INPUT_MT_DROP_UNUSED its slot stayed active for ever, so the MT
+	 * core's pointer emulation kept BTN_TOUCH at 1 and ABS_X/Y parked on
+	 * the stale slot: evdev consumers that read ABS_X/ABS_Y and BTN_TOUCH
+	 * (LVGL among them) saw a device that never pressed or moved
+	 * (2026-09-07). The drop on input_mt_sync_frame() is what the comment
+	 * at the sync call always assumed.
+	 */
+	err = input_mt_init_slots(input, GRAPE_SLOTS,
+				  INPUT_MT_DIRECT | INPUT_MT_DROP_UNUSED);
 	if (err) {
 		grape_touch_cal_sysfs_remove(n);
 		return err;
@@ -4165,8 +4951,50 @@ static int grape_probe(struct spi_device *spi)
 		return err;
 	}
 
-	if (n->cal_uploaded && n->exec_sent &&
-	    (n->runtime_ready || !require_runtime)) {
+	/*
+	 * Arm ATTN only once the controller has actually answered a runtime
+	 * ping, whatever require_runtime says about the upload retry policy.
+	 *
+	 * Those are different decisions and only one of them is stock. The
+	 * comment below is right that sub_1A5AC arms ATN after sub_20E94
+	 * reports success -- so a controller still sitting in its bootloader
+	 * should not have the line armed at all. Arming it anyway is what
+	 * takes the machine down: the controller holds ATTN asserted because
+	 * nothing ever reads a report, every service fails, and the EIC keeps
+	 * re-dispatching a level line that no handler can quiet. The CPU then
+	 * lives in eic_chained_handler until the kernel gives up and prints
+	 * "irq 81: nobody cared". Measured 2026-09-06, with audio playing:
+	 * the radio broke up, ssh stopped answering, and the way back was a
+	 * button-hold into DFU.
+	 *
+	 * Without the interrupt the driver still registers its input device
+	 * and falls back to polling ATTN, so a Grape that does come up later
+	 * is not locked out -- and one that never does costs nothing.
+	 */
+	/*
+	 * Stock's gate is the download's own return value and nothing else:
+	 *
+	 *	v3 = sub_20E94();
+	 *	byte_89144D5 = v3;
+	 *	if (v3) { sub_20490(1); return 0; }
+	 *	return 20;
+	 *
+	 * sub_20E94 reports the transport result -- chunks ACKed, calibration
+	 * accepted -- and sub_20490(1) arms ATTN on that alone. Nothing in
+	 * RetailOS pings the application before arming the line, and 1.1.2's
+	 * sub_801937C is the same code.
+	 *
+	 * runtime_ready used to be in this condition, while the comment below
+	 * claimed it was not part of the verdict. The comment was right about
+	 * what should happen and the code did the other thing, so a part whose
+	 * download had fully succeeded was parked without ever arming the
+	 * interrupt stock arms at exactly this point. A ping that fails proves
+	 * nothing on its own -- 0x4879 has already had two different readings
+	 * in this driver -- and gating the input path on it means a running
+	 * application can never announce itself, because ATTN is the only way
+	 * it ever would.
+	 */
+	if (n->cal_uploaded && n->exec_sent) {
 			/*
 		 * sub_1A5AC arms ATN (sub_20490) only after sub_20E94
 		 * reports success. Done here, with the input device already
@@ -4196,8 +5024,15 @@ static int grape_probe(struct spi_device *spi)
 			}
 		}
 	} else {
+		/*
+		 * Now reached only when the transport itself failed, which is
+		 * the same thing sub_20E94 returning zero means. runtime= is
+		 * printed for the record and is not part of the verdict: a
+		 * ping can only succeed once the application is running, so
+		 * it is downstream of everything above it.
+		 */
 		dev_err(&spi->dev,
-			"Grape boot failed: cal=%d exec=%d runtime=%d; not registering input\n",
+			"Grape download failed: cal=%d exec=%d; ATTN not armed (runtime=%d is downstream, not a cause)\n",
 			n->cal_uploaded, n->exec_sent, n->runtime_ready);
 		if (!n->parked)
 			grape_park(n, "boot incomplete");
@@ -4219,8 +5054,11 @@ static int grape_probe(struct spi_device *spi)
 		n->thread = NULL;
 	}
 
-	dev_info(&spi->dev, "Grape up (attn=%d runtime=%d)\n",
-		 !!n->attn, n->runtime_ready);
+	dev_info(&spi->dev,
+		 "Grape touch up: application %s, ATTN %s, input \"Apple Grape Touchscreen\" %ux%u\n",
+		 n->runtime_ready ? "running" : "NOT running",
+		 n->use_irq ? "interrupt-driven" : "polled",
+		 GRAPE_ABS_X_MAX + 1, GRAPE_ABS_Y_MAX + 1);
 	return 0;
 }
 
@@ -4262,7 +5100,6 @@ static void grape_remove(struct spi_device *spi)
 	 * were never registered rather than registered twice.
 	 */
 	sysfs_remove_groups(&spi->dev.kobj, grape_groups);
-	grape_clkcon_restore();
 	grape_power_down(n);
 }
 
@@ -4272,11 +5109,19 @@ static const struct of_device_id grape_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, grape_of_match);
 
+/* The SPI core warns at every load without one of these. */
+static const struct spi_device_id grape_spi_ids[] = {
+	{ "grape", 0 },
+	{ }
+};
+MODULE_DEVICE_TABLE(spi, grape_spi_ids);
+
 static struct spi_driver grape_driver = {
 	.driver = {
 		.name = "apple-grape",
 		.of_match_table = grape_of_match,
 	},
+	.id_table = grape_spi_ids,
 	.probe = grape_probe,
 	.remove = grape_remove,
 	.shutdown = grape_shutdown,

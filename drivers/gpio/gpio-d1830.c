@@ -32,6 +32,7 @@
 #include <linux/io.h>
 #include <linux/irq.h>
 #include <linux/jiffies.h>
+#include <linux/mutex.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_irq.h>
@@ -302,6 +303,18 @@ MODULE_PARM_DESC(ack_events,
 		 "Write back the PMIC event latches to release nIRQ");
 
 /*
+ * Report a button only when the PMIC latched an event for it.
+ *
+ * Off restores the previous behaviour, which reported on any observed change in
+ * the status registers. That is not what stock does and it is how a disturbed
+ * I2C byte became a press: it is kept solely so one flash can compare the two.
+ */
+static bool btn_event_gate = true;
+module_param(btn_event_gate, bool, 0644);
+MODULE_PARM_DESC(btn_event_gate,
+		 "Only report a key when its PMIC event latch fired (default Y)");
+
+/*
  * Polled by default. The PMIC nIRQ reaches the EIC, but the EIC's level
  * behaviour is not yet pinned down, so this is what makes Home, Play and
  * Sleep work today. 100 ms is well inside a keypress.
@@ -352,6 +365,8 @@ struct d1830_gpio {
 	u8 sleep_hold;
 	int last_r5, last_r6, last_r7, last_r8;
 	bool keys_inited;
+	/* Serialises d1830_btn_poll_once(); see the comment there. */
+	struct mutex btn_lock;
 	/* Event-register reads serviced, for the input diagnostics. */
 	unsigned int irq_events;
 	bool lsb_logged;
@@ -1072,28 +1087,69 @@ static ssize_t buttons_show(struct device *dev, struct device_attribute *a,
 }
 static DEVICE_ATTR_RO(buttons);
 
-static void d1830_ack_events(struct i2c_client *client,
-			     int r5, int r6, int r7, int r8)
+/*
+ * The PMIC event latches are registers 1-4, not 5-8.
+ *
+ * sub_1485F8 (0x1485F8) is stock's read-and-clear: register 1 is read with
+ * sub_41286E and the same byte written straight back with sub_4118BC, then the
+ * same for 2, 3 and 4. sub_16CA5E (0x16CA5E) concatenates the four bytes into
+ * one word -- reg1 in bits 0-7, reg2 in 8-15, reg3 in 16-23, reg4 in 24-31.
+ *
+ * Registers 5-8 are the live status registers: sub_26520 (0x26520) reads them
+ * and never writes them, and sub_4118BC is called with a register number of
+ * 5, 6, 7 or 8 nowhere in the image. Registers 9-12 are the masks, which
+ * sub_174288 (0x174288) writes and d1830_osos_nirq_mask() already matches.
+ *
+ * This used to write 1-bits into the status registers and leave every latch
+ * set. An uncleared latch holds nIRQ asserted, which is why GPIO 86 produces
+ * one doorbell edge per boot and then nothing, and why the 100 ms poll had to
+ * carry the whole button path.
+ */
+static u32 d1830_ack_events(struct i2c_client *client)
 {
-	static const u8 regs[] = { 5, 6, 7, 8 };
-	int vals[4] = { r5, r6, r7, r8 };
+	static const u8 regs[] = { 1, 2, 3, 4 };
+	u32 word = 0;
 	unsigned int i;
+	int v;
 
 	for (i = 0; i < ARRAY_SIZE(regs); i++) {
-		if (vals[i] <= 0)
+		v = i2c_smbus_read_byte_data(client, regs[i]);
+		if (v <= 0)
 			continue;
-		if (i2c_smbus_write_byte_data(client, regs[i], (u8)vals[i]))
+		word |= (u32)(u8)v << (8 * i);
+		if (i2c_smbus_write_byte_data(client, regs[i], (u8)v))
 			dev_warn_ratelimited(&client->dev,
 					     "event ack r%u=0x%02x failed\n",
-					     regs[i], vals[i]);
+					     regs[i], v);
 	}
+	return word;
 }
 
-static void d1830_btn_poll_once(struct d1830_gpio *gpio_dev)
+/*
+ * Which latch bit belongs to which button, and where its level is read. All of
+ * it from sub_FF9C8 (0xFF9C8), the dispatcher sub_EFBB4 (0xEFBB4) drives off
+ * the nIRQ, via sub_4F83EE's (0x4F83EE) renumbering:
+ *
+ *	reg 3 bit 0 -> logical 0x20000 -> sub_3B3100(14) = r7 b4
+ *	reg 3 bit 1 -> logical 0x400   -> sub_3B3100(15) = r7 b5
+ *	reg 3 bit 3 -> logical 0x10000 -> sub_3B3100(10) = r8 b1
+ *
+ * with pressed = (level == 0) in all three cases. The registers and bits below
+ * were already right; the gate is what was missing. Stock never derives a press
+ * from a level it watched change -- it waits for the hardware to latch an event
+ * for that button and only then reads the level. A disturbed I2C byte cannot
+ * set a latch, so it cannot become a keypress.
+ */
+#define D1830_EVT_HOME		BIT(16)		/* reg 3 bit 0 */
+#define D1830_EVT_SLEEP		BIT(17)		/* reg 3 bit 1 */
+#define D1830_EVT_PLAY		BIT(19)		/* reg 3 bit 3 */
+
+static void d1830_btn_poll_locked(struct d1830_gpio *gpio_dev)
 {
 	struct i2c_client *client = gpio_dev->client;
 	int r5, r6, r7, r8;
 	u8 home, sleep, play;
+	u32 events;
 
 	r5 = i2c_smbus_read_byte_data(client, 5);
 	r6 = i2c_smbus_read_byte_data(client, 6);
@@ -1102,8 +1158,7 @@ static void d1830_btn_poll_once(struct d1830_gpio *gpio_dev)
 	if (r7 < 0)
 		return;
 
-	if (ack_events)
-		d1830_ack_events(client, r5, r6, r7, r8);
+	events = ack_events ? d1830_ack_events(client) : 0;
 	gpio_dev->irq_events++;
 
 	/* OSOS sub_26520: Home=r7b4, Sleep=r7b5, Play=r8b1. */
@@ -1140,12 +1195,33 @@ static void d1830_btn_poll_once(struct d1830_gpio *gpio_dev)
 		dev_dbg(&client->dev, "n31-pmic r8 0x%02x->0x%02x xor=0x%02x\n",
 			gpio_dev->last_r8, r8, gpio_dev->last_r8 ^ r8);
 
-	d1830_key_active_low(gpio_dev, KEY_HOMEPAGE, home,
-			     &gpio_dev->last_home, "HOME");
-	d1830_key_active_low(gpio_dev, KEY_PLAYPAUSE, play,
-			     &gpio_dev->last_play, "PLAY");
+	/*
+	 * btn_event_gate=0 falls back to the old level-watching poll, which is
+	 * what produced the reported phantom Play/Pause; it is kept only so one
+	 * flash can compare the two. The else arms keep the shadows current, so
+	 * turning the gate off does not then fire a stale edge.
+	 */
+	if (!btn_event_gate || (events & D1830_EVT_HOME))
+		d1830_key_active_low(gpio_dev, KEY_HOMEPAGE, home,
+				     &gpio_dev->last_home, "HOME");
+	else
+		gpio_dev->last_home = home;
+	if (!btn_event_gate || (events & D1830_EVT_PLAY))
+		d1830_key_active_low(gpio_dev, KEY_PLAYPAUSE, play,
+				     &gpio_dev->last_play, "PLAY");
+	else
+		gpio_dev->last_play = play;
 
-	if (!sleep) {
+	/*
+	 * Sleep gets the same gate. btn_confirm_ms below stays as the second
+	 * line of defence -- it was added after a measured phantom SLEEP during
+	 * a NAND CS storm, and power-watch turns one KEY_POWER into
+	 * reboot(RB_POWER_OFF), so this is the one key where two independent
+	 * checks are worth their cost.
+	 */
+	if (btn_event_gate && !(events & D1830_EVT_SLEEP)) {
+		gpio_dev->last_sleep = sleep;
+	} else if (!sleep) {
 		if (gpio_dev->last_sleep) {
 			/*
 			 * First low sample only arms the press. A real press easily
@@ -1216,6 +1292,20 @@ static void d1830_btn_poll_once(struct d1830_gpio *gpio_dev)
 	gpio_dev->last_r7 = r7;
 	if (r8 >= 0)
 		gpio_dev->last_r8 = r8;
+}
+
+/*
+ * Four callers reach the poll and all of them commit to the same shadows: the
+ * 200 ms trace work, the Sleep confirm work, the threaded nIRQ handler, and the
+ * GPIO-86 doorbell. Two interleaving can apply a stale sample after a fresh one
+ * and turn one physical press into press-release-press. All four are sleepable,
+ * so a mutex is the right primitive.
+ */
+static void d1830_btn_poll_once(struct d1830_gpio *gpio_dev)
+{
+	mutex_lock(&gpio_dev->btn_lock);
+	d1830_btn_poll_locked(gpio_dev);
+	mutex_unlock(&gpio_dev->btn_lock);
 }
 
 /* Split the silent-PMIC case: do r5-r8 bits move when Home/Play/Sleep
@@ -2269,20 +2359,34 @@ static char *pmu_variant = N31_PMU_VARIANT;
 module_param(pmu_variant, charp, 0444);
 MODULE_PARM_DESC(pmu_variant, "PMU register-map variant this driver decodes");
 
-static bool allow_pmu_writes;
-module_param(allow_pmu_writes, bool, 0644);
-MODULE_PARM_DESC(allow_pmu_writes,
-		 "Permit PMU rail writes at all (default N — decode only)");
-
+/*
+ * The PMU rails are writable.
+ *
+ * They were gated behind allow_pmu_writes, defaulting off, from when this driver
+ * was still decoding the register map and a wrong write could have been a
+ * hardware fault rather than a bug. The map is settled now -- every rail in
+ * n31_pmu_rails[] has its enable register, mask, base and step read out of the
+ * image -- and a regulator whose .disable returns -EPERM is not a regulator, it
+ * is a decode tool wearing the interface. Consumers cannot do power management
+ * through it, which is the only reason to register it.
+ *
+ * The two experiments below stay opt-in, because they are a different kind of
+ * thing: one replays the boot sequence and writes rails nothing asked for, the
+ * other drives a rail deliberately to see what happens.
+ *
+ * Voltage stays read-only regardless: n31_pmu_reg_ops has get_voltage and no
+ * set_voltage. Enable and disable are what stock does routinely, whereas a wrong
+ * voltage is the write that damages parts, and nothing here needs to make one.
+ */
 static bool apply_boot_rails;
 module_param(apply_boot_rails, bool, 0644);
 MODULE_PARM_DESC(apply_boot_rails,
-		 "Replay the boot rail sequence exactly (needs allow_pmu_writes)");
+		 "Replay the boot rail sequence exactly (writes rails nothing asked for)");
 
 static bool audio_rail_test;
 module_param(audio_rail_test, bool, 0644);
 MODULE_PARM_DESC(audio_rail_test,
-		 "Arm the analog rail experiment (needs allow_pmu_writes)");
+		 "Arm the analog rail experiment (drives a rail deliberately)");
 
 static bool restore_after_test = true;
 module_param(restore_after_test, bool, 0644);
@@ -2726,8 +2830,8 @@ static int n31_pmu_apply_bootseq_dryrun_show(struct seq_file *s, void *unused)
 {
 	int r10, r11, r13, r23, r0d, r29, r2a, r2b, r26, r30, r59;
 
-	seq_printf(s, "allow_pmu_writes=%d apply_boot_rails=%d (dry run only)\n\n",
-		   allow_pmu_writes, apply_boot_rails);
+	seq_printf(s, "apply_boot_rails=%d audio_rail_test=%d\n\n",
+		   apply_boot_rails, audio_rail_test);
 
 	r23 = n31_pmu_read(0x23);
 	r10 = n31_pmu_read(0x10);
@@ -3208,8 +3312,6 @@ static int n31_pmu_reg_enable(struct regulator_dev *rdev)
 {
 	unsigned int id = rdev_get_id(rdev);
 
-	if (!allow_pmu_writes)
-		return -EPERM;
 	return n31_pmu_rail_get(id);
 }
 
@@ -3217,8 +3319,6 @@ static int n31_pmu_reg_disable(struct regulator_dev *rdev)
 {
 	unsigned int id = rdev_get_id(rdev);
 
-	if (!allow_pmu_writes)
-		return -EPERM;
 	n31_pmu_rail_put(id);
 	return 0;
 }
@@ -3375,9 +3475,9 @@ static void n31_pmu_regulators_register(struct device *dev)
 			dev_info(dev, "bt rail exposed as a regulator\n");
 	}
 
-	dev_info(dev, "%u PMU rails exposed as regulators (writes %s)\n",
-		 (unsigned int)ARRAY_SIZE(n31_pmu_rails),
-		 allow_pmu_writes ? "allowed" : "blocked");
+	dev_info(dev,
+		 "%u PMU rails exposed as regulators (enable/disable live, voltage read-only)\n",
+		 (unsigned int)ARRAY_SIZE(n31_pmu_rails));
 }
 
 static void n31_pmu_debugfs_init(void)
@@ -3457,6 +3557,167 @@ static void d1830_log_audio_regs(struct i2c_client *client, const char *tag)
 static u8 d1830_bt_saved_a, d1830_bt_saved_b;
 static bool d1830_bt_saved;
 
+/*
+ * The backlight is the PMIC's white-LED driver, and it was never in the SoC.
+ *
+ *	0x25  WLED_ISET   LED current, 7 bits.
+ *
+ *	                  sub_A2650 reaches it two ways and they disagree about
+ *	                  the width. Its byte-at-a-time path writes
+ *	                  `sub_4118BC(a1, 37, v6 & 7, ...)`, three bits; its
+ *	                  fast path builds one 16-bit transaction whose value
+ *	                  byte is `(a2 >> 5) & 0x7F`, seven. Seven is the real
+ *	                  width: three was tried on hardware first and the panel
+ *	                  lit, but nowhere near as bright as stock, which is
+ *	                  exactly what capping a 7-bit current at 7 of 127 would
+ *	                  look like.
+ *	0x26  WLED_CTRL   sub_D438 does a read-modify-write of bit 0 alone:
+ *	                  `(a2 != 0) | old & 0xFE`. A boolean enable.
+ *
+ * Traced from the display power-on to be sure it is the panel's light and not
+ * some other LED:
+ *
+ *	sub_1C20   display power-on: LCDIF init (sub_2C64), then
+ *	sub_1D04     -> sub_4D08(0)
+ *	sub_4D08       -> sub_BA50(on)          -> sub_D438(0x26, on)
+ *	               -> sub_439B64(9, on)      power-domain resource 9
+ *	sub_5704F8 -> sub_4D08(on)               the runtime on/off path
+ *
+ * and sub_1C20 asserts pad 14 immediately afterwards, which is the ordering
+ * that made pad 14 look like the backlight enable on its own. It is not: pad 14
+ * and PMIC 0x26 bit 0 are asserted together, along with power domain 9.
+ *
+ * Why every earlier search missed it. All of them looked inside the SoC: six
+ * display MMIO ranges swept register by register at three brightness levels,
+ * 0x3E000008 read as a level when its 62 is a five-bit mask on a domain gate,
+ * and PMIC 0x2A, which is the charge-current ladder. The register is one the SoC
+ * cannot see.
+ *
+ * Two deliberate restrictions, because this drives a boost converter into LEDs
+ * and a wrong value there is a hardware fault rather than a bug:
+ *
+ * The code the bootloader leaves in 0x25 is the ceiling. Apple's own code chose
+ * it for this panel, so scaling down from it can only ask for less current than
+ * the hardware is already running. Nothing here can compute a larger code.
+ *
+ * And 0x26 is touched bit 0 only, by read-modify-write, exactly as sub_D438
+ * does. That is not merely caution about unknown bits: the upper half of this
+ * register is understood to configure the boost converter itself -- its current
+ * limit and its switching rate -- which is where a wrong value stops being a
+ * dark screen and starts being a damaged LED string. Stock sets bit 0 and
+ * preserves the other seven from that path, and so does this. Nothing here has
+ * any reason to reconfigure a converter the bootloader already set up.
+ *
+ * The 0x25 naming is not new, incidentally: this driver's own register table has
+ * carried PMU_WLED_ISET for it since before any of this, which is independent
+ * corroboration of what the register is.
+ *
+ * Not done here: power domain 9. sub_4D08 acquires it alongside the enable, and
+ * that domain is likely what actually sleeps the panel module rather than only
+ * its LEDs -- the 0x39700000 block, which our DTS currently hands entirely to
+ * the EIC node. Wiring it needs an owner for that page first.
+ */
+#define D1830_WLED_ISET		0x25
+#define D1830_WLED_ISET_MASK	0x7f
+#define D1830_WLED_CTRL		0x26
+#define D1830_WLED_CTRL_EN	0x01
+
+/*
+ * The current ceiling.
+ *
+ * This started as "whatever the bootloader left in 0x25", on the reasoning that
+ * Apple's own code chose it and scaling down from it can only ask for less. The
+ * first boot disproved the premise: the register reads **0** while the panel is
+ * lit, so the ceiling was zero and every level mapped to code 0. What worked was
+ * the enable bit, which is why on/off responded and graded brightness did not.
+ *
+ * The reason is the boot chain. Our U-Boot does not touch the white-LED driver
+ * at all -- board/apple/n31/n31-lcd.c only enables a power domain and the media
+ * gate -- so the state we inherit is whatever the Apple SEC bootloader, the one
+ * that draws the pink logo, happened to leave. That is not a calibrated
+ * brightness and must not be treated as one.
+ *
+ * So the ceiling is the field itself, 3 bits, and iset_max exists to cap it
+ * without a rebuild if a lower limit turns out to be wanted. The boost
+ * converter's own configuration in 0x26's upper bits is still never written, and
+ * that is what actually bounds the current the string can draw.
+ */
+static u8 d1830_wled_ceiling = D1830_WLED_ISET_MASK;
+static bool d1830_wled_probed;
+
+static unsigned int iset_max = D1830_WLED_ISET_MASK;
+module_param(iset_max, uint, 0644);
+MODULE_PARM_DESC(iset_max,
+		 "Cap the white-LED current code (0-127, default 127 = the full field)");
+
+/*
+ * Latch the bootloader's current once, on first use rather than at probe: this
+ * driver is a module loaded long after the panel is lit, so by the time anything
+ * asks, the register already holds a brightness that works.
+ */
+static int d1830_wled_snapshot(struct i2c_client *client)
+{
+	int iset, ctrl;
+
+	if (d1830_wled_probed)
+		return 0;
+	iset = i2c_smbus_read_byte_data(client, D1830_WLED_ISET);
+	if (iset < 0)
+		return iset;
+	ctrl = i2c_smbus_read_byte_data(client, D1830_WLED_CTRL);
+	d1830_wled_ceiling = (u8)min(iset_max, (unsigned int)D1830_WLED_ISET_MASK);
+	d1830_wled_probed = true;
+	dev_info(&client->dev,
+		 "wled: iset=%02x (current %u of %u) ctrl=%02x en=%d\n",
+		 iset, d1830_wled_ceiling, D1830_WLED_ISET_MASK,
+		 ctrl, ctrl < 0 ? -1 : !!(ctrl & D1830_WLED_CTRL_EN));
+	return 0;
+}
+
+/* level/max are the backlight class's scale. 0 disables the driver outright. */
+int d1830_wled_set(unsigned int level, unsigned int max)
+{
+	struct i2c_client *client = d1830_poweroff_client;
+	unsigned int code;
+	int ret;
+
+	if (!client)
+		return -ENODEV;
+	if (!max)
+		return -EINVAL;
+	ret = d1830_wled_snapshot(client);
+	if (ret)
+		return ret;
+	if (level > max)
+		level = max;
+
+	/* Rounded so the top of the range reaches the ceiling exactly. */
+	code = (level * d1830_wled_ceiling + max / 2) / max;
+	if (code > d1830_wled_ceiling)
+		code = d1830_wled_ceiling;
+
+	ret = d1830_rmw(client, D1830_WLED_ISET, D1830_WLED_ISET_MASK, (u8)code);
+	if (!ret)
+		ret = d1830_rmw(client, D1830_WLED_CTRL, D1830_WLED_CTRL_EN,
+				level ? D1830_WLED_CTRL_EN : 0);
+	d1830_vinfo(&client->dev, "wled level %u/%u -> iset %u en=%d ret=%d\n",
+		    level, max, code, !!level, ret);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(d1830_wled_set);
+
+int d1830_wled_get(void)
+{
+	struct i2c_client *client = d1830_poweroff_client;
+	int v;
+
+	if (!client)
+		return -ENODEV;
+	v = i2c_smbus_read_byte_data(client, D1830_WLED_ISET);
+	return v < 0 ? v : (v & D1830_WLED_ISET_MASK);
+}
+EXPORT_SYMBOL_GPL(d1830_wled_get);
+
 int d1830_bt_rails(bool on)
 {
 	struct i2c_client *client = d1830_poweroff_client;
@@ -3500,9 +3761,150 @@ int d1830_bt_rails(bool on)
 }
 EXPORT_SYMBOL_GPL(d1830_bt_rails);
 
+/*
+ * Register 0x2A is charge current. It is NOT panel brightness.
+ *
+ * This driver briefly wrote backlight levels here, on the strength of an
+ * analysis that found 0x2A was the only multi-bit magnitude any PMIC write
+ * in the image carries, that the SEC bootloader sets it to 20 of 63 right
+ * before LCD init, and that its writer sub_1758 "had no callers". The first
+ * two are true. The third was wrong, and it was the one holding the
+ * conclusion up.
+ *
+ * sub_1758 has a caller, and it is the charger:
+ *
+ *	0x4DB774  "ChargeMgmtTask"
+ *	0x4DB784  0x084F9C99          -> sub_4F9C98, the task entry
+ *
+ *	4f9cb8  bl 0x11930            ; battery voltage
+ *	4f9cc0  bl 0x516914           ; ADC channel 7 (thermistor)
+ *	4f9cfe  bl 0x1758             ; -> sub_1EB4 -> reg 0x2A
+ *
+ * The task buckets battery voltage against the ADC reading and picks one of
+ * {0, 52, 77, 103, 129, 154}, which sub_1EB4 converts with
+ * (v * 1000 + 4500) / 7681 into codes {0, 7, 10, 13, 17, 20}. That is a
+ * charge-current ladder of about 7.681 mA per code with a stock ceiling
+ * around 154 mA -- and it explains the bootloader's 20 as the starting
+ * current, not a starting brightness.
+ *
+ * So a backlight driver asking for "full brightness" here would have
+ * requested code 63, roughly 484 mA, against a part whose own firmware never
+ * goes above 20. The path is removed rather than clamped: this register does
+ * not belong to the display at all.
+ *
+ * Related: 0x29 bit 2 is the charge-policy enable (sub_2D58), and 0x28 bit 5
+ * is a rail enable (sub_7484). Treat the whole 0x28..0x2B group as charger
+ * territory until something proves otherwise.
+ *
+ * The real display-brightness applier is still unidentified. Do not wire
+ * anything to this register while looking for it.
+ */
+
+/*
+ * The line that actually starts the BCM2078.
+ *
+ * The Bluetooth bring-up does not release the part with a SoC pad. It
+ * pulses PMIC register 0x4B, and until now nothing in this driver wrote
+ * that register at all.
+ *
+ * The path was invisible in the decompiled export because it runs through
+ * an IRAM veneer with all seven arguments dropped. sub_345D40 tail-chains
+ * to 0x220002B2, and the IRAM module is memcpy(0x22000000, 0x08982B00,
+ * 0x3A60), so IRAM 0x2200xxxx reads at file offset 0x982B00 + (x -
+ * 0x22000000). What lives there is a small id-to-register map:
+ *
+ *	982de2  tbb  [pc, r1]		; r1 = id
+ *	982de6  .byte 31 08 0a 14 16 ...
+ *	982dfa  movs r1, #75		; id 2 -> register 0x4B
+ *	982dfc  bfi  r2, r4, #1, #31	; cfg = arg2
+ *	982e00  orr  r2, r2, r5, lsl #2	;     | arg3 << 1
+ *	982e04  orr  r2, r2, r3, lsl #3	;     | arg4 << 2
+ *	982e08  orr  r2, r2, r6, lsl #5	;     | (arg5 & 3) << 3
+ *					;     | (arg6 & 7) << 5
+ *	982e44  b.w  0x9839cc		; -> sub_4118BC(h, reg, cfg)
+ *
+ * and sub_4118BC is a two-byte {reg, val} write to slave 115 -- 0x73, the
+ * D1830. The ids the map covers are 1..15, registers 0x4A..0x56 plus
+ * 0x5C/0x5D, which is the PMIC's GPIO block.
+ *
+ * So the constants below are the literal bytes stock puts on the wire.
+ * They are transcribed rather than reconstructed from the bit fields on
+ * purpose: the sequence is proven by disassembly, the meaning of the
+ * individual bits is not, and this driver does not need the meaning.
+ *
+ *	sub_51681C	reg 0x52 = 0xEA
+ *			reg 0x56 = 0x49
+ *			10 ms
+ *			reg 0x4B = 0x09
+ *	sub_5169A8	reg 0x4B = 0x09
+ *			50 ms
+ *			reg 0x4B = 0x0B		<- the part starts here
+ *
+ * Two things establish 0x4B as the enable rather than a guess. It is
+ * written by exactly three functions image-wide and all three are
+ * Bluetooth; and sub_570040, which BluetoothOSBridgeInit calls between
+ * each of its three retries, is sub_516700(0), which is 0x4B = 0x09 on
+ * its own -- stock re-asserts this one line before every retry.
+ *
+ * This is separate from d1830_bt_rails() above. That is the LDO pair at
+ * registers 87/88; this is a GPIO-block output, and having the rails up
+ * has never been sufficient because the part was still held here.
+ */
+#define D1830_BT_ENABLE_REG	0x4b
+#define D1830_BT_PREP_REG_A	0x52
+#define D1830_BT_PREP_VAL_A	0xea
+#define D1830_BT_PREP_REG_B	0x56
+#define D1830_BT_PREP_VAL_B	0x49
+#define D1830_BT_ENABLE_HELD	0x09
+#define D1830_BT_ENABLE_RUN	0x0b
+
+int d1830_bt_enable(unsigned int step)
+{
+	struct i2c_client *client = d1830_poweroff_client;
+	int ret;
+
+	if (!client)
+		return -ENODEV;
+
+	switch (step) {
+	case D1830_BT_STEP_PREP:		/* sub_51681C */
+		ret = d1830_write8(client, D1830_BT_PREP_REG_A,
+				   D1830_BT_PREP_VAL_A);
+		if (!ret)
+			ret = d1830_write8(client, D1830_BT_PREP_REG_B,
+					   D1830_BT_PREP_VAL_B);
+		if (!ret) {
+			msleep(10);
+			ret = d1830_write8(client, D1830_BT_ENABLE_REG,
+					   D1830_BT_ENABLE_HELD);
+		}
+		break;
+	case D1830_BT_STEP_RELEASE:		/* sub_5169A8 */
+		ret = d1830_write8(client, D1830_BT_ENABLE_REG,
+				   D1830_BT_ENABLE_HELD);
+		if (!ret) {
+			msleep(50);
+			ret = d1830_write8(client, D1830_BT_ENABLE_REG,
+					   D1830_BT_ENABLE_RUN);
+		}
+		break;
+	case D1830_BT_STEP_HOLD:		/* sub_516700(0) */
+		ret = d1830_write8(client, D1830_BT_ENABLE_REG,
+				   D1830_BT_ENABLE_HELD);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	d1830_vinfo(&client->dev, "bt enable step %u ret=%d\n", step, ret);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(d1830_bt_enable);
+
 /* bcm2078-bt is built in and cannot link against this module, so it
  * publishes a hook and we fill it in. */
 void bcm2078_register_bt_rails(int (*fn)(bool on));
+void bcm2078_register_bt_enable(int (*fn)(unsigned int step));
 
 /*
  * Read PMIC register 0x51 during touch bring-up.
@@ -3559,6 +3961,67 @@ int d1830_grape_rail(bool on)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(d1830_grape_rail);
+
+/*
+ * The touch controller's second line: PMU_GPIO_8, register 0x51.
+ *
+ * sub_439B00(1, on) is not one operation. It is sub_6644(4, on), which is
+ * the rail above, and then sub_66A8(8), whose body the Hex-Rays export
+ * shows as a bare sub_345D40() with every argument dropped -- the same
+ * IRAM veneer that hid the BCM2078's enable line at register 0x4B. Read
+ * through it, sub_66A8's tail call is
+ *
+ *	r0 = handle  r1 = 8  r2 = 1  r3 = 0
+ *	[sp+0] = 0   [sp+4] = 2   [sp+8] = on ? 2 : 0
+ *
+ * and the veneer's id table sends id 8 to register 0x51 and packs the
+ * value as
+ *
+ *	bit 0    = arg3
+ *	bit 1    = arg4
+ *	bit 2    = arg5
+ *	bits 4:3 = arg6 & 3
+ *	bits 7:5 = arg7 & 7
+ *
+ * so on is 0x51 and off is 0x11. That packing is not a guess: it
+ * reproduces all three of the Bluetooth constants this driver already
+ * ships and has been running with -- 0x52 = 0xEA, 0x56 = 0x49 and
+ * 0x4B = 0x09 -- from their own call sites in sub_51681C.
+ *
+ * This unit boots at 0x11, the off value, and has never been given the
+ * other one, so apple-grape now writes it where sub_20766 does: after
+ * the rail, before that function's 3 ms, and the off value on the way
+ * down.
+ *
+ * Setting it by hand on a running device and re-running the touch
+ * bring-up makes the controller stop answering the bootstrap port. That
+ * is recorded because it is what happened, not because it decides
+ * anything: writing one register mid-flight lands the part in a state
+ * stock never occupies, so it is not evidence about a clean boot and
+ * must not be treated as any. The sequence is what gets tested, from
+ * reset, the way stock runs it.
+ */
+#define D1830_TOUCH_GPIO8_REG	0x51
+#define D1830_TOUCH_GPIO8_ON	0x51
+#define D1830_TOUCH_GPIO8_OFF	0x11
+
+int d1830_touch_gpio8(bool on)
+{
+	struct i2c_client *client = d1830_poweroff_client;
+	int before, ret;
+
+	if (!client)
+		return -ENODEV;
+	before = i2c_smbus_read_byte_data(client, D1830_TOUCH_GPIO8_REG);
+	ret = d1830_write8(client, D1830_TOUCH_GPIO8_REG,
+			   on ? D1830_TOUCH_GPIO8_ON : D1830_TOUCH_GPIO8_OFF);
+	dev_info(&client->dev,
+		 "n31-pmic: touch PMU_GPIO_8 0x51: 0x%02x -> 0x%02x ret=%d\n",
+		 before < 0 ? 0 : before,
+		 on ? D1830_TOUCH_GPIO8_ON : D1830_TOUCH_GPIO8_OFF, ret);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(d1830_touch_gpio8);
 
 /*
  * SEC sub_23EC trim — sibling LDOs used by analog HP.
@@ -4098,6 +4561,7 @@ static int d1830_gpio_probe(struct i2c_client *client)
 		return -ENOMEM;
 
 	gpio_dev->client = client;
+	mutex_init(&gpio_dev->btn_lock);
 	i2c_set_clientdata(client, gpio_dev);
 
 	ret = d1830_gpio_parse_dt(gpio_dev);
@@ -4112,6 +4576,15 @@ static int d1830_gpio_probe(struct i2c_client *client)
 	/* bcm2078-bt is built in; hand it our rail control now that we have
 	 * a client to talk to. */
 	bcm2078_register_bt_rails(d1830_bt_rails);
+	bcm2078_register_bt_enable(d1830_bt_enable);
+	/*
+	 * The backlight, same direction as the two above: backlight-s5l8740 is
+	 * built in and cannot reference this module, so it publishes the hook.
+	 * It replays a level requested before we arrived, which is the normal
+	 * case -- the class device exists from early boot and this module loads
+	 * at about t=7 s.
+	 */
+	n31_backlight_register_wled(d1830_wled_set);
 
 	/* Opt-in only. Default probe is GPIO + VBAT reads — no rail writes.
 	 * The old default seq wrote reg 13 = 0x01 (POWEROFF bit) at boot.
@@ -4390,6 +4863,7 @@ static void d1830_gpio_remove(struct i2c_client *client)
 	n31_pmu_debugfs_exit();
 	n31_pmu_rail_exit();
 	bcm2078_register_bt_rails(NULL);
+	bcm2078_register_bt_enable(NULL);
 	d1830_poweroff_client = NULL;
 }
 

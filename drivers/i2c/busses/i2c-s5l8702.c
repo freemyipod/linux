@@ -18,6 +18,7 @@
  * so DS stayed 0x31/0xe7. One IRQPEND per RX byte, then read DS.
  * SEC 4AC4 / Rockbox also treat INT 0x100 as byte-ready. Not PIO.
  */
+#include <linux/apple-n31.h>
 #include <linux/bitops.h>
 #include <linux/clk.h>
 #include <linux/completion.h>
@@ -52,10 +53,29 @@
 #define S5L8702_I2C_CON_ACKEN		BIT(7)
 #define S5L8702_I2C_CON_SEC_BIT8	BIT(8)
 
-#define S5L8702_I2C_CON_IDLE		(S5L8702_I2C_CON_SEC_BIT8 | \
+#define S5L8702_I2C_CON_IDLE_BASE	(S5L8702_I2C_CON_SEC_BIT8 | \
 					 S5L8702_I2C_CON_ACKEN | \
-					 S5L8702_I2C_CON_IRQEN | \
-					 S5L8702_I2C_CON_SCALE(1))	/* 0x1A1 */
+					 S5L8702_I2C_CON_IRQEN)		/* 0x1A0 */
+
+/*
+ * IICCON bits 3:0 are the SCL prescaler, and RetailOS moves them at runtime.
+ *
+ * sub_570590(bus, arg) picks 0x3C600000 for bus 0 and 0x3C900000 for bus 1,
+ * then does one read-modify-write of the register at offset 0 -- bic #0xf,
+ * orr (arg - 1) -- and nothing else. Its two callers are the FM power path:
+ * sub_15DD5C raises bus 1 to sub_570590(1, 7) when FM comes on and drops it
+ * back to sub_570590(1, 2) when FM goes off, both inside the same i2c lock
+ * (sub_40F13C / sub_40F142). So the field is 6 while FM is on and 1 the rest
+ * of the time, and 1 is what this driver has always used.
+ *
+ * These are the field values, not sub_570590's argument, because the field is
+ * what the hardware sees. Both live in apple-n31.h, because the caller that
+ * moves the field is the FM audio enable in another driver.
+ */
+
+#define S5L8702_I2C_CON_IDLE		(S5L8702_I2C_CON_IDLE_BASE | \
+					 S5L8702_I2C_CON_SCALE( \
+						S5L8702_I2C_SCALE_DEFAULT))
 
 #define S5L8702_I2C_STAT_LASTBIT	BIT(0)
 #define S5L8702_I2C_STAT_TXRXEN		BIT(4)
@@ -99,6 +119,8 @@ struct s5l8702_i2c_dev {
 	unsigned int nmsgs;
 	int msg_ret;
 	unsigned int iiccon;
+	u32 phys;		/* MMIO base, the id sub_570590 selects a bus by */
+	unsigned int con_scale;	/* IICCON bits 3:0, see S5L8702_I2C_SCALE_* */
 	bool timeout_logged;
 	bool start_logged;
 	bool isr_logged;
@@ -117,9 +139,81 @@ struct s5l8702_i2c_dev {
 	unsigned int npads;
 };
 
+/*
+ * sub_570590 names a bus by MMIO base, so this driver has to be reachable the
+ * same way. The FM path knows 0x3C900000; it does not know which adapter
+ * number the kernel gave i2c1, and it has no phandle to it. Probed buses
+ * register here so the exported prescaler setter can find one without a
+ * device-tree change.
+ */
+#define S5L8702_I2C_MAX_BUSES		4
+static struct s5l8702_i2c_dev *s5l8702_i2c_buses[S5L8702_I2C_MAX_BUSES];
+static DEFINE_SPINLOCK(s5l8702_i2c_buses_lock);
+
+static void s5l8702_i2c_register_bus(struct s5l8702_i2c_dev *i2c_dev)
+{
+	unsigned long flags;
+	unsigned int i;
+
+	spin_lock_irqsave(&s5l8702_i2c_buses_lock, flags);
+	for (i = 0; i < S5L8702_I2C_MAX_BUSES; i++) {
+		if (!s5l8702_i2c_buses[i]) {
+			s5l8702_i2c_buses[i] = i2c_dev;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&s5l8702_i2c_buses_lock, flags);
+}
+
+static void s5l8702_i2c_forget_bus(void *data)
+{
+	struct s5l8702_i2c_dev *i2c_dev = data;
+	unsigned long flags;
+	unsigned int i;
+
+	spin_lock_irqsave(&s5l8702_i2c_buses_lock, flags);
+	for (i = 0; i < S5L8702_I2C_MAX_BUSES; i++) {
+		if (s5l8702_i2c_buses[i] == i2c_dev)
+			s5l8702_i2c_buses[i] = NULL;
+	}
+	spin_unlock_irqrestore(&s5l8702_i2c_buses_lock, flags);
+}
+
+static struct s5l8702_i2c_dev *s5l8702_i2c_find_bus(u32 phys)
+{
+	struct s5l8702_i2c_dev *found = NULL;
+	unsigned long flags;
+	unsigned int i;
+
+	spin_lock_irqsave(&s5l8702_i2c_buses_lock, flags);
+	for (i = 0; i < S5L8702_I2C_MAX_BUSES; i++) {
+		if (s5l8702_i2c_buses[i] &&
+		    s5l8702_i2c_buses[i]->phys == phys) {
+			found = s5l8702_i2c_buses[i];
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&s5l8702_i2c_buses_lock, flags);
+	return found;
+}
+
 static inline u32 s5l8702_i2c_readl(struct s5l8702_i2c_dev *i2c_dev, u32 reg)
 {
 	return readl(i2c_dev->regs + reg);
+}
+
+/*
+ * The idle IICCON this bus should be left in, prescaler included.
+ *
+ * Every place that returns the controller to idle rewrites the whole word,
+ * so the prescaler has to be composed in here rather than baked into a
+ * constant -- otherwise the next transfer after a scale change would put
+ * bits 3:0 back to 1 behind the caller's back.
+ */
+static u32 s5l8702_i2c_con_idle(struct s5l8702_i2c_dev *i2c_dev)
+{
+	return S5L8702_I2C_CON_IDLE_BASE |
+	       S5L8702_I2C_CON_SCALE(i2c_dev->con_scale);
 }
 
 static void s5l8702_i2c_write_raw(struct s5l8702_i2c_dev *i2c_dev, u32 reg,
@@ -177,7 +271,7 @@ static void s5l8702_i2c_stop(struct s5l8702_i2c_dev *i2c_dev)
 	s5l8702_i2c_wait_rdy(i2c_dev);
 	s5l8702_i2c_write_raw(i2c_dev, S5L8702_I2C_STAT,
 			      mode | S5L8702_I2C_STAT_SEC_SOE);
-	i2c_dev->iiccon = S5L8702_I2C_CON_IDLE;
+	i2c_dev->iiccon = s5l8702_i2c_con_idle(i2c_dev);
 	s5l8702_i2c_write_raw(i2c_dev, S5L8702_I2C_CON, i2c_dev->iiccon);
 	i2c_dev->nmsgs = 0;
 	s5l8702_i2c_finish(i2c_dev);
@@ -200,7 +294,7 @@ static void s5l8702_i2c_state_machine(struct s5l8702_i2c_dev *i2c_dev)
 			stat = S5L8702_I2C_STAT_MASTER_RX;
 		else
 			stat = S5L8702_I2C_STAT_MASTER_TX;
-		i2c_dev->iiccon = S5L8702_I2C_CON_IDLE;
+		i2c_dev->iiccon = s5l8702_i2c_con_idle(i2c_dev);
 		s5l8702_i2c_wait_rdy(i2c_dev);
 		s5l8702_i2c_write_raw(i2c_dev, S5L8702_I2C_STAT, stat);
 		s5l8702_i2c_wait_rdy(i2c_dev);
@@ -526,7 +620,7 @@ out:
 			break;
 		cpu_relax();
 	}
-	i2c_dev->iiccon = S5L8702_I2C_CON_IDLE;
+	i2c_dev->iiccon = s5l8702_i2c_con_idle(i2c_dev);
 	s5l8702_i2c_write_raw(i2c_dev, S5L8702_I2C_CON, i2c_dev->iiccon);
 	enable_irq(i2c_dev->irq);
 	if (ret)
@@ -572,7 +666,7 @@ out:
 			break;
 		cpu_relax();
 	}
-	i2c_dev->iiccon = S5L8702_I2C_CON_IDLE;
+	i2c_dev->iiccon = s5l8702_i2c_con_idle(i2c_dev);
 	s5l8702_i2c_write_raw(i2c_dev, S5L8702_I2C_CON, i2c_dev->iiccon);
 	enable_irq(i2c_dev->irq);
 	if (ret)
@@ -654,7 +748,7 @@ static int s5l8702_i2c_init(struct s5l8702_i2c_dev *i2c_dev)
 	s5l8702_i2c_write_raw(i2c_dev, S5L8702_I2C_STAT, 0);
 	s5l8702_i2c_write_raw(i2c_dev, S5L8702_I2C_CON, 0);
 	s5l8702_i2c_write_raw(i2c_dev, S5L8702_I2C_DS, 0x40);
-	i2c_dev->iiccon = S5L8702_I2C_CON_IDLE;
+	i2c_dev->iiccon = s5l8702_i2c_con_idle(i2c_dev);
 	s5l8702_i2c_write_raw(i2c_dev, S5L8702_I2C_CON, i2c_dev->iiccon);
 	s5l8702_i2c_write_raw(i2c_dev, S5L8702_I2C_STAT, S5L8702_I2C_STAT_TXRXEN);
 	s5l8702_i2c_write_raw(i2c_dev, S5L8702_I2C_UNK28, 0);
@@ -797,6 +891,7 @@ static int s5l8702_i2c_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	platform_set_drvdata(pdev, i2c_dev);
 	i2c_dev->dev = &pdev->dev;
+	i2c_dev->con_scale = S5L8702_I2C_SCALE_DEFAULT;
 	spin_lock_init(&i2c_dev->lock);
 
 	i2c_dev->regs = devm_platform_get_and_ioremap_resource(pdev, 0, NULL);
@@ -804,8 +899,10 @@ static int s5l8702_i2c_probe(struct platform_device *pdev)
 		return PTR_ERR(i2c_dev->regs);
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	if (res)
+	if (res) {
+		i2c_dev->phys = (u32)res->start;
 		s5l8702_i2c_ungate(i2c_dev, res->start);
+	}
 
 	ret = devm_clk_bulk_get_all(&pdev->dev, &i2c_dev->clks);
 	if (ret > 0) {
@@ -843,8 +940,66 @@ static int s5l8702_i2c_probe(struct platform_device *pdev)
 	adap->dev.parent = &pdev->dev;
 	adap->dev.of_node = pdev->dev.of_node;
 
-	return devm_i2c_add_adapter(&pdev->dev, adap);
+	ret = devm_i2c_add_adapter(&pdev->dev, adap);
+	if (ret)
+		return ret;
+
+	/*
+	 * Registered only once the adapter exists, because the exported setter
+	 * takes the adapter's bus lock. Forgetting is a devm action added after
+	 * the adapter so it runs before the adapter is torn down.
+	 */
+	ret = devm_add_action_or_reset(&pdev->dev, s5l8702_i2c_forget_bus,
+				      i2c_dev);
+	if (ret)
+		return ret;
+	s5l8702_i2c_register_bus(i2c_dev);
+	return 0;
 }
+
+/*
+ * sub_570590 -- set one bus's IICCON prescaler, and nothing else.
+ *
+ * The whole of sub_570590 is a bus select, one read-modify-write of the
+ * register at offset 0 clearing bits 3:0 and ORing in (arg - 1), and two
+ * optional callbacks either side of it. It does not touch ACKEN, IRQEN or the
+ * SEC bit, and it does not reinitialise the controller, so neither does this.
+ *
+ * The bus lock stands in for sub_40F13C / sub_40F142, which take i2c lock 5
+ * around both of stock's calls. Holding it means no transfer is in flight, so
+ * the value read back cannot contain a mid-transfer ACKEN drop -- and cannot
+ * contain a set IRQPEND either. Writing IRQPEND back would in any case leave
+ * it exactly as pending as it already was, since the bit is write-zero-to-
+ * clear, so the blind read-modify-write cannot stretch a bus that was not
+ * already stretched.
+ *
+ * `scale` is the field value, 0..15, not sub_570590's argument: pass
+ * S5L8702_I2C_SCALE_FM_ON for stock's sub_570590(bus, 7) and
+ * S5L8702_I2C_SCALE_DEFAULT for its sub_570590(bus, 2).
+ */
+int s5l8702_i2c_set_clock_scale(u32 phys_base, unsigned int scale)
+{
+	struct s5l8702_i2c_dev *i2c_dev = s5l8702_i2c_find_bus(phys_base);
+	u32 con;
+
+	if (!i2c_dev)
+		return -ENODEV;
+	if (scale > 0xf)
+		return -EINVAL;
+
+	i2c_lock_bus(&i2c_dev->adapter, I2C_LOCK_SEGMENT);
+	i2c_dev->con_scale = scale;
+	con = s5l8702_i2c_readl(i2c_dev, S5L8702_I2C_CON);
+	con &= ~S5L8702_I2C_CON_SCALE(0xf);
+	con |= S5L8702_I2C_CON_SCALE(scale);
+	s5l8702_i2c_write_raw(i2c_dev, S5L8702_I2C_CON, con);
+	i2c_dev->iiccon = s5l8702_i2c_con_idle(i2c_dev);
+	i2c_unlock_bus(&i2c_dev->adapter, I2C_LOCK_SEGMENT);
+
+	dev_dbg(i2c_dev->dev, "IICCON scale=%u CON=0x%03x\n", scale, con);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(s5l8702_i2c_set_clock_scale);
 
 static const struct of_device_id s5l8702_i2c_of_match[] = {
 	{ .compatible = "samsung,s5l8702-i2c" },

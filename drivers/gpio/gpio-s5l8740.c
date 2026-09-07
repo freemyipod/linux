@@ -46,6 +46,7 @@
 /* sub_428F70 target: input/pull enable, one bit per pad. */
 #define S5L8740_GPIO_INEN_OFF		0x0c
 #define S5L8740_GPIO_DOUT_OFF		0x08
+#define S5L8740_GPIO_PUNC_OFF		0x10
 #define S5L8740_GPIO_DIR_OFF		0x14
 
 /*
@@ -55,12 +56,27 @@
  */
 static DEFINE_RAW_SPINLOCK(s5l8740_gpio_reg_lock);
 #define S5L8740_GPIOCMD_OFF		0x1e0
+
 /*
- * 32 banks of 8 across the 0x400 the block occupies. The old 128 cleared
- * BT host-wake at 119 but not pad 200, which sub_17D4DC uses as the
- * Bluetooth power control on some board variants.
+ * 15 banks of 8, so 120 pads, and the GPIOCMD offset is the proof.
+ *
+ * sub_43D38C forms a bank pointer as base + 32 * (pad >> 3) and latches
+ * GPIOCMD at base + 0x1E0. 0x1E0 is 32 * 15, i.e. exactly where a bank 15
+ * would begin, so the banked pad registers can only occupy banks 0..14 and
+ * the block's remaining 0x400 - 0x1E0 is command and status space, not more
+ * pads. The bootloader's pinmux table agrees independently: 120 packed words
+ * covering banks 0x00 through 0x0E, then a zero terminator.
+ *
+ * Pad 200 is a "no pad" sentinel, not a 26th bank. sub_43D38C and sub_57056C
+ * each open with an equality test against 200 and return having touched
+ * nothing (43D38E: cmp r0, #0xc8 / beq), so every stock sub_43D38C(200, ...)
+ * -- including the pair in sub_17D4DC that a comment here used to call a
+ * Bluetooth power control -- is a no-op. Tables that hold a pad number per
+ * board variant use 200 for "this variant does not have one"; sub_17D4DC's
+ * other branch names pad 70, which is real.
  */
-#define S5L8740_GPIO_DEFAULT_NGPIO	256
+#define S5L8740_GPIO_PADS		120
+#define S5L8740_GPIO_DEFAULT_NGPIO	S5L8740_GPIO_PADS
 
 #define S5L8740_CMD_OUT_LOW		14
 #define S5L8740_CMD_OUT_HIGH		15
@@ -126,8 +142,22 @@ static void s5l8740_pinmux_223C(struct device *dev, void __iomem *gpio_base)
 	}
 
 	s5l8740_pinmux_apply_word(gpio_base, 0x0C041100u);
-	/* SEC busy(~0x1F4); approximate with short delay */
-	udelay(500);
+	/*
+	 * sub_347C(0x1F4) waits 1 ms, and this used to wait half of it.
+	 *
+	 * It is not a magic "short delay": sub_347C spins on the counter at
+	 * 0x3C700084 -- the same one sub_41D558 reads inside the firmware
+	 * download -- until the delta exceeds 2 * a1, so 0x1F4 is 1000 ticks.
+	 * A tick is one microsecond: the millisecond form of the same helper,
+	 * at 0x8983AFA, converts its argument for this counter as
+	 * (125 * ms) << 3 = 1000 ticks per millisecond, and caps it at
+	 * 0x00418937 = 4295479 ms, which is 2^32 microseconds.
+	 *
+	 * So this is 1000 us. udelay(500) was the "approximate with a short
+	 * delay" that stood here, and it was half the wait stock takes across
+	 * a strap read.
+	 */
+	udelay(1000);
 	s5l8740_pinmux_apply_word(gpio_base, 0x0C040000u);
 
 	writel(1377685u, gpio_base + 0x380);
@@ -142,6 +172,36 @@ static void s5l8740_pinmux_223C(struct device *dev, void __iomem *gpio_base)
 #define S5L8740_NKEYS	2
 /* Re-entries before a key is judged to be misconfigured, not pressed. */
 #define S5L8740_KEY_STORM_MAX	64
+
+/*
+ * Sweep cadence, from the stock GPIO button task sub_E10BC (0xE10BC): its
+ * wait on RTOS event 72 times out after 200 ms when every watched pad is
+ * settled, and after 5 ms while any of them is still moving.
+ */
+#define S5L8740_DIN_IDLE_MS	200
+#define S5L8740_DIN_SETTLE_MS	5
+
+/* The pads this driver sweeps, in the order of struct s5l8740_gpio::din. */
+enum {
+	S5L8740_DIN_VOLUP,
+	S5L8740_DIN_VOLDN,
+	S5L8740_DIN_NIRQ,
+	S5L8740_DIN_COUNT,
+};
+
+/*
+ * One pad's debounce state, laid out like stock's three per-pad words.
+ *
+ * sub_E10BC keeps a raw shadow at 0x8929F6C that follows every sample and
+ * restamps 0x8929F70 whenever it moves, and a reported shadow at 0x8929F68
+ * that only advances once the elapsed-time test passes. Only the second
+ * shadow moving calls sub_4195D8.
+ */
+struct s5l8740_din {
+	u8 sample;		/* 0x8929F6C: the last raw DIN bit read */
+	u8 reported;		/* 0x8929F68: the last level handed on */
+	unsigned long stamp;	/* 0x8929F70: when @sample last changed */
+};
 
 struct s5l8740_key {
 	struct s5l8740_gpio *sg;
@@ -162,8 +222,9 @@ struct s5l8740_gpio {
 	struct irq_domain *eic_domain;
 	struct timer_list din_timer;
 	struct work_struct poweroff_work;
+	struct work_struct nirq_work;
 	struct input_dev *input;
-	u8 last40, last41, last86;
+	struct s5l8740_din din[S5L8740_DIN_COUNT];
 	bool din_inited;
 	struct s5l8740_key keys[S5L8740_NKEYS];
 	bool keys_on_irq;
@@ -412,9 +473,11 @@ static int s5l8740_gpio_get_direction(struct gpio_chip *gc, unsigned int offset)
 	return GPIO_LINE_DIRECTION_IN;
 }
 
-static int s5l8740_gpio_to_irq(struct gpio_chip *gc, unsigned int offset)
+int s5l8740_gpio_input_enable(unsigned int gpio, bool enable);
+
+static int s5l8740_gpio_to_irq_sense(struct s5l8740_gpio *sg,
+				     unsigned int offset, unsigned int sense)
 {
-	struct s5l8740_gpio *sg = gpiochip_get_data(gc);
 	int ret, virq;
 
 	if (!sg->eic_domain)
@@ -424,17 +487,16 @@ static int s5l8740_gpio_to_irq(struct gpio_chip *gc, unsigned int offset)
 	 * Stock arms an interrupt-capable pad with sub_43D38C(gpio, 0, 1)
 	 * followed by sub_428F70(gpio, 1), which sets the bank's +0x0C bit.
 	 * Without that second step the pad is muxed but its input stage is
-	 * not enabled, so the EIC has nothing to level-detect.
+	 * not enabled, so the EIC has nothing to detect.
+	 *
+	 * sub_428F70 is more than that one bit, so this goes through the
+	 * helper that reproduces all of it rather than setting +0x0C alone.
 	 */
-	{
-		void __iomem *b = s5l8740_bank(sg, offset);
-		unsigned int pin = offset & 7;
+	ret = s5l8740_gpio_input_enable(offset, true);
+	if (ret)
+		return ret;
 
-		writel(readl(b + S5L8740_GPIO_INEN_OFF) | BIT(pin),
-		       b + S5L8740_GPIO_INEN_OFF);
-	}
-
-	ret = s5l8740_eic_enable_gpio(offset, IRQ_TYPE_LEVEL_LOW);
+	ret = s5l8740_eic_enable_gpio(offset, sense);
 	if (ret)
 		return ret;
 
@@ -442,6 +504,12 @@ static int s5l8740_gpio_to_irq(struct gpio_chip *gc, unsigned int offset)
 	if (!virq)
 		return -EINVAL;
 	return virq;
+}
+
+static int s5l8740_gpio_to_irq(struct gpio_chip *gc, unsigned int offset)
+{
+	return s5l8740_gpio_to_irq_sense(gpiochip_get_data(gc), offset,
+					 IRQ_TYPE_LEVEL_LOW);
 }
 
 static u8 s5l8740_din_bit(struct s5l8740_gpio *sg, unsigned int gpio)
@@ -526,6 +594,66 @@ static void s5l8740_log_pinmux_map(struct s5l8740_gpio *sg, const char *tag)
 	s5l8740_log_pads(sg, tag, "iis0", iis0, ARRAY_SIZE(iis0));
 }
 
+/*
+ * The rest of sub_223C, for the pads nothing in this kernel owns.
+ *
+ * Replaying the whole table is not an option -- it would put pads 87-90,
+ * 70, 78-82 and 97-99 back to their cold-boot functions underneath SPI2,
+ * Bluetooth and two serial peripherals that have since claimed them. That
+ * is not a reason to skip the table, though, only a reason to apply it a
+ * pad at a time. Diffing all 121 words against a live dump of the fifteen
+ * banks leaves 31 pads that differ; naming an owner for each of them
+ * leaves these, and only these, in a state stock reaches and we never do:
+ *
+ *   99, 100  the strap sub_223C pulses either side of its 500 us wait,
+ *            reading GPIO +0x404 in between. Pad 99 goes high before the
+ *            table and low after it; pad 100 takes DIR and PUNC, is read,
+ *            and is released.
+ *   64       PUNC only. Nothing claims the pad and no capture of bank 8
+ *            exists to say otherwise, so the bootloader's value stands.
+ *
+ * The four block registers at the end are the same case: SEC writes them
+ * once at cold boot and our chain never has.
+ *
+ * Two things sub_223C does are deliberately not here. The 121-word loop is
+ * covered above. The EIC mask-all belongs to irq-s5l8740-eic, which has
+ * configured that block by the time this runs; SEC does it before any OS
+ * exists, and repeating it from a driver probe would take out the Vol±
+ * interrupts, which is what made the whole table get skipped in the first
+ * place.
+ */
+#define S5L8740_GPIO_STRAP_STATUS	0x404
+
+static void s5l8740_sec_strap_and_block(struct s5l8740_gpio *sg)
+{
+	u32 strap;
+
+	/* 0x0C03000F then 0x0C03000E: pad 99 high across the table, then low. */
+	s5l8740_pinmux_apply_word(sg->base, 0x0C03000Fu);
+	s5l8740_pinmux_apply_word(sg->base, 0x0C03000Eu);
+
+	/* 0x08001002: pad 64, PUNC cleared as the bootloader leaves it. */
+	s5l8740_pinmux_apply_word(sg->base, 0x08001002u);
+
+	/*
+	 * 0x0C041100, sub_347C(0x1F4), read +0x404, 0x0C040000. 1000 ticks of
+	 * the counter at 0x3C700084 at one microsecond each; see the
+	 * derivation in s5l8740_pinmux_223C().
+	 */
+	s5l8740_pinmux_apply_word(sg->base, 0x0C041100u);
+	udelay(1000);
+	strap = readl(sg->base + S5L8740_GPIO_STRAP_STATUS);
+	s5l8740_pinmux_apply_word(sg->base, 0x0C040000u);
+
+	writel(1377685u, sg->base + 0x380);
+	writel(1, sg->base + 0x388);
+	writel(1, sg->base + 0x3f4);
+	writel(1, sg->base + 0x3e0);
+
+	dev_info(sg->gc.parent, "SEC sub_223C strap read +0x404 = 0x%08x\n",
+		 strap);
+}
+
 static void s5l8740_sec_gpio86(struct s5l8740_gpio *sg)
 {
 	s5l8740_log_pinmux_map(sg, "before-SEC");
@@ -533,6 +661,7 @@ static void s5l8740_sec_gpio86(struct s5l8740_gpio *sg)
 	/* OSOS BCB60 IIS0 on: 43D38C(20,3) 43D38C(7,3). No IIC GPIOCMD. */
 	s5l8740_gpiocmd_mode(sg, 20, 3, 0);
 	s5l8740_gpiocmd_mode(sg, 7, 3, 0);
+	s5l8740_sec_strap_and_block(sg);
 	s5l8740_log_pinmux_map(sg, "after-SEC-86-iis0");
 }
 
@@ -660,6 +789,86 @@ int s5l8740_gpio_dir_set(unsigned int gpio, bool out)
 }
 EXPORT_SYMBOL_GPL(s5l8740_gpio_dir_set);
 
+/*
+ * sub_428F70 -- enable one pad's input stage, the way stock does it.
+ *
+ * sub_428F70 splits the pad and tail-calls sub_428F76, which builds a packed
+ * pad descriptor, fills it from the live bank through sub_72F4, flips one bit
+ * of it, and writes every field back through sub_7358:
+ *
+ *	sub_72F4     w = (bank << 24) | (pin << 16)
+ *	                 | ((DIR  >> pin) & 1) << 12
+ *	                 | ((PUNC >> pin) & 1) <<  8
+ *	                 | ((INEN >> pin) & 1) <<  4
+ *	                 | nibble
+ *	             nibble = (PCON >> 4 * pin) & 0xf, remapped from 1 to
+ *	             DIN ? 15 : 14
+ *	sub_428F76   w = (w & ~0x10) | (enable ? 0x10 : 0)
+ *	sub_7358     PCON nibble = w & 0xf;  DIR bit = w >> 12;
+ *	             INEN bit    = w >> 4;   PUNC bit = w >> 8
+ *
+ * Only bit 4 -- the bank's +0x0C input-enable bit -- carries new information.
+ * DIR and PUNC go back with the value they were just read with, and they are
+ * written here anyway because sub_7358 writes them unconditionally and this
+ * is not the place to decide a store the hardware was shipped with is
+ * redundant.
+ *
+ * PCON is the field that genuinely changes: a nibble of 1 -- plain output --
+ * comes back as 14 or 15 according to the pad's current DIN, which is the
+ * same drive-low / drive-high encoding sub_43D38C latches through GPIOCMD.
+ * Enabling the input stage on a pad that is currently an output therefore
+ * also rewrites its mode into the explicit drive form, and omitting that
+ * would leave the pad in a state stock never leaves it in.
+ *
+ * Pads at or above S5L8740_GPIO_PADS are refused, which stock does not do:
+ * sub_428F70 has no sentinel guard where sub_43D38C and sub_57056C both have
+ * one, so stock reaches this arithmetic with pad 200 from sub_15DD5C's FM
+ * power-on and from sub_17D4DC, computes base + 0x320, and stores into space
+ * the block does not decode. That write is discarded on hardware. Refusing
+ * it here loses nothing and keeps pads 120..127, whose bank base would be
+ * the GPIOCMD latch itself, from being written through this path.
+ */
+int s5l8740_gpio_input_enable(unsigned int gpio, bool enable)
+{
+	struct s5l8740_gpio *sg = s5l8740_n31;
+	unsigned int pin = gpio & 7;
+	unsigned int shift = 4 * pin;
+	void __iomem *bank;
+	unsigned long flags;
+	u32 pcon, nibble, v;
+
+	if (!sg || !sg->base)
+		return -ENODEV;
+	if (gpio >= S5L8740_GPIO_PADS)
+		return -EINVAL;
+	bank = s5l8740_bank(sg, gpio);
+
+	raw_spin_lock_irqsave(&s5l8740_gpio_reg_lock, flags);
+	pcon = readl(bank + S5L8740_GPIO_PCON_OFF);
+	nibble = (pcon >> shift) & 0xf;
+	if (nibble == 1)
+		nibble = (readl(bank + S5L8740_GPIO_DIN_OFF) & BIT(pin)) ?
+			 S5L8740_CMD_OUT_HIGH : S5L8740_CMD_OUT_LOW;
+	writel((pcon & ~(0xfu << shift)) | (nibble << shift),
+	       bank + S5L8740_GPIO_PCON_OFF);
+
+	v = readl(bank + S5L8740_GPIO_DIR_OFF);
+	writel(v, bank + S5L8740_GPIO_DIR_OFF);
+
+	v = readl(bank + S5L8740_GPIO_INEN_OFF);
+	if (enable)
+		v |= BIT(pin);
+	else
+		v &= ~BIT(pin);
+	writel(v, bank + S5L8740_GPIO_INEN_OFF);
+
+	v = readl(bank + S5L8740_GPIO_PUNC_OFF);
+	writel(v, bank + S5L8740_GPIO_PUNC_OFF);
+	raw_spin_unlock_irqrestore(&s5l8740_gpio_reg_lock, flags);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(s5l8740_gpio_input_enable);
+
 void s5l8740_gpio_log_iis0_pads(const char *tag)
 {
 	struct s5l8740_gpio *sg = s5l8740_n31;
@@ -684,80 +893,183 @@ static void s5l8740_poweroff_work(struct work_struct *work)
 		pm_power_off();
 }
 
-static void s5l8740_key_edge(struct s5l8740_gpio *sg, unsigned int code,
-			     u8 now, u8 *last, const char *name)
+/*
+ * How long a level must hold before it is believed.
+ *
+ * sub_E10BC never reports the first sample of a new level: the raw shadow
+ * takes it, the timestamp is refreshed, and sub_4195D8 is reached only on a
+ * later pass whose elapsed-time test passes. The threshold itself is not
+ * recoverable from the image -- sub_345D68 is a thunk to 0x22000FE6, outside
+ * OSOS -- so the number below is this port's, not stock's. What is stock is
+ * the shape: a level seen once is never an event, and the re-check comes
+ * 5 ms later.
+ *
+ * This mattered because the sweep used to report the first differing sample
+ * straight to the input device, which turns one disturbed read of a DIN word
+ * into a press and a release that nobody performed.
+ */
+static unsigned int btn_debounce_ms = 20;
+module_param(btn_debounce_ms, uint, 0644);
+MODULE_PARM_DESC(btn_debounce_ms,
+		 "How long a pad level must hold before it is reported (0=off)");
+
+/*
+ * Fold one sample into a pad's two shadows, the inner half of sub_E10BC.
+ *
+ * Returns true when the pad is settled -- either unchanged, or changed and
+ * now old enough to believe. @changed says whether ->reported just moved,
+ * which is the only condition under which stock emits an event.
+ */
+static bool s5l8740_din_settle(struct s5l8740_din *d, u8 now, bool *changed)
 {
-	if (now == *last)
-		return;
+	*changed = false;
+
+	if (now != d->sample) {
+		/* 0x8929F6C moves and 0x8929F70 is restamped; no event. */
+		d->sample = now;
+		d->stamp = jiffies;
+		return false;
+	}
+	if (d->sample == d->reported)
+		return true;
+	if (btn_debounce_ms &&
+	    time_before(jiffies, d->stamp + msecs_to_jiffies(btn_debounce_ms)))
+		return false;
+
+	/* 0x8929F68 moves: this is the sub_4195D8 call site. */
+	d->reported = d->sample;
+	*changed = true;
+	return true;
+}
+
+static void s5l8740_key_edge(struct s5l8740_gpio *sg, unsigned int code,
+			     u8 level, const char *name)
+{
 	if (sg->input) {
-		/* Active-low pad: 0 = pressed */
-		input_report_key(sg->input, code, now ? 0 : 1);
+		/*
+		 * sub_E10BC calls sub_4195D8(id, table[2] != din) and both
+		 * table entries at 0x87891B8 carry 1, so a pad reading 0 is
+		 * a press.
+		 */
+		input_report_key(sg->input, code, level ? 0 : 1);
 		input_sync(sg->input);
 	}
 	/* One line per key edge: tracing, not an error. */
 	dev_dbg(sg->gc.parent, "n31-btn %s %s din=%u\n",
-		name, now ? "release" : "PRESS", now);
-	*last = now;
+		name, level ? "release" : "PRESS", level);
+}
+
+/*
+ * The PMIC doorbell, off the timer.
+ *
+ * d1830_n31_din_nirq() reads four I2C registers, which sleeps, and the sweep
+ * runs in softirq context -- so this used to be a sleeping call from a timer
+ * callback. It is also a second, unsynchronised sampler of the same PMIC
+ * registers the PMIC driver's own poll reads, and two samplers interleaving
+ * their read-compare-commit can apply a stale sample after a fresh one and
+ * manufacture a key transition out of a real one.
+ */
+static void s5l8740_nirq_work(struct work_struct *work)
+{
+	void (*hook)(void) = READ_ONCE(d1830_n31_din_nirq_hook);
+
+	if (hook)
+		hook();
 }
 
 static void s5l8740_din_timer(struct timer_list *t)
 {
 	struct s5l8740_gpio *sg = container_of(t, struct s5l8740_gpio, din_timer);
-	u8 v40 = s5l8740_din_bit(sg, 40);
-	u8 v41 = s5l8740_din_bit(sg, 41);
-	u8 v86 = s5l8740_din_bit(sg, 86);
+	/* OSOS GPIOButtonManager (0x87891B8): only GPIO 40 and 41 are keys.
+	 * Home, Play and Sleep are PMIC status bits; GPIO 86 is the PMIC
+	 * nIRQ doorbell, which sub_EFBB4 services while it reads 0.
+	 */
+	static const unsigned int gpios[S5L8740_DIN_COUNT] = { 40, 41, 86 };
+	u8 now[S5L8740_DIN_COUNT];
+	bool settled = true;
+	unsigned int i;
+
+	for (i = 0; i < S5L8740_DIN_COUNT; i++)
+		now[i] = s5l8740_din_bit(sg, gpios[i]);
 
 	if (!sg->din_inited) {
-		sg->last40 = v40;
-		sg->last41 = v41;
-		sg->last86 = v86;
-		sg->din_inited = true;
-	} else {
-		/* OSOS GPIOButtonManager: only GPIO 40/41. Home/Play/Sleep
-		 * are PMIC bits; GPIO 86 is the nIRQ doorbell into d1830.
-		 */
-		if (!sg->keys_on_irq) {
-			s5l8740_key_edge(sg, KEY_VOLUMEUP, v40,
-					 &sg->last40, "VOL+");
-			s5l8740_key_edge(sg, KEY_VOLUMEDOWN, v41,
-					 &sg->last41, "VOL-");
+		for (i = 0; i < S5L8740_DIN_COUNT; i++) {
+			sg->din[i].sample = now[i];
+			sg->din[i].reported = now[i];
+			sg->din[i].stamp = jiffies;
 		}
-		if (v86 != sg->last86) {
-			dev_dbg(sg->gc.parent, "n31-btn NIRQ86 %u->%u\n",
-				sg->last86, v86);
-			sg->last86 = v86;
-			if (d1830_n31_din_nirq_hook)
-				d1830_n31_din_nirq_hook();
+		sg->din_inited = true;
+		goto rearm;
+	}
+
+	for (i = 0; i < S5L8740_DIN_COUNT; i++) {
+		bool changed;
+
+		if (!s5l8740_din_settle(&sg->din[i], now[i], &changed))
+			settled = false;
+		if (!changed)
+			continue;
+
+		switch (i) {
+		case S5L8740_DIN_VOLUP:
+			s5l8740_key_edge(sg, KEY_VOLUMEUP,
+					 sg->din[i].reported, "VOL+");
+			break;
+		case S5L8740_DIN_VOLDN:
+			s5l8740_key_edge(sg, KEY_VOLUMEDOWN,
+					 sg->din[i].reported, "VOL-");
+			break;
+		case S5L8740_DIN_NIRQ:
+			dev_dbg(sg->gc.parent, "n31-btn NIRQ86 -> %u\n",
+				sg->din[i].reported);
+			/*
+			 * sub_EFBB4 drains the PMIC while sub_42BBEC(0x56)
+			 * reads 0 and only re-arms once it reads 1, so the
+			 * de-asserting edge is not a reason to go and look.
+			 */
+			if (!sg->din[i].reported)
+				schedule_work(&sg->nirq_work);
+			break;
 		}
 	}
 
-	mod_timer(&sg->din_timer, jiffies + msecs_to_jiffies(50));
+rearm:
+	mod_timer(&sg->din_timer,
+		  jiffies + msecs_to_jiffies(settled ? S5L8740_DIN_IDLE_MS
+						     : S5L8740_DIN_SETTLE_MS));
 }
 
 /* ------------------------------------------------------------------ */
 /* Volume keys on real interrupts                                       */
 /*                                                                      */
-/* The EIC only offers level-low, so a held key would re-assert forever  */
-/* and genirq would retire the line as spurious -- the same failure the  */
-/* PMIC event latches caused. The shape that works on a level-only       */
-/* irqchip is: take the interrupt for the press, mask the line, then     */
-/* poll only while the key is down, and unmask on release.              */
+/* Stock does not report a key from the interrupt. sub_E10BC waits on    */
+/* RTOS event 72, and whatever wakes it -- the EIC line or the 200 ms    */
+/* timeout -- it then reads DIN through sub_42BBEC and runs the two      */
+/* shadows before it will call sub_4195D8. The interrupt is a wakeup.    */
 /*                                                                      */
-/* So the press is interrupt-driven, which is the part latency is        */
-/* visible in, and polling exists only for the tens of milliseconds a    */
-/* finger is actually on the button instead of forever at 50 ms.         */
+/* So the handler here masks its line and pulls the sweep forward to     */
+/* stock's 5 ms settle interval. It does not report, because it has not  */
+/* read the pad: an interrupt that fires for any other reason -- a       */
+/* mis-set polarity, a shared line, a level source that never            */
+/* deasserts -- would otherwise become a keypress out of nothing.        */
 /* ------------------------------------------------------------------ */
 
 /*
- * Off until the EIC level semantics are understood. The VIC routing is
- * now correct, so enabling this actually delivers interrupts -- and an
- * idle active-low pad reads as permanently asserted, which wedges the
- * system. The sweep is slower but it works.
+ * Off by default, and the description used to claim otherwise.
+ *
+ * The reason it had to be off is now understood: this path armed the pads
+ * with IRQ_TYPE_LEVEL_LOW, which eic_encode_sense() programs as INTLEVEL
+ * clear plus INTTYPE set -- and a clear INTLEVEL asserts while the pad is
+ * HIGH, which is how a released volume key looks. Stock arms these two pads
+ * as an edge source instead: sub_E10BC calls sub_5D308(gpio, 2, 0), which is
+ * INTLEVEL set and INTTYPE clear. s5l8740_keys_irq_init() now asks for that,
+ * but the default stays off until a flash confirms it, because getting EIC
+ * polarity wrong wedges the system rather than merely failing.
  */
 static bool btn_irq;
 module_param(btn_irq, bool, 0444);
 MODULE_PARM_DESC(btn_irq,
-		 "Drive the volume keys from EIC interrupts (default Y)");
+		 "Drive the volume keys from EIC interrupts (default N)");
 
 static unsigned int btn_release_ms = 30;
 module_param(btn_release_ms, uint, 0644);
@@ -789,14 +1101,16 @@ static irqreturn_t s5l8740_key_isr(int irq, void *data)
 		k->sg->keys_on_irq = false;
 		return IRQ_HANDLED;
 	}
-	if (!k->down) {
-		k->down = true;
-		if (sg->input) {
-			input_report_key(sg->input, k->code, 1);
-			input_sync(sg->input);
-		}
-		dev_dbg(sg->gc.parent, "n31-btn %s PRESS (irq)\n", k->name);
-	}
+	k->down = true;
+	dev_dbg(sg->gc.parent, "n31-btn %s wake (irq)\n", k->name);
+	/*
+	 * Hand the pad to the sweep rather than reporting from here. That is
+	 * stock's split, and it means a spurious interrupt costs one early
+	 * DIN read instead of a keypress userspace cannot distinguish from a
+	 * real one.
+	 */
+	mod_timer(&sg->din_timer,
+		  jiffies + msecs_to_jiffies(S5L8740_DIN_SETTLE_MS));
 	schedule_delayed_work(&k->release,
 			      msecs_to_jiffies(btn_release_ms));
 	return IRQ_HANDLED;
@@ -815,18 +1129,57 @@ static void s5l8740_key_release_work(struct work_struct *work)
 		return;
 	}
 	k->storm = 0;
-	if (k->down) {
-		k->down = false;
-		if (sg->input) {
-			input_report_key(sg->input, k->code, 0);
-			input_sync(sg->input);
-		}
-		dev_dbg(sg->gc.parent, "n31-btn %s release\n", k->name);
-	}
+	k->down = false;
+	/*
+	 * The release event belongs to the sweep, which owns the shadows for
+	 * this pad. All this has to do is put the line back.
+	 */
 	if (k->masked) {
 		k->masked = false;
 		enable_irq(k->irq);
 	}
+}
+
+/*
+ * Stock's pad arming for the two volume keys, in stock's order.
+ *
+ * sub_E10BC walks the table at 0x87891B8 -- {id 8, gpio 0x28, 1} and
+ * {id 7, gpio 0x29, 1} -- and for each entry runs:
+ *
+ *	sub_43D38C(gpio, 0, 1)	function nibble 0, DIR bit set
+ *	sub_428F70(gpio, 1)	bank +0x0C bit set, the input stage
+ *	sub_5D308(gpio, 2, 0)	INTLEVEL set, INTTYPE clear, INTEN, INTSTAT
+ *	sub_7D490(gpio, 2)	INTLEVEL set again
+ *
+ * The last two steps are s5l8740_keys_irq_init()'s EDGE_FALLING arm. The
+ * first two are here, and off by default: an earlier image re-muxed these
+ * pads and recorded that DIN then stopped moving. That note is not evidence
+ * and the device cannot be retested from here, but the sweep works on
+ * whatever SEC and U-Boot leave behind, so this stays available rather than
+ * automatic. Set btn_arm_pads=1 on a flash to settle it in one boot.
+ */
+static bool btn_arm_pads;
+module_param(btn_arm_pads, bool, 0444);
+MODULE_PARM_DESC(btn_arm_pads,
+		 "Replay sub_E10BC's volume-key pad arming (default N)");
+
+static void s5l8740_keys_arm_pads(struct s5l8740_gpio *sg)
+{
+	static const unsigned int gpios[] = { 40, 41 };
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(gpios); i++) {
+		void __iomem *b = s5l8740_bank(sg, gpios[i]);
+		unsigned int pin = gpios[i] & 7;
+		unsigned long flags;
+
+		s5l8740_gpiocmd_mode(sg, gpios[i], 0, 1);
+		raw_spin_lock_irqsave(&s5l8740_gpio_reg_lock, flags);
+		writel(readl(b + S5L8740_GPIO_INEN_OFF) | BIT(pin),
+		       b + S5L8740_GPIO_INEN_OFF);
+		raw_spin_unlock_irqrestore(&s5l8740_gpio_reg_lock, flags);
+	}
+	dev_info(sg->gc.parent, "volume pads armed per sub_E10BC\n");
 }
 
 /*
@@ -845,6 +1198,21 @@ static unsigned int s5l8740_keys_irq_init(struct s5l8740_gpio *sg)
 	};
 	unsigned int i, ok = 0;
 
+	/*
+	 * Populate the array unconditionally: remove() cancels these works,
+	 * and cancelling one that was never initialised is not something the
+	 * workqueue API forgives.
+	 */
+	for (i = 0; i < ARRAY_SIZE(want) && i < S5L8740_NKEYS; i++) {
+		struct s5l8740_key *k = &sg->keys[i];
+
+		k->sg = sg;
+		k->gpio = want[i].gpio;
+		k->code = want[i].code;
+		k->name = want[i].name;
+		INIT_DELAYED_WORK(&k->release, s5l8740_key_release_work);
+	}
+
 	if (!btn_irq || !sg->eic_domain)
 		return 0;
 
@@ -852,13 +1220,15 @@ static unsigned int s5l8740_keys_irq_init(struct s5l8740_gpio *sg)
 		struct s5l8740_key *k = &sg->keys[i];
 		int virq;
 
-		k->sg = sg;
-		k->gpio = want[i].gpio;
-		k->code = want[i].code;
-		k->name = want[i].name;
-		INIT_DELAYED_WORK(&k->release, s5l8740_key_release_work);
-
-		virq = s5l8740_gpio_to_irq(&sg->gc, k->gpio);
+		/*
+		 * sub_5D308(gpio, 2, 0) -- INTLEVEL set, INTTYPE clear --
+		 * is what sub_E10BC arms these two pads with, so ask for the
+		 * sense that eic_encode_sense() programs that way. The old
+		 * IRQ_TYPE_LEVEL_LOW is the opposite pair and leaves a
+		 * released, idle-high key looking permanently asserted.
+		 */
+		virq = s5l8740_gpio_to_irq_sense(sg, k->gpio,
+						 IRQ_TYPE_EDGE_FALLING);
 		if (virq <= 0) {
 			dev_info(sg->gc.parent,
 				 "key %s: no EIC irq (%d), staying on the sweep\n",
@@ -866,9 +1236,14 @@ static unsigned int s5l8740_keys_irq_init(struct s5l8740_gpio *sg)
 			continue;
 		}
 		k->irq = virq;
+		/*
+		 * Not IRQF_SHARED. Each pad gets its own EIC hwirq, and
+		 * declaring the line shared would let a handler run for an
+		 * interrupt raised by some other pad -- which, before this
+		 * handler stopped reporting, was a press with no press.
+		 */
 		if (devm_request_irq(sg->gc.parent, virq, s5l8740_key_isr,
-				     IRQF_TRIGGER_LOW | IRQF_SHARED,
-				     k->name, k)) {
+				     IRQF_TRIGGER_FALLING, k->name, k)) {
 			dev_info(sg->gc.parent,
 				 "key %s: irq %d busy, staying on the sweep\n",
 				 k->name, virq);
@@ -876,7 +1251,7 @@ static unsigned int s5l8740_keys_irq_init(struct s5l8740_gpio *sg)
 			continue;
 		}
 		ok++;
-		dev_info(sg->gc.parent, "key %s on irq %d (EIC level-low)\n",
+		dev_info(sg->gc.parent, "key %s on irq %d (EIC falling edge)\n",
 			 k->name, virq);
 	}
 	return ok;
@@ -986,16 +1361,21 @@ static int s5l8740_gpio_probe(struct platform_device *pdev)
 	}
 
 	INIT_WORK(&sg->poweroff_work, s5l8740_poweroff_work);
+	INIT_WORK(&sg->nirq_work, s5l8740_nirq_work);
+	timer_setup(&sg->din_timer, s5l8740_din_timer, 0);
+
+	if (btn_arm_pads)
+		s5l8740_keys_arm_pads(sg);
 	/*
-	 * GPIO 86 is the PMIC doorbell and still needs watching, so the
-	 * sweep runs either way; it just stops carrying the volume keys
-	 * once they are on interrupts.
+	 * The sweep owns the key events either way. GPIO 86 needs watching,
+	 * and stock reads DIN and debounces even when the EIC line is armed,
+	 * so an interrupt only buys an earlier read.
 	 */
 	sg->keys_on_irq = s5l8740_keys_irq_init(sg) == S5L8740_NKEYS;
-	dev_info(dev, "volume keys: %s\n",
-		 sg->keys_on_irq ? "EIC interrupts" : "50 ms sweep");
-	timer_setup(&sg->din_timer, s5l8740_din_timer, 0);
-	mod_timer(&sg->din_timer, jiffies + msecs_to_jiffies(50));
+	dev_info(dev, "volume keys: %u ms sweep%s\n", S5L8740_DIN_IDLE_MS,
+		 sg->keys_on_irq ? ", woken by EIC" : "");
+	mod_timer(&sg->din_timer,
+		  jiffies + msecs_to_jiffies(S5L8740_DIN_SETTLE_MS));
 	s5l8740_n31 = sg;
 	platform_set_drvdata(pdev, sg);
 	s5l8740_gpio_debugfs_init(sg);
@@ -1008,11 +1388,20 @@ static int s5l8740_gpio_probe(struct platform_device *pdev)
 static void s5l8740_gpio_remove(struct platform_device *pdev)
 {
 	struct s5l8740_gpio *sg = platform_get_drvdata(pdev);
+	unsigned int i;
 
 	if (!sg)
 		return;
 	s5l8740_n31 = NULL;
 	timer_delete_sync(&sg->din_timer);
+	/*
+	 * The release works hold a pointer to devm memory and re-arm
+	 * themselves while a key is down, so they have to be stopped here
+	 * rather than left for devm to outlive.
+	 */
+	for (i = 0; i < S5L8740_NKEYS; i++)
+		cancel_delayed_work_sync(&sg->keys[i].release);
+	cancel_work_sync(&sg->nirq_work);
 	cancel_work_sync(&sg->poweroff_work);
 }
 

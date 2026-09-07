@@ -216,6 +216,33 @@ struct n31_ftl_cs {
 	struct n31_ftl_slice ftl_alias;
 	struct n31_ftl_slice firmware;
 	u8 *bounce;
+
+	/*
+	 * One 16 KiB NAND page, kept across reads.
+	 *
+	 * Four 4 KiB LBAs live in one page, and this path read a whole page
+	 * and threw away three quarters of it for every one of them -- with
+	 * a fresh order-2 kmalloc each time, on a path the block layer can
+	 * enter during writeback. Keyed on (ce, cau, block, page), a
+	 * sequential file read costs one CS kick per page instead of four.
+	 *
+	 * The volume is mounted read-only and this driver has no program or
+	 * erase, so nothing we do can invalidate a cached page. A failed
+	 * read clears the key, because s5l8740_nand_cs_phys_read() memsets
+	 * the destination before it fills it and a partly-filled page must
+	 * not be served as the real one.
+	 *
+	 * page_lock, not ftl->lock: the block path already holds ftl->lock
+	 * across this function and the sysfs readers do not, so the buffer
+	 * needs a lock of its own that neither of them nests inside.
+	 */
+	struct mutex page_lock;
+	struct s5l8740_cs_page *cs_page;
+	u8 pc_ce, pc_cau, pc_page;
+	u16 pc_block;
+	bool pc_valid;
+	unsigned int pc_hits;
+	unsigned int pc_misses;
 };
 
 static int n31_ftl_find_bpb(struct n31_ftl_cs *ftl);
@@ -268,6 +295,18 @@ static unsigned int read_miss_diag_window_ms = 5000;
 module_param(read_miss_diag_window_ms, uint, 0644);
 MODULE_PARM_DESC(read_miss_diag_window_ms,
 		 "Refill the read-miss description budget after this long (0=never)");
+
+/*
+ * Serve the four 4 KiB LBAs of one NAND page from one read.
+ *
+ * N reads the page again for each of them, which is what this path did
+ * before -- useful for telling a cache bug apart from a map bug without a
+ * rebuild. The buffer is still preallocated either way.
+ */
+static bool csmap_page_cache = true;
+module_param(csmap_page_cache, bool, 0644);
+MODULE_PARM_DESC(csmap_page_cache,
+		 "Reuse the last 16 KiB page across the four LBAs that share it (default Y)");
 
 static bool ftl_block_enable = true;
 module_param(ftl_block_enable, bool, 0644);
@@ -1112,46 +1151,68 @@ static int n31_ftl_read_fmss_lba_flags(struct n31_ftl_cs *ftl, u32 fmss_lba,
 	pg = leg.page;
 
 	/*
-	 * GFP_NOIO, and no zeroing.
+	 * The page buffer is allocated once at init and reused.
 	 *
-	 * struct s5l8740_cs_page is about 16 KiB, so this is an order-2
-	 * allocation on a path the block layer can enter during writeback --
-	 * GFP_KERNEL there lets reclaim recurse back into the filesystem
-	 * that is waiting on this read. It mattered less when the fallback
-	 * path was dead; it is live now.
-	 *
-	 * The zeroing was redundant either way: s5l8740_nand_cs_phys_read_slc()
-	 * memsets the whole struct before it fills it.
+	 * struct s5l8740_cs_page is about 16 KiB, so this used to be an
+	 * order-2 kmalloc on every 4 KiB read, on a path the block layer can
+	 * enter during writeback -- and then the page it filled was
+	 * discarded, so the next of the four LBAs sharing it allocated and
+	 * read the whole thing again.
 	 */
-	page = kmalloc(sizeof(*page), GFP_NOIO);
-	if (!page)
+	mutex_lock(&ftl->page_lock);
+	page = ftl->cs_page;
+	if (!page) {
+		mutex_unlock(&ftl->page_lock);
 		return -ENOMEM;
+	}
 
-	/*
-	 * Arm CS for this read.
-	 *
-	 * Nothing did, and the disk-lifetime session that was supposed to
-	 * cover it never actually existed -- so every read that got this far
-	 * came back -EAGAIN from the dma_dry test inside
-	 * s5l8740_nand_cs_phys_read(), before f->lock, in microseconds. That
-	 * is the whole hash/vec fallback path, and it failed silently.
-	 *
-	 * Sessions nest, so this costs nothing when a caller above already
-	 * holds one.
-	 */
-	sess = s5l8740_nand_dma_session_begin();
-	ret = s5l8740_nand_cs_phys_read(ce, cau, blk, pg, page);
-	if (sess == 0)
-		s5l8740_nand_dma_session_end();
+	if (csmap_page_cache && ftl->pc_valid && ftl->pc_ce == ce &&
+	    ftl->pc_cau == cau && ftl->pc_block == blk && ftl->pc_page == pg) {
+		ftl->pc_hits++;
+		ret = 0;
+	} else {
+		/*
+		 * Arm CS for this read.
+		 *
+		 * Nothing did, and the disk-lifetime session that was
+		 * supposed to cover it never actually existed -- so every
+		 * read that got this far came back -EAGAIN from the dma_dry
+		 * test inside s5l8740_nand_cs_phys_read(), before f->lock, in
+		 * microseconds. That is the whole hash/vec fallback path, and
+		 * it failed silently.
+		 *
+		 * Sessions nest, so this costs nothing when a caller above
+		 * already holds one.
+		 */
+		ftl->pc_valid = false;
+		ftl->pc_misses++;
+		sess = s5l8740_nand_dma_session_begin();
+		ret = s5l8740_nand_cs_phys_read(ce, cau, blk, pg, page);
+		if (sess == 0)
+			s5l8740_nand_dma_session_end();
+		if (!ret) {
+			ftl->pc_ce = ce;
+			ftl->pc_cau = cau;
+			ftl->pc_block = blk;
+			ftl->pc_page = pg;
+			ftl->pc_valid = csmap_page_cache;
+			n31_map_ingest_page(ftl, ce, cau, blk, pg, page);
+		}
+	}
 	if (ret) {
 		dev_err_ratelimited(ftl->dev,
 				    "CS read failed fmss_lba=%u ce=%u cau=%u blk=%u pg=%u: %d\n",
 				    fmss_lba, ce, cau, blk, pg, ret);
-		ret = -EIO;
+		/*
+		 * -EBADMSG is the NAND layer saying the controller reported
+		 * uECC or a status it does not recognise, which is a
+		 * different fault from a transport failure and the only one
+		 * that means the data is wrong rather than absent. Keep it.
+		 */
+		if (ret != -EBADMSG)
+			ret = -EIO;
 		goto out;
 	}
-
-	n31_map_ingest_page(ftl, ce, cau, blk, pg, page);
 
 	slot = s5l8740_nand_meta_pick_lba(page, fmss_lba);
 	if (slot < 0) {
@@ -1167,7 +1228,7 @@ static int n31_ftl_read_fmss_lba_flags(struct n31_ftl_cs *ftl, u32 fmss_lba,
 	memcpy(dst, page->data[slot], N31_DATA_SLOT_SIZE);
 	ret = 0;
 out:
-	kfree(page);
+	mutex_unlock(&ftl->page_lock);
 	return ret;
 }
 
@@ -2291,7 +2352,8 @@ static ssize_t ftl_map_stats_show(struct device *dev,
 			  "built=%d entries=%u pages=%u valid_records=%u "
 			  "lba_min=%u lba_max=%u extents=%u largest=%u "
 			  "duplicates=%u newer=%u has_49279=%d "
-			  "demand_scans=%u read_misses=%u capped=%u skips=%u\n%s",
+			  "demand_scans=%u read_misses=%u capped=%u skips=%u "
+			  "page_cache_hits=%u page_cache_misses=%u\n%s",
 			  ftl->map_built, ftl->map_entries, ftl->map_pages,
 			  ftl->map_data_recs,
 			  ftl->lba_min == ~0u ? 0 : ftl->lba_min, ftl->lba_max,
@@ -2299,7 +2361,8 @@ static ssize_t ftl_map_stats_show(struct device *dev,
 			  ftl->map_collisions, ftl->newer_replacements,
 			  n31_map_find(ftl, N31_FAT_BASE_DEFAULT) ? 1 : 0,
 			  ftl->demand_scans, ftl->read_miss_count,
-			  ftl->map_capped, ftl->map_skips, ftl->last_log);
+			  ftl->map_capped, ftl->map_skips,
+			  ftl->pc_hits, ftl->pc_misses, ftl->last_log);
 }
 static DEVICE_ATTR_RO(ftl_map_stats);
 
@@ -3251,8 +3314,20 @@ int ftl_s5l8740_csmap_init(struct device *dev)
 		kfree(ftl);
 		return -ENOMEM;
 	}
+	/*
+	 * kvmalloc: 16 KiB is order-2 and this is only ever filled by
+	 * memcpy inside s5l8740_nand_cs_phys_read_slc(), never handed to the
+	 * DMA engine, so it does not need to be physically contiguous.
+	 */
+	ftl->cs_page = kvmalloc(sizeof(*ftl->cs_page), GFP_KERNEL);
+	if (!ftl->cs_page) {
+		kfree(ftl->bounce);
+		kfree(ftl);
+		return -ENOMEM;
+	}
 	ftl->dev = dev;
 	mutex_init(&ftl->lock);
+	mutex_init(&ftl->page_lock);
 	hash_init(ftl->map);
 	ftl->lba_min = ~0u;
 	ftl->fat_base_lba = N31_FAT_BASE_DEFAULT;
@@ -3261,6 +3336,7 @@ int ftl_s5l8740_csmap_init(struct device *dev)
 
 	ret = sysfs_create_group(&dev->kobj, &n31_ftl_finish_group);
 	if (ret) {
+		kvfree(ftl->cs_page);
 		kfree(ftl->bounce);
 		kfree(ftl);
 		return ret;
@@ -3284,6 +3360,10 @@ void ftl_s5l8740_csmap_exit(struct device *dev)
 	mutex_lock(&ftl->lock);
 	n31_map_free(ftl);
 	mutex_unlock(&ftl->lock);
+	mutex_lock(&ftl->page_lock);
+	ftl->pc_valid = false;
+	mutex_unlock(&ftl->page_lock);
+	kvfree(ftl->cs_page);
 	kfree(ftl->bounce);
 	kfree(ftl);
 	n31_ftl = NULL;

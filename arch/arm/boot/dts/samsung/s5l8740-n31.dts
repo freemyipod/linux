@@ -258,6 +258,23 @@
                  * from the chip driver.
                  */
                 vbat-supply = <&bt_rail>;
+                /*
+                 * 2,400,000, which is stock's rate, verified on the wire:
+                 * UBRDIV on a live RetailOS 1.1.2 with Bluetooth connected
+                 * reads 0x00060000 -- divisor 0 with an oversample field of 6,
+                 * so 24 MHz / (16 - 6) = 2.4 Mbaud. That is the post-0xFC18
+                 * rate, and reaching it means stock's whole bring-up finished.
+                 *
+                 * This was briefly dropped to 115200 to make hci_bcm skip the
+                 * 0xFC18 change, which was timing out. The real cause was the
+                 * patchram: we were feeding the chip a BCM2076B1 .hcd found on
+                 * the internet for an unrelated board. A patch is where the
+                 * chip's own clock and PLL setup live, so a foreign one gets it
+                 * as far as identifying itself and then fails exactly the
+                 * command that reprograms its baud generator. Apple's patch is
+                 * embedded in OSOS and is now what ships -- see
+                 * tools/linux-n31/firmware/brcm/BCM2076B1.hcd.
+                 */
                 max-speed = <2400000>;
                 /*
                  * 97/98/119 were once listed as shutdown/device-wakeup/
@@ -300,13 +317,6 @@
              * force_plugged until resistor backend; RX = raw+osos rings.
              */
             status = "okay";
-
-            mikeybus {
-                compatible = "apple,mikeybus", "apple,n31-mikeybus";
-                current-speed = <115200>;
-                apple,force-plugged;
-                status = "okay";
-            };
         };
 
         usbphy: usbphy@3c400000 {
@@ -344,7 +354,34 @@
              * DCS command-mode panel: the window is set through the DSI
              * host and only the pixels go through LCDIF. */
             reg = <0x38300000 0x10000>, <0x3c500000 0x100>,
-                  <0x3d800000 0x1000>;
+                  <0x3d800000 0x1000>,
+                  /* The layer compositor stock draws with at runtime:
+                   * one XRGB8888 layer from DRAM, kicked by the LCDIF
+                   * transfer gate. Captured 2026-09-07 from 1.1.2. */
+                  <0x38900000 0x2000>;
+            /*
+             * Frame DMA. The pixel FIFO at 0x38300040 is a PL080
+             * peripheral in its own right: OSOS lists it as entry [0] of
+             * the FIFO address table at 0x0891DC14, with the byte at
+             * 0x0891DC98[0] = 0x01 marking it serviceable by DMAC0 only,
+             * and stock pushes whole frames into it from sub_47B0 at
+             * 0x080047B0.
+             *
+             * The cell is the hardware request line, which is NOT that
+             * table index. sub_B424C reads the line number out of a
+             * second table at 0x080B437E --
+             *   *(u32 *)(0x0891DCBC + id*8 + ctrl*4 - 4) & 0xF
+             * -- and ORs it into CxConfig at 0x080B43D6. For id 0 on
+             * DMAC0 that word is 0x00000003, so the LCDIF is request
+             * line 3. The same table is what turns IIS0 TX (id 12) into
+             * line 10 and IIS2 RX (id 17) into line 13, which is exactly
+             * what i2s0 and i2s2 below already ask for.
+             *
+             * Stock's resulting channel config is
+             *   0x800 (M2P) | (3 << 6) | 0x8001 = 0x000088C1.
+             */
+            dmas = <&dmac 3 0>;
+            dma-names = "tx";
         };
 
         /* MMIO backlight only. Never LCDIF CON/PHTIME. U-Boot already
@@ -393,7 +430,7 @@
              * pad 0xC8 = 200 out of reach, and sub_17D4DC drives that one
              * as the Bluetooth power control on board variants 1 and 2.
              */
-            ngpios = <256>;
+            ngpios = <120>;
             status = "okay";
         };
 
@@ -456,10 +493,20 @@
                 status = "okay";
             };
 
-            lis3dc: lis331dlh@18 {
+            lis3dc: accelerometer@18 {
                 compatible = "st,lis3lv02d";
-                /* Linux DT 7-bit. Wire 8-bit is 0x30 write / 0x31 read. */
+                /* Linux DT 7-bit. Wire 8-bit is 0x30 write / 0x31 read.
+                 * WHO_AM_I (0x0F) reads 0x33: an ST LIS3DH-family part, which
+                 * the driver calls WAI_3DC. RetailOS reaches the same part on
+                 * bus 1 at 0x18 -- chip detect 0x0814D0C8, register wrapper
+                 * 0x083EA55C. The node was named lis331dlh, which is the 0x32
+                 * part and never described this one.
+                 */
                 reg = <0x18>;
+                /* Read all three axes in one auto-incrementing transfer from
+                 * 0xA9, which is the transfer RetailOS uses at 0x08188118.
+                 */
+                st,block-read;
                 status = "okay";
             };
 
@@ -622,7 +669,16 @@
              * cacheable kernel mapping and oopses in v7_dma_clean_range.
              */
             dma-coherent;
-            /* RetailOS music: TX peri 10 confirmed. RX 11 still assumed. */
+            /*
+             * Request lines from RetailOS's own tables, not inference.
+             * The peripheral index table at VA 0x891DC14 maps index to FIFO
+             * address -- 12 is 0x3CA00010 (IIS0 TX), 13 is 0x3CA00038 (IIS0
+             * RX), 16 and 17 are IIS2's -- and the table at 0x891DCBC gives
+             * each one's request number per controller, 0x10 meaning the
+             * line does not exist there. Every I2S line is on the DMAC at
+             * 0x38200000 and none on 0x38700000: IIS0 TX 10, IIS0 RX 11,
+             * IIS2 TX 12, IIS2 RX 13.
+             */
             dmas = <&dmac 10 0>, <&dmac 11 0>;
             dma-names = "tx", "rx";
             #sound-dai-cells = <0>;
@@ -638,6 +694,8 @@
         i2s2: i2s@3d400000 {
             compatible = "apple,s5l8740-bcm2078-pcm", "apple,s5l8740-iis2";
             reg = <0x3d400000 0x1000>;
+            /* Peripheral 17 in stock's table; request 13 on the 0x38200000
+             * controller, which is the only one carrying it. */
             dmas = <&dmac 13 0>;
             dma-names = "rx";
             /* Capture buffer in low SRAM; see the i2s2_sram node. */

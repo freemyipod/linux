@@ -40,7 +40,36 @@
  */
 #define S5L8740_NAND_BATCH_META_SIZE	16U
 #define S5L8740_NAND_BATCH_DATA_HEAD	64U
-#define S5L8740_NAND_BATCH_MAX		256U
+/*
+ * 128 pages, which is the largest command the sequencer is ever handed.
+ *
+ * The cap is enforced where a page is appended to the command list, at
+ * 0x085172A0:
+ *
+ *	85172cc  ldrh   r0,[r4,#8]      cmd->num_pages
+ *	85172ce  cmp    r0,#0x80
+ *	85172d2  bhs    0x85172ec       return 0, command is full
+ *	85172dc  ldrh.w lr,[r7,#0x10]   per-CE page count
+ *	85172e0  cmp.w  lr,#0x80        and the same ceiling per CE
+ *	85172e4  bhs    0x85172ec
+ *
+ * and every allocation FMSS_PPN Init makes for that command agrees:
+ *
+ *	80ffeec  movw  r0,#0x1010       descriptor list, 4112 bytes
+ *	80ffef8  mov.w r5,#0x200        status array, 512 bytes
+ *
+ * 4112 is 16 * 257 -- two 16-byte descriptors per page plus the terminator --
+ * and 512 is four status bytes per page, so both are 128 pages. The VFL
+ * flushes its read queue at the same number:
+ *
+ *	84f0bde  cmp   r0,#0x80         queued spans
+ *	84f0be0  blo   0x84f0bee
+ *	84f0be4  bl    0x84f0934        _ppnvflReadSpans, then queued = 0
+ *
+ * Callers size their own work from this, so lowering it lowers the scan's
+ * pages-per-kick with it.
+ */
+#define S5L8740_NAND_BATCH_MAX		128U
 
 /*
  * Read-path batch: whole pages, so the cap is lower than the meta scan's --
@@ -79,6 +108,32 @@ struct s5l8740_nand_geom {
 	u32 geom_104;	/* FIL selector 104 analogue */
 	u32 geom_105;	/* FIL selector 105 analogue */
 	u32 geom_135;	/* FIL selector 135 analogue */
+	/*
+	 * The rest of the PPN parameter page, at the offsets _FillDevInfo
+	 * (0x0812ED9C) prints them from. That function takes the raw 512-byte
+	 * page as a1 and forms v2 = a1 + 140, so every field below is
+	 * (v2 + k) rewritten as an absolute offset:
+	 *
+	 *	v2 + 84  = 224	params->read_queue_size
+	 *	v2 + 88  = 228	params->program_queue_size
+	 *	v2 + 92  = 232	params->erase_queue_size
+	 *	v2 + 96  = 236	params->prep_function_buffer_size
+	 *	v2 + 112 = 252	params->tCERDY_us
+	 *	v2 + 20  = 160	params->tRC, then tREA, tREH, tRHOH, tRHZ,
+	 *			tRLOH, tRP at 166, and tWC/tWH/tWP at 168-170
+	 *
+	 * read_queue_size is the one with teeth: _performPPNRead
+	 * (0x084EDDDC) stores it at 0x08D10304 and uses it as the per-CE
+	 * prefetch depth, which is the whole reason a stock read pipelines
+	 * and ours does not.
+	 */
+	u32 read_queue_size;
+	u32 program_queue_size;
+	u32 erase_queue_size;
+	u32 prep_function_buffer_size;
+	u32 tcerdy_us;
+	u8 t_rc, t_rea, t_reh, t_rhoh, t_rhz, t_rloh, t_rp;
+	u8 t_wc, t_wh, t_wp;
 	bool from_param_page;
 };
 

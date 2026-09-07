@@ -21,9 +21,13 @@
  *     comes up, and domain 2 is the LCD domain. So the domain gates the
  *     block; it does not supply the level.
  *
- * No PMIC register anywhere in the D1830 map carries brightness. A rail
- * feeding the LED string would be a separate question, but nothing in the
- * PMIC state analysis names one, so do not assume it either way.
+ * The brightness level IS on the PMIC, and an earlier revision of this
+ * comment saying no D1830 register carries it was wrong. sub_A2650 writes
+ * a 16-bit level as D1830 reg 0x24 = level bits 15:8 and reg 0x25 bits
+ * 2:0 = level bits 7:5 (0x25 is PMU_WLED_ISET in gpio-d1830.c), or, when
+ * the PMIC handle has its fast-path function installed, as one 16-bit
+ * word on the single-wire transmitter at 0x3DE00000. See
+ * docs/N31-BACKLIGHT-BRIGHTNESS-PATH.md. Not implemented here yet.
  *
  * Kconfig fragment (wire Makefile / Kconfig separately):
  *   config BACKLIGHT_S5L8740
@@ -43,9 +47,40 @@
 #include <linux/platform_device.h>
 #include <linux/workqueue.h>
 
-#define S5L8740_BL_ENABLE_OFF	0x04
-#define S5L8740_BL_LEVEL_OFF	0x08
-#define S5L8740_BL_MAX		62
+/*
+ * The brightness control is on the PMIC, not in this MMIO block.
+ *
+ * What this driver used to write, and why it never did anything:
+ *
+ *	#define S5L8740_BL_ENABLE_OFF   0x04
+ *	#define S5L8740_BL_LEVEL_OFF    0x08
+ *	#define S5L8740_BL_MAX          62
+ *
+ * with 62 described as "this register's full-scale level" and bits 1..5 of
+ * 0x3E000008 treated as a magnitude. 62 is 0b111110 -- five separate bits
+ * with bit 0 clear -- and bit 0 is the only bit at that address the hardware
+ * owns. Its two writers in the whole image are the SoC power-domain enable
+ * and its counterpart:
+ *
+ *	sub_4399FC  MEMORY[0x3E000008] |= 1u;    (display domain comes up)
+ *	sub_1234    MEMORY[0x3E000008] &= ~1u;   (domain goes down)
+ *
+ * Nothing anywhere writes a variable to it. The whole 0x3E000000 block is
+ * single-bit and two-bit fields; 0x3E00000C takes 0, 1 and 3 from sub_A06,
+ * and 0x3E000004 bit 0 is set and cleared by the media-engine start and
+ * stop. It is a power gate, and a sweep of 62 -> 1 -> 0 -> 62 on the real
+ * panel changed nothing, exactly as a power gate would not.
+ *
+ * Where the level lives was found on 2026-09-07: D1830 regs 0x24/0x25 via
+ * sub_A2650 (see the header comment and docs/N31-BACKLIGHT-BRIGHTNESS-PATH.md).
+ * It was earlier believed to be D1830 register 0x2A bits 5:0; that register
+ * is charge current, owned by ChargeMgmtTask, and the reasoning behind that
+ * mistake is recorded on it in gpio-d1830.c. This driver still writes
+ * nothing anywhere -- see s5l8740_bl_hw_set() -- until the 0x24/0x25 path
+ * is wired through the PMIC provider.
+ */
+/* A scale for userspace only; nothing downstream consumes it. */
+#define S5L8740_BL_MAX		63
 
 /*
  * The LED boost is the expensive part of the display, so screen sleep
@@ -64,27 +99,94 @@ struct s5l8740_bl {
 
 static struct s5l8740_bl *s5l8740_bl_dev;
 
+/*
+ * The PMIC provider, registered rather than called directly.
+ *
+ * This driver is built into the kernel and gpio-d1830 is a module userspace
+ * loads later, so a direct call does not link: vmlinux cannot reference a
+ * module's exports. Same hook shape as bcm2078_register_bt_rails() and for the
+ * same reason.
+ *
+ * With a deferred replay, because here the ordering is harmless. The last
+ * requested level is remembered and applied when the provider arrives, so a
+ * brightness set during boot is not silently lost -- the panel is already lit by
+ * the bootloader at that point, so replaying late only moves it to what was
+ * actually asked for.
+ */
+static int (*s5l8740_bl_wled_fn)(unsigned int level, unsigned int max);
+static int s5l8740_bl_wled_want = -1;
+
+void n31_backlight_register_wled(int (*fn)(unsigned int level, unsigned int max))
+{
+	s5l8740_bl_wled_fn = fn;
+
+	if (fn && s5l8740_bl_wled_want >= 0) {
+		int ret = fn((unsigned int)s5l8740_bl_wled_want, S5L8740_BL_MAX);
+
+		pr_info("s5l8740-bl: wled provider arrived; applied %d: %d\n",
+			s5l8740_bl_wled_want, ret);
+		s5l8740_bl_wled_want = -1;
+	}
+}
+EXPORT_SYMBOL_GPL(n31_backlight_register_wled);
+
 static void s5l8740_bl_hw_set(struct s5l8740_bl *bl, int level)
 {
-	u32 en, lvl;
+	int ret;
 
 	if (level > S5L8740_BL_MAX)
 		level = S5L8740_BL_MAX;
-	bl->level = level > 0 ? level : 0;
+	if (level < 0)
+		level = 0;
+	bl->level = level;
 
-	if (level <= 0) {
-		en = readl(bl->base + S5L8740_BL_ENABLE_OFF);
-		writel(en & ~BIT(0), bl->base + S5L8740_BL_ENABLE_OFF);
-		lvl = readl(bl->base + S5L8740_BL_LEVEL_OFF);
-		writel(lvl & ~BIT(0), bl->base + S5L8740_BL_LEVEL_OFF);
+	/*
+	 * The backlight is in the PMIC's white-LED driver, not in this block.
+	 *
+	 * WLED_ISET at PMIC 0x25 is the LED current -- the image writes bits 2:0,
+	 * so eight levels -- and WLED_CTRL at 0x26 bit 0 is the enable. Traced
+	 * from the display power-on: sub_1C20 -> sub_1D04 -> sub_4D08 ->
+	 * sub_BA50 -> sub_D438, which read-modify-writes 0x26 bit 0, with
+	 * sub_1C20 asserting pad 14 immediately afterwards.
+	 *
+	 * So pad 14 was never the backlight enable on its own; it is asserted
+	 * together with the PMIC enable and power-domain resource 9.
+	 *
+	 * gpio-d1830 owns the PMIC bus and clamps to the current the bootloader
+	 * left, so this can only ask for less than the panel is already running.
+	 * -ENODEV means that module is not loaded yet, which is ordinary during
+	 * boot and not worth a message.
+	 */
+	if (!s5l8740_bl_wled_fn) {
+		s5l8740_bl_wled_want = level;
 		return;
 	}
+	ret = s5l8740_bl_wled_fn((unsigned int)level, S5L8740_BL_MAX);
+	if (ret && ret != -ENODEV)
+		pr_warn_ratelimited("s5l8740-bl: wled %d: %d\n", level, ret);
 
-	writel((u32)level, bl->base + S5L8740_BL_LEVEL_OFF);
-	en = readl(bl->base + S5L8740_BL_ENABLE_OFF);
-	writel(en | BIT(0), bl->base + S5L8740_BL_ENABLE_OFF);
-	lvl = readl(bl->base + S5L8740_BL_LEVEL_OFF);
-	writel(lvl | BIT(0), bl->base + S5L8740_BL_LEVEL_OFF);
+	/*
+	 * Deliberately writes nothing. Both candidate registers are known to
+	 * be the wrong hardware:
+	 *
+	 *   0x3E000008  is a SoC power-domain gate. Its only two writers in
+	 *               the image are sub_4399FC (domain up) and sub_1234
+	 *               (domain down), both touching bit 0 alone. 62 is
+	 *               0b111110 -- five bits with bit 0 clear -- so reading
+	 *               bits 1..5 as a magnitude was reading a bitmask as a
+	 *               number. Sweeping it 62 -> 1 -> 0 -> 62 on the real
+	 *               panel changed nothing, exactly as a power gate would
+	 *               not.
+	 *
+	 *   D1830 0x2A  is charge current, owned by ChargeMgmtTask. See the
+	 *               comment on it in gpio-d1830.c. A full-brightness
+	 *               request here would have asked for roughly 484 mA
+	 *               against a stock ceiling near 154 mA.
+	 *
+	 * So the level is accepted and remembered and the panel does not
+	 * move. That is honest: this driver does not know where brightness
+	 * lives, and guessing has now cost two wrong answers.
+	 */
 }
 
 static void s5l8740_bl_fade_work(struct work_struct *work)

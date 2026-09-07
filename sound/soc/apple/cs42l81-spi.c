@@ -14,6 +14,7 @@
  * running the graph and path configuration from .prepare rather than the
  * transport trigger -- the reasons are in section 7 of that document.
  */
+#include <linux/bitops.h>
 #include <linux/crc16.h>
 #include <linux/delay.h>
 #include <linux/module.h>
@@ -32,6 +33,18 @@
 #include <linux/apple-n31.h>
 
 #include "n31-audio-rates.h"
+
+/*
+ * Provisional prototypes for the five entry points this file gained with the
+ * MikeyBus move. Their permanent home is <linux/apple-n31.h>, which no single
+ * driver owns; delete this block when that declaration lands. The identical
+ * block is in apple-mikeybus.c, which is the consumer.
+ */
+int cs42l81_mbox_level(void);
+int cs42l81_mbox_read_frame(u8 *buf, size_t buf_size);
+int cs42l81_mbox_enable(bool on);
+int cs42l81_mbox_reset(void);
+int cs42l81_headset_model(void);
 
 /* Output gain, 0x0227. cs42_db_to_code() maps dB to the code it carries. */
 #define CS42_DB_MIN		(-76)
@@ -81,6 +94,25 @@ MODULE_PARM_DESC(trace_spi, "log every SPI frame sent to the codec");
 static bool debug_regs;
 module_param(debug_regs, bool, 0644);
 MODULE_PARM_DESC(debug_regs, "dump codec state at each lifecycle transition");
+
+/*
+ * Headset detection.
+ *
+ * The detector reads 0x0074..0x007C and, on two of its branches, writes
+ * 0x0070, 0x0074, 0x0075, 0x0079 and 0x007A. Those are page-0 registers,
+ * which land whether or not the codec clock is running -- see the
+ * cs42_state_park() comment on gated writes -- so detection does not need
+ * the audio block up. It does share 0x0074 and 0x0075 with the park and run
+ * sequences, so it runs under c->lock and is deferred while a stream is
+ * playing rather than interleaving with the analog path.
+ *
+ * This exists so it can be turned off in one boot if the codec misbehaves
+ * with it enabled, since audio is the thing at risk in this file.
+ */
+static bool jack_detect = true;
+module_param(jack_detect, bool, 0644);
+MODULE_PARM_DESC(jack_detect,
+		 "run codec headset detection (default Y)");
 
 /*
  * Mixer graph selection.
@@ -188,6 +220,23 @@ struct cs42l81 {
 	/* Cached left and right gain, in dB. */
 	int gain_l_db;
 	int gain_r_db;
+
+	/*
+	 * Jack status cache: 0x007B and 0x007C, stock's 0x892A050 and
+	 * 0x892A051. sub_43DC0C (0x43DC0C) is the pair of reads that fills
+	 * them and cs42_jack_cache_refresh() is its transcription.
+	 */
+	u8 jack_cache[2];
+
+	/*
+	 * Shadow of stock's 0x892A052 / 0x892A053, the two bytes
+	 * sub_40C048 (0x40C048) keeps and writes back complemented to
+	 * 0x0079 and 0x007A.
+	 */
+	u8 jack_preset[2];
+
+	/* Last model the detector returned; -1 until it has run. */
+	int jack_model;
 };
 
 struct cs42_reg {
@@ -303,21 +352,36 @@ static int cs42_write_table(struct cs42l81 *c, const struct cs42_reg *t,
 /*
  * Accessory and headphone-remote message channel.
  *
- * 0x051E..0x0525 is a byte-oriented message FIFO that shares the 0x05xx page
- * with the audio graph registers but has nothing to do with audio:
+ * 0x051E..0x0528 is a byte-oriented message FIFO that shares the 0x05xx page
+ * with the audio graph registers but has nothing to do with audio. This is
+ * MikeyBus: there is no UART anywhere in this path and no baud rate.
  *
  *	0x051E	write-side control; bit 0 latches the level pair, bit 5
  *		strobes a reset
- *	0x051F	write-side status, bit 1 = full
- *	0x0520	free space, less one
+ *	0x051F	status; bit 1 = write side full, bit 0 = read side empty
+ *	0x0520	write-side free space, less one
  *	0x0521	write data port
- *	0x0523	read-side control, bit 5 strobes a reset
- *	0x0524	read-side status
+ *	0x0523	read-side control; bit 0 latches the level pair, bit 5
+ *		strobes a reset
+ *	0x0524	read-side level, less one
  *	0x0525	read data port
+ *	0x0527	enable byte: 0x60 on, 0xFF off
+ *	0x0528	status, read during stock's bring-up (sub_570620)
  *
- * Frames carry a CRC-16 over the first len+5 bytes. Stock computes it from a
- * ROM table that is bit-exact CRC-16/ARC, so the kernel's crc16() is a drop-in
- * and nothing here is invented.
+ * Frames carry a CRC-16 over the first len+5 bytes. sub_19A838 (0x19A838)
+ * computes it from the 256-entry table at 0x892A0C8, file offset 0x92A0C8,
+ * which is bit-exact CRC-16/ARC -- all 256 entries compared against the
+ * reflected 0xA001 polynomial -- so the kernel's crc16() is a drop-in and
+ * nothing here is invented. It stores the high byte at len+5 and the low byte
+ * at len+6.
+ *
+ * Stock routines, all confirmed in raw disassembly:
+ *
+ *	sub_15A50C  0x15A50C  send one frame
+ *	sub_14DD16  0x14DD16  read-side level
+ *	sub_15409C  0x15409C  read one frame
+ *	sub_F141C   0xF141C   enable / disable
+ *	sub_F1444   0xF1444   reset both FIFOs
  *
  * No part of the audio path sends a message. This is implemented and exported
  * so the MikeyBus side has a transport, and so that the audio path's absence
@@ -326,6 +390,11 @@ static int cs42_write_table(struct cs42l81 *c, const struct cs42_reg *t,
 #define CS42_MBOX_LEN_OFF	1	/* payload length lives in byte 1 */
 #define CS42_MBOX_OVERHEAD	7	/* header + the two CRC bytes */
 #define CS42_MBOX_MAX		64	/* bound on the prepare-time FIFO drain */
+
+/* sub_15409C's own bounds: level 8 to start, buf[1] + 3 capped at 152. */
+#define CS42_MBOX_FRAME_MIN		8
+#define CS42_MBOX_FRAME_TAIL_MAX	152
+#define CS42_MBOX_FRAME_MAX		(5 + CS42_MBOX_FRAME_TAIL_MAX)
 
 /* Append the CRC-16 and return the full frame length. */
 static size_t cs42_mbox_frame(u8 *buf, size_t buf_size)
@@ -343,7 +412,8 @@ static size_t cs42_mbox_frame(u8 *buf, size_t buf_size)
 
 /*
  * Check the free space, then push the frame a byte at a time. Stock reports
- * a distinct error when the frame does not fit; -ENOSPC is the equivalent.
+ * error 33 when the frame does not fit (sub_15A50C at 0x15A556); -ENOSPC is
+ * the equivalent.
  */
 static int cs42_mbox_send_locked(struct cs42l81 *c, const u8 *frame, size_t len)
 {
@@ -395,18 +465,57 @@ int cs42l81_mbox_send(u8 *buf, size_t buf_size)
 }
 EXPORT_SYMBOL_GPL(cs42l81_mbox_send);
 
-/* Drain whatever the read side has queued. Returns the byte count. */
+/*
+ * sub_14DD16 (0x14DD16): how many bytes the read side holds.
+ *
+ * Latch by setting 0x0523 bit 0, read 0x051F and 0x0524, clear it again. Bit 0
+ * of 0x051F reads back set when there is nothing there; otherwise the count is
+ * 0x0524 plus one. The previous version of this driver read 0x0524 alone, with
+ * no latch, no empty test and no plus-one, so it reported one byte available
+ * on an empty FIFO and was short by one on a full one.
+ */
+static int cs42_mbox_level_locked(struct cs42l81 *c)
+{
+	u8 status = 0, level = 0;
+	int ret;
+
+	ret = cs42_rmw(c, 0x0523, 0x01, 0x01);
+	if (ret)
+		return ret;
+	ret = cs42_rd(c, 0x051f, &status);
+	if (ret)
+		return ret;
+	ret = cs42_rd(c, 0x0524, &level);
+	if (ret)
+		return ret;
+	ret = cs42_rmw(c, 0x0523, 0x01, 0x00);
+	if (ret)
+		return ret;
+
+	if (status & 0x01)
+		return 0;
+	return (int)level + 1;
+}
+
+/*
+ * Drain the read side into @buf. Kept for the existing declaration; it is
+ * cs42_mbox_level_locked() plus reads of 0x0525, which is what stock does
+ * ahead of the frame parse.
+ */
 int cs42l81_mbox_recv(u8 *buf, size_t buf_size)
 {
 	struct cs42l81 *c = cs42l81_dev;
-	u8 level = 0;
-	size_t i;
+	int level, i = 0;
 
 	if (!c)
 		return -ENODEV;
 
 	mutex_lock(&c->lock);
-	cs42_rd(c, 0x0524, &level);
+	level = cs42_mbox_level_locked(c);
+	if (level < 0) {
+		mutex_unlock(&c->lock);
+		return level;
+	}
 	if (level > buf_size)
 		level = buf_size;
 	for (i = 0; i < level; i++) {
@@ -417,6 +526,668 @@ int cs42l81_mbox_recv(u8 *buf, size_t buf_size)
 	return i;
 }
 EXPORT_SYMBOL_GPL(cs42l81_mbox_recv);
+
+/* The byte count the read side holds, or a negative errno. */
+int cs42l81_mbox_level(void)
+{
+	struct cs42l81 *c = cs42l81_dev;
+	int ret;
+
+	if (!c)
+		return -ENODEV;
+
+	mutex_lock(&c->lock);
+	ret = cs42_mbox_level_locked(c);
+	mutex_unlock(&c->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(cs42l81_mbox_level);
+
+/*
+ * sub_15409C (0x15409C): read one frame out of the read FIFO.
+ *
+ * Five header bytes from 0x0525, then buf[1] + 3 more, so the whole frame is
+ * buf[1] + 8 bytes. Stock will not start below a level of 8 (returning 1) and
+ * refuses a frame whose buf[1] + 3 exceeds 152 (returning 16). It then returns
+ * the last byte read with bit 1 masked off, as a status; this returns the byte
+ * count instead and leaves the trailer in the buffer for the caller.
+ */
+int cs42l81_mbox_read_frame(u8 *buf, size_t buf_size)
+{
+	struct cs42l81 *c = cs42l81_dev;
+	unsigned int tail, i;
+	int level, ret = 0;
+
+	if (!c)
+		return -ENODEV;
+	if (buf_size < CS42_MBOX_FRAME_MIN)
+		return -EINVAL;
+
+	mutex_lock(&c->lock);
+
+	level = cs42_mbox_level_locked(c);
+	if (level < 0) {
+		ret = level;
+		goto out;
+	}
+	if (level < CS42_MBOX_FRAME_MIN)
+		goto out;
+
+	for (i = 0; i < 5; i++) {
+		ret = cs42_rd(c, 0x0525, &buf[i]);
+		if (ret)
+			goto out;
+	}
+
+	tail = (unsigned int)buf[CS42_MBOX_LEN_OFF] + 3;
+	if (tail > CS42_MBOX_FRAME_TAIL_MAX) {
+		ret = -EMSGSIZE;
+		goto out;
+	}
+	if (5 + tail > buf_size) {
+		ret = -ENOBUFS;
+		goto out;
+	}
+
+	for (i = 0; i < tail; i++) {
+		ret = cs42_rd(c, 0x0525, &buf[5 + i]);
+		if (ret)
+			goto out;
+	}
+	ret = 5 + tail;
+
+out:
+	mutex_unlock(&c->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(cs42l81_mbox_read_frame);
+
+/*
+ * sub_F141C (0xF141C): the enable byte. 0x60 on, 0xFF off. Stock also stores
+ * the complement to 0x892A05A as the mask its link-state reader ANDs against
+ * 0x892A059; that byte has no writer in the decompile and its bits are not
+ * named here.
+ */
+int cs42l81_mbox_enable(bool on)
+{
+	struct cs42l81 *c = cs42l81_dev;
+	int ret;
+
+	if (!c)
+		return -ENODEV;
+
+	mutex_lock(&c->lock);
+	ret = cs42_wr8(c, 0x0527, on ? 0x60 : 0xff);
+	mutex_unlock(&c->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(cs42l81_mbox_enable);
+
+/* sub_F1444 (0xF1444): strobe bit 5 of 0x051E, then bit 5 of 0x0523. */
+int cs42l81_mbox_reset(void)
+{
+	struct cs42l81 *c = cs42l81_dev;
+	int ret;
+
+	if (!c)
+		return -ENODEV;
+
+	mutex_lock(&c->lock);
+	ret = cs42_rmw(c, 0x051e, 0x20, 0x20);
+	if (!ret)
+		ret = cs42_rmw(c, 0x051e, 0x20, 0x00);
+	if (!ret)
+		ret = cs42_rmw(c, 0x0523, 0x20, 0x20);
+	if (!ret)
+		ret = cs42_rmw(c, 0x0523, 0x20, 0x00);
+	mutex_unlock(&c->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(cs42l81_mbox_reset);
+
+/* ------------------------------------------------------------------ */
+/* Headset detect							*/
+/* ------------------------------------------------------------------ */
+
+/*
+ * Jack detection is a codec register read. It is not a GPIO, not Tristar and
+ * not a UART probe: the whole of it lives in 0x0074, 0x0075, 0x0077, 0x0078,
+ * 0x007B and 0x007C on this SPI control port.
+ *
+ * Stock's detector is sub_140EC8 (0x140EC8). Its single caller is 0x587D1E,
+ * which stores the result to the model global at 0x8925CD3 -- the same byte
+ * the UI formats. The return value *is* the presence answer: 0 means removed,
+ * 11 means an open circuit, anything else means something is in the jack.
+ * sub_40BE5C (0x40BE5C) accepts models {2,4,5,6,7,8,9,10,13,14,16} as
+ * carrying a remote, and sub_150B2C adds 3 to that set.
+ *
+ * Every helper below was recovered from raw disassembly, not from the IDA
+ * export. The export was not usable here: sub_3B8872 (0x3B8872) is a bare
+ * `b.w 0x43CDB4`, the register write, and the export drops its value
+ * argument, so sub_40C048's whole write sequence reads as argument-less calls.
+ *
+ * Three things stock does that have no equivalent here, so that their absence
+ * is a recorded choice rather than an omission:
+ *
+ *   - sub_140EC8 ignores every helper's return value and decides on whatever
+ *     the output variable holds. This propagates errors instead.
+ *   - the removed branches set 0x8925CE4 and free the handle at 0x8925CDC.
+ *     Both are RTOS bookkeeping with no counterpart.
+ *   - when MEMORY[0x8A8FCB8] is non-zero the result is passed through
+ *     sub_43A540(183, model), a hook whose gating global has no traced
+ *     writer. Not implemented.
+ */
+
+/* jack_cache[] indices. */
+#define CS42_JACK_R7B		0
+#define CS42_JACK_R7C		1
+
+/* Flags sub_1909D0 (0x1909D0) derives from 0x007B, bit 0 upward. */
+#define CS42_J7B_B0		0x04
+#define CS42_J7B_B1		0x08
+#define CS42_J7B_B2		0x10
+#define CS42_J7B_B3		0x20
+#define CS42_J7B_B4		0x40
+
+/* Flags sub_1F0A (0x1F0A) derives from 0x007C, bits 0 and 1. */
+#define CS42_J7C_REMOVED	0x01
+#define CS42_J7C_B1		0x02
+
+/* sub_43DC0C (0x43DC0C): refresh the cached 0x007B / 0x007C pair. */
+static int cs42_jack_cache_refresh(struct cs42l81 *c)
+{
+	int ret = cs42_rd(c, 0x007b, &c->jack_cache[CS42_JACK_R7B]);
+
+	if (ret)
+		return ret;
+	return cs42_rd(c, 0x007c, &c->jack_cache[CS42_JACK_R7C]);
+}
+
+/*
+ * sub_1909D0 (0x1909D0). @cached non-NULL takes the cached byte; NULL issues a
+ * live read of 0x007B. sub_140EC8 calls it both ways and uses only the cached
+ * result, so the live call is a transaction stock performs and a value it
+ * discards. It is kept because it is on the wire.
+ */
+static int cs42_jack_flags_7b(struct cs42l81 *c, const u8 *cached, u32 *flags)
+{
+	u8 v = 0;
+	int ret;
+
+	*flags = 0;
+	if (cached) {
+		v = *cached;
+	} else {
+		ret = cs42_rd(c, 0x007b, &v);
+		if (ret)
+			return ret;
+	}
+
+	if (v & BIT(0))
+		*flags |= CS42_J7B_B0;
+	if (v & BIT(1))
+		*flags |= CS42_J7B_B1;
+	if (v & BIT(2))
+		*flags |= CS42_J7B_B2;
+	if (v & BIT(3))
+		*flags |= CS42_J7B_B3;
+	if (v & BIT(4))
+		*flags |= CS42_J7B_B4;
+	return 0;
+}
+
+/* sub_1F0A (0x1F0A). The same shape over 0x007C. */
+static int cs42_jack_flags_7c(struct cs42l81 *c, const u8 *cached, u32 *flags)
+{
+	u8 v = 0;
+	int ret;
+
+	*flags = 0;
+	if (cached) {
+		v = *cached;
+	} else {
+		ret = cs42_rd(c, 0x007c, &v);
+		if (ret)
+			return ret;
+	}
+
+	if (v & BIT(0))
+		*flags |= CS42_J7C_REMOVED;
+	if (v & BIT(1))
+		*flags |= CS42_J7C_B1;
+	return 0;
+}
+
+/*
+ * sub_177BDC (0x177BDC): the cached 0x007C masked with 0x18. Cache only --
+ * this one never touches the bus.
+ */
+static u8 cs42_jack_gate(struct cs42l81 *c)
+{
+	return c->jack_cache[CS42_JACK_R7C] & 0x18;
+}
+
+/*
+ * sub_185C74 (0x185C74): the resistor-ladder identity code.
+ *
+ * Three 3-bit fields packed at nibble positions 0, 4 and 8, which is why the
+ * comparisons below are 0x111 / 0x222 / 0x333 / 0x444. The arithmetic is
+ * transcribed as stock performs it rather than re-derived into field
+ * assignments, so the packing cannot drift.
+ */
+static int cs42_jack_ladder(struct cs42l81 *c, u32 *code)
+{
+	u8 r77 = 0, r78 = 0;
+	u32 a;
+	int ret;
+
+	ret = cs42_rd(c, 0x0077, &r77);
+	if (ret)
+		return ret;
+	ret = cs42_rd(c, 0x0078, &r78);
+	if (ret)
+		return ret;
+
+	a = ((u32)r77 << 4) | (u32)(r78 >> 4);
+	*code = (a & 0x07) | ((a & 0x38) << 1) |
+		((0x1c0u & ((u32)r77 << 4)) << 2);
+	return 0;
+}
+
+/*
+ * sub_18FD84 (0x18FD84): 0x0078 bit 1, read with 0x0074 bit 0 clear.
+ *
+ * The toggle is conditional: stock clears bit 0 and waits 15 ms only when it
+ * was already set, and restores it afterwards only in that case. The 15 ms is
+ * stock's sub_43E006(15, 0).
+ */
+static int cs42_jack_r78_b1(struct cs42l81 *c, bool *out)
+{
+	u8 r74 = 0, r78 = 0;
+	bool toggled = false;
+	int ret;
+
+	ret = cs42_rd(c, 0x0074, &r74);
+	if (ret)
+		return ret;
+
+	if (r74 & BIT(0)) {
+		ret = cs42_rmw(c, 0x0074, 0x01, 0x00);
+		if (ret)
+			return ret;
+		toggled = true;
+		msleep(15);
+	}
+
+	ret = cs42_rd(c, 0x0078, &r78);
+	if (ret)
+		return ret;
+	*out = !!(r78 & BIT(1));
+
+	if (toggled)
+		return cs42_rmw(c, 0x0074, 0x01, 0x01);
+	return 0;
+}
+
+/*
+ * sub_191B70 (0x191B70): 0x0078 bit 0, refused when 0x0074 bits [2:1] read 1.
+ * Stock returns error 71 there; the numeric code is logged so a trace maps
+ * back to the stock path.
+ */
+static int cs42_jack_r78_b0(struct cs42l81 *c, bool *out)
+{
+	u8 r74 = 0, r78 = 0;
+	int ret;
+
+	ret = cs42_rd(c, 0x0074, &r74);
+	if (ret)
+		return ret;
+	if (((r74 >> 1) & 3) == 1) {
+		dev_dbg(&c->spi->dev,
+			"jack: 0x0074=0x%02x bits[2:1]==1, stock error 71\n",
+			r74);
+		return -EBUSY;
+	}
+
+	ret = cs42_rd(c, 0x0078, &r78);
+	if (ret)
+		return ret;
+	*out = !!(r78 & BIT(0));
+	return 0;
+}
+
+/*
+ * sub_40C028 (0x40C028): select the measurement bias, 0x0075 under mask 0x3F.
+ * The three literals are stock's. Anything outside 0..2 writes zero, which is
+ * also stock's default arm. Mask 0x3F does not overlap the 0x40 and 0x80 bits
+ * the park and run sequences use in this register.
+ */
+static int cs42_jack_bias(struct cs42l81 *c, int sel)
+{
+	u8 v;
+
+	switch (sel) {
+	case 0:
+		v = 54;
+		break;
+	case 1:
+		v = 52;
+		break;
+	case 2:
+		v = 60;
+		break;
+	default:
+		v = 0;
+		break;
+	}
+	return cs42_rmw(c, 0x0075, 0x3f, v);
+}
+
+/*
+ * sub_40C048 (0x40C048): the analog measurement presets.
+ *
+ * A twelve-way table of four bytes -- the 0x0074 value, an arm byte, and the
+ * two shadow bytes -- followed by one common write sequence. The whole table
+ * came out of the tbb dispatch at 0x40C072; the export rendered the writes as
+ * argument-less calls to sub_3B8872 and could not have produced it.
+ *
+ * Modes 5 and 6 are not implemented. Their sub-path at 0x40C0BA calls
+ * sub_DBB4(0xA410), which was not recovered, and sub_140EC8 does not use
+ * them: it calls this with 1 and with 10 only.
+ *
+ * Stock also spins at the head of this function until MEMORY[0x892A030]
+ * reaches 4, sleeping 10 ms a turn. That global's meaning was not determined,
+ * so the wait has no counterpart here; the caller runs after probe instead.
+ */
+static int cs42_jack_preset(struct cs42l81 *c, int mode)
+{
+	u8 r74, arm, hi, lo, v70;
+	unsigned int wait_ms;
+	int ret;
+
+	switch (mode) {
+	case 0:
+	case 1:
+		r74 = 3;
+		arm = 0;
+		hi = 0;
+		lo = 0;
+		break;
+	case 2:
+		r74 = 13;
+		arm = 32;
+		hi = 0;
+		lo = 1;
+		break;
+	case 3:
+		r74 = 158;
+		arm = 32;
+		hi = 0;
+		lo = 24;
+		break;
+	case 4:
+		r74 = 31;
+		arm = 32;
+		hi = 0x80;
+		lo = 35;
+		break;
+	case 8:
+		r74 = 31;
+		arm = 32;
+		hi = 0x80;
+		lo = 3;
+		break;
+	case 9:
+		r74 = 6;
+		arm = 32;
+		hi = 0;
+		lo = 0;
+		break;
+	case 10:
+		r74 = 28;
+		arm = 32;
+		hi = 0;
+		lo = 0;
+		break;
+	case 11:
+		r74 = 30;
+		arm = 32;
+		hi = 0;
+		lo = 65;
+		break;
+	case 12:
+		r74 = 31;
+		arm = 0xa0;
+		hi = 0x80;
+		lo = 2;
+		break;
+	case 5:
+	case 6:
+		return -EOPNOTSUPP;
+	default:
+		/* Mode 7 and anything from 13 up: the all-zero arm. */
+		r74 = 0;
+		arm = 0;
+		hi = 0;
+		lo = 0;
+		break;
+	}
+
+	/* 0x40C11A onward, common to every mode. */
+	if ((arm & 0x80) || (arm & 0x20))
+		arm |= 0x40;
+	v70 = arm | 0x01;
+
+	if (!(v70 & 0x80)) {
+		ret = cs42_wr8(c, 0x0070, v70);
+		if (ret)
+			return ret;
+	}
+
+	ret = cs42_wr8(c, 0x0074, r74);
+	if (ret)
+		return ret;
+
+	if ((r74 & 6) >= 4)
+		wait_ms = 35;
+	else if (r74 & 1)
+		wait_ms = 20;
+	else
+		wait_ms = 15;
+	msleep(wait_ms);
+
+	if (v70 & 0x80) {
+		ret = cs42_wr8(c, 0x0070, v70);
+		if (ret)
+			return ret;
+	}
+
+	c->jack_preset[0] = (c->jack_preset[0] & ~0x80) | hi;
+	c->jack_preset[1] = lo;
+
+	ret = cs42_wr8(c, 0x0079, (u8)~c->jack_preset[0]);
+	if (ret)
+		return ret;
+	return cs42_wr8(c, 0x007a, (u8)~c->jack_preset[1]);
+}
+
+/*
+ * sub_140EC8 (0x140EC8), transcribed from the disassembly at 0x140EC8.
+ *
+ * Returns the model, or a negative errno. The caller must hold c->lock and
+ * must have refreshed the cache: stock's cache is refreshed at the headset
+ * task's loop head (0x587B0C, 0x587B10, 0x587B6A) and in sub_416440's tail,
+ * not inside the detector.
+ */
+static int cs42_headset_detect_locked(struct cs42l81 *c)
+{
+	u32 f_cached = 0, f_live = 0, s = 0, code = 0;
+	bool r78b1 = false, r78b0 = false, measured = false;
+	int model = 0;
+	u8 gate;
+	int ret;
+
+	msleep(15);					/* sub_43E006(15, 0) */
+
+	ret = cs42_jack_flags_7b(c, &c->jack_cache[CS42_JACK_R7B], &f_cached);
+	if (ret)
+		return ret;
+	ret = cs42_jack_flags_7b(c, NULL, &f_live);	/* on the wire, unused */
+	if (ret)
+		return ret;
+	(void)f_live;
+	ret = cs42_jack_flags_7c(c, &c->jack_cache[CS42_JACK_R7C], &s);
+	if (ret)
+		return ret;
+	gate = cs42_jack_gate(c);
+	ret = cs42_jack_ladder(c, &code);
+	if (ret)
+		return ret;
+	ret = cs42_jack_r78_b1(c, &r78b1);
+	if (ret)
+		return ret;
+	ret = cs42_jack_r78_b0(c, &r78b0);
+	if (ret)
+		return ret;
+
+	/* 0x140F14: removed, and nothing else runs. */
+	if (s & CS42_J7C_REMOVED)
+		return 0;
+
+	if (gate & 0x08) {
+		/* 0x140F4E: measure the ladder. */
+		ret = cs42_jack_bias(c, 1);
+		if (ret)
+			return ret;
+		ret = cs42_jack_r78_b1(c, &measured);
+		if (ret)
+			return ret;
+
+		if (measured) {
+			/* 0x140F8E */
+			if (code == 0x444 && f_cached == 0)
+				model = 4;
+			else if (code == 0x444 &&
+				 (f_cached & CS42_J7B_B2) &&
+				 (f_cached & CS42_J7B_B4))
+				model = 13;
+			else if (code == 0x222 &&
+				 (f_cached & CS42_J7B_B2) &&
+				 (f_cached & CS42_J7B_B4))
+				model = 14;
+			else if (code == 0x333 &&
+				 (f_cached & CS42_J7B_B2) &&
+				 (f_cached & CS42_J7B_B4))
+				model = 16;
+			else if (code == 0x333)
+				model = 5;
+			else if (code == 0x222)
+				model = 10;
+			else if (code == 0x111)
+				model = 8;
+		} else {
+			/* 0x140F72 */
+			if (code == 0x444 && f_cached == 0)
+				model = 2;
+			else if (code == 0x444 &&
+				 (f_cached & CS42_J7B_B3) &&
+				 (f_cached & CS42_J7B_B4))
+				model = 15;
+			else if (code == 0x333)
+				model = 6;
+			else if (code == 0x222)
+				model = 9;
+			else if (code == 0x111)
+				model = 7;
+		}
+	} else if (r78b0) {
+		model = 1;				/* 0x141012 */
+	} else if (!r78b1) {
+		model = 11;				/* 0x141052: open */
+	} else {
+		/* 0x14101C */
+		ret = cs42_jack_preset(c, 1);
+		if (ret)
+			return ret;
+		ret = cs42_jack_preset(c, 10);
+		if (ret)
+			return ret;
+		ret = cs42_jack_bias(c, 0);
+		if (ret)
+			return ret;
+		ret = cs42_jack_r78_b1(c, &measured);
+		if (ret)
+			return ret;
+		if (!measured)
+			return 0;
+		model = 3;
+	}
+
+	/*
+	 * 0x141040: re-read the cached 0x007C and force 0 on a late removal.
+	 *
+	 * Stock re-reads the *cache*, not the register, and the cache is
+	 * refreshed by the headset task rather than by the detector -- so
+	 * within one pass of this function the value cannot have changed. It
+	 * is transcribed rather than upgraded to a live read, because a live
+	 * read here would be this driver's decision and not stock's.
+	 */
+	ret = cs42_jack_flags_7c(c, &c->jack_cache[CS42_JACK_R7C], &s);
+	if (ret)
+		return ret;
+	if (s & CS42_J7C_REMOVED)
+		return 0;
+
+	return model;
+}
+
+/*
+ * The headset model, per stock's numbering. 0 = removed, 11 = open circuit,
+ * anything else = something in the jack. Negative is an error, and callers
+ * deriving presence must treat it as "not known", not as "plugged".
+ */
+int cs42l81_headset_model(void)
+{
+	struct cs42l81 *c = cs42l81_dev;
+	int ret;
+
+	if (!c)
+		return -ENODEV;
+	if (!jack_detect)
+		return -EOPNOTSUPP;
+
+	mutex_lock(&c->lock);
+
+	/*
+	 * Deferred across the whole prepare-to-play window; it runs only from
+	 * CS42_PROBED or CS42_STANDBY, and otherwise hands back the last
+	 * answer.
+	 *
+	 * Two reasons, and both are about audio rather than about detection.
+	 * The detector shares 0x0074 with cs42_state_run() and, on the model-3
+	 * branch, writes the whole register rather than a masked field -- the
+	 * lock makes that safe against concurrency but not harmless mid-stream.
+	 * And one pass sleeps 15 ms at least twice and up to 70 ms on the
+	 * model-3 branch, all of it holding c->lock, which is the same lock
+	 * cs42_prepare() and the trigger path take; letting that land inside a
+	 * stream start would show up as an underrun, not as a jack event.
+	 */
+	if (c->state != CS42_PROBED && c->state != CS42_STANDBY) {
+		ret = c->jack_model;
+		mutex_unlock(&c->lock);
+		return ret;
+	}
+
+	ret = cs42_jack_cache_refresh(c);
+	if (!ret)
+		ret = cs42_headset_detect_locked(c);
+	if (ret >= 0)
+		c->jack_model = ret;
+
+	mutex_unlock(&c->lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(cs42l81_headset_model);
 
 /* ------------------------------------------------------------------ */
 /* SoC clock (owned by the IIS driver)					*/
@@ -707,12 +1478,18 @@ static int cs42_state_park(struct cs42l81 *c)
 
 /*
  * Run. Selects the codec clock divider, turns the clock back on, sends the
- * key once, releases the freeze latch and reads the two trim bytes stock
- * caches for later use.
+ * key once, releases the freeze latch and reads the two bytes stock caches for
+ * later use.
+ *
+ * Those two bytes were called trim0 and trim1 here. They are 0x007B and
+ * 0x007C, the jack status pair, and this read is the same one sub_43DC0C
+ * (0x43DC0C) performs into stock's 0x892A050 / 0x892A051. They are kept in
+ * jack_cache[] so the detector has them; the sequence itself, including the
+ * 0x0074 write either side, is unchanged.
  */
 static int cs42_state_run(struct cs42l81 *c)
 {
-	u8 r74 = 0, trim0 = 0, trim1 = 0;
+	u8 r74 = 0;
 	int ret;
 
 	cs42_soc_clk_divider(c);
@@ -740,8 +1517,8 @@ static int cs42_state_run(struct cs42l81 *c)
 	if (ret)
 		return ret;
 	cs42_wr8(c, 0x0074, (r74 & 0xe7) | 0x08);
-	cs42_rd(c, 0x007b, &trim0);
-	cs42_rd(c, 0x007c, &trim1);
+	cs42_rd(c, 0x007b, &c->jack_cache[CS42_JACK_R7B]);
+	cs42_rd(c, 0x007c, &c->jack_cache[CS42_JACK_R7C]);
 	cs42_wr8(c, 0x0074, r74);
 
 	ret = cs42_rmw(c, 0x0075, 0x40, 0x00);
@@ -2193,6 +2970,7 @@ static int cs42l81_probe(struct spi_device *spi)
 	c->gain_r_db = c->gain_l_db;
 	c->rate = N31_RATE_DEFAULT;
 	c->state = CS42_PROBED;
+	c->jack_model = -1;		/* the detector has not run yet */
 	mutex_init(&c->lock);
 	INIT_DELAYED_WORK(&c->post_iis_work, cs42_post_iis_workfn);
 	spi_set_drvdata(spi, c);

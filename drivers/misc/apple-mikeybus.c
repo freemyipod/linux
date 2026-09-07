@@ -1,871 +1,781 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Apple N31 MikeyBus, decomp-aligned Linux driver.
+ * Apple N31 MikeyBus.
  *
- * RetailOS objects:
- *   CMikeyBusUartReadTask
- *   CMikeyBusUartResistorTask
+ * MikeyBus is not a UART. It is a byte FIFO inside the CS42L81 codec, driven
+ * over the codec's SPI control port, and this driver is a client of that
+ * codec rather than a serdev client of anything.
  *
- * Read path:
- *   sub_570BA8 opens channel 4 with command 9/0x71/channel4.
- *   sub_500ECC handles lower packet type 0x70 and appends payload bytes
- *   to a 1024-byte RX ring.
- *   sub_2542F0 drains that RX ring and appends each byte to a parent stream.
- *   If byte == 0xAA, it appends an extra 0x01 to the stream.
+ * The previous version of this file bound to UART2 at 0x3DC00000 and carried a
+ * baud rate. That binding is closed negatively: 0x3DC00000 appears in RetailOS
+ * only in the generic four-UART descriptor table at file 0x929C00 (IRQs 24..27)
+ * and has no owner, no transfer and no baud setup anywhere in the image. The
+ * only UART MMIO in the decompile is UART1 at 0x3DB00000, which is Bluetooth.
  *
- * Resistor/model path:
- *   sub_410DB0 enables channel 3 and submits command 3/0x8D/channel3.
- *   It waits with timeout 100 on the backend result object.
- *   It reads sample byte 0x8A92444 and modifier byte 0x8A9244C.
- *   If sample == 15 and modifier == 0, sample is remapped to 100.
+ * Where the transport lives, all confirmed in raw disassembly:
  *
- * Presence/model state:
- *   sub_587F38 consumes 0x7E / 0x8A-like presence events.
- *   sub_17DD6C toggles the model modifier/state byte and opens/closes
- *   the read path.
+ *	0x051E..0x0528	the FIFO registers, on the codec's SPI port
+ *	sub_15A50C  0x15A50C	send a frame
+ *	sub_14DD16  0x14DD16	read-side level
+ *	sub_15409C  0x15409C	read a frame
+ *	sub_F141C   0xF141C	enable (0x0527 = 0x60) / disable (0xFF)
+ *	sub_F1444   0xF1444	reset both FIFOs, bit 5 of 0x051E and 0x0523
  *
- * Gate/audio route:
- *   sub_42D364 and sub_587E60 tie the Mikey state to the CS42/audio route.
- *   Do not blindly poke audio rails here.
+ * cs42l81-spi.c owns those registers and exports the five entry points this
+ * file uses. Nothing here touches MMIO.
  *
- * Not implemented yet:
- *   button input-event mapping.
+ * Wire format
+ * -----------
+ * One frame, from sub_1757B0 (0x1757B0, the command serializer) and
+ * sub_19A838 (0x19A838, the CRC finalizer):
  *
- * Never do:
- *   GPIO66/67 resistor detection. Those are UART pins, not model-detect GPIOs.
+ *	[0]		0
+ *	[1]		payload length
+ *	[2]		0x00 or 0xFF, the dispatch selector
+ *	[3]		flags: 0x40 on a command, low nibble 0 = packet,
+ *			low nibble 2 = one byte in [4]
+ *	[4]		sequence number
+ *	[5 ..]		the payload
+ *	[5+len]		CRC-16/ARC high byte, over [0 .. len+4]
+ *	[6+len]		CRC low byte
  *
- * Optional UART pad mux (GPIO 66/67 = TX/RX):
- *   GPIO_PHYS 0x3cf00000, GPIOCMD_PHYS 0x3cf001e0, TX=0x42 RX=0x43,
- *   GPIOCMD mode 2 for UART function ONLY. Never sample those pins as
- *   resistor DIN / model detect.
+ * And the payload is self-describing, the same shape in both directions:
+ *
+ *	[0]		payload length again, 3 + parameter count
+ *	[1]		command
+ *	[2]		channel
+ *	[3 ..]		parameters
+ *
+ * That last point corrects the reading this driver was written against, which
+ * called payload[0] a "class". It is the length. Three commands agree:
+ * sub_43B2D8 (0x43B2D8) channel enable is {4, 0x60, ch, on}; sub_410DB0
+ * (0x410DB0) resistor query is {3, 0x8D, 3}; sub_570BA8 (0x570BA8) read-channel
+ * open is {9, 0x71, 4, 0x83|..., 0x2A, 0x30, 0x1C, 0x80, 0x80}. In each the
+ * first byte equals the payload length. The receive side reads it the same
+ * way: sub_500E98 takes pkt[2] as the channel and drains pkt[0] - 3 payload
+ * bytes from pkt[3].
+ *
+ * Channel dispatch (sub_500E98, 0x500E98, tbb table at 0x500EA2)
+ * --------------------------------------------------------------
+ *	3	sub_16FCC0	command 0x8E only: the accessory-reported model
+ *	4	sub_500ECC	commands 0x70, 0x74, 0x76, 0x8A
+ *	5	sub_15C1E8
+ *	6	sub_167F54
+ *	0x10	sub_15C218
+ * Every other channel below 17 returns without doing anything, and 17 and
+ * above are rejected before the table.
+ *
+ * What this driver does not know
+ * ------------------------------
+ * The remote-button wire encoding. Stock appends channel-4 command 0x70
+ * payload bytes to a 1024-byte ring at 0x8AE5298 (head 0x8AE5294, masked to 10
+ * bits) and drains it in sub_2542F0 (0x2542F0), which feeds bytes one at a time
+ * to a parser and inserts an extra 0x01 after a raw 0xAA. That proves a
+ * serialized, byte-stuffed protocol and nothing about button codes. The
+ * parser's completed-frame callback was not recovered, so there is no decoder
+ * here and no input device: an inferred keymap would be a guess wearing a
+ * driver's clothes.
+ *
+ * To close it, capture the channel-4 stream for each action separately --
+ * press, release, click, double click, volume up, volume down, hold -- and log
+ * both ch4_raw and ch4_stuffed with timestamps. Framing should be inferred only
+ * after repeated captures agree. The two rings and their sysfs files exist for
+ * exactly that.
+ *
+ * Link state, and why the active commands default off
+ * --------------------------------------------------
+ * Stock will not serialize a command unless the MikeyBus link state at
+ * 0x892A058 is at least 3 (sub_1757B0 at 0x1757BC), and sub_410DB0 refuses
+ * with error 35 unless it is non-zero. That state is written only by
+ * sub_42D364, driven from the Mikey task at 0x587E60 on RTOS events 74 and 76
+ * -- and the hardware source of those events is a trace question, not a
+ * software one: the software edge ends at sub_566E8C -> sub_42D5F4(76, ...)
+ * and sub_5671E8 -> sub_42D5F4(74, ...), consecutive entries in the callback
+ * table at runtime 0x08795EEC, with no GPIO or EIC line carried in.
+ *
+ * So there is no way to reproduce stock's gate. Sending is implemented and
+ * left switched off; jack detection needs none of it, because that is a codec
+ * register read.
  */
 #include <linux/bitops.h>
 #include <linux/delay.h>
-#include <linux/io.h>
 #include <linux/kernel.h>
-#include <linux/input.h>
+#include <linux/kstrtox.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
-#include <linux/of.h>
 #include <linux/platform_device.h>
-#include <linux/property.h>
-#include <linux/serdev.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
 #include <linux/workqueue.h>
 
-#define GPIO_PHYS		0x3cf00000ul
-#define GPIOCMD_PHYS		0x3cf001e0ul
+/*
+ * Provisional prototypes for the codec entry points this driver calls. Their
+ * permanent home is <linux/apple-n31.h>, which no single driver owns; delete
+ * this block when that declaration lands. The identical block is in
+ * cs42l81-spi.c.
+ */
+int cs42l81_mbox_send(u8 *buf, size_t buf_size);
+int cs42l81_mbox_level(void);
+int cs42l81_mbox_read_frame(u8 *buf, size_t buf_size);
+int cs42l81_mbox_enable(bool on);
+int cs42l81_mbox_reset(void);
+int cs42l81_headset_model(void);
 
-/* UART2 pad mux only — NOT DIN / resistor detect. */
-#define MIKEY_GPIO_TX		0x42u	/* 66 — UART TX mux */
-#define MIKEY_GPIO_RX		0x43u	/* 67 — UART RX mux */
+/* Frame offsets, per sub_1757B0 and sub_19A838. */
+#define MIKEY_FRM_LEN		1
+#define MIKEY_FRM_SELECTOR	2
+#define MIKEY_FRM_FLAGS		3
+#define MIKEY_FRM_SEQ		4
+#define MIKEY_FRM_PAYLOAD	5
+#define MIKEY_FRM_OVERHEAD	7	/* header plus the two CRC bytes */
 
-#define MIKEY_RX_RING_SIZE	1024
-#define MIKEY_TASK_RING_SIZE	2048
+#define MIKEY_SELECTOR_PACKET	0xff	/* 0x587FEC: 0xFF dispatches sub_500E98 */
+#define MIKEY_SELECTOR_ALT	0x00	/* 0x587FF8: 0x00 dispatches sub_4FF5E4 */
 
-#define MIKEY_SAMPLE_DEFAULT		0x64
-#define MIKEY_SAMPLE_OPEN_CIRCUIT	0x0b
-#define MIKEY_SAMPLE_REMAP_FROM		0x0f
+#define MIKEY_FLAGS_COMMAND	0x40	/* 0x1757EA */
 
-#define MIKEY_CH_RESISTOR	3
-#define MIKEY_CH_READ		4
+/* Payload offsets, the same in both directions. */
+#define MIKEY_PL_LEN		0
+#define MIKEY_PL_CMD		1
+#define MIKEY_PL_CHAN		2
+#define MIKEY_PL_PARAM		3
+#define MIKEY_PL_MIN		3	/* len, cmd, channel */
 
-#define MIKEY_PKT_RX_BYTES	0x70
-#define MIKEY_PKT_IGNORED_74	0x74
-#define MIKEY_PKT_STATUS_76	0x76
-#define MIKEY_PKT_STATUS_8A	0x8a
+/* Channels, from sub_500E98's table. */
+#define MIKEY_CH_MODEL		3
+#define MIKEY_CH_REMOTE		4
+#define MIKEY_CH_BULK		5
+#define MIKEY_CH_SIX		6
+#define MIKEY_CH_TEN		0x10
+#define MIKEY_CH_MAX		0x10
 
-#define MIKEY_INJECT_MAX	64
+/* Channel-4 commands, from sub_500ECC (0x500ECC). */
+#define MIKEY_CMD_BYTES		0x70	/* payload bytes into the ring */
+#define MIKEY_CMD_IGNORED	0x74	/* stock returns without acting */
+#define MIKEY_CMD_STATUS_76	0x76	/* sub_18911C, and posts */
+#define MIKEY_CMD_STATUS_8A	0x8a	/* sub_182AFC */
+
+/* Channel-3 command, from sub_16FCC0 (0x16FCC0). */
+#define MIKEY_CMD_MODEL		0x8e
+
+/* Commands this driver can send. */
+#define MIKEY_CMD_CHAN_ENABLE	0x60	/* sub_43B2D8 */
+#define MIKEY_CMD_RESISTOR	0x8d	/* sub_410DB0 */
+#define MIKEY_CMD_READ_OPEN	0x71	/* sub_570BA8 */
+
+/*
+ * sub_15409C's bounds: it will not start below a read level of 8, and refuses
+ * a frame whose length byte plus three exceeds 152.
+ */
+#define MIKEY_FRAME_TAIL_MAX	152
+#define MIKEY_FRAME_MAX		(MIKEY_FRM_PAYLOAD + MIKEY_FRAME_TAIL_MAX)
+
+/* Stock's ring at 0x8AE5298: 1024 bytes, head masked to ten bits. */
+#define MIKEY_CH4_RING		1024
+/* The byte-stuffed replica of sub_2542F0, which can double every byte. */
+#define MIKEY_CH4_STUFFED	2048
+/* Stock's eight-entry single-byte ring at 0x8AE4F1A. */
+#define MIKEY_BYTE_RING		8
+
+/* Models sub_140EC8 returns that mean "nothing in the jack". */
+#define MIKEY_MODEL_REMOVED	0
+#define MIKEY_MODEL_OPEN	11
 
 /* -------------------- module parameters -------------------- */
 
-static bool force_plugged;
-module_param(force_plugged, bool, 0644);
-MODULE_PARM_DESC(force_plugged, "Force headset plugged state for bring-up");
-
-static int force_model = -1;
-module_param(force_model, int, 0644);
-MODULE_PARM_DESC(force_model, "Force headset model sample, -1 disables");
+/*
+ * 200 ms sits inside stock's own band: the headset task refreshes the jack
+ * cache at its loop head and sleeps 100 to 300 ms a turn, with 15 ms settles
+ * inside the detector. Note this shares SPI0 with the codec's audio traffic,
+ * so it is not free.
+ */
+static int poll_ms = 200;
+module_param(poll_ms, int, 0644);
+MODULE_PARM_DESC(poll_ms, "receive and detect poll interval in milliseconds");
 
 static bool auto_report = true;
 module_param(auto_report, bool, 0644);
-MODULE_PARM_DESC(auto_report, "Print plug/unplug/model changes to kernel log");
-
-static bool active_probe;
-module_param(active_probe, bool, 0644);
-MODULE_PARM_DESC(active_probe,
-		 "Experimental: actively send model probe command if transport is implemented");
-
-static int poll_ms = 500;
-module_param(poll_ms, int, 0644);
-MODULE_PARM_DESC(poll_ms, "Model poll interval in milliseconds");
+MODULE_PARM_DESC(auto_report, "log plug, unplug and model changes");
 
 /*
- * Remote buttons.
- *
- * What the decomp proves: the event vocabulary, from the handler names --
- * HandleMikeyCenter, HandleMikeyVolumeUp, HandleMikeyVolumeDown and
- * HandleMikeyAllUp. That last one is the useful inference. An "all up"
- * event only makes sense if the wire carries a bitmap of the buttons
- * currently held rather than discrete press and release codes: with
- * discrete codes each button would report its own release and a combined
- * all-up event would be redundant. So this decodes a held-button bitmap and
- * derives press/release by comparing against the previous value, with an
- * all-zero byte meaning everything is released.
- *
- * What the decomp does NOT give is which bit is which button. The names
- * prove the vocabulary, not the wire encoding, and nothing in the
- * disassembly pins the bit order down. Guessing it in the source would bury
- * an assumption somewhere it cannot be seen, so it lives here instead: one
- * keycode per bit, changeable at runtime. Read remote_raw while pressing a
- * known button, see which bit moves, and set the map accordingly -- that is
- * one session with the hardware rather than an argument about byte order.
- *
- * The default below is a placeholder ordering, NOT an attested one.
+ * Sending. Off by default because stock gates every command on a link state
+ * this port cannot reproduce -- see the header. The frames themselves are
+ * correct; what is missing is the condition under which stock believes the
+ * far end is listening.
  */
-#define MIKEY_BUTTON_BITS	8
+static bool allow_tx;
+module_param(allow_tx, bool, 0644);
+MODULE_PARM_DESC(allow_tx,
+		 "permit MikeyBus command frames (default N, no link-state gate exists)");
 
-static int button_map[MIKEY_BUTTON_BITS] = {
-	KEY_PLAYPAUSE, KEY_VOLUMEUP, KEY_VOLUMEDOWN, KEY_NEXTSONG,
-	KEY_PREVIOUSSONG, 0, 0, 0,
-};
-static int button_map_count = MIKEY_BUTTON_BITS;
-module_param_array(button_map, int, &button_map_count, 0644);
-MODULE_PARM_DESC(button_map,
-		 "keycode per remote bitmap bit 0..7, 0=unused; bit order is NOT attested, confirm with remote_raw");
-
-static int baud = 115200;
-module_param(baud, int, 0644);
-MODULE_PARM_DESC(baud, "MikeyBus UART baud rate");
-
-static bool accept_case3_model = true;
-module_param(accept_case3_model, bool, 0644);
-MODULE_PARM_DESC(accept_case3_model,
-		 "Accept backend packet class 3 as model sample candidate");
+/*
+ * FIFO enable. Writing 0x0527 = 0x60 is what sub_F141C does, and stock reaches
+ * it from sub_570620 (0x570620) only when two conditions hold together:
+ * MEMORY[0x8925CF4], the accessory port type, reads 1, and sub_410090()
+ * returns non-zero (both via sub_41F944 at 0x41F944; either failure means
+ * sub_42D364(0) and error 17). Neither condition's physical meaning is
+ * determined, so the write is available and not automatic.
+ *
+ * sub_570620 also writes codec 0x054F under mask 0xF0, clears bits 1 and 2 of
+ * 0x0401, writes 0x0404..0x0406, sets bit 1 of 0x0401, waits 100 ms and reads
+ * 0x0528. That sequence is not reproduced here: it is not the FIFO, and it was
+ * not traced far enough to know what it configures.
+ */
+static bool enable_fifo;
+module_param(enable_fifo, bool, 0644);
+MODULE_PARM_DESC(enable_fifo,
+		 "write 0x0527 = 0x60 at probe (default N; stock also gates on 0x8925CF4 == 1)");
 
 /* -------------------- state -------------------- */
 
-struct apple_mikey_ring {
-	u8 data[MIKEY_TASK_RING_SIZE];
-	u16 head;
-	u16 tail;
+struct mikey_ring {
+	u8 *data;
+	size_t size;
+	size_t head;
+	size_t tail;
 	u32 drops;
 };
 
 struct apple_mikeybus {
 	struct device *dev;
-	struct serdev_device *serdev;
 	struct mutex lock;
-	struct delayed_work poll_work;
-
-	void __iomem *gpio;
-	void __iomem *gpiocmd;
-	bool pinmux_on;
-	bool uart_opened;
+	struct delayed_work work;
 
 	bool auto_report;
-	bool active_probe;
-	bool resistor_backend_ready;
 
-	bool plugged;
-	bool last_reported_plugged;
+	/* From cs42l81_headset_model(); -1 until it has answered. */
+	int model;
+	int last_reported_model;
 
-	u8 model;
-	u8 last_reported_model;
-	u8 model_sample;
-	u8 model_modifier;
+	/*
+	 * The accessory's own report, channel 3 command 0x8E: four bits, per
+	 * sub_16FCC0. Stock keeps it at 0x8A92444 and it is a different thing
+	 * from the codec's model number.
+	 */
+	int accessory_sample;
+	bool accessory_valid;
 
-	bool force_plugged;
-	int force_model;
+	/* Stock's 0x892A2C8, written by sub_18911C and sub_182AFC. */
+	u16 status_word;
 
-	u32 decomp_channel_mask_shadow;
-	u8 rx_status_shadow;
+	/* Stock's channel-enable shadow at 0x8A9239C. */
+	u32 channel_shadow;
 
-	struct apple_mikey_ring rx_raw;
-	struct apple_mikey_ring rx_task_stream;
-	struct apple_mikey_ring remote_raw;	/* channel 4 only */
+	/* Stock's sequence counter at 0x892A09C. */
+	u8 seq;
 
-	struct input_dev *input;
-	u8 last_buttons;
-	u32 remote_bytes;
-	u32 button_events;
-	u32 all_up_events;
+	struct mikey_ring ch4_raw;
+	struct mikey_ring ch4_stuffed;
+	u8 byte_ring[MIKEY_BYTE_RING];
+	u8 byte_ring_head;
+	u8 byte_ring_tail;
 
-	u32 rx_bytes;
-	u32 lower_packets;
-	u32 lower_rx70_packets;
-	u32 lower_status_packets;
-	u32 presence_packets;
-	u32 aa_stuff_count;
-	u32 model_changes;
-	u32 plug_events;
-	u32 unplug_events;
-	u32 active_probe_count;
-	u32 active_probe_fail_count;
-
-	int baud;
+	u32 frames;
+	u32 frame_errors;
+	u32 packets;
+	u32 single_bytes;
+	u32 ch_unhandled[MIKEY_CH_MAX + 1];
+	u32 ch4_bytes;
+	u32 aa_stuffed;
+	u32 status_events;
+	u32 model_reports;
+	u32 tx_frames;
+	u32 tx_errors;
+	u32 detect_errors;
 };
 
-static struct apple_mikeybus *mikeybus_singleton;
-static DEFINE_MUTEX(mikeybus_singleton_lock);
-static struct platform_device *mikey_plat_pdev;
-static void mikey_ensure_plat(struct work_struct *work);
-static DECLARE_WORK(mikey_plat_work, mikey_ensure_plat);
+static struct platform_device *mikey_pdev;
 
-/* -------------------- model tables -------------------- */
+/* -------------------- model names -------------------- */
 
-static const char *mikey_model_name(u8 model)
+/*
+ * The names sub_DCEC formats for the UI, against the model numbers
+ * sub_140EC8 returns. 0 and 11 are the two that mean nothing is connected.
+ */
+static const char *mikey_model_name(int model)
 {
 	switch (model) {
-	case 0x01: return "A18";
-	case 0x02: return "B18";
-	case 0x03: return "A62";
-	case 0x04: return "B15";
-	case 0x05: return "A36";
-	case 0x06: return "Apple noise occluding";
-	case 0x07: return "mfg noise occluding";
-	case 0x08: return "mfg noise occluding w/ mic";
-	case 0x09: return "mfg std";
-	case 0x0a: return "mfg std w/ mic";
-	case 0x0b: return "open circuit";
-	case 0x0d: return "B60f";
-	case 0x0e: return "B60g";
-	case 0x0f: return "B149";
-	case 0x10: return "B187";
-	case 0x64: return "default/open/unknown";
-	default: return "inscrutable";
+	case 0:  return "removed";
+	case 1:  return "A18";
+	case 2:  return "B18";
+	case 3:  return "A62";
+	case 4:  return "B15";
+	case 5:  return "A36";
+	case 6:  return "Apple noise occluding";
+	case 7:  return "mfg noise occluding";
+	case 8:  return "mfg noise occluding w/ mic";
+	case 9:  return "mfg std";
+	case 10: return "mfg std w/ mic";
+	case 11: return "open circuit";
+	case 13: return "B60f";
+	case 14: return "B60g";
+	case 15: return "B149";
+	case 16: return "B187";
+	default: return "unnamed";
 	}
 }
 
-static bool mikey_sample_is_plugged(u8 sample)
+/*
+ * sub_40BE5C (0x40BE5C): the models stock treats as carrying a Mikey remote.
+ * sub_150B2C is this set plus 3.
+ */
+static bool mikey_model_has_remote(int model)
 {
-	switch (sample) {
-	case 0x0b: /* open circuit */
-	case 0x64: /* RetailOS default/open/unknown */
-		return false;
-	default:
+	switch (model) {
+	case 2: case 4: case 5: case 6: case 7:
+	case 8: case 9: case 10: case 13: case 14: case 16:
 		return true;
+	default:
+		return false;
 	}
 }
 
-/* -------------------- CS42 exports -------------------- */
+/* -------------------- exports for the codec side -------------------- */
 
+/*
+ * Presence, derived from the model exactly as stock derives it: 0 is removed,
+ * 11 is an open circuit, anything else is something in the jack. A negative
+ * model means the codec could not answer, which is not the same as unplugged
+ * and is reported as an error rather than as 0.
+ */
 int apple_mikeybus_jack_present(void)
 {
-	int ret;
+	int model = cs42l81_headset_model();
 
-	mutex_lock(&mikeybus_singleton_lock);
-	if (!mikeybus_singleton) {
-		mutex_unlock(&mikeybus_singleton_lock);
-		return -ENODEV;
-	}
-	mutex_lock(&mikeybus_singleton->lock);
-	ret = mikeybus_singleton->plugged ? 1 : 0;
-	mutex_unlock(&mikeybus_singleton->lock);
-	mutex_unlock(&mikeybus_singleton_lock);
-	return ret;
+	if (model < 0)
+		return model;
+	return (model != MIKEY_MODEL_REMOVED && model != MIKEY_MODEL_OPEN);
 }
 EXPORT_SYMBOL_GPL(apple_mikeybus_jack_present);
 
 int apple_mikeybus_headset_ready(void)
 {
-	/* Same as jack_present for now (analog HP gate). */
 	return apple_mikeybus_jack_present();
 }
 EXPORT_SYMBOL_GPL(apple_mikeybus_headset_ready);
 
 /* -------------------- rings -------------------- */
 
-static void mikey_ring_put(struct apple_mikey_ring *r, u8 b)
+static void mikey_ring_put(struct mikey_ring *r, u8 b)
 {
-	u16 next = (r->head + 1) % sizeof(r->data);
+	size_t next;
 
+	if (!r->data || !r->size)
+		return;
+
+	next = (r->head + 1) % r->size;
 	if (next == r->tail) {
 		r->drops++;
-		r->tail = (r->tail + 1) % sizeof(r->data);
+		r->tail = (r->tail + 1) % r->size;
 	}
-
 	r->data[r->head] = b;
 	r->head = next;
 }
 
-static size_t mikey_ring_dump_hex(struct apple_mikey_ring *r,
-				  char *buf, size_t max)
+static size_t mikey_ring_dump(struct mikey_ring *r, char *buf, size_t max)
 {
-	size_t n = 0;
-	u16 p = r->tail;
+	size_t n = 0, p;
 
-	while (p != r->head && n + 4 < max) {
+	if (!r->data)
+		return 0;
+
+	for (p = r->tail; p != r->head && n + 4 < max; p = (p + 1) % r->size)
 		n += scnprintf(buf + n, max - n, "%02x ", r->data[p]);
-		p = (p + 1) % sizeof(r->data);
-	}
 
 	if (n && n < max)
 		buf[n - 1] = '\n';
-
 	return n;
 }
 
-/* -------------------- UART pad mux (UART function only) -------------------- */
-
-static void mikey_gpiocmd(struct apple_mikeybus *m, u8 gpio, u8 mode)
+static int mikey_ring_alloc(struct apple_mikeybus *m, struct mikey_ring *r,
+			    size_t size)
 {
-	u32 bank = gpio >> 3;
-	u32 pin = gpio & 7;
-
-	if (!m->gpiocmd)
-		return;
-	writel((bank << 16) | (pin << 8) | mode, m->gpiocmd);
-}
-
-static void mikey_pinmux_uart(struct apple_mikeybus *m, bool on)
-{
-	u32 bank, pin, dir;
-	void __iomem *b;
-
-	if (!m->gpio || !m->gpiocmd)
-		return;
-
-	if (on) {
-		bank = MIKEY_GPIO_TX >> 3;
-		pin = MIKEY_GPIO_TX & 7;
-		b = m->gpio + 32 * bank;
-		dir = readl(b + 0x14);
-		writel(dir | BIT(pin), b + 0x14);
-		mikey_gpiocmd(m, MIKEY_GPIO_TX, 2);
-
-		bank = MIKEY_GPIO_RX >> 3;
-		pin = MIKEY_GPIO_RX & 7;
-		b = m->gpio + 32 * bank;
-		dir = readl(b + 0x14);
-		writel(dir | BIT(pin), b + 0x14);
-		mikey_gpiocmd(m, MIKEY_GPIO_RX, 2);
-		m->pinmux_on = true;
-	} else {
-		bank = MIKEY_GPIO_TX >> 3;
-		pin = MIKEY_GPIO_TX & 7;
-		b = m->gpio + 32 * bank;
-		dir = readl(b + 0x14);
-		writel(dir & ~BIT(pin), b + 0x14);
-		mikey_gpiocmd(m, MIKEY_GPIO_TX, 0);
-
-		bank = MIKEY_GPIO_RX >> 3;
-		pin = MIKEY_GPIO_RX & 7;
-		b = m->gpio + 32 * bank;
-		dir = readl(b + 0x14);
-		writel(dir & ~BIT(pin), b + 0x14);
-		mikey_gpiocmd(m, MIKEY_GPIO_RX, 0);
-		m->pinmux_on = false;
-	}
-}
-
-/* -------------------- RX / state -------------------- */
-
-static void mikey_rx_byte_locked(struct apple_mikeybus *m, u8 b)
-{
-	mikey_ring_put(&m->rx_raw, b);
-	mikey_ring_put(&m->rx_task_stream, b);
-
-	if (b == 0xaa) {
-		mikey_ring_put(&m->rx_task_stream, 0x01);
-		m->aa_stuff_count++;
-	}
-
-	m->rx_bytes++;
-}
-
-/*
- * One byte of the channel 4 remote stream.
- *
- * Treated as a held-button bitmap: bits set now that were not set before are
- * presses, bits that cleared are releases, and 0x00 releases everything --
- * the AllUp case. Reporting is edge-driven, so a repeated identical byte
- * costs nothing and a dropped byte self-corrects on the next one.
- */
-static void mikey_remote_byte_locked(struct apple_mikeybus *m, u8 b)
-{
-	u8 changed;
-	unsigned int bit;
-
-	mikey_ring_put(&m->remote_raw, b);
-	m->remote_bytes++;
-
-	if (!m->input)
-		return;
-
-	changed = b ^ m->last_buttons;
-	if (!changed)
-		return;
-
-	for (bit = 0; bit < MIKEY_BUTTON_BITS; bit++) {
-		int code = button_map[bit];
-
-		if (!code || !(changed & BIT(bit)))
-			continue;
-		input_report_key(m->input, code, !!(b & BIT(bit)));
-		m->button_events++;
-	}
-	input_sync(m->input);
-
-	if (!b && m->last_buttons)
-		m->all_up_events++;
-
-	m->last_buttons = b;
-}
-
-static void mikey_report_state_locked(struct apple_mikeybus *m,
-				      const char *reason)
-{
-	if (!m->auto_report)
-		return;
-
-	if (m->plugged == m->last_reported_plugged &&
-	    m->model == m->last_reported_model)
-		return;
-
-	if (m->plugged && m->last_reported_plugged &&
-	    m->model != m->last_reported_model) {
-		dev_info(m->dev,
-			 "headset changed: %s sample=0x%02x modifier=%u reason=%s\n",
-			 mikey_model_name(m->model), m->model_sample,
-			 m->model_modifier, reason);
-	} else if (m->plugged) {
-		dev_info(m->dev,
-			 "headset plugged: %s sample=0x%02x modifier=%u reason=%s\n",
-			 mikey_model_name(m->model), m->model_sample,
-			 m->model_modifier, reason);
-		m->plug_events++;
-	} else {
-		dev_info(m->dev,
-			 "headset unplugged: %s sample=0x%02x modifier=%u reason=%s\n",
-			 mikey_model_name(m->model), m->model_sample,
-			 m->model_modifier, reason);
-		m->unplug_events++;
-	}
-
-	m->last_reported_plugged = m->plugged;
-	m->last_reported_model = m->model;
-}
-
-static void mikey_apply_model_sample_locked(struct apple_mikeybus *m,
-					    u8 sample,
-					    const char *reason)
-{
-	bool plugged;
-	u8 model;
-
-	if (sample == MIKEY_SAMPLE_REMAP_FROM && m->model_modifier == 0)
-		sample = MIKEY_SAMPLE_DEFAULT;
-
-	if (m->force_plugged) {
-		plugged = true;
-		model = (m->force_model >= 0) ? (u8)m->force_model : sample;
-	} else if (m->force_model >= 0) {
-		sample = (u8)m->force_model;
-		model = sample;
-		plugged = mikey_sample_is_plugged(sample);
-	} else {
-		model = sample;
-		plugged = mikey_sample_is_plugged(sample);
-	}
-
-	if (m->model_sample != sample || m->model != model ||
-	    m->plugged != plugged)
-		m->model_changes++;
-
-	m->model_sample = sample;
-	m->model = model;
-	m->plugged = plugged;
-
-	mikey_report_state_locked(m, reason);
-}
-
-/* -------------------- lower / backend packets -------------------- */
-
-static void mikey_handle_lower_packet_locked(struct apple_mikeybus *m,
-					     const u8 *pkt, size_t len)
-{
-	u8 type;
-	u8 v;
-	size_t i;
-	u8 count;
-
-	if (len < 2)
-		return;
-
-	m->lower_packets++;
-	type = pkt[1];
-
-	switch (type) {
-	case MIKEY_PKT_RX_BYTES:
-		if (len < 3 || pkt[0] < 3 || pkt[0] > len)
-			return;
-
-		count = pkt[0] - 3;
-
-		/*
-		 * pkt[2] is the channel and was being thrown away, so the
-		 * headset-model stream on channel 3 and the remote stream on
-		 * channel 4 were interleaved into one buffer. They are
-		 * different protocols; anything reading the mixed result is
-		 * parsing two things at once. Keep feeding both to the raw
-		 * ring for tracing, but route channel 4 to the remote decoder.
-		 */
-		for (i = 0; i < count; i++) {
-			u8 payload = pkt[3 + i];
-
-			mikey_rx_byte_locked(m, payload);
-			if (pkt[2] == MIKEY_CH_READ)
-				mikey_remote_byte_locked(m, payload);
-		}
-
-		m->lower_rx70_packets++;
-		break;
-
-	case MIKEY_PKT_IGNORED_74:
-		break;
-
-	case MIKEY_PKT_STATUS_76:
-	case MIKEY_PKT_STATUS_8A:
-		if (len < 4)
-			return;
-
-		v = pkt[3];
-
-		if (v & 0x10)
-			m->rx_status_shadow = 0;
-		else if (v & 0x20)
-			m->rx_status_shadow = 0x80;
-
-		m->lower_status_packets++;
-		break;
-
-	default:
-		dev_dbg(m->dev, "unknown lower packet type=0x%02x len=%zu\n",
-			type, len);
-		break;
-	}
-}
-
-static bool model_completion_byte_plausible(u8 b)
-{
-	switch (b) {
-	case 0x01 ... 0x0b:
-	case 0x0d ... 0x10:
-	case 0x64:
-		return true;
-	default:
-		return false;
-	}
-}
-
-static void mikey_handle_model_completion_candidate_locked(
-	struct apple_mikeybus *m, const u8 *pkt, size_t len)
-{
-	u8 sample = 0xff;
-
-	if (!accept_case3_model)
-		return;
-
-	/*
-	 * Conservative candidate extraction:
-	 *   Try packet[3], packet[4], packet[1] in that order.
-	 *
-	 * Why not hard-code one forever?
-	 *   The decomp proves the sample global is written in the case-3 lane,
-	 *   but the current dump does not yet show enough local context to
-	 *   name the exact source byte with full confidence.
-	 */
-	if (len > 3 && model_completion_byte_plausible(pkt[3]))
-		sample = pkt[3];
-	else if (len > 4 && model_completion_byte_plausible(pkt[4]))
-		sample = pkt[4];
-	else if (len > 1 && model_completion_byte_plausible(pkt[1]))
-		sample = pkt[1];
-
-	if (sample == 0xff) {
-		dev_dbg(m->dev, "case3 model candidate ignored len=%zu\n", len);
-		return;
-	}
-
-	m->resistor_backend_ready = true;
-	mikey_apply_model_sample_locked(m, sample, "case3");
-}
-
-static void mikey_handle_presence_candidate_locked(struct apple_mikeybus *m,
-						   const u8 *pkt, size_t len)
-{
-	u8 code;
-	u8 arg = 0;
-
-	if (len < 2)
-		return;
-
-	code = pkt[1];
-	if (len > 4)
-		arg = pkt[4];
-
-	m->presence_packets++;
-
-	if (code == 0x7e) {
-		m->model_modifier = arg & 1;
-		dev_info(m->dev,
-			 "presence event: code=0x7e arg=0x%02x modifier=%u\n",
-			 arg, m->model_modifier);
-		return;
-	}
-
-	if (code == 0x8a) {
-		dev_info(m->dev, "presence event: code=0x8a\n");
-		return;
-	}
-
-	dev_dbg(m->dev, "presence candidate code=0x%02x arg=0x%02x\n",
-		code, arg);
-}
-
-static void mikey_handle_backend_packet_locked(struct apple_mikeybus *m,
-					       const u8 *pkt, size_t len)
-{
-	u8 cls;
-
-	if (len < 3)
-		return;
-
-	cls = pkt[2];
-
-	switch (cls) {
-	case 3:
-		mikey_handle_model_completion_candidate_locked(m, pkt, len);
-		break;
-
-	case 4:
-		mikey_handle_lower_packet_locked(m, pkt, len);
-		break;
-
-	case 5:
-		dev_dbg(m->dev, "backend case5 len=%zu\n", len);
-		break;
-
-	case 6:
-		mikey_handle_presence_candidate_locked(m, pkt, len);
-		break;
-
-	case 16:
-		dev_dbg(m->dev, "backend case16 len=%zu\n", len);
-		break;
-
-	default:
-		dev_dbg(m->dev, "backend packet class=%u len=%zu\n", cls, len);
-		break;
-	}
-}
-
-/* -------------------- active probe / poll -------------------- */
-
-static int mikey_send_active_probe(struct apple_mikeybus *m)
-{
-	/*
-	 * Do not write this blindly unless the lower transport framing is known.
-	 *
-	 * RetailOS command-object shape:
-	 *   cmd[6] = 3
-	 *   cmd[7] = 0x8D
-	 *   cmd[8] = 3
-	 *   cmd[3] = 0xFF
-	 *
-	 * The Linux serial transport may not accept the command object bytes
-	 * directly. Keep this disabled until glass capture proves framing.
-	 */
-	u8 cmd[] = {
-		0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x03, 0x8d, 0x03
-	};
-	int ret;
-
-	if (!m->active_probe)
-		return -EOPNOTSUPP;
-
-	m->active_probe_count++;
-
-	if (!m->serdev || !m->uart_opened)
-		return -ENODEV;
-
-	m->decomp_channel_mask_shadow |= BIT(MIKEY_CH_RESISTOR);
-
-	ret = serdev_device_write_buf(m->serdev, cmd, sizeof(cmd));
-	if (ret < 0)
-		return ret;
-	if (ret != sizeof(cmd))
-		return -EIO;
+	r->data = devm_kzalloc(m->dev, size, GFP_KERNEL);
+	if (!r->data)
+		return -ENOMEM;
+	r->size = size;
 	return 0;
 }
 
-static void mikey_poll_work(struct work_struct *work)
+/* -------------------- receive -------------------- */
+
+/*
+ * Channel 4, command 0x70 (sub_500ECC at 0x500EE8).
+ *
+ * Stock appends the payload bytes to the ring at 0x8AE5298 and posts event 33.
+ * The stuffed copy is sub_2542F0's (0x2542F0) view of the same stream: every
+ * byte, plus an extra 0x01 after each raw 0xAA. Both are kept because the
+ * encoding is unknown and a capture wants to see the escape as well as the
+ * bytes that produced it.
+ */
+static void mikey_ch4_bytes_locked(struct apple_mikeybus *m,
+				   const u8 *payload, unsigned int count)
 {
-	struct apple_mikeybus *m =
-		container_of(to_delayed_work(work), struct apple_mikeybus,
-			     poll_work);
-	int ret;
-	int interval;
+	unsigned int i;
 
-	mutex_lock(&m->lock);
+	for (i = 0; i < count; i++) {
+		u8 b = payload[i];
 
-	if (m->force_plugged || m->force_model >= 0) {
-		u8 sample = (m->force_model >= 0) ?
-			(u8)m->force_model : MIKEY_SAMPLE_DEFAULT;
-		mikey_apply_model_sample_locked(m, sample, "force");
-		goto out;
-	}
-
-	if (m->active_probe) {
-		ret = mikey_send_active_probe(m);
-		if (ret < 0) {
-			m->active_probe_fail_count++;
-			dev_dbg(m->dev, "active probe failed ret=%d\n", ret);
+		mikey_ring_put(&m->ch4_raw, b);
+		mikey_ring_put(&m->ch4_stuffed, b);
+		if (b == 0xaa) {
+			mikey_ring_put(&m->ch4_stuffed, 0x01);
+			m->aa_stuffed++;
 		}
+		m->ch4_bytes++;
 	}
-
-out:
-	mutex_unlock(&m->lock);
-
-	interval = poll_ms;
-	if (interval < 100)
-		interval = 100;
-	schedule_delayed_work(&m->poll_work, msecs_to_jiffies(interval));
 }
 
-/* -------------------- hex inject parser -------------------- */
-
-static int mikey_parse_hex_bytes(const char *buf, size_t count,
-				 u8 *out, size_t max, size_t *out_len)
+/*
+ * Channel 4, commands 0x76 and 0x8A (sub_18911C at 0x18911C, sub_182AFC at
+ * 0x182AFC). Both set the same 16-bit word at 0x892A2C8 from payload[0]:
+ * bit 4 stores 0, bit 5 stores 0x80, and neither bit means the word is left
+ * alone. 0x76 additionally posts on 0x8AE5288; there is nothing waiting on
+ * that here.
+ */
+static void mikey_ch4_status_locked(struct apple_mikeybus *m, u8 b)
 {
-	const char *p = buf;
-	const char *end = buf + count;
-	size_t n = 0;
+	if (b & 0x10)
+		m->status_word = 0;
+	else if (b & 0x20)
+		m->status_word = 0x80;
+	else
+		return;
 
-	while (p < end) {
-		u8 byte;
-		char tok[32];
-		size_t i = 0;
-
-		while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' ||
-				   *p == '\r' || *p == ','))
-			p++;
-		if (p >= end)
-			break;
-
-		while (p < end && *p != ' ' && *p != '\t' && *p != '\n' &&
-		       *p != '\r' && *p != ',' && i + 1 < sizeof(tok))
-			tok[i++] = *p++;
-		tok[i] = '\0';
-		if (!i)
-			break;
-
-		/* Inject ABI is hex bytes (guide: "06 70 00 aa 55 33"). */
-		if (kstrtou8(tok, 16, &byte))
-			return -EINVAL;
-		if (n >= max)
-			return -EINVAL;
-		out[n++] = byte;
-	}
-
-	*out_len = n;
-	return n ? 0 : -EINVAL;
+	m->status_events++;
 }
 
-/* -------------------- serdev -------------------- */
-
-static size_t mikey_serdev_receive(struct serdev_device *serdev,
-				   const u8 *data, size_t count)
+/* Channel 4 (sub_500ECC, 0x500ECC). */
+static void mikey_ch4_locked(struct apple_mikeybus *m, const u8 *pl,
+			     unsigned int len)
 {
-	struct apple_mikeybus *m = serdev_device_get_drvdata(serdev);
-	size_t i;
+	unsigned int count;
 
-	if (!m)
-		return count;
+	switch (pl[MIKEY_PL_CMD]) {
+	case MIKEY_CMD_BYTES:
+		if (pl[MIKEY_PL_LEN] < MIKEY_PL_MIN ||
+		    pl[MIKEY_PL_LEN] > len)
+			return;
+		count = pl[MIKEY_PL_LEN] - MIKEY_PL_MIN;
+		mikey_ch4_bytes_locked(m, &pl[MIKEY_PL_PARAM], count);
+		break;
+
+	case MIKEY_CMD_IGNORED:
+		/* 0x500F34: stock returns without acting. */
+		break;
+
+	case MIKEY_CMD_STATUS_76:
+	case MIKEY_CMD_STATUS_8A:
+		if (len > MIKEY_PL_PARAM)
+			mikey_ch4_status_locked(m, pl[MIKEY_PL_PARAM]);
+		break;
+
+	default:
+		dev_dbg(m->dev, "ch4 cmd 0x%02x len %u unhandled\n",
+			pl[MIKEY_PL_CMD], len);
+		break;
+	}
+}
+
+/*
+ * Channel 3 (sub_16FCC0, 0x16FCC0).
+ *
+ * One command and one byte, with no candidate scan: command 0x8E, and the
+ * accessory-reported model is payload[0] & 0x0F. Stock stores it at 0x8A92444
+ * and signals 0x8A92448; sub_410DB0 then reads it back and, when it reads 15
+ * with the modifier at 0x8A9244C zero, substitutes 100.
+ */
+static void mikey_ch3_locked(struct apple_mikeybus *m, const u8 *pl,
+			     unsigned int len)
+{
+	if (pl[MIKEY_PL_CMD] != MIKEY_CMD_MODEL)
+		return;
+	if (len <= MIKEY_PL_PARAM)
+		return;
+
+	m->accessory_sample = pl[MIKEY_PL_PARAM] & 0x0f;
+	m->accessory_valid = true;
+	m->model_reports++;
+
+	if (m->auto_report)
+		dev_info(m->dev, "accessory reports sample %u\n",
+			 m->accessory_sample);
+}
+
+/*
+ * sub_500E98 (0x500E98). Channel is payload[2]; 17 and above are rejected
+ * before the table, and channels 0, 1, 2 and 7..15 are in the table but
+ * branch straight to a return.
+ */
+static void mikey_dispatch_locked(struct apple_mikeybus *m, const u8 *pl,
+				  unsigned int len)
+{
+	u8 ch;
+
+	if (len < MIKEY_PL_MIN)
+		return;
+
+	ch = pl[MIKEY_PL_CHAN];
+	if (ch > MIKEY_CH_MAX) {
+		dev_dbg(m->dev, "channel %u rejected\n", ch);
+		return;
+	}
+
+	m->packets++;
+
+	switch (ch) {
+	case MIKEY_CH_MODEL:
+		mikey_ch3_locked(m, pl, len);
+		break;
+	case MIKEY_CH_REMOTE:
+		mikey_ch4_locked(m, pl, len);
+		break;
+	case MIKEY_CH_BULK:		/* sub_15C1E8 */
+	case MIKEY_CH_SIX:		/* sub_167F54 */
+	case MIKEY_CH_TEN:		/* sub_15C218 */
+		m->ch_unhandled[ch]++;
+		dev_dbg(m->dev, "channel %u cmd 0x%02x len %u not decoded\n",
+			ch, pl[MIKEY_PL_CMD], len);
+		break;
+	default:
+		/* In stock's table and deliberately inert. */
+		m->ch_unhandled[ch]++;
+		break;
+	}
+}
+
+/*
+ * One frame, as the stock receive task at 0x587F78 handles it.
+ *
+ * flags bit 7 clears the sequence counter (0x587FA0); the low nibble selects
+ * between a packet (0) and a single byte in frame[4] (2); anything else is
+ * dropped. A packet goes to sub_500E98 when the selector is 0xFF and to
+ * sub_4FF5E4 when it is 0x00. sub_4FF5E4 is not decoded here.
+ */
+static void mikey_frame_locked(struct apple_mikeybus *m, const u8 *frm,
+			       unsigned int len)
+{
+	u8 flags, low, next;
+
+	if (len < MIKEY_FRM_PAYLOAD)
+		return;
+
+	m->frames++;
+	flags = frm[MIKEY_FRM_FLAGS];
+
+	if (flags & 0x80)
+		m->seq = 0;
+
+	low = flags & 0x0f;
+	if (low == 2) {
+		/* 0x587FB4: one byte into the eight-entry ring. */
+		next = (m->byte_ring_head + 1) & (MIKEY_BYTE_RING - 1);
+		if (next != m->byte_ring_tail) {
+			m->byte_ring[m->byte_ring_head] = frm[MIKEY_FRM_SEQ];
+			m->byte_ring_head = next;
+		}
+		m->single_bytes++;
+		return;
+	}
+	if (low != 0)
+		return;
+
+	if (frm[MIKEY_FRM_SELECTOR] == MIKEY_SELECTOR_PACKET) {
+		mikey_dispatch_locked(m, &frm[MIKEY_FRM_PAYLOAD],
+				      len - MIKEY_FRM_PAYLOAD);
+	} else if (frm[MIKEY_FRM_SELECTOR] == MIKEY_SELECTOR_ALT) {
+		dev_dbg(m->dev, "selector 0x00 packet, sub_4FF5E4, not decoded\n");
+	}
+}
+
+/* -------------------- transmit -------------------- */
+
+/*
+ * Build and send one command frame.
+ *
+ * @cmd and @chan go into the payload; @params is appended after them. The
+ * payload length byte is 3 + @nparams, which is what stock writes and what the
+ * receive side reads back. The outer header and the CRC are the codec's
+ * cs42l81_mbox_send(), which frames per sub_19A838.
+ */
+static int mikey_send_locked(struct apple_mikeybus *m, u8 cmd, u8 chan,
+			     const u8 *params, unsigned int nparams)
+{
+	u8 frame[MIKEY_FRAME_MAX + MIKEY_FRM_OVERHEAD];
+	unsigned int pl_len = MIKEY_PL_MIN + nparams;
+	int ret;
+
+	if (!allow_tx)
+		return -EPERM;
+	if (MIKEY_FRM_PAYLOAD + pl_len + 2 > sizeof(frame))
+		return -EINVAL;
+
+	memset(frame, 0, sizeof(frame));
+	frame[0] = 0;
+	frame[MIKEY_FRM_LEN] = pl_len;
+	frame[MIKEY_FRM_SELECTOR] = MIKEY_SELECTOR_PACKET;
+	frame[MIKEY_FRM_FLAGS] = MIKEY_FLAGS_COMMAND;
+	frame[MIKEY_FRM_SEQ] = m->seq++;
+	frame[MIKEY_FRM_PAYLOAD + MIKEY_PL_LEN] = pl_len;
+	frame[MIKEY_FRM_PAYLOAD + MIKEY_PL_CMD] = cmd;
+	frame[MIKEY_FRM_PAYLOAD + MIKEY_PL_CHAN] = chan;
+	if (nparams)
+		memcpy(&frame[MIKEY_FRM_PAYLOAD + MIKEY_PL_PARAM], params,
+		       nparams);
+
+	ret = cs42l81_mbox_send(frame, sizeof(frame));
+	if (ret) {
+		m->tx_errors++;
+		return ret;
+	}
+	m->tx_frames++;
+	return 0;
+}
+
+/* sub_43B2D8 (0x43B2D8): {4, 0x60, ch, on}, with a shadow of the mask. */
+static int mikey_channel_enable_locked(struct apple_mikeybus *m, u8 ch, bool on)
+{
+	u8 param = on ? 1 : 0;
+	bool cur = !!(m->channel_shadow & BIT(ch));
+	int ret;
+
+	if (ch > 31)
+		return -EINVAL;
+	if (cur == on)
+		return 0;
+
+	ret = mikey_send_locked(m, MIKEY_CMD_CHAN_ENABLE, ch, &param, 1);
+	if (ret)
+		return ret;
+
+	if (on)
+		m->channel_shadow |= BIT(ch);
+	else
+		m->channel_shadow &= ~BIT(ch);
+	return 0;
+}
+
+/*
+ * sub_410DB0 (0x410DB0): enable channel 3, then {3, 0x8D, 3}. Stock waits
+ * 100 ms on 0x8A92448 for the reply; here the reply arrives through the poll
+ * worker as a channel-3 command 0x8E and lands in accessory_sample.
+ */
+static int mikey_query_resistor_locked(struct apple_mikeybus *m)
+{
+	int ret = mikey_channel_enable_locked(m, MIKEY_CH_MODEL, true);
+
+	if (ret)
+		return ret;
+	return mikey_send_locked(m, MIKEY_CMD_RESISTOR, MIKEY_CH_MODEL,
+				 NULL, 0);
+}
+
+/*
+ * sub_570BA8 (0x570BA8): enable channel 4, then {9, 0x71, 4, p0, 0x2A, 0x30,
+ * 0x1C, 0x80, 0x80} where p0 = 0x83 | (a << 4) | (b ? 0 : 4). Stock then
+ * clears the ring head and tail and the status word, which is done here too.
+ */
+static int mikey_open_read_channel_locked(struct apple_mikeybus *m, u8 a, bool b)
+{
+	u8 params[6] = { 0x83, 0x2a, 0x30, 0x1c, 0x80, 0x80 };
+	int ret;
+
+	params[0] = 0x83 | (u8)(a << 4) | (b ? 0x00 : 0x04);
+
+	ret = mikey_channel_enable_locked(m, MIKEY_CH_REMOTE, true);
+	if (ret)
+		return ret;
+	ret = mikey_send_locked(m, MIKEY_CMD_READ_OPEN, MIKEY_CH_REMOTE,
+				params, sizeof(params));
+	if (ret)
+		return ret;
+
+	m->ch4_raw.head = 0;
+	m->ch4_raw.tail = 0;
+	m->status_word = 0;
+	return 0;
+}
+
+/* -------------------- poll worker -------------------- */
+
+static void mikey_report_locked(struct apple_mikeybus *m)
+{
+	if (!m->auto_report || m->model == m->last_reported_model)
+		return;
+
+	/*
+	 * A negative model is dev_dbg, not dev_info: it can alternate with a
+	 * real answer -- the 0x0078 bit-0 read refuses with stock's error 71
+	 * whenever 0x0074 bits [2:1] happen to read 1 -- and at this poll rate
+	 * that would be a log flood rather than a jack event.
+	 */
+	if (m->model < 0)
+		dev_dbg(m->dev, "headset state unknown (%d)\n", m->model);
+	else if (m->model == MIKEY_MODEL_REMOVED)
+		dev_info(m->dev, "headset removed\n");
+	else if (m->model == MIKEY_MODEL_OPEN)
+		dev_info(m->dev, "jack open circuit\n");
+	else
+		dev_info(m->dev, "headset present: model %d (%s), remote %s\n",
+			 m->model, mikey_model_name(m->model),
+			 mikey_model_has_remote(m->model) ? "yes" : "no");
+
+	m->last_reported_model = m->model;
+}
+
+static void mikey_work_fn(struct work_struct *work)
+{
+	struct apple_mikeybus *m = container_of(to_delayed_work(work),
+					        struct apple_mikeybus, work);
+	u8 frame[MIKEY_FRAME_MAX];
+	unsigned int guard;
+	int model, ret;
+
+	/*
+	 * The detect call takes the codec's own mutex, so it is made outside
+	 * this driver's lock.
+	 */
+	model = cs42l81_headset_model();
 
 	mutex_lock(&m->lock);
-	for (i = 0; i < count; i++)
-		mikey_rx_byte_locked(m, data[i]);
+	if (model < 0 && m->model >= 0)
+		m->detect_errors++;
+	m->model = model;
+	mikey_report_locked(m);
+
+	/*
+	 * Drain what the FIFO has. Bounded, because stock's equivalent loop at
+	 * 0x587F86 is driven by an event and re-tests the level rather than
+	 * running on a timer.
+	 */
+	for (guard = 0; guard < 16; guard++) {
+		ret = cs42l81_mbox_read_frame(frame, sizeof(frame));
+		if (ret <= 0) {
+			if (ret < 0 && ret != -ENODEV)
+				m->frame_errors++;
+			break;
+		}
+		mikey_frame_locked(m, frame, ret);
+	}
 	mutex_unlock(&m->lock);
 
-	dev_dbg(&serdev->dev, "Mikey RX %zu: %*ph\n", count,
-		(int)min(count, (size_t)16), data);
-
-	return count;
+	schedule_delayed_work(&m->work,
+			      msecs_to_jiffies(clamp(poll_ms, 50, 10000)));
 }
-
-static const struct serdev_device_ops mikey_serdev_ops = {
-	.receive_buf = mikey_serdev_receive,
-	.write_wakeup = serdev_device_write_wakeup,
-};
 
 /* -------------------- sysfs -------------------- */
-
-static ssize_t info_show(struct device *dev, struct device_attribute *attr,
-			 char *buf)
-{
-	struct apple_mikeybus *m = dev_get_drvdata(dev);
-	ssize_t n;
-
-	mutex_lock(&m->lock);
-	n = sysfs_emit(buf,
-		       "N31 MikeyBus\n"
-		       "status=YELLOW\n"
-		       "read_path=channel4 command 9/0x71\n"
-		       "resistor_path=channel3 command 3/0x8D\n"
-		       "auto_report=%d\n"
-		       "active_probe=%d\n"
-		       "plugged=%d\n"
-		       "model=0x%02x %s\n"
-		       "model_sample=0x%02x\n"
-		       "model_modifier=%u\n"
-		       "force_plugged=%d\n"
-		       "force_model=%d\n"
-		       "resistor_backend_ready=%d\n"
-		       "accept_case3_model=%d\n"
-		       "baud=%d\n"
-		       "serdev=%s\n"
-		       "uart_opened=%d\n"
-		       "pinmux_on=%d\n"
-		       "button_decode=raw-only\n",
-		       m->auto_report, m->active_probe, m->plugged,
-		       m->model, mikey_model_name(m->model),
-		       m->model_sample, m->model_modifier,
-		       m->force_plugged, m->force_model,
-		       m->resistor_backend_ready, accept_case3_model,
-		       m->baud, m->serdev ? "yes" : "no",
-		       m->uart_opened, m->pinmux_on);
-	mutex_unlock(&m->lock);
-	return n;
-}
-static DEVICE_ATTR_RO(info);
-
-static ssize_t plugged_show(struct device *dev, struct device_attribute *attr,
-			    char *buf)
-{
-	struct apple_mikeybus *m = dev_get_drvdata(dev);
-	bool plugged;
-
-	mutex_lock(&m->lock);
-	plugged = m->plugged;
-	mutex_unlock(&m->lock);
-	return sysfs_emit(buf, "%d\n", plugged);
-}
-static DEVICE_ATTR_RO(plugged);
 
 static ssize_t model_show(struct device *dev, struct device_attribute *attr,
 			  char *buf)
 {
 	struct apple_mikeybus *m = dev_get_drvdata(dev);
-	u8 model;
+	int model;
 
 	mutex_lock(&m->lock);
 	model = m->model;
 	mutex_unlock(&m->lock);
-	return sysfs_emit(buf, "0x%02x\n", model);
+	return sysfs_emit(buf, "%d\n", model);
 }
 static DEVICE_ATTR_RO(model);
 
@@ -873,411 +783,245 @@ static ssize_t model_name_show(struct device *dev,
 			       struct device_attribute *attr, char *buf)
 {
 	struct apple_mikeybus *m = dev_get_drvdata(dev);
-	u8 model;
+	int model;
 
 	mutex_lock(&m->lock);
 	model = m->model;
 	mutex_unlock(&m->lock);
-	return sysfs_emit(buf, "%s\n", mikey_model_name(model));
+	return sysfs_emit(buf, "%s\n",
+			  model < 0 ? "unknown" : mikey_model_name(model));
 }
 static DEVICE_ATTR_RO(model_name);
 
-static ssize_t model_sample_show(struct device *dev,
-				 struct device_attribute *attr, char *buf)
+static ssize_t plugged_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
 {
-	struct apple_mikeybus *m = dev_get_drvdata(dev);
-	u8 sample;
+	int ret = apple_mikeybus_jack_present();
 
-	mutex_lock(&m->lock);
-	sample = m->model_sample;
-	mutex_unlock(&m->lock);
-	return sysfs_emit(buf, "0x%02x\n", sample);
+	if (ret < 0)
+		return sysfs_emit(buf, "unknown\n");
+	return sysfs_emit(buf, "%d\n", ret);
 }
-static DEVICE_ATTR_RO(model_sample);
+static DEVICE_ATTR_RO(plugged);
 
-static ssize_t model_sample_inject_store(struct device *dev,
-					 struct device_attribute *attr,
-					 const char *buf, size_t count)
-{
-	struct apple_mikeybus *m = dev_get_drvdata(dev);
-	unsigned int val;
-	int ret;
-
-	ret = kstrtouint(buf, 0, &val);
-	if (ret)
-		return ret;
-	if (val > 0xff)
-		return -EINVAL;
-
-	mutex_lock(&m->lock);
-	mikey_apply_model_sample_locked(m, (u8)val, "sample_inject");
-	mutex_unlock(&m->lock);
-
-	return count;
-}
-static DEVICE_ATTR_WO(model_sample_inject);
-
-static ssize_t model_modifier_show(struct device *dev,
-				   struct device_attribute *attr, char *buf)
-{
-	struct apple_mikeybus *m = dev_get_drvdata(dev);
-	u8 mod;
-
-	mutex_lock(&m->lock);
-	mod = m->model_modifier;
-	mutex_unlock(&m->lock);
-	return sysfs_emit(buf, "%u\n", mod);
-}
-
-static ssize_t model_modifier_store(struct device *dev,
-				    struct device_attribute *attr,
-				    const char *buf, size_t count)
-{
-	struct apple_mikeybus *m = dev_get_drvdata(dev);
-	unsigned int val;
-	int ret;
-
-	ret = kstrtouint(buf, 0, &val);
-	if (ret)
-		return ret;
-	if (val > 1)
-		return -EINVAL;
-
-	mutex_lock(&m->lock);
-	m->model_modifier = (u8)val;
-	mutex_unlock(&m->lock);
-	return count;
-}
-static DEVICE_ATTR_RW(model_modifier);
-
-static ssize_t force_plugged_show(struct device *dev,
-				  struct device_attribute *attr, char *buf)
-{
-	struct apple_mikeybus *m = dev_get_drvdata(dev);
-
-	return sysfs_emit(buf, "%d\n", m->force_plugged);
-}
-
-static ssize_t force_plugged_store(struct device *dev,
-				   struct device_attribute *attr,
-				   const char *buf, size_t count)
-{
-	struct apple_mikeybus *m = dev_get_drvdata(dev);
-	bool v;
-	int ret;
-
-	ret = kstrtobool(buf, &v);
-	if (ret)
-		return ret;
-
-	mutex_lock(&m->lock);
-	m->force_plugged = v;
-	force_plugged = v;
-	if (v) {
-		u8 sample = (m->force_model >= 0) ?
-			(u8)m->force_model : MIKEY_SAMPLE_DEFAULT;
-		mikey_apply_model_sample_locked(m, sample, "force");
-	} else if (m->force_model < 0) {
-		mikey_apply_model_sample_locked(m, m->model_sample, "force_clear");
-	}
-	mutex_unlock(&m->lock);
-	return count;
-}
-static DEVICE_ATTR_RW(force_plugged);
-
-static ssize_t force_model_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct apple_mikeybus *m = dev_get_drvdata(dev);
-
-	return sysfs_emit(buf, "%d\n", m->force_model);
-}
-
-static ssize_t force_model_store(struct device *dev,
-				 struct device_attribute *attr,
-				 const char *buf, size_t count)
-{
-	struct apple_mikeybus *m = dev_get_drvdata(dev);
-	int val;
-	int ret;
-
-	ret = kstrtoint(buf, 0, &val);
-	if (ret)
-		return ret;
-	if (val < -1 || val > 0xff)
-		return -EINVAL;
-
-	mutex_lock(&m->lock);
-	m->force_model = val;
-	force_model = val;
-	if (m->force_plugged || val >= 0) {
-		u8 sample = (val >= 0) ? (u8)val : MIKEY_SAMPLE_DEFAULT;
-
-		mikey_apply_model_sample_locked(m, sample, "force");
-	}
-	mutex_unlock(&m->lock);
-	return count;
-}
-static DEVICE_ATTR_RW(force_model);
-
-static ssize_t auto_report_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct apple_mikeybus *m = dev_get_drvdata(dev);
-
-	return sysfs_emit(buf, "%d\n", m->auto_report);
-}
-
-static ssize_t auto_report_store(struct device *dev,
-				 struct device_attribute *attr,
-				 const char *buf, size_t count)
-{
-	struct apple_mikeybus *m = dev_get_drvdata(dev);
-	bool v;
-	int ret;
-
-	ret = kstrtobool(buf, &v);
-	if (ret)
-		return ret;
-
-	mutex_lock(&m->lock);
-	m->auto_report = v;
-	auto_report = v;
-	mutex_unlock(&m->lock);
-	return count;
-}
-static DEVICE_ATTR_RW(auto_report);
-
-static ssize_t active_probe_show(struct device *dev,
-				 struct device_attribute *attr, char *buf)
-{
-	struct apple_mikeybus *m = dev_get_drvdata(dev);
-
-	return sysfs_emit(buf, "%d\n", m->active_probe);
-}
-
-static ssize_t active_probe_store(struct device *dev,
-				  struct device_attribute *attr,
-				  const char *buf, size_t count)
-{
-	struct apple_mikeybus *m = dev_get_drvdata(dev);
-	bool v;
-	int ret;
-
-	ret = kstrtobool(buf, &v);
-	if (ret)
-		return ret;
-
-	mutex_lock(&m->lock);
-	m->active_probe = v;
-	active_probe = v;
-	mutex_unlock(&m->lock);
-	return count;
-}
-static DEVICE_ATTR_RW(active_probe);
-
-static ssize_t resistor_backend_ready_show(struct device *dev,
-					   struct device_attribute *attr,
-					   char *buf)
-{
-	struct apple_mikeybus *m = dev_get_drvdata(dev);
-	bool ready;
-
-	mutex_lock(&m->lock);
-	ready = m->resistor_backend_ready;
-	mutex_unlock(&m->lock);
-	return sysfs_emit(buf, "%d\n", ready);
-}
-static DEVICE_ATTR_RO(resistor_backend_ready);
-
-static ssize_t decomp_channel_mask_shadow_show(struct device *dev,
-					       struct device_attribute *attr,
-					       char *buf)
-{
-	struct apple_mikeybus *m = dev_get_drvdata(dev);
-	u32 mask;
-
-	mutex_lock(&m->lock);
-	mask = m->decomp_channel_mask_shadow;
-	mutex_unlock(&m->lock);
-	return sysfs_emit(buf, "0x%08x\n", mask);
-}
-static DEVICE_ATTR_RO(decomp_channel_mask_shadow);
-
-static ssize_t rx_status_shadow_show(struct device *dev,
+static ssize_t accessory_sample_show(struct device *dev,
 				     struct device_attribute *attr, char *buf)
 {
 	struct apple_mikeybus *m = dev_get_drvdata(dev);
-	u8 st;
+	ssize_t n;
 
 	mutex_lock(&m->lock);
-	st = m->rx_status_shadow;
-	mutex_unlock(&m->lock);
-	return sysfs_emit(buf, "0x%02x\n", st);
-}
-static DEVICE_ATTR_RO(rx_status_shadow);
-
-static ssize_t remote_raw_show(struct device *dev,
-			       struct device_attribute *attr, char *buf)
-{
-	struct apple_mikeybus *m = dev_get_drvdata(dev);
-	size_t n;
-
-	mutex_lock(&m->lock);
-	n = mikey_ring_dump_hex(&m->remote_raw, buf, PAGE_SIZE);
+	n = m->accessory_valid ? sysfs_emit(buf, "%d\n", m->accessory_sample)
+			       : sysfs_emit(buf, "none\n");
 	mutex_unlock(&m->lock);
 	return n;
 }
-static DEVICE_ATTR_RO(remote_raw);
+static DEVICE_ATTR_RO(accessory_sample);
 
-/*
- * Everything needed to pin down the bit order: the live bitmap, the map in
- * force, and whether any of it is moving. Hold a button, read this.
- */
-static ssize_t buttons_show(struct device *dev, struct device_attribute *attr,
+static ssize_t mbox_level_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%d\n", cs42l81_mbox_level());
+}
+static DEVICE_ATTR_RO(mbox_level);
+
+static ssize_t ch4_raw_show(struct device *dev, struct device_attribute *attr,
 			    char *buf)
 {
 	struct apple_mikeybus *m = dev_get_drvdata(dev);
-	unsigned int i;
-	size_t n = 0;
+	size_t n;
 
 	mutex_lock(&m->lock);
-	n += scnprintf(buf + n, PAGE_SIZE - n,
-		       "held=0x%02x remote_bytes=%u events=%u all_up=%u\n",
-		       m->last_buttons, m->remote_bytes, m->button_events,
-		       m->all_up_events);
-	for (i = 0; i < MIKEY_BUTTON_BITS; i++)
-		n += scnprintf(buf + n, PAGE_SIZE - n,
-			       "bit%u keycode=%d held=%d\n",
-			       i, button_map[i],
-			       !!(m->last_buttons & BIT(i)));
-	n += scnprintf(buf + n, PAGE_SIZE - n,
-		       "note: bit order is not attested by the decomp; confirm here\n");
+	n = mikey_ring_dump(&m->ch4_raw, buf, PAGE_SIZE);
 	mutex_unlock(&m->lock);
 	return n;
 }
-static DEVICE_ATTR_RO(buttons);
+static DEVICE_ATTR_RO(ch4_raw);
 
-static ssize_t rx_raw_show(struct device *dev, struct device_attribute *attr,
-			   char *buf)
+static ssize_t ch4_stuffed_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
 {
 	struct apple_mikeybus *m = dev_get_drvdata(dev);
 	size_t n;
 
 	mutex_lock(&m->lock);
-	n = mikey_ring_dump_hex(&m->rx_raw, buf, PAGE_SIZE);
+	n = mikey_ring_dump(&m->ch4_stuffed, buf, PAGE_SIZE);
 	mutex_unlock(&m->lock);
 	return n;
 }
-static DEVICE_ATTR_RO(rx_raw);
+static DEVICE_ATTR_RO(ch4_stuffed);
 
-static ssize_t rx_task_stream_show(struct device *dev,
-				   struct device_attribute *attr, char *buf)
-{
-	struct apple_mikeybus *m = dev_get_drvdata(dev);
-	size_t n;
-
-	mutex_lock(&m->lock);
-	n = mikey_ring_dump_hex(&m->rx_task_stream, buf, PAGE_SIZE);
-	mutex_unlock(&m->lock);
-	return n;
-}
-static DEVICE_ATTR_RO(rx_task_stream);
-
-static ssize_t rx_stats_show(struct device *dev, struct device_attribute *attr,
-			     char *buf)
+static ssize_t stats_show(struct device *dev, struct device_attribute *attr,
+			  char *buf)
 {
 	struct apple_mikeybus *m = dev_get_drvdata(dev);
 	ssize_t n;
 
 	mutex_lock(&m->lock);
 	n = sysfs_emit(buf,
-		       "rx_bytes=%u\n"
-		       "aa_stuff_count=%u\n"
-		       "lower_packets=%u\n"
-		       "lower_rx70_packets=%u\n"
-		       "lower_status_packets=%u\n"
-		       "presence_packets=%u\n"
-		       "model_changes=%u\n"
-		       "plug_events=%u\n"
-		       "unplug_events=%u\n"
-		       "active_probe_count=%u\n"
-		       "active_probe_fail_count=%u\n"
-		       "rx_raw_drops=%u\n"
-		       "rx_task_drops=%u\n",
-		       m->rx_bytes, m->aa_stuff_count,
-		       m->lower_packets, m->lower_rx70_packets,
-		       m->lower_status_packets, m->presence_packets,
-		       m->model_changes, m->plug_events, m->unplug_events,
-		       m->active_probe_count, m->active_probe_fail_count,
-		       m->rx_raw.drops, m->rx_task_stream.drops);
+		       "frames=%u frame_errors=%u packets=%u single_bytes=%u\n"
+		       "ch4_bytes=%u aa_stuffed=%u ch4_drops=%u status_events=%u\n"
+		       "status_word=0x%04x model_reports=%u channel_shadow=0x%08x\n"
+		       "tx_frames=%u tx_errors=%u detect_errors=%u seq=%u\n"
+		       "unhandled: ch5=%u ch6=%u ch16=%u\n",
+		       m->frames, m->frame_errors, m->packets, m->single_bytes,
+		       m->ch4_bytes, m->aa_stuffed, m->ch4_raw.drops,
+		       m->status_events, m->status_word, m->model_reports,
+		       m->channel_shadow, m->tx_frames, m->tx_errors,
+		       m->detect_errors, m->seq,
+		       m->ch_unhandled[MIKEY_CH_BULK],
+		       m->ch_unhandled[MIKEY_CH_SIX],
+		       m->ch_unhandled[MIKEY_CH_TEN]);
 	mutex_unlock(&m->lock);
 	return n;
 }
-static DEVICE_ATTR_RO(rx_stats);
+static DEVICE_ATTR_RO(stats);
 
-static ssize_t lower_packet_inject_store(struct device *dev,
-					 struct device_attribute *attr,
-					 const char *buf, size_t count)
+/* Write "1" to send stock's resistor query, {3, 0x8D, 3}. */
+static ssize_t query_resistor_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
 {
 	struct apple_mikeybus *m = dev_get_drvdata(dev);
-	u8 pkt[MIKEY_INJECT_MAX];
-	size_t len;
 	int ret;
 
-	ret = mikey_parse_hex_bytes(buf, count, pkt, sizeof(pkt), &len);
-	if (ret)
-		return ret;
+	mutex_lock(&m->lock);
+	ret = mikey_query_resistor_locked(m);
+	mutex_unlock(&m->lock);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(query_resistor);
+
+/*
+ * Write "<a> <b>" to send stock's read-channel open, sub_570BA8's
+ * {9, 0x71, 4, 0x83|(a<<4)|(b?0:4), 0x2A, 0x30, 0x1C, 0x80, 0x80}. This is
+ * what starts the channel-4 byte stream a button capture needs.
+ */
+static ssize_t open_read_channel_store(struct device *dev,
+				       struct device_attribute *attr,
+				       const char *buf, size_t count)
+{
+	struct apple_mikeybus *m = dev_get_drvdata(dev);
+	unsigned int a = 0, b = 0;
+	int ret;
+
+	if (sscanf(buf, "%u %u", &a, &b) < 1)
+		return -EINVAL;
+	if (a > 15)
+		return -EINVAL;
 
 	mutex_lock(&m->lock);
-	mikey_handle_lower_packet_locked(m, pkt, len);
+	ret = mikey_open_read_channel_locked(m, (u8)a, b != 0);
+	mutex_unlock(&m->lock);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(open_read_channel);
+
+/* Write "<ch> <0|1>" for stock's channel enable, {4, 0x60, ch, on}. */
+static ssize_t channel_enable_store(struct device *dev,
+				    struct device_attribute *attr,
+				    const char *buf, size_t count)
+{
+	struct apple_mikeybus *m = dev_get_drvdata(dev);
+	unsigned int ch, on;
+	int ret;
+
+	if (sscanf(buf, "%u %u", &ch, &on) != 2)
+		return -EINVAL;
+	if (ch > 31)
+		return -EINVAL;
+
+	mutex_lock(&m->lock);
+	ret = mikey_channel_enable_locked(m, (u8)ch, on != 0);
+	mutex_unlock(&m->lock);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(channel_enable);
+
+/* Write "1" for sub_F1444's reset of both FIFOs. */
+static ssize_t fifo_reset_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	int ret = cs42l81_mbox_reset();
+
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(fifo_reset);
+
+/* Write "0" or "1" for sub_F141C's 0x0527 = 0xFF / 0x60. */
+static ssize_t fifo_enable_store(struct device *dev,
+				 struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	bool on;
+	int ret;
+
+	if (kstrtobool(buf, &on))
+		return -EINVAL;
+	ret = cs42l81_mbox_enable(on);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_WO(fifo_enable);
+
+/*
+ * Feed a frame in as if the FIFO had produced it, for testing the dispatch
+ * without hardware. Hex bytes, whitespace separated, starting at frame[0].
+ */
+static ssize_t frame_inject_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	struct apple_mikeybus *m = dev_get_drvdata(dev);
+	u8 frame[MIKEY_FRAME_MAX];
+	unsigned int n = 0;
+	const char *p = buf;
+	const char *end = buf + count;
+
+	while (p < end && n < sizeof(frame)) {
+		unsigned int v = 0, digits = 0;
+		int d;
+
+		while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' ||
+				   *p == '\r' || *p == ','))
+			p++;
+		while (p < end && digits < 2) {
+			d = hex_to_bin(*p);
+			if (d < 0)
+				break;
+			v = (v << 4) | (unsigned int)d;
+			digits++;
+			p++;
+		}
+		if (!digits)
+			break;
+		frame[n++] = (u8)v;
+	}
+	if (n < MIKEY_FRM_PAYLOAD)
+		return -EINVAL;
+
+	mutex_lock(&m->lock);
+	mikey_frame_locked(m, frame, n);
 	mutex_unlock(&m->lock);
 	return count;
 }
-static DEVICE_ATTR_WO(lower_packet_inject);
-
-static ssize_t backend_packet_inject_store(struct device *dev,
-					   struct device_attribute *attr,
-					   const char *buf, size_t count)
-{
-	struct apple_mikeybus *m = dev_get_drvdata(dev);
-	u8 pkt[MIKEY_INJECT_MAX];
-	size_t len;
-	int ret;
-
-	ret = mikey_parse_hex_bytes(buf, count, pkt, sizeof(pkt), &len);
-	if (ret)
-		return ret;
-
-	mutex_lock(&m->lock);
-	mikey_handle_backend_packet_locked(m, pkt, len);
-	mutex_unlock(&m->lock);
-	return count;
-}
-static DEVICE_ATTR_WO(backend_packet_inject);
+static DEVICE_ATTR_WO(frame_inject);
 
 static struct attribute *mikey_attrs[] = {
-	&dev_attr_info.attr,
-	&dev_attr_plugged.attr,
 	&dev_attr_model.attr,
 	&dev_attr_model_name.attr,
-	&dev_attr_model_sample.attr,
-	&dev_attr_model_sample_inject.attr,
-	&dev_attr_model_modifier.attr,
-	&dev_attr_force_plugged.attr,
-	&dev_attr_force_model.attr,
-	&dev_attr_auto_report.attr,
-	&dev_attr_active_probe.attr,
-	&dev_attr_resistor_backend_ready.attr,
-	&dev_attr_decomp_channel_mask_shadow.attr,
-	&dev_attr_remote_raw.attr,
-	&dev_attr_buttons.attr,
-	&dev_attr_rx_status_shadow.attr,
-	&dev_attr_rx_raw.attr,
-	&dev_attr_rx_task_stream.attr,
-	&dev_attr_rx_stats.attr,
-	&dev_attr_lower_packet_inject.attr,
-	&dev_attr_backend_packet_inject.attr,
+	&dev_attr_plugged.attr,
+	&dev_attr_accessory_sample.attr,
+	&dev_attr_mbox_level.attr,
+	&dev_attr_ch4_raw.attr,
+	&dev_attr_ch4_stuffed.attr,
+	&dev_attr_stats.attr,
+	&dev_attr_query_resistor.attr,
+	&dev_attr_open_read_channel.attr,
+	&dev_attr_channel_enable.attr,
+	&dev_attr_fifo_reset.attr,
+	&dev_attr_fifo_enable.attr,
+	&dev_attr_frame_inject.attr,
 	NULL,
 };
 
@@ -1285,291 +1029,112 @@ static const struct attribute_group mikey_attr_group = {
 	.attrs = mikey_attrs,
 };
 
-static const struct attribute_group *mikey_groups[] = {
-	&mikey_attr_group,
-	NULL,
-};
+/* -------------------- probe / remove -------------------- */
 
-/*
- * The remote is an input device, so publish it as one.
- *
- * Without this the driver decoded a button stream into nothing: no evdev
- * node, so no key ever reached userspace no matter how well the packets
- * parsed. devm-managed, so teardown follows the device.
- */
-static int mikey_register_input(struct apple_mikeybus *m)
-{
-	struct input_dev *in;
-	unsigned int i;
-	int ret;
-
-	in = devm_input_allocate_device(m->dev);
-	if (!in)
-		return -ENOMEM;
-
-	in->name = "Apple MikeyBus Remote";
-	in->phys = "mikeybus/input0";
-	in->id.bustype = BUS_HOST;
-
-	for (i = 0; i < MIKEY_BUTTON_BITS; i++)
-		if (button_map[i])
-			input_set_capability(in, EV_KEY, button_map[i]);
-
-	ret = input_register_device(in);
-	if (ret)
-		return ret;
-
-	m->input = in;
-	return 0;
-}
-
-static int mikey_create_sysfs(struct apple_mikeybus *m)
-{
-	return sysfs_create_groups(&m->dev->kobj, mikey_groups);
-}
-
-static void mikey_remove_sysfs(struct apple_mikeybus *m)
-{
-	sysfs_remove_groups(&m->dev->kobj, mikey_groups);
-}
-
-/* -------------------- bind / unbind -------------------- */
-
-static int mikey_bind(struct device *dev, struct serdev_device *serdev)
+static int mikey_probe(struct platform_device *pdev)
 {
 	struct apple_mikeybus *m;
 	int ret;
 
-	m = devm_kzalloc(dev, sizeof(*m), GFP_KERNEL);
+	m = devm_kzalloc(&pdev->dev, sizeof(*m), GFP_KERNEL);
 	if (!m)
 		return -ENOMEM;
 
-	m->dev = dev;
-	m->serdev = serdev;
-	m->baud = baud;
+	m->dev = &pdev->dev;
 	m->auto_report = auto_report;
-	m->active_probe = active_probe;
-	/*
-	 * The module parameter, OR the device tree. apple,force-plugged has
-	 * been in the N31 dts since the port began and was read by nothing:
-	 * this driver had no property reads at all, so the board said "assume
-	 * a headset is plugged in until the resistor backend exists" and
-	 * nothing was listening.
-	 *
-	 * Ported from n31/wip-local-backup-20260827 (8efa5c0e11ec). The rest
-	 * of that commit is superseded: its codec half stopped jack detection
-	 * returning -ENODEV, and this tree has since removed codec headset
-	 * detection altogether.
-	 */
-	m->force_plugged = force_plugged ||
-			   device_property_read_bool(dev, "apple,force-plugged");
-	m->force_model = force_model;
-
+	m->model = -1;
+	m->last_reported_model = -2;	/* so the first answer always logs */
+	m->accessory_sample = -1;
 	mutex_init(&m->lock);
-	INIT_DELAYED_WORK(&m->poll_work, mikey_poll_work);
+	INIT_DELAYED_WORK(&m->work, mikey_work_fn);
 
-	m->model_sample = MIKEY_SAMPLE_DEFAULT;
-	m->model = MIKEY_SAMPLE_DEFAULT;
-	m->plugged = false;
-	m->last_reported_plugged = false;
-	m->last_reported_model = MIKEY_SAMPLE_DEFAULT;
-
-	m->gpio = devm_ioremap(dev, GPIO_PHYS, 0x200);
-	m->gpiocmd = devm_ioremap(dev, GPIOCMD_PHYS, 4);
-
-	dev_set_drvdata(dev, m);
-
-	if (serdev) {
-		serdev_device_set_drvdata(serdev, m);
-		serdev_device_set_client_ops(serdev, &mikey_serdev_ops);
-
-		ret = serdev_device_open(serdev);
-		if (ret)
-			return ret;
-
-		serdev_device_set_baudrate(serdev, m->baud);
-		serdev_device_set_flow_control(serdev, false);
-		m->uart_opened = true;
-		m->decomp_channel_mask_shadow |= BIT(MIKEY_CH_READ);
-	}
-
-	mikey_pinmux_uart(m, true);
-
-	/*
-	 * Not fatal: the bus is still useful for headset detection and
-	 * tracing even if the input node cannot be created.
-	 */
-	ret = mikey_register_input(m);
+	ret = mikey_ring_alloc(m, &m->ch4_raw, MIKEY_CH4_RING);
 	if (ret)
-		dev_warn(m->dev, "no input device: %d\n", ret);
-
-	ret = mikey_create_sysfs(m);
-	if (ret) {
-		if (serdev && m->uart_opened) {
-			serdev_device_close(serdev);
-			m->uart_opened = false;
-		}
 		return ret;
+	ret = mikey_ring_alloc(m, &m->ch4_stuffed, MIKEY_CH4_STUFFED);
+	if (ret)
+		return ret;
+
+	platform_set_drvdata(pdev, m);
+
+	ret = sysfs_create_group(&pdev->dev.kobj, &mikey_attr_group);
+	if (ret)
+		return ret;
+
+	if (enable_fifo) {
+		ret = cs42l81_mbox_enable(true);
+		if (ret)
+			dev_warn(m->dev, "0x0527 enable failed: %d\n", ret);
+		else
+			cs42l81_mbox_reset();
 	}
 
-	mutex_lock(&mikeybus_singleton_lock);
-	mikeybus_singleton = m;
-	mutex_unlock(&mikeybus_singleton_lock);
+	dev_info(m->dev,
+		 "MikeyBus on the CS42L81 FIFO: poll=%dms tx=%d fifo_enable=%d\n",
+		 poll_ms, allow_tx, enable_fifo);
 
-	dev_info(dev,
-		 "N31 MikeyBus loaded (%s): auto_report=%d active_probe=%d force_plugged=%d force_model=%d baud=%d\n",
-		 serdev ? "serdev" : "platform",
-		 m->auto_report, m->active_probe,
-		 m->force_plugged, m->force_model, m->baud);
-
-	schedule_delayed_work(&m->poll_work, msecs_to_jiffies(100));
+	schedule_delayed_work(&m->work, msecs_to_jiffies(100));
 	return 0;
 }
 
-static void mikey_unbind(struct device *dev)
+static void mikey_remove(struct platform_device *pdev)
 {
-	struct apple_mikeybus *m = dev_get_drvdata(dev);
+	struct apple_mikeybus *m = platform_get_drvdata(pdev);
 
 	if (!m)
 		return;
 
-	cancel_delayed_work_sync(&m->poll_work);
-
-	mutex_lock(&mikeybus_singleton_lock);
-	if (mikeybus_singleton == m)
-		mikeybus_singleton = NULL;
-	mutex_unlock(&mikeybus_singleton_lock);
-
-	mikey_remove_sysfs(m);
-
-	mutex_lock(&m->lock);
-	if (m->uart_opened && m->serdev) {
-		serdev_device_close(m->serdev);
-		m->uart_opened = false;
-	}
-	mikey_pinmux_uart(m, false);
-	mutex_unlock(&m->lock);
+	cancel_delayed_work_sync(&m->work);
+	sysfs_remove_group(&pdev->dev.kobj, &mikey_attr_group);
 }
 
-/* -------------------- platform fallback -------------------- */
-
-static void mikey_ensure_plat(struct work_struct *work)
-{
-	struct device_node *uart_np, *mikey_np = NULL;
-	int ret;
-
-	(void)work;
-	if (mikeybus_singleton)
-		return;
-
-	/*
-	 * Prefer serdev when uart2 is okay in DT. Only instantiate the
-	 * platform fallback when uart2 is disabled / missing so exports
-	 * and sysfs still exist for CS42 bring-up.
-	 */
-	uart_np = of_find_node_by_path("/soc/serial@3dc00000");
-	if (uart_np && of_device_is_available(uart_np)) {
-		pr_info("apple-mikeybus: uart2 okay in DT — waiting on serdev\n");
-		of_node_put(uart_np);
-		return;
-	}
-	if (uart_np)
-		mikey_np = of_get_child_by_name(uart_np, "mikeybus");
-
-	mikey_plat_pdev = platform_device_alloc("apple-mikeybus-plat",
-						PLATFORM_DEVID_NONE);
-	if (!mikey_plat_pdev)
-		goto out;
-	if (mikey_np)
-		mikey_plat_pdev->dev.of_node = of_node_get(mikey_np);
-	ret = platform_device_add(mikey_plat_pdev);
-	if (ret) {
-		pr_warn("apple-mikeybus: plat add %d\n", ret);
-		platform_device_put(mikey_plat_pdev);
-		mikey_plat_pdev = NULL;
-	}
-out:
-	if (mikey_np)
-		of_node_put(mikey_np);
-	if (uart_np)
-		of_node_put(uart_np);
-}
-
-static int mikey_serdev_probe(struct serdev_device *serdev)
-{
-	return mikey_bind(&serdev->dev, serdev);
-}
-
-static void mikey_serdev_remove(struct serdev_device *serdev)
-{
-	mikey_unbind(&serdev->dev);
-}
-
-static const struct of_device_id mikey_serdev_of_match[] = {
-	{ .compatible = "apple,mikeybus" },
-	{ .compatible = "apple,n31-mikeybus" },
-	{ }
-};
-MODULE_DEVICE_TABLE(of, mikey_serdev_of_match);
-
-static struct serdev_device_driver mikey_serdev_driver = {
-	.probe = mikey_serdev_probe,
-	.remove = mikey_serdev_remove,
+static struct platform_driver mikey_driver = {
+	.probe = mikey_probe,
+	.remove = mikey_remove,
 	.driver = {
 		.name = "apple-mikeybus",
-		.of_match_table = mikey_serdev_of_match,
 	},
 };
 
-static int mikey_plat_probe(struct platform_device *pdev)
-{
-	return mikey_bind(&pdev->dev, NULL);
-}
-
-static void mikey_plat_remove(struct platform_device *pdev)
-{
-	mikey_unbind(&pdev->dev);
-}
-
-static struct platform_driver mikey_plat_driver = {
-	.probe = mikey_plat_probe,
-	.remove = mikey_plat_remove,
-	.driver = {
-		.name = "apple-mikeybus-plat",
-	},
-};
-
+/*
+ * No device tree node.
+ *
+ * The old one was a child of serial@3dc00000, which is not MikeyBus. There is
+ * nothing left for a node to describe: the registers belong to the codec and
+ * the codec is found through its exports, so the device is created here.
+ */
 static int __init mikey_init(void)
 {
-	int ret;
+	int ret = platform_driver_register(&mikey_driver);
 
-	ret = serdev_device_driver_register(&mikey_serdev_driver);
 	if (ret)
 		return ret;
-	ret = platform_driver_register(&mikey_plat_driver);
-	if (ret) {
-		serdev_device_driver_unregister(&mikey_serdev_driver);
+
+	mikey_pdev = platform_device_register_simple("apple-mikeybus",
+						     PLATFORM_DEVID_NONE,
+						     NULL, 0);
+	if (IS_ERR(mikey_pdev)) {
+		ret = PTR_ERR(mikey_pdev);
+		mikey_pdev = NULL;
+		platform_driver_unregister(&mikey_driver);
 		return ret;
 	}
-	schedule_work(&mikey_plat_work);
 	return 0;
 }
 
 static void __exit mikey_exit(void)
 {
-	cancel_work_sync(&mikey_plat_work);
-	if (mikey_plat_pdev) {
-		platform_device_unregister(mikey_plat_pdev);
-		mikey_plat_pdev = NULL;
+	if (mikey_pdev) {
+		platform_device_unregister(mikey_pdev);
+		mikey_pdev = NULL;
 	}
-	platform_driver_unregister(&mikey_plat_driver);
-	serdev_device_driver_unregister(&mikey_serdev_driver);
+	platform_driver_unregister(&mikey_driver);
 }
 
 module_init(mikey_init);
 module_exit(mikey_exit);
 
-MODULE_DESCRIPTION("Apple N31 MikeyBus (serdev RX, model/jack state, CS42 exports)");
+MODULE_DESCRIPTION("Apple N31 MikeyBus, on the CS42L81 message FIFO");
 MODULE_AUTHOR("FreeMyiPod");
 MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:apple-mikeybus-plat");
+MODULE_ALIAS("platform:apple-mikeybus");

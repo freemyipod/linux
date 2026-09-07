@@ -2,7 +2,22 @@
 #ifndef FMSS_SEQ_READ_H
 #define FMSS_SEQ_READ_H
 
-#define FMSS_SEQ_READ_LEN 2824u
+/*
+ * 2832, which is what FIL_Init cache-cleans from 0x8980EA0 before handing
+ * the program to the sequencer:
+ *
+ *	ffe7e  mov.w r1, #2832        @ 0xb10
+ *	ffe82  ldr   r0, [pc, #192]   @ = 0x08980EA0
+ *
+ * and it is also sizeof(fmss_seq_read_blob) below. This said 2824, so the
+ * memcpys copied eight bytes short and the coherent allocation was eight
+ * bytes short of the program length. The truncated bytes are the trailing
+ * operand zeros of the final instruction -- 00 0d 00 01 ff ff ff ff, "write
+ * 0xFFFFFFFF to register 0x0D00" -- so with a zeroing allocator nothing
+ * misbehaved, but the buffer was still smaller than what the sequencer is
+ * entitled to fetch.
+ */
+#define FMSS_SEQ_READ_LEN 2832u
 static const u8 fmss_seq_read_blob[] = {
 	0x0c, 0x0c, 0x00, 0x01, 0xff, 0x00, 0x00, 0x00, 0x10, 0x0c, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00,
 	0x58, 0x0c, 0x00, 0x01, 0x04, 0x00, 0x00, 0x00, 0x4c, 0x0c, 0x00, 0x01, 0x00, 0x0b, 0x00, 0x00,
@@ -182,4 +197,6 @@ static const u8 fmss_seq_read_blob[] = {
 	0x00, 0x0d, 0x00, 0x01, 0xfe, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0x0d, 0x00, 0x01, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 };
+static_assert(sizeof(fmss_seq_read_blob) == FMSS_SEQ_READ_LEN,
+	      "FMSS read sequence length does not match the extracted blob");
 #endif

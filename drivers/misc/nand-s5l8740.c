@@ -9,6 +9,8 @@
  * CS physical reads use span-4 / 4112-byte records with four 4096+16 slots
  * per page. True metadata DMA remains optional and disabled by default.
  */
+#include <linux/bitops.h>
+#include <linux/build_bug.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
@@ -53,6 +55,22 @@
 #define FMSEQBASE		0xc04
 #define FMSEQSTAT		0xc08
 #define FMSEQIRQ		0xc0c
+/*
+ * 0xd00 + 4 * i for i in 0..0x1F is the command sequencer's general-register
+ * file, and it is named as such by the CS fault dumper, which walks the whole
+ * range: `for (i = 0; i < 0x20; ++i) print("FMSS__CS_GEN_REG_%02X: 0x%x", i,
+ * *(u32 *)(0x38A00D00 + 4 * i))` in CS.cpp alongside FMCTRL0, FMCTRL1,
+ * NANDSTAT and the offending microcode instruction.
+ *
+ * So these are microcode scratch, not architectural registers. FMGEN1..FMGEN5
+ * are the read program's inputs -- timing word, descriptor list, sector
+ * length, status array, address cycles -- and FMGEN0 is its output slot, which
+ * _performPPNRead tests for exactly two values (0x4EE0BC: -2 GEB, -1 unexpected
+ * interrupt) and otherwise only records the low byte of (0x4EE184). A byte left
+ * in FMGEN0 that happens to equal the last page's read status is therefore what
+ * a scratch register looks like after the program's last fetch, and carries no
+ * information the status array does not already have.
+ */
 #define FMGEN0			0xd00
 #define FMGEN1			0xd04
 #define FMGEN2			0xd08
@@ -61,7 +79,16 @@
 #define FMGEN5			0xd14
 #define FMUNK81C		0x81c
 
-#define FMSS_DMA_STATUS_LEN	512
+/*
+ * One status word per page in the batch.
+ *
+ * Four bytes per page is what sub_4EDDDC's own cache maintenance proves
+ * (0x4EE08C: r8 = npages << 2, then invalidate), and with the batch at
+ * stock's 128-page command ceiling this expression is stock's own literal:
+ * FMSS_PPN Init allocates exactly 512 bytes for the status array at
+ * 0x080FFEF8 (mov.w r5, #512).
+ */
+#define FMSS_DMA_STATUS_LEN	(FMSS_DMA_BATCH_MAX * 4)
 /* Consecutive IRQ-less-but-clean transfers before the driver stops waiting. */
 #define FMSS_IRQ_GIVEUP		8
 #define FMSS_DMA_CMDLIST_LEN	256
@@ -84,12 +111,42 @@
  * wanted.
  */
 /*
- * 256 meta records per kick, which is stock's S_SCAN_META_SIZE
- * (s_cxt_diff.c:349). The scan queues two reads per superblock -- first
- * page and last page -- so one kick covers 128 superblocks.
+ * 128 pages per kick, and 128 is a hardware-side ceiling rather than a
+ * preference.
+ *
+ * The scan wants 256 meta records at a time -- stock's S_SCAN_META_SIZE, two
+ * reads per superblock -- and this constant was set to 256 to serve that in
+ * one kick. But a command list is not allowed to grow that far. Stock refuses
+ * the 129th page where it appends one, at 0x085172A0:
+ *
+ *	85172cc  ldrh   r0,[r4,#8]      cmd->num_pages
+ *	85172ce  cmp    r0,#0x80
+ *	85172d2  bhs    0x85172ec       return 0 -- flush and start a new one
+ *	85172dc  ldrh.w lr,[r7,#0x10]   and the same ceiling per CE
+ *	85172e0  cmp.w  lr,#0x80
+ *
+ * and _ppnvflReadSpans is flushed on exactly that boundary (0x084F0BDE:
+ * `cmp r0,#0x80 / blo / bl 0x84f0934`). So a 256-record scan is two commands
+ * in stock, never one.
+ *
+ * The two allocations FMSS_PPN Init makes agree, and they are the reason to
+ * trust the number rather than argue about it -- with the cap at 128 the
+ * expressions below evaluate to stock's own literals and at 256 they do not:
+ *
+ *	80ffeec  movw  r0,#0x1010      descriptor list = 128 * 32 + 16
+ *	80ffef8  mov.w r5,#0x200       status array    = 128 * 4
+ *
+ * A page costs two 16-byte descriptors, one to issue the address and one to
+ * move the data, hence the 32.
  */
-#define FMSS_DMA_BATCH_MAX	256
+#define FMSS_DMA_BATCH_MAX	128
 #define FMSS_DMA_BATCH_CMDL_LEN	(FMSS_DMA_BATCH_MAX * 32 + 16)
+static_assert(FMSS_DMA_BATCH_CMDL_LEN == 4112,
+	      "descriptor list must be the 4112 bytes 0x080FFEEC allocates");
+static_assert(FMSS_DMA_BATCH_MAX == S5L8740_NAND_BATCH_MAX,
+	      "the exported cap and the internal one must not drift apart");
+static_assert(FMSS_DMA_STATUS_LEN == 512,
+	      "status array must be the 512 bytes 0x080FFEF8 allocates");
 
 /*
  * Two shapes share these buffers, and the buffer is sized for whichever
@@ -410,6 +467,57 @@ struct nand_s5l8740 {
 	struct completion cs_irq;
 	u32 last_vic_raw;
 	u32 last_vic_en;
+
+	/*
+	 * Read status, classified per _analyzeSpansReadStatuses
+	 * (0x084EA4B8). st_pages is every page whose status word was looked
+	 * at; the rest are the flag counts that function ORs into *a3, plus
+	 * the two whole-transfer faults _performPPNRead tests FMGEN0 for.
+	 */
+	u32 st_pages;
+	u32 st_clean;
+	u32 st_refresh;
+	u32 st_retire;
+	u32 st_uecc;
+	u32 st_blank;
+	u32 st_unknown;
+	u32 st_geb;
+	u32 st_fault;
+	u8 last_status;
+	/* A status in stock's accepted set has been seen at least once. */
+	bool status_live;
+
+	/*
+	 * Every distinct status byte, and where in the command list it sat.
+	 *
+	 * The counters above answer "how many" and nothing else, and the two
+	 * open questions both need "which byte, at which index, in a command
+	 * of what length":
+	 *
+	 *  - the unrecognised statuses are all reported as one value, but the
+	 *    log only ever printed the first bad page of a batch, so that is
+	 *    an inference from a repeated line rather than a histogram.
+	 *  - the same statuses may be a property of position rather than of
+	 *    the page. Stock refuses to build a command past 128 pages
+	 *    (0x085172A0) and this driver was building 256, so a status that
+	 *    only ever appears at an index at or above the ceiling is a
+	 *    command-length artefact and not media.
+	 *
+	 * st_seen is indexed by the status byte. st_odd_* record the index
+	 * span and the command length for the pages that were neither clean
+	 * nor blank, which is what distinguishes those two answers.
+	 */
+	u32 st_seen[256];
+	u32 st_odd_idx_min;
+	u32 st_odd_idx_max;
+	u32 st_odd_n_min;
+	u32 st_odd_n_max;
+	bool st_odd_any;
+
+	/* Per-CE chip IDs, for the compare 0x084F1048 does after a reset. */
+	u8 ce_id[S5L8740_NAND_MAX_CE][8];
+	unsigned int ce_id_valid;
+	unsigned int ce_id_mismatch;
 };
 
 static struct nand_s5l8740 *nand_dev;
@@ -434,17 +542,59 @@ module_param(ctrl0_or, uint, 0644);
 MODULE_PARM_DESC(ctrl0_or, "FMCTRL0 extra bits for ID/param/features (default 0xFF000)");
 
 /*
- * FFE70 timing row 171 MHz: CA4 = 0x20011000. 50D960 uses this, not 0xFF000.
- * 0xFF000 for array reads returns zeros and wedges PPN.
+ * FMCTRL0 timing bits for array reads. 0xFF000 here returns zeros and wedges
+ * PPN, so this is a separate word from ctrl0_or -- that much was right.
+ *
+ * The value was not. Stock does not hardcode it: sub_4EC958 asks for clock
+ * id 20, picks a row from the four-entry table at 0x087A95A8 keyed on the
+ * rate, and FIL_Init folds that row into the word at 0x08980CA4.
+ *
+ *	0x087A95A8   43 MHz : 00 00 00 00 00  ->  0x00000000
+ *	             85 MHz : 01 00 01 00 00  ->  0x10010000
+ *	            114 MHz : 01 00 02 01 00  ->  0x20010000
+ *	            171 MHz : 01 01 02 01 01  ->  0x20011000
+ *
+ * 0x20011000 is the 171 MHz row. On a stock boot the clock is 114 MHz --
+ * the Apple bootloader writes PLLCON0 = 0x03000558 (M=171, P=6, S=0, so
+ * 24 x 171 / 6 = 684 MHz) and 0x3C50001C = 0x10122003, whose dividers are
+ * bits[19:16]+1 = 3 and bits[23:20]+1 = 2, giving 684 / 6 = 114. So stock
+ * would take the row above ours.
+ *
+ * We do not boot through the Apple bootloader, so neither constant is
+ * safe to assume: whatever U-Boot leaves in 0x3C50001C is what our driver
+ * inherits. Derive it the way stock does, and keep this as the fallback and
+ * the override.
  */
 static unsigned int page_ctrl0_or = 0x20011000;
 module_param(page_ctrl0_or, uint, 0644);
-MODULE_PARM_DESC(page_ctrl0_or, "FMCTRL0 extra bits for 50D960 page read (171MHz timing)");
+MODULE_PARM_DESC(page_ctrl0_or,
+		 "FMCTRL0 timing bits for array reads; 0 = derive from the NAND clock (default 0x20011000)");
 
-/* 50D960 wedges PPN after many reads; re-run 10453C+0xFF+power-state. */
-static unsigned int reset_every = 32;
+static bool derive_timing = true;
+module_param(derive_timing, bool, 0644);
+MODULE_PARM_DESC(derive_timing,
+		 "Compute the FMCTRL0 timing word from the live NAND clock, as sub_4EC958 does (default Y)");
+
+/*
+ * Off, because stock has no counterpart to it.
+ *
+ * ResetFMSS (0x0810453C) and _ResetFMSSAndDeviceAndReadIDs (0x08130060) are
+ * reached from _initDevice (0x084EC6F4) at bring-up and from the GEB handler
+ * (0x084EDDDC -> 0x084EC110); nothing in the read, program or erase paths
+ * counts operations and reasserts the controller partway through. Steady-state
+ * I/O in stock runs from one bring-up to the next.
+ *
+ * This existed because the PIO page read wedged PPN after enough reads and a
+ * reset unwedged it. That is a real symptom, but resetting on a counter hides
+ * whatever produced it, and the read status array is now classified per
+ * _analyzeSpansReadStatuses, so the fault it was masking should have somewhere
+ * to show up. Left as a parameter rather than deleted: one boot with it back
+ * at 32 says whether it was carrying weight.
+ */
+static unsigned int reset_every;
 module_param(reset_every, uint, 0644);
-MODULE_PARM_DESC(reset_every, "nand_reset after this many page_read calls (0=off)");
+MODULE_PARM_DESC(reset_every,
+		 "nand_reset after this many page_read calls (0=off, default; stock never does this)");
 
 /* 50D960 uses 3; full PPN page is 16 x 1K data (+64 spare not in this PIO). */
 /*
@@ -466,19 +616,102 @@ static u64 cs_ns_kick, cs_ns_copy;
 static unsigned int cs_batch_kicks;
 
 /*
- * Must be non-zero. A recovery walks eight thousand pages of back-to-back
- * live C00 kicks; with this at 0 the counter is incremented in five places
- * and acted on in none, so nothing reasserts the sequencer across the whole
- * run -- exactly the condition the comment above describes.
+ * Off, for the same reason reset_every is: the CS path in stock is
+ * _performPPNRead (0x084EDDDC) into KICK/WAIT (0x080D39EC / 0x080D3A2C), and
+ * neither keeps a page count nor touches ResetFMSS. The only reset a read can
+ * reach is the GEB branch at 0x084EE0CA, which is a fault handler and not a
+ * schedule.
  *
- * 4096 costs two register writes and two 10 us delays roughly twice per
- * recovery, unmeasurable against the reads between them, and it bounds how
- * far the sequencer can drift before something puts it back.
+ * The argument for keeping it was that a recovery walks thousands of
+ * back-to-back kicks with nothing reasserting the sequencer in between. That
+ * is true of stock as well, and stock is the oracle. FMGEN0 and the status
+ * array are both read after every kick now, so a sequencer that has drifted
+ * says so instead of being quietly put back.
  */
-static unsigned int cs_reset_every = 4096;
+static unsigned int cs_reset_every;
 module_param(cs_reset_every, uint, 0644);
 MODULE_PARM_DESC(cs_reset_every,
-		 "fmss_nand_reset after this many CS phys reads (0=off)");
+		 "fmss_nand_reset after this many CS phys reads (0=off, default; stock never does this)");
+
+/*
+ * What to do with the per-page read status the controller writes to the
+ * array at FMGEN4 (D10).
+ *
+ * Until now: nothing. fmss_dma_page_read() took byte 0 of page 0 into a
+ * debug field and fmss_dma_meta_read_batch() never touched the array at
+ * all, so a uECC page, an erased page and a good page were the same
+ * result, and FMGEN0 -- which _performPPNRead treats as a GEB at -2 and
+ * panics on at -1 -- was logged and never tested.
+ *
+ * The classifier is _analyzeSpansReadStatuses at 0x084EA4B8. Stock has no
+ * read retry anywhere (0x084EDDDC always returns 1, and no _SetFeatures
+ * call site programs a retry feature), so classifying the status IS the
+ * error strategy rather than the first half of one.
+ *
+ *   0 off      pre-change behaviour: nothing is read, nothing can fail.
+ *   1 observe  classify, count and log; never turn a read into an error.
+ *   2 armed    enforce, but only once a status byte in stock's accepted
+ *              set has actually been seen. This driver memsets the array
+ *              to zero before every kick, and 0x00 is not in that set, so
+ *              a controller that never writes the array would otherwise
+ *              make every read fail -- reporting our own scratch buffer as
+ *              a media error. Whether it writes it is not established from
+ *              the image, so prove it once and then trust it.
+ *   3 strict   enforce from the first transfer, with no calibration.
+ *
+ * Meta scans classify and count but never fail whatever this is set to:
+ * a classify scan deliberately reads erased and unwritten blocks, and
+ * stock's own scan (s_cxt_diff.c:349) records the flags per page and
+ * carries on rather than abandoning the batch.
+ */
+#define FMSS_STATUS_OFF		0u
+#define FMSS_STATUS_OBSERVE	1u
+#define FMSS_STATUS_ARMED	2u
+#define FMSS_STATUS_STRICT	3u
+static unsigned int status_check = FMSS_STATUS_ARMED;
+module_param(status_check, uint, 0644);
+MODULE_PARM_DESC(status_check,
+		 "PPN read status: 0=off 1=observe 2=enforce once proven live 3=enforce always (default 2)");
+
+/*
+ * Per-CE prefetch depth for the batch descriptor list, i.e. how many
+ * address-issue descriptors _performPPNRead puts ahead of a transfer
+ * descriptor (0x084EDF46: outstanding[ce] >= params->read_queue_size stops
+ * issuing). 0 takes the value the part reports in its parameter page, which
+ * is what stock does; 1 reproduces the strictly alternating list this
+ * driver emitted before, which is the same thing as no pipelining.
+ */
+static unsigned int read_queue_depth;
+module_param(read_queue_depth, uint, 0644);
+MODULE_PARM_DESC(read_queue_depth,
+		 "Batch prefetch depth per CE (0=parameter page read_queue_size, 1=no pipelining)");
+
+/*
+ * Reset the way _ResetFMSSAndDeviceAndReadIDs does outside discovery:
+ * 0xFF then 0x70 per CE, then poll each CE ready. N restores the blind
+ * msleep(50), which is stock's discovery variant (a3=1).
+ */
+static bool reset_stock_seq = true;
+module_param(reset_stock_seq, bool, 0644);
+MODULE_PARM_DESC(reset_stock_seq,
+		 "Reset with cmd 0x70 + per-CE ready poll as 0x08130060 does (default Y)");
+
+/*
+ * The delay between 0xFF and 0x70, which stock takes by calling sub_345D58
+ * -- a thunk into IRAM (JUMPOUT 0x2200104A). The IRAM image is not in this
+ * artifact in a form these tools can follow, so the length stock waits is
+ * NOT recoverable and this number is ours, not Apple's. It is exposed so it
+ * can be moved on hardware without a rebuild.
+ */
+static unsigned int reset_cmd_delay_us = 10;
+module_param(reset_cmd_delay_us, uint, 0644);
+MODULE_PARM_DESC(reset_cmd_delay_us,
+		 "Delay between RESET and READ STATUS per CE; stock's is an IRAM thunk and unknown (default 10)");
+
+static bool reset_check_ids = true;
+module_param(reset_check_ids, bool, 0644);
+MODULE_PARM_DESC(reset_check_ids,
+		 "Read and compare chip IDs across CEs after reset, as 0x084F1048 does (default Y)");
 
 static unsigned int page_chunks = 16;
 module_param(page_chunks, uint, 0644);
@@ -820,6 +1053,120 @@ static int fmss_get_feature(struct nand_s5l8740 *f, unsigned int ce, u16 feat,
 		  ce, feat, ret, st,
 		  ((u8 *)dst)[0], ((u8 *)dst)[1], ((u8 *)dst)[2], ((u8 *)dst)[3]);
 	return ret;
+}
+
+/*
+ * 12F684 (_GetDebugData): PPN READ DEVICE REGISTER, cmd 0xE8.
+ *
+ * A sibling of GET FEATURES and not a variant of it. The differences are all
+ * load-bearing and all in the decompilation of 0x0812F684:
+ *
+ *	FMCTRL0 = MEMORY[0x8980CA4] | (2 * (1 << ce)) | 1
+ *	  -- the derived timing word, where GET FEATURES uses the 0xFF001
+ *	     literal (0x0841CEDC)
+ *	cmd 0xE8            sub_41C738(232)
+ *	address, 3 cycles   sub_41A510(3, &addr)   GET FEATURES uses 2
+ *	cmd 0xE7            sub_41C738(231)
+ *	delay               sub_345D58()           no 0x77 here, unlike 0xEE
+ *	cmd 0x7D            sub_41C738(125)
+ *	wait ready          sub_41DA70(100000, &status)
+ *	  on ready:  cmd 0x7A, then data in <= 1024-byte beats
+ *	  on timeout: "Timeout with status 0x%02x addr 0x%04x"
+ *	FMCTRL0 restored to whatever it was on entry
+ *
+ * and it asserts len >= 4 ("len >= 4", FMSS_PPN.c:1011). sub_345D58 is an IRAM
+ * thunk, so the delay's length is not recoverable from these artefacts; the
+ * driver reuses the one the reset path already had to guess at.
+ */
+static int fmss_read_device_reg(struct nand_s5l8740 *f, unsigned int ce,
+				u32 addr, void *dst, unsigned int len)
+{
+	u8 *p = dst;
+	u8 st = 0;
+	u32 saved;
+	int ret = 0;
+
+	if (ce > 7 || len < 4 || (len & 3))
+		return -EINVAL;
+
+	memset(dst, 0, len);
+	saved = readl(f->base + FMCTRL0);
+	writel(fmss_page_ctrl0(ce), f->base + FMCTRL0);
+
+	if (fmss_cmd(f, 0xe8) || fmss_addr_n(f, addr, 3))
+		ret = -ETIMEDOUT;
+	fmss_cmd(f, 0xe7);
+	udelay(reset_cmd_delay_us);
+	fmss_cmd(f, 0x7d);
+	if (fmss_wait_status(f, 100000, &st)) {
+		dev_err_ratelimited(f->dev,
+				    "read_device_reg: timeout with status 0x%02x addr 0x%04x\n",
+				    st, addr);
+		ret = -ETIMEDOUT;
+	} else if (!ret) {
+		fmss_cmd(f, 0x7a);
+		while (len) {
+			unsigned int beat = min(len, 1024u);
+
+			if (fmss_data_in(f, p, beat)) {
+				ret = -ETIMEDOUT;
+				break;
+			}
+			p += beat;
+			len -= beat;
+		}
+	}
+
+	writel(saved, f->base + FMCTRL0);
+	return ret;
+}
+
+/*
+ * 4EB610: the per-CAU status register, PPN command type 4.
+ *
+ * PPN_PerformCommandList dispatches it alongside read, program and erase
+ * (0x080FFF58: `case 4: return sub_4EB610(cmd)`), so it is a first-class
+ * operation rather than a diagnostic. It is a GET FEATURES with a computed
+ * feature id, and the two things worth having from 0x084EB610 are how the id
+ * is built and how long the answer is:
+ *
+ *	cau = (row >> (page_address_bits + block_bits)) & ((1 << cau_bits) - 1)
+ *	feature = (u16)((cau << 8) | 0x84)
+ *	len = (blocks_per_cau + 7) >> 3
+ *	assert cau < caus_per_ce                        FMSS_PPN.c:1932
+ *	_GetFeatures(ce, feature, buf, len, &status)
+ *
+ * The three shifts and the length come from device_info words that
+ * _FillDevInfo fills from the parameter page and names in its own printfs:
+ * 0x08D102CC = params->blocks_per_cau (params+24), 0x08D102D0 =
+ * params->caus_per_channel (params+16), 0x08D102E0 = params->cau_bits
+ * (params+20), 0x08D102E4 = params->page_address_bits (params+40),
+ * 0x08D102E8 = params->block_bits (params+28).
+ *
+ * So the register is one bit per block in the CAU, and 0x084EB610 rounds the
+ * block count up to a byte to size the read. That makes it the device's own
+ * account of which blocks it considers unusable -- which is the only
+ * first-party answer available to the question of why a page returns a status
+ * outside the accepted set.
+ */
+static int fmss_cau_status(struct nand_s5l8740 *f, unsigned int ce,
+			   unsigned int cau, u8 *dst, unsigned int len)
+{
+	if (ce >= FMSS_NUM_CE || cau >= FMSS_NUM_CAU)
+		return -EINVAL;
+	if (len < 4)
+		return -EINVAL;
+	return fmss_get_feature(f, ce, (u16)((cau << 8) | 0x84u), dst, len);
+}
+
+/* 4EB610: (blocks_per_cau + 7) >> 3, rounded up to the 4-byte GET FEATURES
+ * minimum FMSS_PPN.c:957 asserts.
+ */
+static unsigned int fmss_cau_status_len(void)
+{
+	unsigned int len = (FMSS_BLOCKS_PER_CAU + 7u) >> 3;
+
+	return round_up(max(len, 4u), 4u);
 }
 
 /*(ce, addr=0, buf): READ ID, no 10453C reset. */
@@ -1426,6 +1773,202 @@ static int fmss_dma_setup(struct nand_s5l8740 *f, struct device *dev)
 	return 0;
 }
 
+/*
+ * The flag word _analyzeSpansReadStatuses (0x084EA4B8) derives from one
+ * page's status byte, bit for bit:
+ *
+ *	4ea4f2  cmp r1,#64/66/67/68/69/73/81/193   accepted set
+ *	4ea50e  movs r4,#32                        anything else -> UNKNOWN
+ *	4ea514  lsls r2,r1,#31 / lsls r2,r1,#28    bit0 && !bit3 -> UECC
+ *	4ea520  lsls r2,r1,#24 / orr #4            bit7          -> UECC
+ *	4ea528  lsls r2,r1,#28 / orr #8            bit3          -> BLANK
+ *	4ea530  lsls r2,r1,#30 / orr #1            bit1          -> REFRESH
+ *	4ea538  lsls r2,r1,#29 / orr #2            bit2          -> RETIRE
+ *	4ea540  lsls r2,r1,#31 / orr #16           !bit0         -> OK
+ *
+ * Note the ordering: once UNKNOWN is set nothing else is examined, which
+ * is 0x4ea510's `lsls r2,r4,#26 / bmi` branching straight past the whole
+ * block. Flag names are SFTL's, from the log strings at its read callback.
+ *
+ * UNKNOWN is not a lighter verdict than UECC. Six SFTL call sites carry the
+ * same sentence for it -- "got unidentified read status (0x%x) on vba:0x%x;
+ * did we get a timeout?  Pretending it was uECC." (0x087A8A58, 0x087A8DF0,
+ * 0x087A8FAC, 0x087AAECC, 0x087AB128, 0x087AC890) -- so every caller
+ * rewrites flag 0x20 to flag 0x04 and carries on as if the page were
+ * uncorrectable. Two consequences worth stating:
+ *
+ *  - the accepted-set gate is a whitelist of the bytes this build's author
+ *    had seen, not a classification. A byte outside it still has bits: 0x61
+ *    is bit6 | bit5 | bit0, and the rules below would call it UECC on bit0
+ *    with bit3 clear, exactly as they do for 0x51 (bit4 | bit0) which is on
+ *    the list. bit5 is simply a bit no entry on the list carries.
+ *  - stock's own first guess for an unidentified status is a timeout, i.e.
+ *    the command, not the media. That is the reading a driver should take
+ *    before it blames a page.
+ */
+#define FMSS_ST_REFRESH		0x01u
+#define FMSS_ST_RETIRE		0x02u
+#define FMSS_ST_UECC		0x04u
+#define FMSS_ST_BLANK		0x08u
+#define FMSS_ST_OK		0x10u
+#define FMSS_ST_UNKNOWN		0x20u
+/* (*a3 & 0x27) is what stock calls "Errors in PPN read results". */
+#define FMSS_ST_ERRORS		0x27u
+
+static u32 fmss_status_flags(u8 st)
+{
+	u32 fl = 0;
+
+	switch (st) {
+	case 0x40: case 0x42: case 0x43: case 0x44:
+	case 0x45: case 0x49: case 0x51: case 0xc1:
+		break;
+	default:
+		return FMSS_ST_UNKNOWN;
+	}
+
+	if ((st & 1) && !(st & 8))
+		fl |= FMSS_ST_UECC;
+	if (st & 0x80)
+		fl |= FMSS_ST_UECC;
+	if (st & 8)
+		fl |= FMSS_ST_BLANK;
+	if (st & 2)
+		fl |= FMSS_ST_REFRESH;
+	if (st & 4)
+		fl |= FMSS_ST_RETIRE;
+	if (!(st & 1))
+		fl |= FMSS_ST_OK;
+	return fl;
+}
+
+/*
+ * Read FMGEN0 and the status array after a kick and say whether the
+ * transfer is trustworthy.
+ *
+ *	4ee0bc  [0x38A00D00] == -2 -> "GEB occured during read!"
+ *	4ee0c2  [0x38A00D00] == -1 -> WMR_PANIC "Unexpected interrupt"
+ *	4ee0f6  v32 = (u8)*(u32 *)(status + 4*page)
+ *
+ * One 32-bit word of status per page -- which is also what the cache
+ * maintenance at 0x4ee08c proves, `r8 = npages << 2` before the
+ * invalidate -- and only its low byte is the status.
+ *
+ * @scan is a classify scan: count everything, fail nothing. See the
+ * status_check comment.
+ *
+ * Returns 0, -EIO for a controller-level fault, or -EBADMSG for a page
+ * stock would hand upward as S_TOK_UECC.
+ */
+static int fmss_check_status(struct nand_s5l8740 *f, unsigned int npages,
+			     bool scan, const char *what)
+{
+	bool enforce;
+	u32 seen = 0;
+	unsigned int i;
+	int first_bad = -1;
+	u8 first_bad_st = 0;
+	u32 d00;
+
+	if (status_check == FMSS_STATUS_OFF)
+		return 0;
+
+	d00 = readl(f->base + FMGEN0);
+	f->last_dma_d00 = d00;
+	if (d00 == 0xFFFFFFFEu) {
+		f->st_geb++;
+		dev_err_ratelimited(f->dev, "%s: GEB occurred during read\n",
+				    what);
+		if (status_check != FMSS_STATUS_OBSERVE)
+			return -EIO;
+	} else if (d00 == 0xFFFFFFFFu) {
+		f->st_fault++;
+		dev_err_ratelimited(f->dev,
+				    "%s: sequencer reported an unexpected interrupt\n",
+				    what);
+		if (status_check != FMSS_STATUS_OBSERVE)
+			return -EIO;
+	}
+
+	if (npages > FMSS_DMA_STATUS_LEN / 4)
+		npages = FMSS_DMA_STATUS_LEN / 4;
+
+	for (i = 0; i < npages; i++) {
+		u8 st = (u8)(((const u32 *)f->stbuf)[i]);
+		u32 fl = fmss_status_flags(st);
+
+		f->st_pages++;
+		f->last_status = st;
+		f->st_seen[st]++;
+		seen |= fl;
+		if (fl & ~(FMSS_ST_OK | FMSS_ST_BLANK)) {
+			if (!f->st_odd_any) {
+				f->st_odd_any = true;
+				f->st_odd_idx_min = i;
+				f->st_odd_idx_max = i;
+				f->st_odd_n_min = npages;
+				f->st_odd_n_max = npages;
+			} else {
+				f->st_odd_idx_min = min(f->st_odd_idx_min, i);
+				f->st_odd_idx_max = max(f->st_odd_idx_max, i);
+				f->st_odd_n_min = min(f->st_odd_n_min, npages);
+				f->st_odd_n_max = max(f->st_odd_n_max, npages);
+			}
+		}
+		if (fl & FMSS_ST_UNKNOWN)
+			f->st_unknown++;
+		else
+			f->status_live = true;
+		if (fl & FMSS_ST_OK)
+			f->st_clean++;
+		if (fl & FMSS_ST_BLANK)
+			f->st_blank++;
+		if (fl & FMSS_ST_REFRESH)
+			f->st_refresh++;
+		if (fl & FMSS_ST_RETIRE)
+			f->st_retire++;
+		if (fl & FMSS_ST_UECC)
+			f->st_uecc++;
+		if ((fl & (FMSS_ST_UECC | FMSS_ST_UNKNOWN)) && first_bad < 0) {
+			first_bad = (int)i;
+			first_bad_st = st;
+		}
+	}
+
+	/*
+	 * Decided after the loop, not before it: a batch whose very first
+	 * classified status is a recognised uECC (0x43, 0x45, 0x51, 0xC1)
+	 * has just proven the array live and should be enforced on, not let
+	 * through because it happened to be the first one seen.
+	 */
+	enforce = (status_check == FMSS_STATUS_STRICT) ||
+		  (status_check == FMSS_STATUS_ARMED && f->status_live);
+	if (scan)
+		enforce = false;
+
+	/*
+	 * (*a3 & 0x27) is exactly stock's own test at 0x4EA55C before it
+	 * logs "Errors in PPN read results flags:0x%X".
+	 */
+	if (seen & FMSS_ST_ERRORS)
+		dev_err_ratelimited(f->dev,
+				    "%s: errors in PPN read results flags:0x%02x over %u page(s)\n",
+				    what, seen, npages);
+	if (first_bad >= 0)
+		dev_err_ratelimited(f->dev,
+				    "%s: page %d status 0x%02x is %s%s\n",
+				    what, first_bad, first_bad_st,
+				    fmss_status_flags(first_bad_st) &
+					    FMSS_ST_UNKNOWN ?
+					    "not a status this device is documented to return" :
+					    "uncorrectable",
+				    enforce ? "" : " (not enforced)");
+
+	if (first_bad >= 0 && enforce)
+		return -EBADMSG;
+	return 0;
+}
+
 static int fmss_dma_page_read(struct nand_s5l8740 *f, unsigned int ce, u32 addr)
 {
 	u32 *cl;
@@ -1647,6 +2190,13 @@ static int fmss_dma_page_read(struct nand_s5l8740 *f, unsigned int ce, u32 addr)
 	if (!ret && (f->last_dma_c0c & 0x0d) != 1)
 		ret = -EIO;
 
+	/*
+	 * 4EE0BC/4EE0F6: the whole-transfer fault in FMGEN0 and then the
+	 * per-page status. One page per kick here, so one status word.
+	 */
+	if (!ret)
+		ret = fmss_check_status(f, 1, false, "cs page read");
+
 	f->last_dma_d00 = readl(f->base + FMGEN0);
 	f->last_dma_c00 = readl(f->base + FMSEQ);
 	fmss_peek_vic1(f);
@@ -1726,6 +2276,29 @@ dma_done:
 }
 
 /*
+ * Per-CE prefetch depth: params->read_queue_size, which _FillDevInfo reads
+ * from parameter page offset 224 (0x0812ED9C prints it from v2+84 with
+ * v2 = page+140) and _performPPNRead loads from 0x08D10304.
+ *
+ * The part reports it at runtime, so there is no constant to check this
+ * against; if the parameter page has not been read, or reports 0, fall
+ * back to 1, which is the un-pipelined list this driver has always built.
+ */
+static unsigned int fmss_read_depth(struct nand_s5l8740 *f)
+{
+	u32 q;
+
+	if (read_queue_depth)
+		return read_queue_depth;
+	if (f->last_param_ret)
+		return 1;
+	q = get_unaligned_le32(f->last_param + 224);
+	if (!q || q > FMSS_DMA_BATCH_MAX)
+		return 1;
+	return q;
+}
+
+/*
  * Batched meta read: N pages, one sequencer kick.
  *
  * This is the transport the FTL classify scan wants. It is deliberately a
@@ -1750,18 +2323,22 @@ dma_done:
  * CE-select for a CE and the caller has no way to express a second one here.
  * The FTL scans a CE at a time anyway.
  *
- * span is forced to 1: the scan wants 16 bytes of meta per page, and a
- * one-sector transfer is the smallest the descriptor can express. The 4 KiB
- * of data it lands anyway is not wasted -- the classifier needs the head of
- * slot 0 for its blank test.
+ * span is forced to 1 by the meta callers: the scan wants 16 bytes of meta per
+ * page, and a one-sector transfer is the smallest the descriptor can express.
+ *
+ * @scan is stock's own distinction between a classify scan and an I/O read --
+ * a scan counts statuses and fails nothing. @share_data is separate and is
+ * ours: it says no caller will look at the page data, so all N transfers may
+ * name the same sector. A caller that copies data out per page must pass
+ * false, or it gets page 0's sector and N-1 sectors of the memset below.
  */
 static int fmss_dma_meta_read_batch(struct nand_s5l8740 *f, unsigned int ce,
 				    const u32 *addrs, unsigned int n,
-				    unsigned int span, bool scan_mode)
+				    unsigned int span, bool scan,
+				    bool share_data)
 {
 	u32 *cl;
 	u32 ce_bit, col_len, rec;
-	unsigned int i;
 	int ret = 0;
 
 	if (!f->dma_ok || !f->batch_ok)
@@ -1770,9 +2347,9 @@ static int fmss_dma_meta_read_batch(struct nand_s5l8740 *f, unsigned int ce,
 		return -EINVAL;
 	if (span < 1 || span > FMSS_DMA_BATCH_SPAN_MAX)
 		return -EINVAL;
-	if (!scan_mode && n * span * FMSS_SECTOR_LEN > FMSS_DMA_BATCH_DATA_LEN)
+	if (!share_data && n * span * FMSS_SECTOR_LEN > FMSS_DMA_BATCH_DATA_LEN)
 		return -EINVAL;
-	if (scan_mode && span * FMSS_SECTOR_LEN > FMSS_DMA_BATCH_DATA_LEN)
+	if (share_data && span * FMSS_SECTOR_LEN > FMSS_DMA_BATCH_DATA_LEN)
 		return -EINVAL;
 	if (n * span * 16 > FMSS_DMA_BATCH_SPARE_LEN)
 		return -EINVAL;
@@ -1788,35 +2365,95 @@ static int fmss_dma_meta_read_batch(struct nand_s5l8740 *f, unsigned int ce,
 	rec = dma_rec ? dma_rec : FMSS_PPN_REC;
 	col_len = rec * span;		/* slot 0, span sectors */
 
-	for (i = 0; i < n; i++) {
-		u32 *d = cl + i * 8;
+	/*
+	 * Emit in _performPPNRead's order, not in pairs.
+	 *
+	 * 0x084EDF34-0x084EE030 is one loop over the pages that keeps a
+	 * per-CE count of address-issue descriptors it has put in the list
+	 * ahead of the transfers that consume them:
+	 *
+	 *	4edf50  ldr r0,[r0,#76]        params->read_queue_size
+	 *	4edf66  ldr lr,[r8,ip,lsl #2]  outstanding[ce]
+	 *	4edf6a  cmp lr,r0
+	 *	4edf6c  bcs  ...               stop issuing at the depth
+	 *	4edfa2  adds r4,#16            16-byte descriptor
+	 *	4edfa6  str  lr,[r8,ip,lsl #2] ++outstanding[ce]
+	 *	4edfd8  stmia r4,{r1,sl,fp}    the transfer descriptor
+	 *	4ee022  subs r1,r1,#1          --outstanding[ce] after it
+	 *
+	 * so the list is `depth` addresses, a transfer, then one more
+	 * address, another transfer, and so on. That is what lets the chip
+	 * start tR for page i+1 while page i's data is still moving. The
+	 * old strictly alternating list is exactly this loop with depth 1,
+	 * which is what read_queue_depth=1 restores.
+	 *
+	 * Every page in the batch is on one CE, so there is one counter and
+	 * `issued - done` is it.
+	 */
+	{
+		unsigned int issued = 0, done = 0;
+		unsigned int depth = fmss_read_depth(f);
+		u32 *d = cl;
+		u32 *last_issue = cl;
 
-		d[0] = ce_bit;
-		d[1] = 0;
-		if (dma_d14 >= 7) {
-			d[2] = col_len;
-			d[3] = addrs[i];
-		} else {
-			d[2] = addrs[i];
-			d[3] = 0;
+		while (done < n) {
+			while (issued < n && issued - done < depth) {
+				d[0] = ce_bit;
+				d[1] = 0;
+				if (dma_d14 >= 7) {
+					d[2] = col_len;
+					d[3] = addrs[issued];
+				} else {
+					d[2] = addrs[issued];
+					d[3] = 0;
+				}
+				last_issue = d;
+				d += 4;
+				issued++;
+			}
+			d[0] = ce_bit | 1u;
+			d[1] = span;
+			d[2] = (u32)f->bspare_dma + done * span * 16;
+			/*
+			 * Stock's two targets are not symmetric, which is
+			 * worth stating because the previous comment here had
+			 * it backwards.
+			 *
+			 * The meta target is a staging cursor that advances:
+			 * 0x084EDFD8 stores `v6` and 0x084EE028 does
+			 * `v6 += 16 * nsect` per page, and the copy-out loop
+			 * at 0x084EE18C-0x084EE1C0 walks that staging buffer
+			 * forward while distributing it to the caller.
+			 *
+			 * The data target is not staged at all -- 0x084EDFFA
+			 * computes `buffers[buf_index[j]] + slot_index[j] *
+			 * bytes_per_sector` and writes it straight to
+			 * descriptor+0x0C, so every page names its own
+			 * destination and _ppnvflReadSpans advances it
+			 * (0x084F0934: `data + i * bytes_per_sector`).
+			 *
+			 * So the data cursor advances whenever anybody is
+			 * going to read it. @share_data is for the meta-only
+			 * scan, where the sector still has to land somewhere
+			 * but nobody looks: pointing all N transfers at one
+			 * sector is what lets a 128-entry list run out of a
+			 * 128 KiB buffer. That part is ours, not stock's.
+			 */
+			d[3] = share_data ? (u32)f->bdata_dma
+					  : (u32)f->bdata_dma +
+					    done * span * FMSS_SECTOR_LEN;
+			d += 4;
+			done++;
 		}
-		d[4] = ce_bit | 1u;
-		d[5] = span;
-		d[6] = (u32)f->bspare_dma + i * span * 16;
 		/*
-		 * In scan mode every entry writes its page data to the same
-		 * buffer and only the meta pointer advances, so a 256-entry
-		 * list needs one sector of data buffer rather than 256.
-		 * Stock does exactly this: the data argument to its read is a
-		 * fixed pointer across the whole batch while the meta cursor
-		 * steps by 16.
+		 * bit31 = last CE-select for this CE. Stock sets it in a
+		 * backwards pass over the finished list (0x4EE036), picking
+		 * the last descriptor whose low half-word is clear -- i.e.
+		 * the last issue descriptor -- for each CE it saw.
 		 */
-		d[7] = scan_mode ? (u32)f->bdata_dma
-				 : (u32)f->bdata_dma + i * span * FMSS_SECTOR_LEN;
+		last_issue[0] |= 0x80000000u;
+		d[0] = 0x00010002u;
 	}
-	/* bit31 = last CE-select for this CE, so only the final descriptor. */
-	cl[(n - 1) * 8] |= 0x80000000u;
-	cl[n * 8] = 0x00010002u;
 
 	writel(dma_c6c, f->base + 0xc6c);
 
@@ -1863,6 +2500,17 @@ static int fmss_dma_meta_read_batch(struct nand_s5l8740 *f, unsigned int ce,
 	} else {
 		ret = fmss_wait_cs_poll(f, 20000 * n);
 	}
+
+	/*
+	 * One status word per page, in the array at FMGEN4 -- the batch is
+	 * the shape stock's own read has, so this is the same test
+	 * _performPPNRead makes at 0x4EE0BC and 0x4EE0F6. It was not made
+	 * here at all: this function never read stbuf or FMGEN0.
+	 */
+	if (!ret)
+		ret = fmss_check_status(f, n, scan,
+					scan ? "cs meta scan"
+					     : "cs page batch");
 
 	f->last_stat48 = readl(f->base + FMSTAT48);
 	f->last_nandstat = readl(f->base + NANDSTAT);
@@ -1930,7 +2578,13 @@ int s5l8740_nand_cs_read_meta_batch(u8 ce, u8 cau, const u16 *blocks, u8 page,
 	dma_armed = true;
 	dma_skip_ingest = true;
 	t0 = ktime_get_ns();
-	ret = fmss_dma_meta_read_batch(f, ce, addrs, n, 1, true);
+	/*
+	 * share_data only when nobody asked for the page data. This caller
+	 * copies data_bytes out of every page's sector, so with a shared
+	 * target it would hand back page 0's sector and n-1 zeroed ones.
+	 */
+	ret = fmss_dma_meta_read_batch(f, ce, addrs, n, 1, true,
+				       !(data_out && data_bytes));
 	t1 = ktime_get_ns();
 	dma_skip_ingest = false;
 	if (!dma_one_shot)
@@ -2022,7 +2676,8 @@ int s5l8740_nand_cs_read_pages_batch(u8 ce, const struct s5l8740_ppn_ref *refs,
 	dma_skip_ingest = true;
 	t0 = ktime_get_ns();
 	ret = fmss_dma_meta_read_batch(f, ce, addrs, n,
-				       S5L8740_NAND_SLOTS_PER_PAGE, false);
+				       S5L8740_NAND_SLOTS_PER_PAGE, false,
+				       false);
 	t1 = ktime_get_ns();
 	dma_skip_ingest = false;
 	if (!dma_one_shot)
@@ -2089,7 +2744,8 @@ int s5l8740_nand_cs_scan_meta(u8 ce, const struct s5l8740_ppn_ref *refs,
 	saved_armed = dma_armed;
 	dma_armed = true;
 	dma_skip_ingest = true;
-	ret = fmss_dma_meta_read_batch(f, ce, addrs, n, 1, true);
+	/* Meta only, so all n transfers may share one sector of data buffer. */
+	ret = fmss_dma_meta_read_batch(f, ce, addrs, n, 1, true, true);
 	dma_skip_ingest = false;
 	if (!dma_one_shot)
 		dma_armed = saved_armed;
@@ -2215,6 +2871,86 @@ static int fmss_ctrl_reset(struct nand_s5l8740 *f)
 	return 0;
 }
 
+/*
+ * Read every CE's chip ID and compare, as _ReadChipID's caller
+ * (0x084F1048) does before it will say a reset succeeded:
+ *
+ *	sub_4F11F4(ce, 0, &id);                 // cmd 0x90, 8 bytes
+ *	if (!all_bytes(id, 0x00) && !all_bytes(id, 0xFF)) {
+ *		if (memcmp(ce0_id, id, 6)) -> WMR_PANIC
+ *		else ++num_ce;
+ *	}
+ *
+ * so an all-zero or all-FF ID is an absent CE, and any other CE whose
+ * first six bytes differ from CE0's is a device this build does not
+ * support (_initDevice rejects 0 CEs and more than 2).
+ *
+ * Stock panics on the mismatch. We log it and count it: this driver is
+ * read-only against somebody's music, and a wedged mount is worse
+ * diagnostics than a mount that says what it saw.
+ *
+ * A note here used to call fmss_ctrl0()'s 0xFF000 a divergence and decline
+ * to fix it, on the grounds that the read-ID path already worked. It is not
+ * a divergence, and the deferral was the whole error: stock's ID read does
+ * use MEMORY[0x8980CA4], but its own caller sets that word to 0xFF000 on
+ * the line before the read,
+ *
+ *	MEMORY[0x8980CA4] = 1044480;            // 0xFF000
+ *	result = sub_130060(v7, 0x8D102C0, 1);  // detect CEs, read IDs
+ *
+ * and FIL_Init's clock-derived fold of the same word (which is where
+ * page_ctrl0_or above comes from) happens later, once the device has been
+ * identified and MEMORY[0x8980C80] exists to fold from. At ID-read time the
+ * word is 0xFF000 exactly, so the constant is what stock uses.
+ */
+static void fmss_reset_check_ids(struct nand_s5l8740 *f)
+{
+	unsigned int ce, i;
+	unsigned int valid = 0, mismatch = 0;
+	u8 first[8];
+	bool have_first = false;
+
+	for (ce = 0; ce < S5L8740_NAND_MAX_CE; ce++) {
+		bool all00 = true, allff = true;
+
+		if (fmss_read_id(f, ce)) {
+			memset(f->ce_id[ce], 0, sizeof(f->ce_id[ce]));
+			continue;
+		}
+		memcpy(f->ce_id[ce], f->last_id, sizeof(f->ce_id[ce]));
+		for (i = 0; i < 8; i++) {
+			if (f->ce_id[ce][i] != 0x00)
+				all00 = false;
+			if (f->ce_id[ce][i] != 0xff)
+				allff = false;
+		}
+		if (all00 || allff)
+			continue;
+		valid++;
+		if (!have_first) {
+			memcpy(first, f->ce_id[ce], sizeof(first));
+			have_first = true;
+		} else if (memcmp(first, f->ce_id[ce], 6)) {
+			mismatch++;
+			dev_warn(f->dev,
+				 "CE%u chip ID %02x%02x%02x%02x%02x%02x does not match CE0's %02x%02x%02x%02x%02x%02x\n",
+				 ce,
+				 f->ce_id[ce][0], f->ce_id[ce][1],
+				 f->ce_id[ce][2], f->ce_id[ce][3],
+				 f->ce_id[ce][4], f->ce_id[ce][5],
+				 first[0], first[1], first[2],
+				 first[3], first[4], first[5]);
+		}
+	}
+	f->ce_id_valid = valid;
+	f->ce_id_mismatch = mismatch;
+	if (!valid)
+		dev_warn(f->dev, "no CE returned a usable chip ID after reset\n");
+	else
+		fmss_info("reset chip IDs: %u CE(s) present, %u mismatched\n",
+			  valid, mismatch);
+}
+
 /* 130060: 10453C, then NAND RESET (0xFF) on CE0/CE1. */
 static int fmss_nand_reset(struct nand_s5l8740 *f)
 {
@@ -2237,9 +2973,54 @@ static int fmss_nand_reset(struct nand_s5l8740 *f)
 		if (fmss_cmd(f, 0xff))
 			pr_info("s5l8740-nand: cmd 0xFF timeout ce=%u st=%08x\n",
 				ce, f->last_stat48);
+		/*
+		 * 0x08130060, the branch taken when a3 == 0:
+		 *
+		 *	MEMORY[0x38A00000] = (2*(1<<i)) | 0xFF001;
+		 *	sub_41C738(255);        // 0xFF  RESET
+		 *	sub_345D58();           // short delay
+		 *	sub_41C738(112);        // 0x70  READ STATUS
+		 *
+		 * We only ever issued the 0xFF. sub_345D58 is an IRAM thunk,
+		 * so the delay it takes is not recoverable from the image --
+		 * reset_cmd_delay_us is our number, not stock's.
+		 */
+		if (reset_stock_seq) {
+			udelay(reset_cmd_delay_us);
+			if (fmss_cmd(f, 0x70))
+				pr_info("s5l8740-nand: cmd 0x70 timeout ce=%u st=%08x\n",
+					ce, f->last_stat48);
+		}
 	}
-	msleep(50);
+	if (reset_stock_seq) {
+		/*
+		 * sub_112674, the per-CE ready poll stock runs instead of a
+		 * blind wait. Note the read-modify-write: CE select is bits
+		 * [8:1] and everything else in FMCTRL0 is preserved.
+		 *
+		 *	MEMORY[0x38A00000] =
+		 *		MEMORY[0x38A00000] & 0xFFFFFE01
+		 *		| (2 * (u8)(1 << i)) | 1;
+		 *	if (!sub_41DA70(50000, 0)) v0 = 0;
+		 *
+		 * The blind msleep(50) it replaces is stock's *discovery*
+		 * path (sub_112628(50), reached only when a3 == 1).
+		 */
+		for (ce = 0; ce < 2; ce++) {
+			u32 v = readl(f->base + FMCTRL0);
+
+			writel((v & 0xFFFFFE01u) | (2u * (1u << ce)) | 1u,
+			       f->base + FMCTRL0);
+			if (fmss_wait_status(f, 50000, NULL))
+				pr_info("s5l8740-nand: CE%u not ready after reset st=%08x nand=%08x\n",
+					ce, f->last_stat48, f->last_nandstat);
+		}
+	} else {
+		msleep(50);
+	}
 	writel(1, f->base + FMCTRL0);
+	if (reset_check_ids)
+		fmss_reset_check_ids(f);
 	/* 130544: PPN_FEATURE__POWER_STATE (384) = 2 on each CE. */
 	for (ce = 0; ce < 2; ce++)
 		fmss_set_feature(f, ce, 384, 2);
@@ -2322,11 +3103,18 @@ static ssize_t page_status_show(struct device *dev, struct device_attribute *att
 	if (!f)
 		return -ENODEV;
 	return sysfs_emit(buf,
-			  "ce=%d addr=0x%08x ret=%d chunk=%d len=%u parity=%d cycles=%u chunks=%u stat48=0x%08x nand=0x%08x dma=%d c0c=0x%08x d00=0x%08x c00=0x%08x\n",
+			  "ce=%d addr=0x%08x ret=%d chunk=%d len=%u parity=%d cycles=%u chunks=%u stat48=0x%08x nand=0x%08x dma=%d c0c=0x%08x d00=0x%08x c00=0x%08x\n"
+			  "status mode=%u live=%d last=0x%02x pages=%u clean=%u blank=%u refresh=%u retire=%u uecc=%u unknown=%u geb=%u fault=%u\n"
+			  "ce_ids valid=%u mismatch=%u\n",
 			  f->last_page_ce, f->last_page_addr, f->last_page_ret,
 			  f->last_page_chunk, f->last_page_len, with_parity, addr_cycles,
 			  page_chunks, f->last_stat48, f->last_nandstat, f->dma_ok,
-			  f->last_dma_c0c, f->last_dma_d00, f->last_dma_c00);
+			  f->last_dma_c0c, f->last_dma_d00, f->last_dma_c00,
+			  status_check, f->status_live, f->last_status,
+			  f->st_pages, f->st_clean, f->st_blank, f->st_refresh,
+			  f->st_retire, f->st_uecc, f->st_unknown,
+			  f->st_geb, f->st_fault,
+			  f->ce_id_valid, f->ce_id_mismatch);
 }
 static DEVICE_ATTR_RO(page_status);
 
@@ -2512,7 +3300,12 @@ static ssize_t batch_read_store(struct device *dev,
 		return -ENODEV;
 	if (sscanf(buf, "%u %u %u %u %u", &ce, &cau, &first, &page, &n) != 5)
 		return -EINVAL;
-	if (n < 1 || n > S5L8740_NAND_BATCH_MAX)
+	/*
+	 * This attribute compares each page's data head against a single-page
+	 * read, so every page needs its own sector of the DMA data buffer and
+	 * the ceiling is the buffer, not the command.
+	 */
+	if (n < 1 || n > FMSS_DMA_BATCH_DATA_LEN / FMSS_SECTOR_LEN)
 		return -EINVAL;
 	if (first + n > FMSS_BLOCKS_PER_CAU)
 		return -EINVAL;
@@ -6786,13 +7579,22 @@ static ssize_t param_info_show(struct device *dev, struct device_attribute *attr
 			  "blocks_per_cau=%u block_bits=%u\n"
 			  "pages_per_block=%u pages_per_block_slc=%u\n"
 			  "page_address_bits=%u bits_per_cell_addr=%u default_bits_per_cell=%u\n"
-			  "page_size=%u\n",
+			  "page_size=%u\n"
+			  "read_queue_size=%u program_queue_size=%u erase_queue_size=%u\n"
+			  "prep_function_buffer_size=%u tCERDY_us=%u\n"
+			  "tRC=%u tREA=%u tREH=%u tRHOH=%u tRHZ=%u tRLOH=%u tRP=%u tWC=%u tWH=%u tWP=%u\n"
+			  "prefetch_depth=%u\n",
 			  f->last_param_ce, f->last_param_ret,
 			  fmss_le32(p, 16), fmss_le32(p, 20),
 			  fmss_le32(p, 24), fmss_le32(p, 28),
 			  fmss_le32(p, 32), fmss_le32(p, 36),
 			  fmss_le32(p, 40), fmss_le32(p, 44), fmss_le32(p, 48),
-			  fmss_le32(p, 52));
+			  fmss_le32(p, 52),
+			  fmss_le32(p, 224), fmss_le32(p, 228), fmss_le32(p, 232),
+			  fmss_le32(p, 236), fmss_le32(p, 252),
+			  p[160], p[161], p[162], p[163], p[164], p[165],
+			  p[166], p[168], p[169], p[170],
+			  fmss_read_depth(f));
 }
 static DEVICE_ATTR_RO(param_info);
 
@@ -6883,6 +7685,160 @@ static ssize_t get_feature_show(struct device *dev, struct device_attribute *att
 }
 static DEVICE_ATTR_RW(get_feature);
 
+/*
+ * Every distinct read status the controller has reported, and where the
+ * not-clean ones sat in their command list.
+ *
+ * The counters in page_status say how many pages were uECC or unrecognised;
+ * they cannot say whether one byte accounts for all of them, and they cannot
+ * separate a property of the page from a property of the position. idx/n do
+ * that: a bad status confined to indices at or above stock's 128-page command
+ * ceiling (0x085172A0) is the command's fault, and one spread across the whole
+ * range is the media's.
+ */
+static ssize_t status_hist_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct nand_s5l8740 *f = nand_dev;
+	unsigned int i;
+	int n = 0;
+
+	if (!f)
+		return -ENODEV;
+	n += sysfs_emit_at(buf, n, "batch_max=%u status_words=%u\n",
+			   FMSS_DMA_BATCH_MAX, FMSS_DMA_STATUS_LEN / 4);
+	for (i = 0; i < 256 && n < PAGE_SIZE - 64; i++) {
+		if (!f->st_seen[i])
+			continue;
+		n += sysfs_emit_at(buf, n, "0x%02x %u flags=0x%02x\n",
+				   i, f->st_seen[i], fmss_status_flags((u8)i));
+	}
+	if (f->st_odd_any)
+		n += sysfs_emit_at(buf, n,
+				   "odd idx=%u..%u n=%u..%u\n",
+				   f->st_odd_idx_min, f->st_odd_idx_max,
+				   f->st_odd_n_min, f->st_odd_n_max);
+	else
+		n += sysfs_emit_at(buf, n, "odd none\n");
+	return n;
+}
+static DEVICE_ATTR_RO(status_hist);
+
+/* 12F684: "<ce> <addr> [len]" -> READ DEVICE REGISTER (cmd 0xE8). */
+static u8 last_devreg[64];
+static unsigned int last_devreg_len;
+static u32 last_devreg_addr;
+static int last_devreg_ce = -1;
+static int last_devreg_ret = -1;
+
+static ssize_t device_reg_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct nand_s5l8740 *f = nand_dev;
+	unsigned int ce, len = 4;
+	u32 addr;
+	int nf, ret;
+
+	if (!f)
+		return -ENODEV;
+	nf = sscanf(buf, "%u %i %u", &ce, &addr, &len);
+	if (nf < 2)
+		return -EINVAL;
+	len = clamp(round_up(len, 4u), 4u, (unsigned int)sizeof(last_devreg));
+
+	mutex_lock(&f->lock);
+	last_devreg_ce = (int)ce;
+	last_devreg_addr = addr;
+	last_devreg_len = len;
+	ret = fmss_read_device_reg(f, ce, addr, last_devreg, len);
+	last_devreg_ret = ret;
+	mutex_unlock(&f->lock);
+	return ret ? ret : count;
+}
+
+static ssize_t device_reg_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	unsigned int i;
+	int n = 0;
+
+	n += sysfs_emit_at(buf, n, "ce=%d addr=0x%04x len=%u ret=%d\n",
+			   last_devreg_ce, last_devreg_addr, last_devreg_len,
+			   last_devreg_ret);
+	for (i = 0; i < last_devreg_len; i++)
+		n += sysfs_emit_at(buf, n, "%02x%s", last_devreg[i],
+				   (i % 16) == 15 ? "\n" : " ");
+	if (last_devreg_len % 16)
+		n += sysfs_emit_at(buf, n, "\n");
+	return n;
+}
+static DEVICE_ATTR_RW(device_reg);
+
+/*
+ * 4EB610: "<ce> <cau>" -> the per-CAU status register, one bit per block.
+ *
+ * The popcount is the point of the read. It is the device's own count of
+ * blocks it will not stand behind, and comparing it against the number of
+ * pages that come back with a status outside the accepted set is what
+ * separates "the media has retired these blocks" from "the command was built
+ * wrong".
+ */
+static u8 last_cau_status[512];
+static unsigned int last_cau_status_len;
+static int last_cau_status_ce = -1;
+static int last_cau_status_cau = -1;
+static int last_cau_status_ret = -1;
+
+static ssize_t cau_status_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct nand_s5l8740 *f = nand_dev;
+	unsigned int ce, cau, len;
+	int ret;
+
+	if (!f)
+		return -ENODEV;
+	if (sscanf(buf, "%u %u", &ce, &cau) != 2)
+		return -EINVAL;
+	len = min(fmss_cau_status_len(), (unsigned int)sizeof(last_cau_status));
+
+	mutex_lock(&f->lock);
+	last_cau_status_ce = (int)ce;
+	last_cau_status_cau = (int)cau;
+	last_cau_status_len = len;
+	ret = fmss_cau_status(f, ce, cau, last_cau_status, len);
+	last_cau_status_ret = ret;
+	mutex_unlock(&f->lock);
+	return ret ? ret : count;
+}
+
+static ssize_t cau_status_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	unsigned int i, set = 0;
+	int n = 0;
+
+	for (i = 0; i < last_cau_status_len; i++)
+		set += hweight8(last_cau_status[i]);
+
+	n += sysfs_emit_at(buf, n,
+			   "ce=%d cau=%d feat=0x%04x len=%u ret=%d bits_set=%u blocks_per_cau=%u\n",
+			   last_cau_status_ce, last_cau_status_cau,
+			   last_cau_status_cau < 0 ? 0 :
+				   ((unsigned int)last_cau_status_cau << 8) | 0x84u,
+			   last_cau_status_len, last_cau_status_ret, set,
+			   FMSS_BLOCKS_PER_CAU);
+	for (i = 0; i < last_cau_status_len; i++)
+		n += sysfs_emit_at(buf, n, "%02x%s", last_cau_status[i],
+				   (i % 32) == 31 ? "\n" : "");
+	if (last_cau_status_len % 32)
+		n += sysfs_emit_at(buf, n, "\n");
+	return n;
+}
+static DEVICE_ATTR_RW(cau_status);
+
 static ssize_t page_data_read(struct file *filp, struct kobject *kobj,
 			     struct bin_attribute *attr, char *buf,
 			     loff_t off, size_t count)
@@ -6950,6 +7906,9 @@ static struct attribute *fmss_attrs[] = {
 	&dev_attr_nand_reset.attr,
 	&dev_attr_set_feature.attr,
 	&dev_attr_get_feature.attr,
+	&dev_attr_status_hist.attr,
+	&dev_attr_device_reg.attr,
+	&dev_attr_cau_status.attr,
 	NULL,
 };
 
@@ -7211,6 +8170,122 @@ int s5l8740_nand_meta_transport_ok(void)
 }
 EXPORT_SYMBOL_GPL(s5l8740_nand_meta_transport_ok);
 
+/*
+ * The NAND clock, read the way sub_43CFCC case 20 reads it.
+ *
+ *	43d35a  ldr   r0,[r6,#28]        ; 0x3C50001C
+ *	43d35c  cmp.w r1, r0, lsr #30    ; bits[31:30] == 3 -> clock is off
+ *	43d368  ubfx  r0, r0, #28, #2    ; source select
+ *	43d36c  bl    0x3d7a2c           ; resolve source to kHz
+ *	43d378  ubfx  r0, r0, #16, #4    ; div1 - 1
+ *	43d37e  ubfx  r1, r1, #20, #4    ; div2 - 1
+ *	43d0c6  smulbb r1, r0, r1        ; div = div1 * div2
+ *	                                 ; rate = source / div
+ *
+ * and the source resolver sub_3D7A2C: index 1, 2 and 3 are PLLxCON at
+ * 0x3C500020/24/28, anything else is the 24 MHz crystal. A PLLxCON word is
+ * M = bits[12:3], P = bits[28:23], S = bits[2:0], giving 24000 * M / (P << S)
+ * kHz.
+ *
+ * Bits 30 and 31 of 0x3C50001C are the two FMSS clock gates, 0 meaning
+ * running -- sub_982E50 clears bit 30 for WMR_CLOCK_GATE 0 and bit 31 for
+ * gate 1. Both set is the "clock off" case the caller rejects.
+ *
+ * Returns kHz, or 0 if the clock is gated off.
+ */
+#define S5L8740_CLK_BASE	0x3c500000u
+#define S5L8740_CLK_NAND	0x1cu
+
+static unsigned int fmss_nand_clock_khz(struct nand_s5l8740 *f)
+{
+	void __iomem *clk;
+	u32 cfg, pll;
+	unsigned int src_khz, idx, div;
+
+	clk = ioremap(S5L8740_CLK_BASE, 0x40);
+	if (!clk)
+		return 0;
+
+	cfg = readl(clk + S5L8740_CLK_NAND);
+	if ((cfg >> 30) == 3) {		/* both gates set: not running */
+		iounmap(clk);
+		return 0;
+	}
+
+	idx = (cfg >> 28) & 3;
+	if (idx >= 1 && idx <= 3) {
+		pll = readl(clk + S5L8740_CLK_NAND + 4 * idx);
+		src_khz = (24000u * ((pll >> 3) & 0x3ff)) /
+			  (((pll >> 23) & 0x3f) << (pll & 7));
+	} else {
+		src_khz = 24000u;	/* the crystal */
+	}
+
+	div = (((cfg >> 16) & 0xf) + 1) * (((cfg >> 20) & 0xf) + 1);
+	iounmap(clk);
+
+	return div ? src_khz / div : 0;
+}
+
+/*
+ * Pick the timing row and fold it into FMCTRL0, as sub_4EC958 and FIL_Init
+ * do. The table is stock's, transcribed from 0x087A95A8: a u32 ceiling in
+ * MHz followed by eight timing bytes, and the first row whose ceiling is at
+ * or above the live clock wins.
+ *
+ *	ffea6  ldrb r2,[r0,#5] / ldrb r1,[r0,#8]   ; A = max(t5, t8)
+ *	ffeb0  ldrb r3,[r0,#4] / ldrb r2,[r0,#7]   ; B = max(t4, t7)
+ *	ffebe  ldrb r0,[r0,#6]                     ; C = t6
+ *	ffeca  orr.w r3, r5, r3, lsl #16
+ *	ffece  orr.w r0, r3, r0, lsl #28
+ *	ffed2  str  r0,[r4,#36]                    ; 0x08980CA4
+ */
+static void fmss_derive_timing(struct nand_s5l8740 *f)
+{
+	static const struct {
+		u32 max_mhz;
+		u8 t[8];
+	} rows[] = {
+		{  43, { 0, 0, 0, 0, 0, 0, 0, 0 } },
+		{  85, { 1, 0, 1, 0, 0, 0, 0, 0 } },
+		{ 114, { 1, 0, 2, 1, 0, 0, 0, 0 } },
+		{ 171, { 1, 1, 2, 1, 1, 0, 0, 0 } },
+	};
+	unsigned int khz, mhz, i;
+	u32 a, b, c, word;
+
+	if (!derive_timing)
+		return;
+
+	khz = fmss_nand_clock_khz(f);
+	if (!khz) {
+		dev_warn(f->dev,
+			 "NAND clock reads as gated off; keeping timing %#x\n",
+			 page_ctrl0_or);
+		return;
+	}
+	mhz = khz / 1000;
+
+	for (i = 0; i < ARRAY_SIZE(rows) - 1; i++)
+		if (rows[i].max_mhz >= mhz)
+			break;
+
+	/*
+	 * rows[].t is indexed the way stock indexes the 12-byte entry, so
+	 * t[0] here is the entry's byte 4.
+	 */
+	a = max(rows[i].t[1], rows[i].t[4]) & 0xf;	/* bytes 5 and 8 */
+	b = max(rows[i].t[0], rows[i].t[3]) & 0xf;	/* bytes 4 and 7 */
+	c = rows[i].t[2] & 7;				/* byte 6 */
+	word = (a << 12) | (b << 16) | (c << 28);
+
+	if (word != page_ctrl0_or)
+		dev_info(f->dev,
+			 "NAND clock %u kHz -> %u MHz, timing row %u: FMCTRL0 %#x (was %#x)\n",
+			 khz, mhz, rows[i].max_mhz, word, page_ctrl0_or);
+	page_ctrl0_or = word;
+}
+
 int s5l8740_nand_hw_init(void)
 {
 	struct nand_s5l8740 *f = nand_dev;
@@ -7218,6 +8293,7 @@ int s5l8740_nand_hw_init(void)
 
 	if (!f)
 		return -ENODEV;
+	fmss_derive_timing(f);
 	mutex_lock(&f->lock);
 	ret = fmss_nand_reset(f);
 	if (!ret)
@@ -7282,6 +8358,39 @@ int s5l8740_nand_query_geometry(struct s5l8740_nand_geom *g)
 		if (page_size == 4096 || page_size == 8192 ||
 		    page_size == 16384)
 			g->page_size = page_size;
+		/*
+		 * The queue sizes and the timing bytes, at _FillDevInfo's own
+		 * offsets (0x0812ED9C, v2 = page + 140):
+		 *
+		 *	v2+84  = 224  read_queue_size
+		 *	v2+88  = 228  program_queue_size
+		 *	v2+92  = 232  erase_queue_size
+		 *	v2+96  = 236  prep_function_buffer_size
+		 *	v2+112 = 252  tCERDY_us
+		 *	v2+20  = 160  tRC .. v2+30 = 170  tWP
+		 *
+		 * read_queue_size is the prefetch depth the batch read uses;
+		 * the rest are recorded, not acted on. Our timing word comes
+		 * from the clock table at 0x087A95A8 the way FIL_Init builds
+		 * it, and nothing in stock feeds these bytes into FMCTRL0 --
+		 * so they are here to be compared against the table's row,
+		 * not to replace it.
+		 */
+		g->read_queue_size = fmss_le32(p, 224);
+		g->program_queue_size = fmss_le32(p, 228);
+		g->erase_queue_size = fmss_le32(p, 232);
+		g->prep_function_buffer_size = fmss_le32(p, 236);
+		g->tcerdy_us = fmss_le32(p, 252);
+		g->t_rc   = p[160];
+		g->t_rea  = p[161];
+		g->t_reh  = p[162];
+		g->t_rhoh = p[163];
+		g->t_rhz  = p[164];
+		g->t_rloh = p[165];
+		g->t_rp   = p[166];
+		g->t_wc   = p[168];
+		g->t_wh   = p[169];
+		g->t_wp   = p[170];
 		g->from_param_page = true;
 	}
 	mutex_unlock(&f->lock);
