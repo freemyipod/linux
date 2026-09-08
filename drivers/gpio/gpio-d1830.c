@@ -3303,6 +3303,7 @@ static void n31_home_button(bool pressed)
 struct n31_pmu_reg {
 	struct regulator_desc desc;
 	char name[16];
+	char of_name[8];	/* "ldoN": the node name under "regulators" */
 	unsigned int id;
 };
 
@@ -3449,8 +3450,18 @@ static void n31_pmu_regulators_register(struct device *dev)
 		struct n31_pmu_reg *pr = &n31_pmu_regs[i];
 
 		strscpy(pr->name, n31_pmu_rails[i].name, sizeof(pr->name));
+		/*
+		 * n31_pmu_rails[] index n is LDO n+1 on ACTIVE1/ACTIVE2, so a
+		 * board can name a rail as ldo<n+1> under "regulators". A rail
+		 * with a node and no consumer is switched off by the regulator
+		 * core's late cleanup, so a board must only name rails that
+		 * something holds or mark them regulator-always-on.
+		 */
+		snprintf(pr->of_name, sizeof(pr->of_name), "ldo%u", i + 1);
 		pr->id = i;
 		pr->desc.name = pr->name;
+		pr->desc.of_match = pr->of_name;
+		pr->desc.regulators_node = "regulators";
 		pr->desc.id = i;
 		pr->desc.type = REGULATOR_VOLTAGE;
 		pr->desc.owner = THIS_MODULE;
@@ -3617,7 +3628,8 @@ static bool d1830_bt_saved;
  * its LEDs -- the 0x39700000 block, which our DTS currently hands entirely to
  * the EIC node. Wiring it needs an owner for that page first.
  */
-#define D1830_WLED_ISET		0x25
+#define D1830_WLED_LEVEL	0x24	/* sub_A2650: level >> 8; named BUCK_CONTROL_2 elsewhere here */
+#define D1830_WLED_ISET		0x25	/* sub_A2650: bits 2:0 = level bits 7:5 */
 #define D1830_WLED_ISET_MASK	0x7f
 #define D1830_WLED_CTRL		0x26
 #define D1830_WLED_CTRL_EN	0x01
@@ -3691,30 +3703,34 @@ int d1830_wled_set(unsigned int level, unsigned int max)
 	if (level > max)
 		level = max;
 
-	/* Rounded so the top of the range reaches the ceiling exactly. */
-	code = (level * d1830_wled_ceiling + max / 2) / max;
-	if (code > d1830_wled_ceiling)
-		code = d1830_wled_ceiling;
-
-	ret = d1830_rmw(client, D1830_WLED_ISET, D1830_WLED_ISET_MASK, (u8)code);
+	/*
+	 * sub_A2650, the brightness write RetailOS makes through its PMIC
+	 * handle: a 16-bit level, reg 0x24 = level >> 8 and reg 0x25 bits
+	 * 2:0 = level bits 7:5. The display task drives it as (255 - v) << 8,
+	 * so 0xFF00 is full scale; this unit boots with 0x24 = 0xC0 from the
+	 * SEC bootloader. 0x26 is not part of the write. (The earlier model
+	 * here -- 0x25 as a 7-bit current code, 0x26 bit 0 as the enable --
+	 * was a guess: with the panel lit at 0x24 = 0xC0, 0x25 and 0x26 both
+	 * read 0.)
+	 */
+	code = (level * 0xff00u + max / 2) / max;
+	ret = i2c_smbus_write_byte_data(client, D1830_WLED_LEVEL, code >> 8);
 	if (!ret)
-		ret = d1830_rmw(client, D1830_WLED_CTRL, D1830_WLED_CTRL_EN,
-				level ? D1830_WLED_CTRL_EN : 0);
-	d1830_vinfo(&client->dev, "wled level %u/%u -> iset %u en=%d ret=%d\n",
-		    level, max, code, !!level, ret);
+		ret = d1830_rmw(client, D1830_WLED_ISET, 0x07, (code >> 5) & 0x07);
+	d1830_vinfo(&client->dev, "wled level %u/%u -> 0x24=%02x 0x25[2:0]=%u ret=%d\n",
+		    level, max, code >> 8, (code >> 5) & 7, ret);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(d1830_wled_set);
 
+/* The coarse level byte, 0..255: what the backlight class should show. */
 int d1830_wled_get(void)
 {
 	struct i2c_client *client = d1830_poweroff_client;
-	int v;
 
 	if (!client)
 		return -ENODEV;
-	v = i2c_smbus_read_byte_data(client, D1830_WLED_ISET);
-	return v < 0 ? v : (v & D1830_WLED_ISET_MASK);
+	return i2c_smbus_read_byte_data(client, D1830_WLED_LEVEL);
 }
 EXPORT_SYMBOL_GPL(d1830_wled_get);
 
@@ -4584,7 +4600,7 @@ static int d1830_gpio_probe(struct i2c_client *client)
 	 * case -- the class device exists from early boot and this module loads
 	 * at about t=7 s.
 	 */
-	n31_backlight_register_wled(d1830_wled_set);
+	n31_backlight_register_wled(d1830_wled_set, d1830_wled_get);
 
 	/* Opt-in only. Default probe is GPIO + VBAT reads — no rail writes.
 	 * The old default seq wrote reg 13 = 0x01 (POWEROFF bit) at boot.

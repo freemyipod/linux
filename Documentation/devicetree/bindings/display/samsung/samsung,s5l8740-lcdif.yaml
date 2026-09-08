@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/samsung,s5l8740-lcdif.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Samsung S5L8740 display controller
+
+maintainers:
+  - Andrew Green <me@andrewgreen.ca>
+
+description: |
+  The display path of the S5L8740 (Apple iPod nano 7th generation) is four
+  blocks that only make sense together. The LCDIF carries pixels to a DCS
+  command-mode panel over a MIPI DSI host. The frame itself is composed
+  from DRAM by a layer compositor and pushed through the LCDIF transfer
+  gate, which the driver cycles once per frame. An LCDIF reset has to
+  cycle two gates in the clock controller, which is why that block is a
+  named window here rather than a clock phandle: the clock controller
+  binding for this SoC does not expose those gates.
+
+  The panel is a child node. Its DCS initialisation is performed by the
+  boot ROM chain before the kernel runs; the driver sequences the panel's
+  reset line and supply around the LCDIF and re-issues the window through
+  the DSI host on every frame.
+
+properties:
+  compatible:
+    const: samsung,s5l8740-lcdif
+
+  reg:
+    items:
+      - description: LCDIF register window
+      - description: clock controller window (two gates cycled on reset)
+      - description: MIPI DSI host window
+      - description: layer compositor window
+
+  reg-names:
+    items:
+      - const: lcdif
+      - const: clkcon
+      - const: dsi
+      - const: compositor
+
+  power-supply:
+    description: The panel's rail, PMU_LDO_7 on the D1830 PMIC.
+
+  panel:
+    type: object
+    additionalProperties: false
+    description: The DCS command-mode panel attached to the DSI host.
+
+    properties:
+      compatible:
+        const: apple,n31-panel
+
+      reset-gpios:
+        maxItems: 1
+        description: |
+          The panel reset line, SoC pad 15. Stock releases it before
+          enabling the rail and asserts it after the rail is off.
+
+      width-mm:
+        description: Active area width in millimetres.
+
+      height-mm:
+        description: Active area height in millimetres.
+
+    required:
+      - compatible
+      - reset-gpios
+
+required:
+  - compatible
+  - reg
+  - reg-names
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+
+    display@38300000 {
+        compatible = "samsung,s5l8740-lcdif";
+        reg = <0x38300000 0x10000>, <0x3c500000 0x100>,
+              <0x3d800000 0x1000>, <0x38900000 0x2000>;
+        reg-names = "lcdif", "clkcon", "dsi", "compositor";
+        power-supply = <&display_rail>;
+
+        panel {
+            compatible = "apple,n31-panel";
+            reset-gpios = <&gpio 15 GPIO_ACTIVE_LOW>;
+            width-mm = <30>;
+            height-mm = <56>;
+        };
+    };

@@ -80,7 +80,7 @@
  * is wired through the PMIC provider.
  */
 /* A scale for userspace only; nothing downstream consumes it. */
-#define S5L8740_BL_MAX		63
+#define S5L8740_BL_MAX		255	/* the D1830's coarse level byte, 1:1 */
 
 /*
  * The LED boost is the expensive part of the display, so screen sleep
@@ -116,16 +116,36 @@ static struct s5l8740_bl *s5l8740_bl_dev;
 static int (*s5l8740_bl_wled_fn)(unsigned int level, unsigned int max);
 static int s5l8740_bl_wled_want = -1;
 
-void n31_backlight_register_wled(int (*fn)(unsigned int level, unsigned int max))
+void n31_backlight_register_wled(int (*set)(unsigned int level, unsigned int max),
+				 int (*get)(void))
 {
-	s5l8740_bl_wled_fn = fn;
+	struct s5l8740_bl *bl = s5l8740_bl_dev;
 
-	if (fn && s5l8740_bl_wled_want >= 0) {
-		int ret = fn((unsigned int)s5l8740_bl_wled_want, S5L8740_BL_MAX);
+	s5l8740_bl_wled_fn = set;
+
+	if (set && s5l8740_bl_wled_want >= 0) {
+		int ret = set((unsigned int)s5l8740_bl_wled_want, S5L8740_BL_MAX);
 
 		pr_info("s5l8740-bl: wled provider arrived; applied %d: %d\n",
 			s5l8740_bl_wled_want, ret);
 		s5l8740_bl_wled_want = -1;
+	} else if (set && get && bl) {
+		/*
+		 * Nothing has been asked for yet: report what the hardware
+		 * holds (the bootloader's level) instead of a made-up full
+		 * scale, so the first userspace read is true.
+		 */
+		int cur = get();
+
+		if (cur >= 0) {
+			mutex_lock(&bl->lock);
+			bl->level = bl->target = cur;
+			if (bl->bd)
+				bl->bd->props.brightness = cur;
+			mutex_unlock(&bl->lock);
+			pr_info("s5l8740-bl: wled provider arrived; hardware at %d/%d\n",
+				cur, S5L8740_BL_MAX);
+		}
 	}
 }
 EXPORT_SYMBOL_GPL(n31_backlight_register_wled);
@@ -286,10 +306,14 @@ static int s5l8740_bl_probe(struct platform_device *pdev)
 
 	mutex_init(&bl->lock);
 	INIT_DELAYED_WORK(&bl->fade, s5l8740_bl_fade_work);
+	/*
+	 * The panel is already lit by the bootloader at its own level; do
+	 * not ask for anything until userspace does. The class starts at
+	 * full scale only until the PMIC provider arrives and reports the
+	 * real value (n31_backlight_register_wled()).
+	 */
+	bl->level = S5L8740_BL_MAX;
 	bl->target = S5L8740_BL_MAX;
-
-	/* Full brightness + enables (U-Boot path) */
-	s5l8740_bl_hw_set(bl, S5L8740_BL_MAX);
 
 	props.type = BACKLIGHT_RAW;
 	props.max_brightness = S5L8740_BL_MAX;

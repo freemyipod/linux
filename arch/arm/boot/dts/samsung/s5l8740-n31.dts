@@ -347,41 +347,28 @@
             maximum-speed = "high-speed";
         };
 
-        lcdif: lcdif@38300000 {
+        lcdif: display@38300000 {
             compatible = "samsung,s5l8740-lcdif";
-            /* LCDIF, the clock controller (an LCDIF reset has to cycle
-             * two gates in it), then the MIPI DSI host. The panel is a
-             * DCS command-mode panel: the window is set through the DSI
-             * host and only the pixels go through LCDIF. */
+            /* LCDIF; the clock controller, in which an LCDIF reset cycles
+             * two gates; the MIPI DSI host the panel window is set through;
+             * and the layer compositor stock draws with at runtime, one
+             * XRGB8888 layer from DRAM kicked by the LCDIF transfer gate
+             * (captured 2026-09-07 from 1.1.2). */
             reg = <0x38300000 0x10000>, <0x3c500000 0x100>,
-                  <0x3d800000 0x1000>,
-                  /* The layer compositor stock draws with at runtime:
-                   * one XRGB8888 layer from DRAM, kicked by the LCDIF
-                   * transfer gate. Captured 2026-09-07 from 1.1.2. */
-                  <0x38900000 0x2000>;
-            /*
-             * Frame DMA. The pixel FIFO at 0x38300040 is a PL080
-             * peripheral in its own right: OSOS lists it as entry [0] of
-             * the FIFO address table at 0x0891DC14, with the byte at
-             * 0x0891DC98[0] = 0x01 marking it serviceable by DMAC0 only,
-             * and stock pushes whole frames into it from sub_47B0 at
-             * 0x080047B0.
-             *
-             * The cell is the hardware request line, which is NOT that
-             * table index. sub_B424C reads the line number out of a
-             * second table at 0x080B437E --
-             *   *(u32 *)(0x0891DCBC + id*8 + ctrl*4 - 4) & 0xF
-             * -- and ORs it into CxConfig at 0x080B43D6. For id 0 on
-             * DMAC0 that word is 0x00000003, so the LCDIF is request
-             * line 3. The same table is what turns IIS0 TX (id 12) into
-             * line 10 and IIS2 RX (id 17) into line 13, which is exactly
-             * what i2s0 and i2s2 below already ask for.
-             *
-             * Stock's resulting channel config is
-             *   0x800 (M2P) | (3 << 6) | 0x8001 = 0x000088C1.
-             */
-            dmas = <&dmac 3 0>;
-            dma-names = "tx";
+                  <0x3d800000 0x1000>, <0x38900000 0x2000>;
+            reg-names = "lcdif", "clkcon", "dsi", "compositor";
+            /* PMU_LDO_7, ACTIVE1 bit 6: sub_1C20 -> sub_439B00(4) ->
+             * sub_6644(5) -> sub_7484(10). */
+            power-supply = <&display_rail>;
+
+            panel {
+                compatible = "apple,n31-panel";
+                /* Pad 15. sub_1C20 drives it high before the rail comes up
+                 * and sub_1D04 drives it low after the rail is down. */
+                reset-gpios = <&gpio 15 GPIO_ACTIVE_LOW>;
+                width-mm = <30>;
+                height-mm = <56>;
+            };
         };
 
         /* MMIO backlight only. Never LCDIF CON/PHTIME. U-Boot already
@@ -544,6 +531,17 @@
                 regulators {
                     bt_rail: bt {
                         regulator-name = "bt";
+                    };
+
+                    /*
+                     * The panel's rail. Only rails with a consumer get a
+                     * node here: the regulator core switches off every
+                     * DT-described rail that has no holder 30 s after
+                     * boot, and the other LDOs feed parts no driver
+                     * claims yet.
+                     */
+                    display_rail: ldo7 {
+                        regulator-name = "PMU_LDO_7";
                     };
                 };
             };

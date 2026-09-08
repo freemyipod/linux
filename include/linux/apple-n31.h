@@ -86,7 +86,7 @@ int d1830_bt_enable(unsigned int step);
  * Indexes into n31_pmu_rails[], NOT RetailOS logical rail IDs. The two
  * numbering systems overlap and disagree, which is a trap worth naming:
  *
- *   this table index 2  -> 0x10 bit 5 -> Grape
+ *   this table index 5  -> 0x10 bit 5 -> Grape
  *   RetailOS logical 4  -> 0x10 bit 5 -> Grape
  *
  * Same physical bit, different number, and sub_6644 converts logical
@@ -94,17 +94,22 @@ int d1830_bt_enable(unsigned int step);
  * register and bit. So a bare 4 in a decompiler listing and a bare 4
  * here mean different rails. Always carry the {register, mask} pair.
  *
- * The physical assignments, from sub_7484:
- *   0x10 bits 2..7 are selectors 6..11
- *   0x11 bits 0..3 are selectors 12..15
- * Only 0x10 bit 5 has a proven consumer -- Grape, via the call chain
- * sub_20766(1) to sub_439B00(1) to sub_6644(4) to sub_7484(9). The
- * display and accessory names below are this project's mapping and are
- * not re-proven from the firmware.
+ * The physical assignments, from sub_7484 (its switch, read 2026-09-07):
+ *   selectors 0..4 -> 0x10 bit 0; 5..11 -> 0x10 bits 1..7, one each
+ *   selectors 12..15 -> 0x11 bits 0..3
+ * n31_pmu_rails[] is laid out so that table index n is 0x10 bit n, which
+ * makes index = selector - 4 for the single-bit rails. The consumers:
+ *   Grape:   sub_20766(1) -> sub_439B00(1) -> sub_6644(4) -> sub_7484(9)
+ *            = 0x10 bit 5 = PMU_LDO_6
+ *   display: sub_1C20 -> sub_439B00(4) -> sub_6644(5) -> sub_7484(10)
+ *            = 0x10 bit 6 = PMU_LDO_7
+ * Until 2026-09-07 these ids pointed at PMU_LDO_3 and PMU_LDO_4, so the
+ * display driver was holding bit 3 while believing it held bit 6. The
+ * accessory rail is this project's mapping and is not proven.
  */
-#define N31_PMU_RAIL_TOUCH	2	/* PMU_LDO_3, 0x10 bit 5, Grape */
-#define N31_PMU_RAIL_DISPLAY	3	/* PMU_LDO_4, 0x10 bit 6, unproven */
-#define N31_PMU_RAIL_ACCESSORY	4	/* PMU_LDO_5, 0x10 bit 7, unproven */
+#define N31_PMU_RAIL_TOUCH	5	/* PMU_LDO_6, 0x10 bit 5, Grape */
+#define N31_PMU_RAIL_DISPLAY	6	/* PMU_LDO_7, 0x10 bit 6, panel */
+#define N31_PMU_RAIL_ACCESSORY	7	/* PMU_LDO_8, 0x10 bit 7, unproven */
 
 int n31_pmu_rail_get(unsigned int id);
 void n31_pmu_rail_put(unsigned int id);
@@ -152,7 +157,8 @@ int d1830_wled_get(void);
  * publishes the hook and the module fills it in -- the same shape as
  * bcm2078_register_bt_rails().
  */
-void n31_backlight_register_wled(int (*fn)(unsigned int level, unsigned int max));
+void n31_backlight_register_wled(int (*set)(unsigned int level, unsigned int max),
+				 int (*get)(void));
 
 /* cs42l81-spi.c — true while the analog play graph is latched. */
 bool n31_audio_playback_active(void);
