@@ -373,6 +373,8 @@
                 /* PMU_LDO_7, ACTIVE1 bit 6: sub_1C20 -> sub_439B00(4) ->
                  * sub_6644(5) -> sub_7484(10). */
                 power-supply = <&display_rail>;
+                /* Off before the off script, on after display-on. */
+                backlight = <&backlight>;
             };
         };
 

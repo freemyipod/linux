@@ -293,6 +293,16 @@ static int n31_panel_probe(struct mipi_dsi_device *dsi)
 
 	drm_panel_init(&p->panel, dev, &n31_panel_funcs,
 		       DRM_MODE_CONNECTOR_DSI);
+	/*
+	 * The backlight rides on the panel: the panel framework switches it
+	 * off before disable() and on after enable(), which is the order the
+	 * firmware's power-off takes too (sub_4D08(0) is the first thing
+	 * sub_1D04 does). One DPMS off from a DRM master then darkens the
+	 * glass and puts the panel to sleep in one step.
+	 */
+	ret = drm_panel_of_backlight(&p->panel);
+	if (ret)
+		return dev_err_probe(dev, ret, "backlight\n");
 	drm_panel_add(&p->panel);
 
 	mipi_dsi_set_drvdata(dsi, p);

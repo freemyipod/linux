@@ -38,6 +38,8 @@ properties:
   power-supply:
     description: The panel's rail, PMU_LDO_7 on the D1830 PMIC.
 
+  backlight: true
+
 required:
   - compatible
   - reg
@@ -60,5 +62,6 @@ examples:
             reset-gpios = <&gpio 15 GPIO_ACTIVE_LOW>;
             enable-gpios = <&gpio 14 GPIO_ACTIVE_HIGH>;
             power-supply = <&display_rail>;
+            backlight = <&backlight>;
         };
     };
