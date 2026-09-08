@@ -19,10 +19,8 @@ description: |
   named window here rather than a clock phandle: the clock controller
   binding for this SoC does not expose those gates.
 
-  The panel is a child node. Its DCS initialisation is performed by the
-  boot ROM chain before the kernel runs; the driver sequences the panel's
-  reset line and supply around the LCDIF and re-issues the window through
-  the DSI host on every frame.
+  The DSI host window makes the node a MIPI DSI host; the panel is its
+  child, on channel 0, described by its own binding.
 
 properties:
   compatible:
@@ -42,38 +40,24 @@ properties:
       - const: dsi
       - const: compositor
 
-  power-supply:
-    description: The panel's rail, PMU_LDO_7 on the D1830 PMIC.
+  "#address-cells":
+    const: 1
 
-  panel:
+  "#size-cells":
+    const: 0
+
+patternProperties:
+  "^panel@0$":
     type: object
-    additionalProperties: false
-    description: The DCS command-mode panel attached to the DSI host.
-
-    properties:
-      compatible:
-        const: apple,n31-panel
-
-      reset-gpios:
-        maxItems: 1
-        description: |
-          The panel reset line, SoC pad 15. Stock releases it before
-          enabling the rail and asserts it after the rail is off.
-
-      width-mm:
-        description: Active area width in millimetres.
-
-      height-mm:
-        description: Active area height in millimetres.
-
-    required:
-      - compatible
-      - reset-gpios
+    $ref: panel/apple,n31-panel.yaml#
+    unevaluatedProperties: false
 
 required:
   - compatible
   - reg
   - reg-names
+  - "#address-cells"
+  - "#size-cells"
 
 additionalProperties: false
 
@@ -86,12 +70,14 @@ examples:
         reg = <0x38300000 0x10000>, <0x3c500000 0x100>,
               <0x3d800000 0x1000>, <0x38900000 0x2000>;
         reg-names = "lcdif", "clkcon", "dsi", "compositor";
-        power-supply = <&display_rail>;
+        #address-cells = <1>;
+        #size-cells = <0>;
 
-        panel {
+        panel@0 {
             compatible = "apple,n31-panel";
+            reg = <0>;
             reset-gpios = <&gpio 15 GPIO_ACTIVE_LOW>;
-            width-mm = <30>;
-            height-mm = <56>;
+            enable-gpios = <&gpio 14 GPIO_ACTIVE_HIGH>;
+            power-supply = <&display_rail>;
         };
     };

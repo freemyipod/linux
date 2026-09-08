@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/panel/apple,n31-panel.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple iPod nano 7th generation display panel
+
+maintainers:
+  - Andrew Green <me@andrewgreen.ca>
+
+description: |
+  The 240x432 DCS command-mode panel of the Apple iPod nano 7th generation
+  (N31), on a MIPI DSI link from the S5L8740 display controller. Two panel
+  variants exist and are told apart by the first byte of manufacturer
+  register 0xA1; the driver reads it and picks the initialisation sequence.
+
+allOf:
+  - $ref: panel-common.yaml#
+
+properties:
+  compatible:
+    const: apple,n31-panel
+
+  reg:
+    maxItems: 1
+
+  reset-gpios:
+    maxItems: 1
+    description: Panel reset, SoC pad 15, released before the rail comes up.
+
+  enable-gpios:
+    maxItems: 1
+    description: |
+      Panel enable, SoC pad 14, driven high after the initialisation
+      sequence and low before the power-off sequence.
+
+  power-supply:
+    description: The panel's rail, PMU_LDO_7 on the D1830 PMIC.
+
+required:
+  - compatible
+  - reg
+  - reset-gpios
+  - power-supply
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+
+    dsi {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        panel@0 {
+            compatible = "apple,n31-panel";
+            reg = <0>;
+            reset-gpios = <&gpio 15 GPIO_ACTIVE_LOW>;
+            enable-gpios = <&gpio 14 GPIO_ACTIVE_HIGH>;
+            power-supply = <&display_rail>;
+        };
+    };

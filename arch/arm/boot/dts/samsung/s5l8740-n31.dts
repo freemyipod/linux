@@ -357,17 +357,22 @@
             reg = <0x38300000 0x10000>, <0x3c500000 0x100>,
                   <0x3d800000 0x1000>, <0x38900000 0x2000>;
             reg-names = "lcdif", "clkcon", "dsi", "compositor";
-            /* PMU_LDO_7, ACTIVE1 bit 6: sub_1C20 -> sub_439B00(4) ->
-             * sub_6644(5) -> sub_7484(10). */
-            power-supply = <&display_rail>;
+            #address-cells = <1>;
+            #size-cells = <0>;
 
-            panel {
+            /* The panel, on the DSI host's only channel. */
+            panel@0 {
                 compatible = "apple,n31-panel";
+                reg = <0>;
                 /* Pad 15. sub_1C20 drives it high before the rail comes up
                  * and sub_1D04 drives it low after the rail is down. */
                 reset-gpios = <&gpio 15 GPIO_ACTIVE_LOW>;
-                width-mm = <30>;
-                height-mm = <56>;
+                /* Pad 14, the word at 0x891DF30: sub_38DC drives it high
+                 * after the init script and low before the off script. */
+                enable-gpios = <&gpio 14 GPIO_ACTIVE_HIGH>;
+                /* PMU_LDO_7, ACTIVE1 bit 6: sub_1C20 -> sub_439B00(4) ->
+                 * sub_6644(5) -> sub_7484(10). */
+                power-supply = <&display_rail>;
             };
         };
 
@@ -621,7 +626,6 @@
                  * The controller programs its own divider, so this is
                  * documentation rather than a control. */
                 spi-max-frequency = <12000000>;
-                enable-gpios = <&gpio 14 GPIO_ACTIVE_HIGH>;
                 reset-gpios = <&gpio 39 GPIO_ACTIVE_LOW>;
                 attn-gpios = <&gpio 38 GPIO_ACTIVE_LOW>;
                 /* GPIO38 → EIC group1 → VIC EXT1 */

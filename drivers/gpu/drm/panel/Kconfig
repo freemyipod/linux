@@ -1024,4 +1024,12 @@ config DRM_PANEL_XINPENG_XPP055C272
 	  Say Y here if you want to enable support for the Xinpeng
 	  XPP055C272 controller for 720x1280 LCD panels with MIPI/RGB/SPI
 	  system interfaces.
+config DRM_PANEL_APPLE_N31
+	tristate "Apple iPod nano 7G 240x432 DSI panel"
+	depends on OF
+	depends on DRM_MIPI_DSI
+	help
+	  Say Y here if you want to enable support for the DCS command-mode
+	  panel of the Apple iPod nano 7th generation (N31).
+
 endmenu

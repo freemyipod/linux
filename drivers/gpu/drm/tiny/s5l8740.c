@@ -8,9 +8,10 @@
  * and the clock controller in which an LCDIF reset cycles two gates. The
  * frame path is the one the stock firmware uses at runtime: one XRGB8888
  * layer pointed at a double-buffered frame, kicked by cycling the LCDIF
- * transfer gate. The panel's DCS initialisation is performed by the boot
- * ROM chain; its reset line and supply are sequenced here around the
- * LCDIF, as the firmware's display power path does.
+ * transfer gate. The DSI host is exposed as a MIPI DSI host and the panel
+ * is a drm_panel bound to its child node; power on and off run the
+ * firmware's own order through the panel's prepare, enable, disable and
+ * unprepare around the host and the LCDIF.
  *
  * Binding: Documentation/devicetree/bindings/display/samsung/samsung,s5l8740-lcdif.yaml
  */
@@ -20,10 +21,8 @@
 #include <linux/gfp.h>
 #include <linux/iopoll.h>
 #include <linux/mutex.h>
-#include <linux/gpio/consumer.h>
 #include <linux/io.h>
 #include <linux/of.h>
-#include <linux/regulator/consumer.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
@@ -39,6 +38,9 @@
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_fb_helper.h>
 #include <drm/drm_fbdev_shmem.h>
+#include <drm/drm_mipi_dsi.h>
+#include <drm/drm_panel.h>
+#include <video/mipi_display.h>
 #include <drm/drm_rect.h>
 #include <drm/drm_format_helper.h>
 #include <drm/drm_framebuffer.h>
@@ -218,8 +220,6 @@
  struct s5l8740_device {
 	struct drm_device dev;
 
-	/* simplefb settings */
-	struct drm_display_mode mode;
     const struct drm_format_info *format;
 
     /* memory management */
@@ -251,8 +251,18 @@
 	struct delayed_work comp_retry;
 	bool comp_pending;	/* +0x24 points at a frame no kick has shown yet */
 	unsigned int comp_retries;
-	struct regulator *supply;	/* the panel's rail, from the PMIC */
-	struct gpio_desc *reset_gpio;	/* the panel's reset line; active low */
+	/*
+	 * The MIPI DSI host over the +0x3D800000 window, and the panel
+	 * bound to its child node. The DRM device is built once the panel
+	 * has attached; until then there is nothing to give a connector.
+	 */
+	struct mipi_dsi_host dsi_host;
+	struct drm_panel *panel;
+	struct mutex dsi_lock;		/* one packet at a time */
+	bool dsi_ready;			/* host initialised (bootloader or us) */
+	bool dsi_words_valid;
+	u32 dsi_words[7];		/* PLL CTL RES T28 BAND T54 T58, as found */
+	bool drm_ready;
 
 	/* modesetting */
     uint32_t formats[8];
@@ -291,6 +301,49 @@
 
 #define S5L8740_DSI_DT_DCS_SHORT_0P	0x05
 #define S5L8740_DSI_DT_GEN_LONG		0x29
+
+/*
+ * The rest of the host, from its bring-up sub_2AFC(0) with sub_4FC8 and
+ * sub_3ED8, its shutdown sub_4640, and the read path sub_4870. The words
+ * the bring-up writes to PLL, CTL, RES, +0x28, BAND, +0x54 and +0x58 come
+ * from a panel description the firmware fills at runtime; this driver
+ * captures them from the bootloader-initialised host at probe and writes
+ * them back on a re-initialisation.
+ */
+#define S5L8740_DSI_STAT0		0x00
+#define S5L8740_DSI_STAT0_BUSY		BIT(20)
+#define S5L8740_DSI_STAT0_READY		BIT(8)	/* with one bit per lane below */
+#define S5L8740_DSI_RESET		0x04
+#define S5L8740_DSI_PLL			0x08
+#define S5L8740_DSI_PLL_HS		BIT(31)	/* sub_3ED8: 1 = high speed */
+#define S5L8740_DSI_CTL2		0x14
+#define S5L8740_DSI_CTL2_LP		0xc0	/* sub_3ED8: set = low power */
+#define S5L8740_DSI_CTL2_PULSE		BIT(20)
+#define S5L8740_DSI_RES			0x18	/* hres | vres << 16 */
+#define S5L8740_DSI_RES_EN		BIT(31)
+#define S5L8740_DSI_T28			0x28
+#define S5L8740_DSI_RXSTAT		0x2c
+#define S5L8740_DSI_RXSTAT_ANY		0x00250003u
+#define S5L8740_DSI_RXSTAT_ERR		0x00000003u
+#define S5L8740_DSI_RXSTAT_TIMEOUT	0x00210000u
+#define S5L8740_DSI_INTCLR		0x30
+#define S5L8740_DSI_RXDATA		0x3c
+#define S5L8740_DSI_T40			0x40
+#define S5L8740_DSI_T40_VAL		511
+#define S5L8740_DSI_T44_VAL		29
+#define S5L8740_DSI_ST_RXRDY		BIT(24)
+#define S5L8740_DSI_BAND		0x4c	/* PLL band index << 24 */
+#define S5L8740_DSI_T54			0x54
+#define S5L8740_DSI_T58			0x58
+#define S5L8740_DSI_INIT_TIMEOUT_US	20000
+
+enum { DSI_W_PLL, DSI_W_CTL, DSI_W_RES, DSI_W_T28, DSI_W_BAND, DSI_W_T54,
+       DSI_W_T58 };
+
+/* Clock gates the display path opens and closes, one bit each (sub_41CBD8). */
+#define S5L8740_CLKCON_08_LCDIF		BIT(15)	/* id 8 */
+#define S5L8740_CLKCON_14		0x14
+#define S5L8740_CLKCON_14_DSI		BIT(15)	/* id 13 */
 
 #define S5L8740_DCS_SET_COLUMN		0x2a
 #define S5L8740_DCS_SET_PAGE		0x2b
@@ -360,14 +413,14 @@ module_param(lcd_cabc, bool, 0644);
 MODULE_PARM_DESC(lcd_cabc,
 		 "Program the compositor's +0x1b30 content-adaptive block as stock does (default N: without the PMIC/single-wire consumer it transforms the output)");
 
-/* Short DCS write, no parameters. */
-static int s5l8740_dsi_short(struct s5l8740_device *sdev, u8 dt, u8 cmd)
+/* Short packet: the two parameter bytes ride in the header (sub_6D80). */
+static int s5l8740_dsi_short(struct s5l8740_device *sdev, u8 dt, u8 p0, u8 p1)
 {
 	u32 st;
 
 	if (!sdev->dsi)
 		return -ENODEV;
-	writel((dt & 0x3f) | (cmd << 8), sdev->dsi + S5L8740_DSI_HDR);
+	writel((dt & 0x3f) | (p0 << 8) | (p1 << 16), sdev->dsi + S5L8740_DSI_HDR);
 	/*
 	 * Flush the header write and let the host react before polling.
 	 *
@@ -470,8 +523,289 @@ static int s5l8740_dsi_window(struct s5l8740_device *sdev,
 		return ret;
 
 	return s5l8740_dsi_short(sdev, S5L8740_DSI_DT_DCS_SHORT_0P,
-				 S5L8740_DCS_WRITE_START);
+				 S5L8740_DCS_WRITE_START, 0);
 }
+
+/* Single-bit gate RMW on the shared clock controller; nothing else moves. */
+static void s5l8740_clkcon_gate(struct s5l8740_device *sdev, unsigned int reg,
+				u32 bit, bool open)
+{
+	u32 v;
+
+	if (!sdev->clkcon)
+		return;
+	v = readl(sdev->clkcon + reg);
+	v = open ? (v & ~bit) : (v | bit);
+	writel(v, sdev->clkcon + reg);
+}
+
+/* sub_439C4C(id): power domain 2 carries the whole display path. */
+static void s5l8740_domain_up(struct s5l8740_device *sdev)
+{
+	int (*domain_up)(unsigned int);
+
+	domain_up = (int (*)(unsigned int))__symbol_get("s5l8740_eic_domain_up");
+	if (!domain_up)
+		return;
+	if (domain_up(2))
+		drm_warn(&sdev->dev, "display power domain 2 did not come up\n");
+	__symbol_put("s5l8740_eic_domain_up");
+}
+
+/*
+ * Record the host's words as the bootloader left them. A host that is not
+ * showing the panel's own resolution was not initialised for it, and its
+ * words are not written back.
+ */
+static void s5l8740_dsi_capture(struct s5l8740_device *sdev)
+{
+	void __iomem *d = sdev->dsi;
+	u32 res;
+
+	sdev->dsi_words[DSI_W_PLL] = readl(d + S5L8740_DSI_PLL);
+	sdev->dsi_words[DSI_W_CTL] = readl(d + S5L8740_DSI_CTL);
+	sdev->dsi_words[DSI_W_RES] = readl(d + S5L8740_DSI_RES);
+	sdev->dsi_words[DSI_W_T28] = readl(d + S5L8740_DSI_T28);
+	sdev->dsi_words[DSI_W_BAND] = readl(d + S5L8740_DSI_BAND);
+	sdev->dsi_words[DSI_W_T54] = readl(d + S5L8740_DSI_T54);
+	sdev->dsi_words[DSI_W_T58] = readl(d + S5L8740_DSI_T58);
+	res = sdev->dsi_words[DSI_W_RES] & ~S5L8740_DSI_RES_EN;
+	sdev->dsi_words_valid = res == (WIDTH | (HEIGHT << 16));
+	sdev->dsi_ready = sdev->dsi_words_valid;
+	drm_info(&sdev->dev,
+		 "DSI host as found: PLL %08x CTL %08x RES %08x +28 %08x BAND %08x +54 %08x +58 %08x STAT0 %08x%s\n",
+		 sdev->dsi_words[DSI_W_PLL], sdev->dsi_words[DSI_W_CTL],
+		 sdev->dsi_words[DSI_W_RES], sdev->dsi_words[DSI_W_T28],
+		 sdev->dsi_words[DSI_W_BAND], sdev->dsi_words[DSI_W_T54],
+		 sdev->dsi_words[DSI_W_T58], readl(d + S5L8740_DSI_STAT0),
+		 sdev->dsi_words_valid ? "" : " (not this panel's; no re-init possible)");
+}
+
+/*
+ * sub_2AFC(0) followed by sub_4235A(3), in order. The two delays are
+ * sub_345D48 thunks whose argument the export drops; 1 ms stands in.
+ */
+static int s5l8740_dsi_host_init(struct s5l8740_device *sdev)
+{
+	void __iomem *d = sdev->dsi;
+	u32 lanes, v;
+	int ret;
+
+	if (!sdev->dsi_words_valid)
+		return -ENODEV;
+	lanes = ((sdev->dsi_words[DSI_W_CTL] >> 1) & 0x1f) | S5L8740_DSI_STAT0_READY;
+
+	s5l8740_domain_up(sdev);				/* sub_439C4C(7) */
+	writel(~0u, d + S5L8740_DSI_INTCLR);
+	/* sub_4FC8 */
+	writel(sdev->dsi_words[DSI_W_BAND], d + S5L8740_DSI_BAND);
+	s5l8740_clkcon_gate(sdev, S5L8740_CLKCON_14, S5L8740_CLKCON_14_DSI, true);
+	writel(sdev->dsi_words[DSI_W_PLL] & ~S5L8740_DSI_PLL_HS, d + S5L8740_DSI_PLL);
+
+	writel(1, d + S5L8740_DSI_RESET);
+	usleep_range(1000, 1500);
+	writel(0, d + S5L8740_DSI_RESET);
+	ret = readl_poll_timeout(d + S5L8740_DSI_STAT0, v,
+				 !(v & S5L8740_DSI_STAT0_BUSY), 10,
+				 S5L8740_DSI_INIT_TIMEOUT_US);
+	if (ret)
+		goto fail;
+	writel(~0u, d + S5L8740_DSI_INTCLR);
+	writel(sdev->dsi_words[DSI_W_RES] & ~S5L8740_DSI_RES_EN, d + S5L8740_DSI_RES);
+	writel(sdev->dsi_words[DSI_W_T54], d + S5L8740_DSI_T54);
+	writel(sdev->dsi_words[DSI_W_T58], d + S5L8740_DSI_T58);
+	writel(sdev->dsi_words[DSI_W_T28], d + S5L8740_DSI_T28);
+	writel(S5L8740_DSI_T40_VAL, d + S5L8740_DSI_T40);
+	writel(S5L8740_DSI_T44_VAL, d + S5L8740_DSI_STATUS);
+	writel(sdev->dsi_words[DSI_W_CTL], d + S5L8740_DSI_CTL);
+	writel(S5L8740_DSI_CTL2_PULSE, d + S5L8740_DSI_CTL2);
+	usleep_range(1000, 1500);
+	writel(readl(d + S5L8740_DSI_CTL2) & ~S5L8740_DSI_CTL2_PULSE, d + S5L8740_DSI_CTL2);
+	ret = readl_poll_timeout(d + S5L8740_DSI_STAT0, v, (v & lanes) == lanes,
+				 10, S5L8740_DSI_INIT_TIMEOUT_US);
+	if (ret)
+		goto fail;
+	writel(readl(d + S5L8740_DSI_CTL2) | S5L8740_DSI_CTL2_LP, d + S5L8740_DSI_CTL2);
+	writel(readl(d + S5L8740_DSI_RES) | S5L8740_DSI_RES_EN, d + S5L8740_DSI_RES);
+
+	/* sub_4235A(3) -> sub_3ED8(1): out of low power, high speed on. */
+	writel(readl(d + S5L8740_DSI_CTL2) & ~S5L8740_DSI_CTL2_LP, d + S5L8740_DSI_CTL2);
+	ret = readl_poll_timeout(d + S5L8740_DSI_STAT0, v, (v & lanes) == lanes,
+				 10, S5L8740_DSI_INIT_TIMEOUT_US);
+	if (ret)
+		goto fail;
+	writel(readl(d + S5L8740_DSI_PLL) | S5L8740_DSI_PLL_HS, d + S5L8740_DSI_PLL);
+	sdev->dsi_ready = true;
+	drm_info(&sdev->dev, "DSI host up (STAT0 %08x)\n", readl(d + S5L8740_DSI_STAT0));
+	return 0;
+
+fail:
+	drm_err(&sdev->dev, "DSI host bring-up timed out (STAT0 %08x)\n",
+		readl(d + S5L8740_DSI_STAT0));
+	return ret;
+}
+
+/* sub_4235A(2) -> sub_3ED8(0), then sub_4640: low power, reset, gate closed. */
+static void s5l8740_dsi_host_off(struct s5l8740_device *sdev)
+{
+	void __iomem *d = sdev->dsi;
+
+	writel(readl(d + S5L8740_DSI_CTL2) | S5L8740_DSI_CTL2_LP, d + S5L8740_DSI_CTL2);
+	writel(readl(d + S5L8740_DSI_PLL) & ~S5L8740_DSI_PLL_HS, d + S5L8740_DSI_PLL);
+	writel(1, d + S5L8740_DSI_RESET);
+	s5l8740_clkcon_gate(sdev, S5L8740_CLKCON_14, S5L8740_CLKCON_14_DSI, false);
+	sdev->dsi_ready = false;
+}
+
+/* The host comes up under the first packet after a power cycle: stock's
+ * order is reset released, rail on, host, packets, and the panel's prepare
+ * owns the first two. */
+static int s5l8740_dsi_ensure(struct s5l8740_device *sdev)
+{
+	if (sdev->dsi_ready)
+		return 0;
+	return s5l8740_dsi_host_init(sdev);
+}
+
+/*
+ * sub_4870: a read. Clear the receive status, send the short packet, wait
+ * for the status to say anything, reject errors and timeouts, wait for the
+ * receive FIFO, then decode the response header in +0x3c: type in the low
+ * six bits, a long response's length above it, a short response's bytes
+ * above it. The long path re-reads the FIFO word by word as stock does.
+ */
+static int s5l8740_dsi_read(struct s5l8740_device *sdev, const u8 *hdr,
+			    u8 *buf, size_t len)
+{
+	void __iomem *d = sdev->dsi;
+	u32 st, w, n, i;
+	int ret;
+
+	writel(~0u, d + S5L8740_DSI_RXSTAT);
+	ret = s5l8740_dsi_short(sdev, hdr[0], hdr[1], hdr[2]);
+	if (ret)
+		return ret;
+	ret = readl_poll_timeout(d + S5L8740_DSI_RXSTAT, st,
+				 st & S5L8740_DSI_RXSTAT_ANY, 10,
+				 S5L8740_DSI_INIT_TIMEOUT_US);
+	if (ret)
+		return ret;
+	if (st & S5L8740_DSI_RXSTAT_ERR)
+		return -EIO;
+	if (st & S5L8740_DSI_RXSTAT_TIMEOUT)
+		return -ETIMEDOUT;
+	ret = readl_poll_timeout(d + S5L8740_DSI_STATUS, st,
+				 st & S5L8740_DSI_ST_RXRDY, 10,
+				 S5L8740_DSI_INIT_TIMEOUT_US);
+	if (ret)
+		return ret;
+	w = readl(d + S5L8740_DSI_RXDATA);
+	switch (w & 0x3f) {
+	case MIPI_DSI_RX_GENERIC_LONG_READ_RESPONSE:
+	case MIPI_DSI_RX_DCS_LONG_READ_RESPONSE:
+		n = (w >> 8) & 0xffff;
+		for (i = 0; i < n; i++) {
+			if ((i & 3) == 0) {
+				ret = readl_poll_timeout(d + S5L8740_DSI_STATUS, st,
+							 st & S5L8740_DSI_ST_RXRDY,
+							 10, S5L8740_DSI_INIT_TIMEOUT_US);
+				if (ret)
+					return ret;
+				w = readl(d + S5L8740_DSI_RXDATA);
+			}
+			if (i < len)
+				buf[i] = w & 0xff;
+			w >>= 8;
+		}
+		return min_t(size_t, n, len);
+	case MIPI_DSI_RX_GENERIC_SHORT_READ_RESPONSE_2BYTE:
+	case MIPI_DSI_RX_DCS_SHORT_READ_RESPONSE_2BYTE:
+		if (len > 1)
+			buf[1] = (w >> 16) & 0xff;
+		fallthrough;
+	case MIPI_DSI_RX_GENERIC_SHORT_READ_RESPONSE_1BYTE:
+	case MIPI_DSI_RX_DCS_SHORT_READ_RESPONSE_1BYTE:
+		if (len > 0)
+			buf[0] = (w >> 8) & 0xff;
+		return min_t(size_t, (w & 0x3f) & 0x02 ? 2 : 1, len);
+	case MIPI_DSI_RX_ACKNOWLEDGE_AND_ERROR_REPORT:
+		drm_dbg(&sdev->dev, "DSI ack/error %04x\n", (w >> 8) & 0xffff);
+		return -EIO;
+	default:
+		drm_dbg(&sdev->dev, "DSI unexpected rx %08x\n", w);
+		return -EPROTO;
+	}
+}
+
+static ssize_t s5l8740_dsi_transfer(struct mipi_dsi_host *host,
+				    const struct mipi_dsi_msg *msg)
+{
+	struct s5l8740_device *sdev = container_of(host, struct s5l8740_device, dsi_host);
+	struct mipi_dsi_packet packet;
+	ssize_t ret;
+
+	ret = mipi_dsi_create_packet(&packet, msg);
+	if (ret)
+		return ret;
+	mutex_lock(&sdev->dsi_lock);
+	ret = s5l8740_dsi_ensure(sdev);
+	if (ret)
+		goto out;
+	if (msg->rx_buf && msg->rx_len) {
+		ret = s5l8740_dsi_read(sdev, packet.header, msg->rx_buf, msg->rx_len);
+	} else if (packet.payload_length) {
+		ret = s5l8740_dsi_long(sdev, packet.header[0], packet.payload,
+				       packet.payload_length);
+		if (!ret)
+			ret = msg->tx_len;
+	} else {
+		ret = s5l8740_dsi_short(sdev, packet.header[0], packet.header[1],
+					packet.header[2]);
+		if (!ret)
+			ret = msg->tx_len;
+	}
+out:
+	mutex_unlock(&sdev->dsi_lock);
+	return ret;
+}
+
+static int s5l8740_drm_setup(struct s5l8740_device *sdev);
+
+static int s5l8740_dsi_attach(struct mipi_dsi_host *host, struct mipi_dsi_device *dsi)
+{
+	struct s5l8740_device *sdev = container_of(host, struct s5l8740_device, dsi_host);
+	struct drm_panel *panel;
+
+	panel = of_drm_find_panel(dsi->dev.of_node);
+	if (IS_ERR(panel))
+		return PTR_ERR(panel);
+	sdev->panel = panel;
+	/*
+	 * The bootloader left the panel lit. Tell the panel framework so,
+	 * or the first power-off is skipped as "already unprepared".
+	 */
+	if (sdev->powered) {
+		panel->prepared = true;
+		panel->enabled = true;
+	}
+	drm_info(&sdev->dev, "panel %s attached: %u lanes, format %u\n",
+		 dev_name(&dsi->dev), dsi->lanes, dsi->format);
+	return s5l8740_drm_setup(sdev);
+}
+
+static int s5l8740_dsi_detach(struct mipi_dsi_host *host, struct mipi_dsi_device *dsi)
+{
+	struct s5l8740_device *sdev = container_of(host, struct s5l8740_device, dsi_host);
+
+	sdev->panel = NULL;
+	return 0;
+}
+
+static const struct mipi_dsi_host_ops s5l8740_dsi_host_ops = {
+	.attach = s5l8740_dsi_attach,
+	.detach = s5l8740_dsi_detach,
+	.transfer = s5l8740_dsi_transfer,
+};
 
 /* ------------------------------------------------------------------ */
 /* Frame staging                                                        */
@@ -515,8 +849,11 @@ static int s5l8740_comp_kick(struct s5l8740_device *sdev)
 		return -EBUSY;
 	}
 	writel(1, b + S5L8740_LCD_XFER);
-	if (sdev->dsi)
+	if (sdev->dsi) {
+		mutex_lock(&sdev->dsi_lock);
 		s5l8740_dsi_window(sdev, 0, 0, WIDTH, HEIGHT);
+		mutex_unlock(&sdev->dsi_lock);
+	}
 	udelay(2);
 	writel(0, b + S5L8740_LCD_XFER);
 	sdev->comp_kicks++;
@@ -911,7 +1248,10 @@ static int s5l8740_comp_frame(struct s5l8740_device *sdev, const u32 *src,
 	s5l8740_comp_wait_idle(sdev);
 
 	i = sdev->cbuf_back;
-	s5l8740_stage_into(sdev->cbuf[i], src, pitch_px, w, h);
+	if (src)
+		s5l8740_stage_into(sdev->cbuf[i], src, pitch_px, w, h);
+	else
+		memset(sdev->cbuf[i], 0, S5L8740_COMP_FRAME_BYTES);
 	dma_sync_single_for_device(sdev->dev.dev, sdev->cbuf_dma[i],
 				   S5L8740_COMP_FRAME_BYTES, DMA_TO_DEVICE);
 	writel(lower_32_bits(sdev->cbuf_dma[i]) & 0x7fffffff,
@@ -990,7 +1330,9 @@ static int s5l8740_connector_helper_get_modes(struct drm_connector *connector)
 {
 	struct s5l8740_device *sdev = s5l8740_device_of_dev(connector->dev);
 
-	return drm_connector_helper_get_modes_fixed(connector, &sdev->mode);
+	if (!sdev->panel)
+		return 0;
+	return drm_panel_get_modes(sdev->panel, connector);
 }
 
 static const struct drm_connector_helper_funcs s5l8740_connector_helper_funcs = {
@@ -1161,14 +1503,15 @@ static void s5l8740_lcdif_program(struct s5l8740_device *sdev)
 				 dret);
 		__symbol_put("s5l8740_eic_domain_up");
 	}
+	/* sub_41CBD8(8, 1): the LCDIF gate, closed again by the off path. */
+	s5l8740_clkcon_gate(sdev, S5L8740_CLKCON_08, S5L8740_CLKCON_08_LCDIF, true);
 
 	writel(0x000a000a, b + S5L8740_LCD_UNK78);
 	writel(keep | S5L8740_CON_BASE, b + S5L8740_LCD_CON);
 	writel(1, b + S5L8740_LCD_UNK2C);
 	writel(0, b + S5L8740_LCD_UNK68);
 	writel(0, b + S5L8740_LCD_UNK70);
-	writel(sdev->mode.vdisplay | (sdev->mode.hdisplay << 16),
-	       b + S5L8740_LCD_SIZE);
+	writel(HEIGHT | (WIDTH << 16), b + S5L8740_LCD_SIZE);
 	writel(0, b + S5L8740_LCD_PHTIME);
 	writel(770, b + S5L8740_LCD_UNK7C);
 	writel(100, b + S5L8740_LCD_UNK84);
@@ -1308,18 +1651,19 @@ static int s5l8740_lcd_power_on_locked(struct s5l8740_device *sdev)
 
 	if (sdev->powered)
 		return 0;
+	if (!sdev->panel)
+		return -ENODEV;
 
 	/*
-	 * sub_1C20: the panel's reset line released first, then the display
-	 * rail. The wait between the rail and the LCDIF is a thunk into ROM
-	 * whose length is not recoverable from the image; 3 ms is the
-	 * stand-in that has always been used here.
+	 * sub_1C20: the panel's prepare releases its reset line, raises the
+	 * rail and sends sleep-out; the DSI host comes up under that first
+	 * packet (sub_2AFC(0) and sub_4235A(3)). Then the LCDIF (sub_2C64(0)),
+	 * one blank frame (the script's third opcode), and the panel's enable
+	 * for display-on and its enable line.
 	 */
-	if (sdev->reset_gpio)
-		gpiod_set_value_cansleep(sdev->reset_gpio, 0);
-	if (sdev->supply && regulator_enable(sdev->supply))
-		drm_warn(&sdev->dev, "display rail enable failed\n");
-	usleep_range(3000, 3500);
+	ret = drm_panel_prepare(sdev->panel);
+	if (ret)
+		return ret;
 
 	for (try = 0; try < S5L8740_LCD_RESET_TRIES; try++) {
 		ret = s5l8740_lcdif_reset(sdev, try == 0);
@@ -1342,14 +1686,16 @@ static int s5l8740_lcd_power_on_locked(struct s5l8740_device *sdev)
 	if (ret) {
 		drm_err(&sdev->dev, "failed to turn on display after %u tries\n",
 			S5L8740_LCD_RESET_TRIES);
-		if (sdev->supply)
-			regulator_disable(sdev->supply);
-		if (sdev->reset_gpio)
-			gpiod_set_value_cansleep(sdev->reset_gpio, 1);
+		drm_panel_unprepare(sdev->panel);
 		return ret;
 	}
 
 	sdev->powered = true;
+	if (s5l8740_comp_available(sdev))
+		s5l8740_comp_frame(sdev, NULL, 0, WIDTH, HEIGHT);
+	ret = drm_panel_enable(sdev->panel);
+	if (ret)
+		drm_warn(&sdev->dev, "panel enable failed: %d\n", ret);
 	drm_info(&sdev->dev, "display on (CON=%08x STATUS=%08x)\n",
 		 readl(sdev->lcdif + S5L8740_LCD_CON),
 		 readl(sdev->lcdif + S5L8740_LCD_STATUS));
@@ -1358,19 +1704,31 @@ static int s5l8740_lcd_power_on_locked(struct s5l8740_device *sdev)
 
 static void s5l8740_lcd_power_off_locked(struct s5l8740_device *sdev)
 {
+	void __iomem *b = sdev->lcdif;
+
 	if (!sdev->powered)
 		return;
 
-	writel(readl(sdev->lcdif + S5L8740_LCD_CON) & ~S5L8740_CON_RUN,
-	       sdev->lcdif + S5L8740_LCD_CON);
-	/* sub_1D04, the mirror of sub_1C20: rail down, then reset asserted. */
-	if (sdev->supply)
-		regulator_disable(sdev->supply);
-	if (sdev->reset_gpio)
-		gpiod_set_value_cansleep(sdev->reset_gpio, 1);
+	cancel_delayed_work_sync(&sdev->comp_retry);
+	/*
+	 * sub_1D04: the panel's disable drops its enable line and runs the
+	 * off scripts; then sub_46DC stops the LCDIF (request enable off, a
+	 * light reset, the gate closed), sub_4640 puts the host to sleep, and
+	 * the panel's unprepare drops the rail and asserts reset.
+	 */
+	if (sdev->panel)
+		drm_panel_disable(sdev->panel);
+	writel(readl(b + S5L8740_LCD_CON) & ~(S5L8740_CON_RUN | S5L8740_CON_REQ_EN),
+	       b + S5L8740_LCD_CON);
+	s5l8740_lcdif_reset(sdev, true);
+	s5l8740_clkcon_gate(sdev, S5L8740_CLKCON_08, S5L8740_CLKCON_08_LCDIF, false);
+	sdev->handoff_armed = false;
+	s5l8740_dsi_host_off(sdev);
+	if (sdev->panel)
+		drm_panel_unprepare(sdev->panel);
 	sdev->powered = false;
 	drm_info(&sdev->dev, "display off (CON=%08x)\n",
-		 readl(sdev->lcdif + S5L8740_LCD_CON));
+		 readl(b + S5L8740_LCD_CON));
 }
 
 /*
@@ -1421,8 +1779,30 @@ bool n31_lcd_is_on(void)
 }
 EXPORT_SYMBOL_GPL(n31_lcd_is_on);
 
+static void s5l8740_crtc_atomic_enable(struct drm_crtc *crtc,
+				       struct drm_atomic_state *state)
+{
+	struct s5l8740_device *sdev = s5l8740_device_of_dev(crtc->dev);
+
+	mutex_lock(&sdev->power_lock);
+	s5l8740_lcd_power_on_locked(sdev);
+	mutex_unlock(&sdev->power_lock);
+}
+
+static void s5l8740_crtc_atomic_disable(struct drm_crtc *crtc,
+					struct drm_atomic_state *state)
+{
+	struct s5l8740_device *sdev = s5l8740_device_of_dev(crtc->dev);
+
+	mutex_lock(&sdev->power_lock);
+	s5l8740_lcd_power_off_locked(sdev);
+	mutex_unlock(&sdev->power_lock);
+}
+
 static const struct drm_crtc_helper_funcs s5l8740_crtc_helper_funcs = {
 	.atomic_check = drm_crtc_helper_atomic_check,
+	.atomic_enable = s5l8740_crtc_atomic_enable,
+	.atomic_disable = s5l8740_crtc_atomic_disable,
 };
 
 static const struct drm_crtc_funcs s5l8740_crtc_funcs = {
@@ -1450,21 +1830,6 @@ static const struct drm_mode_config_funcs s5l8740_mode_config_funcs = {
  * about 30 frames a second, so say so: clock = 240 * 432 * 30 / 1000 kHz
  * with no blanking, which drm_mode_vrefresh() reads back as 30.
  */
-static const struct drm_display_mode s5l8740_mode = {
-	.type = DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_PREFERRED,
-	.clock = WIDTH * HEIGHT * 30 / 1000,
-	.hdisplay = WIDTH,
-	.hsync_start = WIDTH,
-	.hsync_end = WIDTH,
-	.htotal = WIDTH,
-	.vdisplay = HEIGHT,
-	.vsync_start = HEIGHT,
-	.vsync_end = HEIGHT,
-	.vtotal = HEIGHT,
-	.width_mm = 30,
-	.height_mm = 56,
-};
-
 /*
  * DRM driver
  */
@@ -1486,155 +1851,24 @@ static struct drm_driver s5l8740_driver = {
  * Platform driver
  */
 
-static int s5l8740_probe(struct platform_device *pdev)
+/*
+ * Everything DRM, built once the panel has attached to the host: mode
+ * config, the one plane, CRTC, encoder and the connector the panel gives
+ * its mode to.
+ */
+static int s5l8740_drm_setup(struct s5l8740_device *sdev)
 {
-    struct s5l8740_device *sdev;
-    struct drm_device *dev;
-    struct resource *res;
-    struct device_node *panel;
-    const struct drm_format_info *format;
+	struct drm_device *dev = &sdev->dev;
+	const struct drm_format_info *format = sdev->format;
 	struct drm_plane *primary_plane;
 	struct drm_crtc *crtc;
 	struct drm_encoder *encoder;
 	struct drm_connector *connector;
 	size_t nformats;
-    int ret;
+	int ret;
 
-	sdev = devm_drm_dev_alloc(&pdev->dev, &s5l8740_driver, struct s5l8740_device, dev);
-    if (IS_ERR(sdev))
-        return PTR_ERR(sdev);
-
-    sdev->mode = s5l8740_mode;
-    format = drm_format_info(DRM_FORMAT_XRGB8888);
-    sdev->format = format;
-
-    dev = &sdev->dev;
-
-    /*
-     * The panel is a child node carrying its reset line and its physical
-     * size. Its DCS initialisation is done by the boot ROM chain before
-     * Linux runs; this driver re-issues the window on each frame and
-     * sequences the reset line and the rail around the LCDIF.
-     */
-    panel = of_get_child_by_name(pdev->dev.of_node, "panel");
-    if (panel) {
-        u32 mm;
-
-        /*
-         * Output, deasserted: the bootloader left the line released, so
-         * this changes nothing on the pad and only records the direction.
-         */
-        sdev->reset_gpio = devm_fwnode_gpiod_get(&pdev->dev,
-                                                 of_fwnode_handle(panel),
-                                                 "reset", GPIOD_OUT_LOW,
-                                                 "panel reset");
-        if (IS_ERR(sdev->reset_gpio)) {
-            ret = PTR_ERR(sdev->reset_gpio);
-            of_node_put(panel);
-            return dev_err_probe(&pdev->dev, ret, "panel reset gpio\n");
-        }
-        if (!of_property_read_u32(panel, "width-mm", &mm))
-            sdev->mode.width_mm = mm;
-        if (!of_property_read_u32(panel, "height-mm", &mm))
-            sdev->mode.height_mm = mm;
-        of_node_put(panel);
-    }
-
-    /*
-     * The display rail, as a regulator from the PMIC. The PMIC driver is
-     * a module, so this defers the probe until it has registered; the
-     * panel stays lit by the bootloader in the meantime and the console
-     * catches up when the device binds.
-     */
-    sdev->supply = devm_regulator_get_optional(&pdev->dev, "power");
-    if (IS_ERR(sdev->supply)) {
-        if (PTR_ERR(sdev->supply) == -EPROBE_DEFER)
-            return -EPROBE_DEFER;
-        sdev->supply = NULL;
-    }
-
-    sdev->lcdif = devm_platform_ioremap_resource_byname(pdev, "lcdif");
-    if (IS_ERR(sdev->lcdif))
-        return PTR_ERR(sdev->lcdif);
-    mutex_init(&sdev->power_lock);
-
-    /* The MIPI DSI host: the panel window is set through it on every frame. */
-    sdev->dsi = devm_platform_ioremap_resource_byname(pdev, "dsi");
-    if (IS_ERR(sdev->dsi))
-        return dev_err_probe(&pdev->dev, PTR_ERR(sdev->dsi), "dsi window\n");
-
-    /* The layer compositor, the engine every frame is drawn with. */
-    sdev->comp = devm_platform_ioremap_resource_byname(pdev, "compositor");
-    if (IS_ERR(sdev->comp))
-        return dev_err_probe(&pdev->dev, PTR_ERR(sdev->comp),
-                             "compositor window\n");
-
-    /*
-     * The clock controller. Two gates in it are cycled across an LCDIF
-     * reset, and nothing else is touched.
-     */
-    res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "clkcon");
-    if (res) {
-    	/*
-    	 * Map without claiming. This window is the clock controller, which
-    	 * the clock-controller node already owns and the IIS driver also
-    	 * maps, so an exclusive devm_ioremap_resource() always lost the
-    	 * race and returned -EBUSY. The driver then carried on with
-    	 * clkcon = NULL and quietly stopped gating the clocks across an
-    	 * LCDIF reset -- a real behaviour change reported only as an error
-    	 * line nobody acted on. CLKCON is a shared block; sharing it is
-    	 * correct, claiming it is not.
-    	 */
-    	sdev->clkcon = devm_ioremap(&pdev->dev, res->start,
-    				    resource_size(res));
-    }
-    if (!sdev->clkcon)
-    	drm_info(dev,
-    		 "no clkcon window; LCDIF reset will not gate clocks\n");
-
-    /* The panel is already running from the boot loader handoff. */
-    sdev->powered = true;
-    /* Compositor retry state; the block itself is programmed on first use. */
-    mutex_init(&sdev->comp_lock);
-    INIT_DELAYED_WORK(&sdev->comp_retry, s5l8740_comp_retry_fn);
-    s5l8740_lcd_dev = sdev;
-    /*
-     * remove() and shutdown() both dereference this; without it the
-     * former was a NULL dereference on unbind.
-     */
-    platform_set_drvdata(pdev, sdev);
-
-    /*
-     * The bootloader left the rail on and the panel lit. Take the
-     * regulator's reference so the rail has a holder from the start;
-     * without one the regulator core would switch it off as unused.
-     */
-    if (sdev->supply && regulator_enable(sdev->supply))
-        drm_warn(dev, "display rail claim failed\n");
-
-    /* GATE0: log WTF handoff, never rewrite CON/PHTIME */
-    drm_info(dev, "LCDIF handoff CON=%08x PHTIME=%08x (untouched)\n",
-	     readl(sdev->lcdif + S5L8740_LCD_CON),
-	     readl(sdev->lcdif + S5L8740_LCD_PHTIME));
-
-    /* CON first (stage0). Print so glass shows whether WDT is still live. */
-    {
-	void __iomem *wdt = ioremap(0x3c800000, 8);
-
-	if (wdt) {
-		writel(0, wdt);
-		writel(0, wdt + 4);
-		writel(0, wdt);
-		writel(0, wdt + 4);
-		drm_info(dev, "WDT CON=%08x CNT=%08x (disarmed)\n",
-			 readl(wdt), readl(wdt + 4));
-		iounmap(wdt);
-	}
-    }
-
-    /*
-	 * Modesetting
-	 */
+	if (sdev->drm_ready)
+		return 0;
 
 	ret = drmm_mode_config_init(dev);
 	if (ret)
@@ -1684,7 +1918,7 @@ static int s5l8740_probe(struct platform_device *pdev)
 
     connector = &sdev->connector;
     ret = drm_connector_init(dev, connector, &s5l8740_connector_funcs,
-     DRM_MODE_CONNECTOR_Unknown);
+     DRM_MODE_CONNECTOR_DSI);
     if (ret)
         return ret;
     drm_connector_helper_add(connector, &s5l8740_connector_helper_funcs);
@@ -1700,9 +1934,114 @@ static int s5l8740_probe(struct platform_device *pdev)
          return ret;
 
     drm_client_setup(dev, sdev->format);
-
+    sdev->drm_ready = true;
     return 0;
- }
+}
+
+static int s5l8740_probe(struct platform_device *pdev)
+{
+    struct s5l8740_device *sdev;
+    struct drm_device *dev;
+    struct resource *res;
+    const struct drm_format_info *format;
+    int ret;
+
+	sdev = devm_drm_dev_alloc(&pdev->dev, &s5l8740_driver, struct s5l8740_device, dev);
+    if (IS_ERR(sdev))
+        return PTR_ERR(sdev);
+
+    format = drm_format_info(DRM_FORMAT_XRGB8888);
+    sdev->format = format;
+
+    dev = &sdev->dev;
+
+    sdev->lcdif = devm_platform_ioremap_resource_byname(pdev, "lcdif");
+    if (IS_ERR(sdev->lcdif))
+        return PTR_ERR(sdev->lcdif);
+    mutex_init(&sdev->power_lock);
+    mutex_init(&sdev->dsi_lock);
+
+    /* The MIPI DSI host: the panel window is set through it on every frame. */
+    sdev->dsi = devm_platform_ioremap_resource_byname(pdev, "dsi");
+    if (IS_ERR(sdev->dsi))
+        return dev_err_probe(&pdev->dev, PTR_ERR(sdev->dsi), "dsi window\n");
+
+    /* The layer compositor, the engine every frame is drawn with. */
+    sdev->comp = devm_platform_ioremap_resource_byname(pdev, "compositor");
+    if (IS_ERR(sdev->comp))
+        return dev_err_probe(&pdev->dev, PTR_ERR(sdev->comp),
+                             "compositor window\n");
+
+    /*
+     * The clock controller. Two gates in it are cycled across an LCDIF
+     * reset, and nothing else is touched.
+     */
+    res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "clkcon");
+    if (res) {
+    	/*
+    	 * Map without claiming. This window is the clock controller, which
+    	 * the clock-controller node already owns and the IIS driver also
+    	 * maps, so an exclusive devm_ioremap_resource() always lost the
+    	 * race and returned -EBUSY. The driver then carried on with
+    	 * clkcon = NULL and quietly stopped gating the clocks across an
+    	 * LCDIF reset -- a real behaviour change reported only as an error
+    	 * line nobody acted on. CLKCON is a shared block; sharing it is
+    	 * correct, claiming it is not.
+    	 */
+    	sdev->clkcon = devm_ioremap(&pdev->dev, res->start,
+    				    resource_size(res));
+    }
+    if (!sdev->clkcon)
+    	drm_info(dev,
+    		 "no clkcon window; LCDIF reset will not gate clocks\n");
+
+    /* The panel is already running from the boot loader handoff. */
+    sdev->powered = true;
+    /* Compositor retry state; the block itself is programmed on first use. */
+    mutex_init(&sdev->comp_lock);
+    INIT_DELAYED_WORK(&sdev->comp_retry, s5l8740_comp_retry_fn);
+    s5l8740_lcd_dev = sdev;
+    /*
+     * remove() and shutdown() both dereference this; without it the
+     * former was a NULL dereference on unbind.
+     */
+    platform_set_drvdata(pdev, sdev);
+
+    /* GATE0: log WTF handoff, never rewrite CON/PHTIME */
+    drm_info(dev, "LCDIF handoff CON=%08x PHTIME=%08x (untouched)\n",
+	     readl(sdev->lcdif + S5L8740_LCD_CON),
+	     readl(sdev->lcdif + S5L8740_LCD_PHTIME));
+
+    /* CON first (stage0). Print so glass shows whether WDT is still live. */
+    {
+	void __iomem *wdt = ioremap(0x3c800000, 8);
+
+	if (wdt) {
+		writel(0, wdt);
+		writel(0, wdt + 4);
+		writel(0, wdt);
+		writel(0, wdt + 4);
+		drm_info(dev, "WDT CON=%08x CNT=%08x (disarmed)\n",
+			 readl(wdt), readl(wdt + 4));
+		iounmap(wdt);
+	}
+    }
+
+    /*
+     * The DSI host. The panel driver binds to the child node, attaches,
+     * and that attach builds the DRM device: there is no display to
+     * register before there is a panel to show it on.
+     */
+    s5l8740_dsi_capture(sdev);
+    sdev->dsi_host.dev = &pdev->dev;
+    sdev->dsi_host.ops = &s5l8740_dsi_host_ops;
+    ret = mipi_dsi_host_register(&sdev->dsi_host);
+    if (ret)
+        return dev_err_probe(&pdev->dev, ret, "dsi host\n");
+    if (!sdev->drm_ready)
+        drm_info(dev, "waiting for the panel driver\n");
+    return 0;
+}
  
 /*
  * The LCDIF has no framebuffer-base or stride register -- it is a
@@ -1731,7 +2070,9 @@ static void s5l8740_remove(struct platform_device *pdev)
     dev = &sdev->dev;
 
     cancel_delayed_work_sync(&sdev->comp_retry);
-    drm_dev_unplug(dev);
+    if (sdev->drm_ready)
+        drm_dev_unplug(dev);
+    mipi_dsi_host_unregister(&sdev->dsi_host);
 }
  
 static const struct of_device_id s5l8740_of_match_table[] = {
