@@ -310,8 +310,8 @@
  * captures them from the bootloader-initialised host at probe and writes
  * them back on a re-initialisation.
  */
-#define S5L8740_DSI_STAT0		0x00
-#define S5L8740_DSI_STAT0_BUSY		BIT(20)
+#define S5L8740_DSI_STAT0		0x00	/* lane ready bits, bit 8, bit 20 */
+#define S5L8740_DSI_STAT0_UP		BIT(20)	/* set once out of reset */
 #define S5L8740_DSI_STAT0_READY		BIT(8)	/* with one bit per lane below */
 #define S5L8740_DSI_RESET		0x04
 #define S5L8740_DSI_PLL			0x08
@@ -331,7 +331,7 @@
 #define S5L8740_DSI_T40			0x40
 #define S5L8740_DSI_T40_VAL		511
 #define S5L8740_DSI_T44_VAL		29
-#define S5L8740_DSI_ST_RXRDY		BIT(24)
+#define S5L8740_DSI_ST_RXEMPTY		BIT(24)	/* receive FIFO empty */
 #define S5L8740_DSI_BAND		0x4c	/* PLL band index << 24 */
 #define S5L8740_DSI_T54			0x54
 #define S5L8740_DSI_T58			0x58
@@ -605,8 +605,14 @@ static int s5l8740_dsi_host_init(struct s5l8740_device *sdev)
 	writel(1, d + S5L8740_DSI_RESET);
 	usleep_range(1000, 1500);
 	writel(0, d + S5L8740_DSI_RESET);
+	/*
+	 * sub_3D11B0(+0x00, bit 20, 0): loop while the bit is clear, so this
+	 * waits for it to SET. Waiting for it to clear instead timed out on
+	 * every re-initialisation 2026-09-08 (STAT0 001001c3, bit 20 set at
+	 * rest), which left the panel white after its first power-off.
+	 */
 	ret = readl_poll_timeout(d + S5L8740_DSI_STAT0, v,
-				 !(v & S5L8740_DSI_STAT0_BUSY), 10,
+				 v & S5L8740_DSI_STAT0_UP, 10,
 				 S5L8740_DSI_INIT_TIMEOUT_US);
 	if (ret)
 		goto fail;
@@ -694,8 +700,9 @@ static int s5l8740_dsi_read(struct s5l8740_device *sdev, const u8 *hdr,
 		return -EIO;
 	if (st & S5L8740_DSI_RXSTAT_TIMEOUT)
 		return -ETIMEDOUT;
+	/* sub_3D11B0(+0x44, bit 24, bit 24): loop while the FIFO is empty. */
 	ret = readl_poll_timeout(d + S5L8740_DSI_STATUS, st,
-				 st & S5L8740_DSI_ST_RXRDY, 10,
+				 !(st & S5L8740_DSI_ST_RXEMPTY), 10,
 				 S5L8740_DSI_INIT_TIMEOUT_US);
 	if (ret)
 		return ret;
@@ -707,7 +714,7 @@ static int s5l8740_dsi_read(struct s5l8740_device *sdev, const u8 *hdr,
 		for (i = 0; i < n; i++) {
 			if ((i & 3) == 0) {
 				ret = readl_poll_timeout(d + S5L8740_DSI_STATUS, st,
-							 st & S5L8740_DSI_ST_RXRDY,
+							 !(st & S5L8740_DSI_ST_RXEMPTY),
 							 10, S5L8740_DSI_INIT_TIMEOUT_US);
 				if (ret)
 					return ret;

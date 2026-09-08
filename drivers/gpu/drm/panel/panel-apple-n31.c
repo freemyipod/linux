@@ -2,7 +2,7 @@
 /*
  * Apple iPod nano 7th generation (N31) display panel.
  *
- * A 240x432 DCS command-mode panel on a two-lane MIPI DSI link, driven by
+ * A 240x432 DCS command-mode panel on a one-lane MIPI DSI link, driven by
  * the S5L8740 display controller's DSI host. Two panel variants exist and
  * are told apart by the first byte of manufacturer register 0xA1: 0x11 is
  * a Samsung-style controller that needs its level-2 command key and a
@@ -254,6 +254,20 @@ static int n31_panel_probe(struct mipi_dsi_device *dsi)
 	p->supply = devm_regulator_get(dev, "power");
 	if (IS_ERR(p->supply))
 		return dev_err_probe(dev, PTR_ERR(p->supply), "power supply\n");
+	/*
+	 * A panel the bootloader lit is running on this rail already. Take
+	 * the reference now, or the regulator core's late cleanup counts the
+	 * rail as unused and switches it off 30 s into boot -- measured
+	 * 2026-09-08 as "PMU_LDO_7: disabling" at 33.8 s, followed by an
+	 * "unbalanced disables" warning at the first power-off. The
+	 * controller marks the panel prepared and enabled for the same
+	 * handoff, so unprepare() balances this.
+	 */
+	if (regulator_is_enabled(p->supply) > 0) {
+		ret = regulator_enable(p->supply);
+		if (ret)
+			return dev_err_probe(dev, ret, "claiming the lit panel's rail\n");
+	}
 
 	/*
 	 * Both lines are taken as they are: the bootloader has already lit
@@ -267,7 +281,13 @@ static int n31_panel_probe(struct mipi_dsi_device *dsi)
 	if (IS_ERR(p->enable_gpio))
 		return dev_err_probe(dev, PTR_ERR(p->enable_gpio), "enable gpio\n");
 
-	dsi->lanes = 2;
+	/*
+	 * One data lane: the host's CTL word as the bootloader leaves it is
+	 * 0x00707003, whose lane field (2 * (1 << n) - 2, sub_2AFC) is 2, so
+	 * n = 1. The format field there is 7, which is the firmware's own
+	 * code for its mode selector 0xE; RGB888 is what the compositor feeds.
+	 */
+	dsi->lanes = 1;
 	dsi->format = MIPI_DSI_FMT_RGB888;
 	dsi->mode_flags = MIPI_DSI_MODE_LPM;
 
