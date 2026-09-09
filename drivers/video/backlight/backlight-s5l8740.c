@@ -93,6 +93,7 @@ struct s5l8740_bl {
 	struct delayed_work fade;
 	struct mutex lock;
 	int level;		/* what the hardware currently has */
+	int last_lit;		/* the last level above zero it had */
 	int target;
 	unsigned int step_ms;
 };
@@ -159,6 +160,8 @@ static void s5l8740_bl_hw_set(struct s5l8740_bl *bl, int level)
 	if (level < 0)
 		level = 0;
 	bl->level = level;
+	if (level > 0)
+		bl->last_lit = level;
 
 	/*
 	 * The backlight is in the PMIC's white-LED driver, not in this block.
@@ -185,28 +188,6 @@ static void s5l8740_bl_hw_set(struct s5l8740_bl *bl, int level)
 	if (ret && ret != -ENODEV)
 		pr_warn_ratelimited("s5l8740-bl: wled %d: %d\n", level, ret);
 
-	/*
-	 * Deliberately writes nothing. Both candidate registers are known to
-	 * be the wrong hardware:
-	 *
-	 *   0x3E000008  is a SoC power-domain gate. Its only two writers in
-	 *               the image are sub_4399FC (domain up) and sub_1234
-	 *               (domain down), both touching bit 0 alone. 62 is
-	 *               0b111110 -- five bits with bit 0 clear -- so reading
-	 *               bits 1..5 as a magnitude was reading a bitmask as a
-	 *               number. Sweeping it 62 -> 1 -> 0 -> 62 on the real
-	 *               panel changed nothing, exactly as a power gate would
-	 *               not.
-	 *
-	 *   D1830 0x2A  is charge current, owned by ChargeMgmtTask. See the
-	 *               comment on it in gpio-d1830.c. A full-brightness
-	 *               request here would have asked for roughly 484 mA
-	 *               against a stock ceiling near 154 mA.
-	 *
-	 * So the level is accepted and remembered and the panel does not
-	 * move. That is honest: this driver does not know where brightness
-	 * lives, and guessing has now cost two wrong answers.
-	 */
 }
 
 static void s5l8740_bl_fade_work(struct work_struct *work)
@@ -263,12 +244,27 @@ int n31_backlight_fade(int level, unsigned int ms)
 }
 EXPORT_SYMBOL_GPL(n31_backlight_fade);
 
-/* Level the hardware currently has, ignoring any fade in progress. */
+/*
+ * The level to come back to after a screen sleep.
+ *
+ * Not the hardware's current level: by the time the sleep is requested
+ * the class may already have been blanked by whoever asked for it, and
+ * restoring that zero wakes the panel into the dark (measured 2026-09-08:
+ * display on, glass off). The class's own brightness is the level the
+ * user set; failing that, the last level the hardware was actually lit
+ * at; failing that, the current level.
+ */
 int n31_backlight_level(void)
 {
 	struct s5l8740_bl *bl = s5l8740_bl_dev;
 
-	return bl ? bl->level : -ENODEV;
+	if (!bl)
+		return -ENODEV;
+	if (bl->bd && bl->bd->props.brightness > 0)
+		return bl->bd->props.brightness;
+	if (bl->level > 0)
+		return bl->level;
+	return bl->last_lit > 0 ? bl->last_lit : bl->level;
 }
 EXPORT_SYMBOL_GPL(n31_backlight_level);
 

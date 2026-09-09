@@ -1703,6 +1703,25 @@ static int s5l8740_lcd_power_on_locked(struct s5l8740_device *sdev)
 	ret = drm_panel_enable(sdev->panel);
 	if (ret)
 		drm_warn(&sdev->dev, "panel enable failed: %d\n", ret);
+	/*
+	 * The blank frame went out through the back buffer and the swap made
+	 * it the front, so the other buffer still holds the last frame drawn
+	 * before the power-off. Show that one now: a DRM master that is not
+	 * redrawing while it believes the screen is off comes back to its
+	 * picture instead of to black under a lit backlight.
+	 */
+	if (sdev->comp_ready) {
+		unsigned int last;
+
+		mutex_lock(&sdev->comp_lock);
+		s5l8740_comp_wait_idle(sdev);
+		last = sdev->cbuf_back;
+		writel(lower_32_bits(sdev->cbuf_dma[last]) & 0x7fffffff,
+		       sdev->comp + S5L8740_COMP_L0_ADDR);
+		if (!s5l8740_comp_kick(sdev))
+			sdev->cbuf_back = last ^ 1;
+		mutex_unlock(&sdev->comp_lock);
+	}
 	drm_info(&sdev->dev, "display on (CON=%08x STATUS=%08x)\n",
 		 readl(sdev->lcdif + S5L8740_LCD_CON),
 		 readl(sdev->lcdif + S5L8740_LCD_STATUS));
