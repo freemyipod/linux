@@ -3046,10 +3046,11 @@ static void n31_pmu_rail_exit(void)
 /* down, which reaches the PMU through the machine pm_power_off this    */
 /* driver already installs.                                             */
 /*                                                                      */
-/* The panel itself is deliberately left running. Nothing in this stack  */
-/* can re-initialise it, so powering it down would be a one-way trip     */
-/* until the panel init sequence is recovered. Backlight and touch are   */
-/* where the current draw is anyway.                                     */
+/* The panel is powered down too, through n31_lcd_power(): since         */
+/* 2026-09-08 the display driver runs the firmware's off and on          */
+/* sequences through the panel driver, and the round trip was measured   */
+/* at 250 ms from "display off" to "display on" with the panel id read   */
+/* back over DSI in between.                                             */
 /*                                                                      */
 /* Two tiers are selected from whether the analog audio rail is held:    */
 /* with playback running a press only sleeps the screen, and the deeper  */
@@ -3057,15 +3058,12 @@ static void n31_pmu_rail_exit(void)
 /* ------------------------------------------------------------------ */
 
 /*
- * Off by default. Twice now a power press has left the panel stuck --
- * image still on screen, no fade, and no wake from a second press --
- * needing DFU to recover. The transition has never been driven
- * deliberately, only caught by accident, so arming it on every boot
- * risks the display on a device whose only recovery is a reflash.
- *
- * The mechanism is still there and still wired: set screen_sleep_enable=1
- * to test it on purpose, with the console reachable, rather than
- * discovering it by pressing a button.
+ * The button path is off by default. Twice a power press left the panel
+ * stuck -- image still on screen, no fade, no wake from a second press --
+ * needing DFU to recover, back when nothing could re-initialise the
+ * panel. The panel driver can now, and the transition is driven on
+ * purpose from userspace through the screen_sleep attribute below; set
+ * screen_sleep_enable=1 to have the button do the same.
  */
 static bool screen_sleep_enable;
 module_param(screen_sleep_enable, bool, 0644);
@@ -3215,6 +3213,33 @@ bool n31_screen_is_asleep(void)
 	return n31_screen_asleep;
 }
 EXPORT_SYMBOL_GPL(n31_screen_is_asleep);
+
+/*
+ * The same transition on request from userspace: 1 sleeps, 0 wakes, and
+ * a read says which the screen is in. This is for a program that owns
+ * the display but cannot reach its DRM master -- the launcher's LVGL
+ * backend keeps that fd to itself -- so its only other route was to
+ * blank the backlight and leave the panel scanning. The work runs off
+ * a workqueue, so the write returns before the fade has finished.
+ */
+static ssize_t screen_sleep_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%d\n", n31_screen_asleep ? 1 : 0);
+}
+
+static ssize_t screen_sleep_store(struct device *dev,
+				  struct device_attribute *attr,
+				  const char *buf, size_t count)
+{
+	bool asleep;
+
+	if (kstrtobool(buf, &asleep))
+		return -EINVAL;
+	n31_screen_request(asleep);
+	return count;
+}
+static DEVICE_ATTR_RW(screen_sleep);
 
 static void n31_power_off_work(struct work_struct *work)
 {
@@ -4644,6 +4669,8 @@ static int d1830_gpio_probe(struct i2c_client *client)
 	ret = device_create_file(dev, &dev_attr_do_poweroff);
 	if (ret)
 		dev_warn(dev, "sysfs do_poweroff unavailable: %d\n", ret);
+	if (device_create_file(dev, &dev_attr_screen_sleep))
+		dev_warn(dev, "screen_sleep sysfs failed\n");
 
 	ret = device_create_file(dev, &dev_attr_audio_rails);
 	if (ret)
@@ -4872,6 +4899,7 @@ static void d1830_gpio_remove(struct i2c_client *client)
 	device_remove_file(&client->dev, &dev_attr_buttons);
 	device_remove_file(&client->dev, &dev_attr_regs);
 	device_remove_file(&client->dev, &dev_attr_do_poweroff);
+	device_remove_file(&client->dev, &dev_attr_screen_sleep);
 	if (pm_power_off == d1830_pm_power_off)
 		pm_power_off = NULL;
 	unregister_restart_handler(&d1830_restart_nb);
