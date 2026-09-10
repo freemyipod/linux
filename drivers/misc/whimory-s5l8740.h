@@ -740,6 +740,15 @@ struct whimory {
 	u32 n_cxt;
 	u32 cxt_next_lba;
 	bool cxt_lba_valid;
+	/*
+	 * Materialised map_export image, and the sftl.map_gen it was built
+	 * from. Built on a read at offset 0, served as slices afterwards, and
+	 * rebuilt whenever map_gen moves, so a reader can never be handed
+	 * records from a map that has since been torn down.
+	 */
+	u8 *map_export_buf;
+	size_t map_export_len;
+	u32 map_export_gen;
 	bool fil_ok;
 	bool sig_ok;
 	bool vfl_ok;

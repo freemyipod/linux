@@ -7000,6 +7000,18 @@ MODULE_PARM_DESC(cxt_max_extents,
 		 "Candidate-map extent ceiling for the CXT TREE parser");
 
 /*
+ * Keep the candidate extent table past the seed so cxt_export can serve it.
+ *
+ * Off, because the table is megabytes on a device with tens of them and the
+ * interval map holds everything it did. Set it only for a boot whose purpose
+ * is to read the parser's own output.
+ */
+static bool cxt_keep_ext;
+module_param(cxt_keep_ext, bool, 0644);
+MODULE_PARM_DESC(cxt_keep_ext,
+		 "Retain the CXT extent table for cxt_export (default N)");
+
+/*
  * CXT VBAs are in the FTL native superblock space, which is not the space
  * whimory_pack_vba() builds. Apple counts one superblock as the same virtual
  * block across every (ce, cau) plane, so a superblock holds
@@ -8510,8 +8522,15 @@ static int whimory_cxt_fast_load(struct whimory *w)
 	/*
 	 * The interval map now holds everything the extent table did, and the
 	 * table is ~12 MiB on a 55 MiB device. Drop it; the Phase 3 tools
-	 * reallocate it on demand.
+	 * reallocate it on demand, and cxt_keep_ext holds it for cxt_export.
 	 */
+	if (cxt_keep_ext) {
+		dev_info(w->dev,
+			 "CXT_KEEP extents=%u bytes=%zu retained for cxt_export\n",
+			 w->n_cxt_ext,
+			 (size_t)w->n_cxt_ext * sizeof(*w->cxt_ext));
+		return 0;
+	}
 	kvfree(w->cxt_ext);
 	w->cxt_ext = NULL;
 	w->max_cxt_ext = 0;
@@ -11172,6 +11191,205 @@ static ssize_t touch_cal_read(struct file *filp, struct kobject *kobj,
 }
 static BIN_ATTR_RO(touch_cal, N31_TOUCH_CAL_LEN);
 
+/* ------------------------------------------------------------------ */
+/* Map exports — reference images for an out-of-tree reimplementation  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * One record per mapped range, little-endian, fixed 32 bytes.
+ *
+ * Two independent facts are carried on purpose. `vba` is the address the map
+ * holds, so comparing it answers whether another implementation built the
+ * same map. `blk`/`ce`/`cau`/`page`/`slot` are that address decoded for the
+ * range's first LBA, so comparing them answers whether it agrees on
+ * whimory_unpack_vba(). Those are different faults with different fixes, and
+ * exporting only one of them leaves the other unchecked.
+ *
+ * The decode comes from whimory_l2v_search_phys() rather than from the range
+ * itself, because the L2V is what the read path consults. A range whose
+ * packed form disagrees with it is exactly the case worth catching.
+ *
+ * A range whose decode fails is emitted with the address fields set to all
+ * ones. It is data, not a reason to drop the range.
+ */
+struct whimory_map_rec {
+	__le32 lba;
+	__le32 span;
+	__le32 vba;
+	__le64 weave;
+	__le16 blk;
+	u8 ce;
+	u8 cau;
+	u8 page;
+	u8 slot;
+	u8 src;		/* whimory_range.src: 1 BTOC, 2 open, 3 CXT, 4 list */
+	u8 pad[5];
+} __packed;
+
+#define WHIMORY_MAP_REC_SIZE	32
+
+static void whimory_map_export_free(struct whimory *w)
+{
+	kvfree(w->map_export_buf);
+	w->map_export_buf = NULL;
+	w->map_export_len = 0;
+}
+
+/*
+ * Materialise the whole image once, then serve slices of it.
+ *
+ * The buffer is filled in two passes because the second needs a lock the
+ * first holds: the tree walk runs under tree_lock, and whimory_l2v_search_phys()
+ * takes it. The buffer is its own snapshot, so nothing else is allocated.
+ */
+static int whimory_map_export_build(struct whimory *w)
+{
+	struct whimory_map_rec *rec;
+	struct rb_node *n;
+	unsigned int count, i, undecoded = 0;
+	u8 *buf;
+
+	mutex_lock(&w->tree_lock);
+	count = w->sftl.range_nodes;
+	mutex_unlock(&w->tree_lock);
+	if (!count)
+		return -ENODATA;
+
+	buf = kvmalloc_array(count, WHIMORY_MAP_REC_SIZE, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	rec = (struct whimory_map_rec *)buf;
+
+	mutex_lock(&w->tree_lock);
+	i = 0;
+	for (n = rb_first(&w->ranges); n && i < count; n = rb_next(n)) {
+		struct whimory_range *r = rb_entry(n, struct whimory_range, rb);
+
+		memset(&rec[i], 0, sizeof(rec[i]));
+		rec[i].lba = cpu_to_le32(r->start);
+		rec[i].span = cpu_to_le32(r->len);
+		rec[i].vba = cpu_to_le32(r->vba);
+		rec[i].weave = cpu_to_le64(r->weave);
+		rec[i].src = r->src;
+		i++;
+	}
+	count = i;
+	w->map_export_gen = w->sftl.map_gen;
+	mutex_unlock(&w->tree_lock);
+
+	for (i = 0; i < count; i++) {
+		u32 lba = le32_to_cpu(rec[i].lba);
+		u16 blk;
+		u8 ce, cau, page, slot;
+
+		if (whimory_l2v_search_phys(lba, &ce, &cau, &blk, &page, &slot,
+					    NULL)) {
+			rec[i].blk = cpu_to_le16(0xffff);
+			rec[i].ce = 0xff;
+			rec[i].cau = 0xff;
+			rec[i].page = 0xff;
+			rec[i].slot = 0xff;
+			undecoded++;
+			continue;
+		}
+		rec[i].blk = cpu_to_le16(blk);
+		rec[i].ce = ce;
+		rec[i].cau = cau;
+		rec[i].page = page;
+		rec[i].slot = slot;
+		if (!(i & 0x3fff))
+			cond_resched();
+	}
+
+	whimory_map_export_free(w);
+	w->map_export_buf = buf;
+	w->map_export_len = (size_t)count * WHIMORY_MAP_REC_SIZE;
+	dev_info(w->dev,
+		 "MAP_EXPORT ranges=%u bytes=%zu undecoded=%u gen=%u\n",
+		 count, w->map_export_len, undecoded, w->map_export_gen);
+	return 0;
+}
+
+static ssize_t map_export_read(struct file *filp, struct kobject *kobj,
+			       struct bin_attribute *attr, char *buf,
+			       loff_t off, size_t count)
+{
+	struct whimory *w = whimory_dev;
+	int ret;
+
+	if (!w)
+		return -ENODEV;
+	if (!off || !w->map_export_buf ||
+	    w->map_export_gen != w->sftl.map_gen) {
+		ret = whimory_map_export_build(w);
+		if (ret)
+			return ret;
+	}
+	if (off >= w->map_export_len)
+		return 0;
+	if (off + count > w->map_export_len)
+		count = w->map_export_len - off;
+	memcpy(buf, w->map_export_buf + off, count);
+	return count;
+}
+static BIN_ATTR_RO(map_export, 0);
+
+/*
+ * The per-virtual-block bank membership mask classify derived, one byte per
+ * virtual block, bit n set meaning bank n is a member. No header: the index
+ * is the virtual block number.
+ *
+ * This is the input to every VBA decode, and a wrong mask produces addresses
+ * that are almost right, so it is worth comparing on its own rather than
+ * only through the map it feeds.
+ */
+static ssize_t bank_export_read(struct file *filp, struct kobject *kobj,
+				struct bin_attribute *attr, char *buf,
+				loff_t off, size_t count)
+{
+	struct whimory *w = whimory_dev;
+	size_t len;
+
+	if (!w || !w->sftl.sb_bank_mask || !w->sftl.sb_bank_blocks)
+		return -ENODEV;
+	len = w->sftl.sb_bank_blocks;
+	if (off >= len)
+		return 0;
+	if (off + count > len)
+		count = len - off;
+	memcpy(buf, w->sftl.sb_bank_mask + off, count);
+	return count;
+}
+static BIN_ATTR_RO(bank_export, 0);
+
+/*
+ * The candidate extent table exactly as the CXT TREE parser produced it —
+ * struct whimory_cxt_extent records, unreformatted, so a comparison sees the
+ * parser's own output rather than anything downstream of it.
+ *
+ * Empty unless cxt_keep_ext was set for the recover that built it; the table
+ * is freed as soon as it has seeded the interval map. See
+ * whimory_cxt_fast_load().
+ */
+static ssize_t cxt_export_read(struct file *filp, struct kobject *kobj,
+			       struct bin_attribute *attr, char *buf,
+			       loff_t off, size_t count)
+{
+	struct whimory *w = whimory_dev;
+	size_t len;
+
+	if (!w || !w->cxt_ext || !w->n_cxt_ext)
+		return -ENODEV;
+	len = (size_t)w->n_cxt_ext * sizeof(*w->cxt_ext);
+	if (off >= len)
+		return 0;
+	if (off + count > len)
+		count = len - off;
+	memcpy(buf, (const u8 *)w->cxt_ext + off, count);
+	return count;
+}
+static BIN_ATTR_RO(cxt_export, 0);
+
 static struct attribute *ftl_attrs[] = {
 	&dev_attr_whimory_status.attr,
 	&dev_attr_recover_progress.attr,
@@ -11182,6 +11400,9 @@ static struct attribute *ftl_attrs[] = {
 static struct bin_attribute *ftl_bin_attrs[] = {
 	&bin_attr_syscfg_raw,
 	&bin_attr_touch_cal,
+	&bin_attr_map_export,
+	&bin_attr_bank_export,
+	&bin_attr_cxt_export,
 	NULL,
 };
 static const struct attribute_group ftl_attr_group = {
@@ -11196,6 +11417,7 @@ static void whimory_free(struct whimory *w)
 	if (!w)
 		return;
 	whimory_unregister_disk(w);
+	whimory_map_export_free(w);
 	whimory_range_free(w);
 	whimory_l2v_free(w);
 	w->syscfg.raw_len = 0;

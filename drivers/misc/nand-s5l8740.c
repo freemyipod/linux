@@ -633,6 +633,104 @@ module_param(cs_reset_every, uint, 0644);
 MODULE_PARM_DESC(cs_reset_every,
 		 "fmss_nand_reset after this many CS phys reads (0=off, default; stock never does this)");
 
+/* ------------------------------------------------------------------ */
+/* Page-read trace                                                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Which physical pages a run of the stack above actually read, in issue
+ * order, as fixed 8-byte little-endian records.
+ *
+ * The record is appended at the four transport entry points rather than in
+ * the caller, because the layers above reach the NAND through several paths
+ * and instrumenting them individually means choosing which ones matter. Every
+ * read arrives here.
+ *
+ * The ring does not wrap. A trace used to build a replay fixture has to be
+ * complete or it is worse than absent, so an overflow stops recording and is
+ * counted instead.
+ */
+struct fmss_page_trace_rec {
+	u8 ce;
+	u8 cau;
+	__le16 blk;
+	u8 page;
+	u8 pad[3];
+} __packed;
+
+/* One recover reads roughly 20 000 pages; 64 Ki records is 512 KiB. */
+#define FMSS_PAGE_TRACE_MAX	65536u
+
+static bool page_trace;
+static struct fmss_page_trace_rec *page_trace_buf;
+static unsigned int page_trace_n;
+static unsigned int page_trace_dropped;
+static DEFINE_SPINLOCK(page_trace_lock);
+
+static void fmss_page_trace_add(u8 ce, u8 cau, u16 block, u8 page)
+{
+	struct fmss_page_trace_rec *r;
+	unsigned long flags;
+
+	if (likely(!page_trace))
+		return;
+
+	spin_lock_irqsave(&page_trace_lock, flags);
+	if (!page_trace_buf || page_trace_n >= FMSS_PAGE_TRACE_MAX) {
+		page_trace_dropped++;
+		spin_unlock_irqrestore(&page_trace_lock, flags);
+		return;
+	}
+	r = &page_trace_buf[page_trace_n++];
+	r->ce = ce;
+	r->cau = cau;
+	r->blk = cpu_to_le16(block);
+	r->page = page;
+	memset(r->pad, 0, sizeof(r->pad));
+	spin_unlock_irqrestore(&page_trace_lock, flags);
+}
+
+/*
+ * The buffer is allocated when tracing is enabled and held until the module
+ * unloads. Freeing it on disable would race a reader mid-copy, and half a
+ * megabyte is a cheaper price than that.
+ */
+static int fmss_page_trace_set(const char *val, const struct kernel_param *kp)
+{
+	struct fmss_page_trace_rec *buf = NULL;
+	unsigned long flags;
+	int ret;
+
+	ret = param_set_bool(val, kp);
+	if (ret)
+		return ret;
+	if (page_trace && !page_trace_buf)
+		buf = kvmalloc_array(FMSS_PAGE_TRACE_MAX, sizeof(*buf),
+				     GFP_KERNEL);
+
+	spin_lock_irqsave(&page_trace_lock, flags);
+	if (buf && !page_trace_buf) {
+		page_trace_buf = buf;
+		buf = NULL;
+	}
+	page_trace_n = 0;
+	page_trace_dropped = 0;
+	spin_unlock_irqrestore(&page_trace_lock, flags);
+
+	kvfree(buf);
+	if (page_trace && !page_trace_buf)
+		return -ENOMEM;
+	return 0;
+}
+
+static const struct kernel_param_ops fmss_page_trace_ops = {
+	.set = fmss_page_trace_set,
+	.get = param_get_bool,
+};
+module_param_cb(page_trace, &fmss_page_trace_ops, &page_trace, 0644);
+MODULE_PARM_DESC(page_trace,
+		 "Record every physical page read into page_trace_log; any write resets the ring (default N)");
+
 /*
  * What to do with the per-page read status the controller writes to the
  * array at FMGEN4 (D10).
@@ -1801,7 +1899,11 @@ static int fmss_dma_setup(struct nand_s5l8740 *f, struct device *dev)
  *    had seen, not a classification. A byte outside it still has bits: 0x61
  *    is bit6 | bit5 | bit0, and the rules below would call it UECC on bit0
  *    with bit3 clear, exactly as they do for 0x51 (bit4 | bit0) which is on
- *    the list. bit5 is simply a bit no entry on the list carries.
+ *    the list. bit5 is simply a bit no entry on the list carries. Line the
+ *    set up and it is a base plus one reason bit -- 0x40, then 0x40|0x02
+ *    and 0x40|0x04 for the two that keep their data, then 0x41 with each of
+ *    0x02, 0x04, 0x08, 0x10 and 0x80 for the five that do not. 0x41|0x20 is
+ *    the one value in that run the whitelist omits, and it is 0x61.
  *  - stock's own first guess for an unidentified status is a timeout, i.e.
  *    the command, not the media. That is the reading a driver should take
  *    before it blames a page.
@@ -2567,6 +2669,7 @@ int s5l8740_nand_cs_read_meta_batch(u8 ce, u8 cau, const u16 *blocks, u8 page,
 			return -EINVAL;
 		}
 		addrs[i] = fmss_ppn_addr(cau, blocks[i], page, 0);
+		fmss_page_trace_add(ce, cau, blocks[i], page);
 	}
 
 	mutex_lock(&f->lock);
@@ -2664,6 +2767,8 @@ int s5l8740_nand_cs_read_pages_batch(u8 ce, const struct s5l8740_ppn_ref *refs,
 		}
 		addrs[i] = fmss_ppn_addr(refs[i].cau, refs[i].block,
 					 refs[i].page, 0);
+		fmss_page_trace_add(ce, refs[i].cau, refs[i].block,
+				    refs[i].page);
 	}
 
 	mutex_lock(&f->lock);
@@ -2734,6 +2839,8 @@ int s5l8740_nand_cs_scan_meta(u8 ce, const struct s5l8740_ppn_ref *refs,
 		}
 		addrs[i] = fmss_ppn_addr(refs[i].cau, refs[i].block,
 					 refs[i].page, 0);
+		fmss_page_trace_add(ce, refs[i].cau, refs[i].block,
+				    refs[i].page);
 	}
 
 	mutex_lock(&f->lock);
@@ -7856,7 +7963,53 @@ static ssize_t page_data_read(struct file *filp, struct kobject *kobj,
 }
 static BIN_ATTR_RO(page_data, FMSS_PAGE_LEN);
 
+/*
+ * The trace ring, verbatim. Records are 8 bytes; the index is issue order.
+ */
+static ssize_t page_trace_log_read(struct file *filp, struct kobject *kobj,
+				   struct bin_attribute *attr, char *buf,
+				   loff_t off, size_t count)
+{
+	unsigned long flags;
+	size_t len;
+
+	spin_lock_irqsave(&page_trace_lock, flags);
+	if (!page_trace_buf) {
+		spin_unlock_irqrestore(&page_trace_lock, flags);
+		return -ENODEV;
+	}
+	len = (size_t)page_trace_n * sizeof(*page_trace_buf);
+	if (off >= len) {
+		spin_unlock_irqrestore(&page_trace_lock, flags);
+		return 0;
+	}
+	if (off + count > len)
+		count = len - off;
+	memcpy(buf, (const u8 *)page_trace_buf + off, count);
+	spin_unlock_irqrestore(&page_trace_lock, flags);
+	return count;
+}
+static BIN_ATTR_RO(page_trace_log, 0);
+
+static ssize_t page_trace_stats_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	unsigned long flags;
+	unsigned int n, dropped;
+
+	spin_lock_irqsave(&page_trace_lock, flags);
+	n = page_trace_n;
+	dropped = page_trace_dropped;
+	spin_unlock_irqrestore(&page_trace_lock, flags);
+
+	return sysfs_emit(buf, "PGTRACE on=%d records=%u dropped=%u max=%u\n",
+			  page_trace ? 1 : 0, n, dropped,
+			  FMSS_PAGE_TRACE_MAX);
+}
+static DEVICE_ATTR_RO(page_trace_stats);
+
 static struct attribute *fmss_attrs[] = {
+	&dev_attr_page_trace_stats.attr,
 	&dev_attr_regs.attr,
 	&dev_attr_id.attr,
 	&dev_attr_read_id.attr,
@@ -7914,6 +8067,7 @@ static struct attribute *fmss_attrs[] = {
 
 static struct bin_attribute *fmss_bin_attrs[] = {
 	&bin_attr_page_data,
+	&bin_attr_page_trace_log,
 	NULL,
 };
 
@@ -8006,6 +8160,10 @@ static void __exit nand_s5l8740_exit(void)
 {
 	platform_device_unregister(nand_pdev);
 	platform_driver_unregister(&nand_driver);
+	page_trace = false;
+	kvfree(page_trace_buf);
+	page_trace_buf = NULL;
+	page_trace_n = 0;
 }
 
 /* --- Exported read-only FTL sector API (ftl-s5l8740.ko) --- */
@@ -8639,6 +8797,7 @@ int s5l8740_nand_cs_phys_read_slc(u8 ce, u8 cau, u16 block, u8 page, u8 slc,
 
 	memset(out, 0, sizeof(*out));
 	addr = fmss_ppn_addr(cau, block, page, slc);
+	fmss_page_trace_add(ce, cau, block, page);
 
 	mutex_lock(&f->lock);
 	if (cs_reset_every && f->pages_since_reset >= cs_reset_every) {
