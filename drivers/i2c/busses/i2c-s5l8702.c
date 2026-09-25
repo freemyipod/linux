@@ -165,12 +165,10 @@ static void s5l8702_i2c_state_machine(struct s5l8702_i2c_dev *i2c_dev) {
 generate_stop:
 		i2c_dev->pending_irq = S5L8702_I2C_INT_STOP;
 
-		if (i2c_dev->msg->flags & I2C_M_RD) {
-			stat &= ~S5L8702_I2C_STAT_BB;
-		}
-		else {
-			stat &= ~( S5L8702_I2C_STAT_BB | S5L8702_I2C_STAT_TX );
-		}
+		// Each state runs in its own interrupt, so stat does not carry
+		// over from STATE_START. Stay master and drop BB (and TX for
+		// writes) to generate the STOP condition.
+		stat = S5L8702_I2C_STAT_SOE | S5L8702_I2C_STAT_MASTER;
 		s5l8702_i2c_writel(i2c_dev, S5L8702_I2C_STAT, stat);
 		i2c_dev->iiccon &= ~S5L8702_I2C_CON_ACKGEN;
 		i2c_dev->iiccon |= S5L8702_I2C_CON_BUSHOLD;
