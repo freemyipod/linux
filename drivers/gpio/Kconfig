@@ -615,6 +615,16 @@ config GPIO_RTD
 	  Say yes here to support GPIO functionality and GPIO interrupt on
 	  Realtek DHC SoCs.
 
+config GPIO_S5L8702
+	tristate "Samsung/Apple S5L8702 GPIO support"
+	depends on ARCH_S5L87XX || COMPILE_TEST
+	depends on OF_GPIO
+	select GPIOLIB_IRQCHIP
+	help
+	  Say yes here to support the GPIO controller and the GPIO external
+	  interrupt controller of the Samsung/Apple S5L8702 SoC, found in the
+	  iPod nano 3rd generation (N46).
+
 config GPIO_SAMA5D2_PIOBU
 	tristate "SAMA5D2 PIOBU GPIO support"
 	depends on MFD_SYSCON

@@ -179,6 +179,23 @@
 			#clock-cells = <1>;
 		};
 
+		/*
+		 * GPIO pins 0..127 (port * 8 + pin). Pin interrupts come from
+		 * the external interrupt controller in the "system alive"
+		 * block, whose GPIO groups feed VIC0 lines 0..3.
+		 */
+		gpio: gpio-controller@3cf00000 {
+			compatible = "apple,s5l8702-gpio";
+			reg = <0x3cf00000 0x204>, <0x39a00080 0x80>;
+			clocks = <&clkctrl CLK_GPIO>;
+			interrupt-parent = <&vic0>;
+			interrupts = <0>, <1>, <2>, <3>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+		};
+
 		sha1: sha1@38000000 {
 			compatible = "samsung,s5l8702-sha1";
 			reg = <0x38000000 0x100>;
