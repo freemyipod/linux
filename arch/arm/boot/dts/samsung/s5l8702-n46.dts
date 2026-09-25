@@ -196,6 +196,62 @@
 			#interrupt-cells = <2>;
 		};
 
+		/*
+		 * ARM PL080 DMA controllers. Request lines (first cell):
+		 *  dmac0: 0/1 I2S2 tx/rx, 2 SPDIF tx, 3 LCD, 4/5 SPI0,
+		 *         6/7 UART0, 8/9 UART1, 10/11 I2S0, 12/13 SPI2,
+		 *         14/15 SPI1
+		 *  dmac1: 0/1 CE-ATA, 2/3 I2S1, 4/5 I2S2, 6/7 SPI1,
+		 *         8/9 UART2, 10/11 SPI0, 12/13 UART3, 14/15 SPI2
+		 * Rockbox uses AHB master 1 for everything (second cell = 1).
+		 * The PrimeCell ID is forced in case the silicon doesn't
+		 * report a standard one.
+		 */
+		dmac0: dma-controller@38200000 {
+			compatible = "arm,pl080", "arm,primecell";
+			arm,primecell-periphid = <0x00041080>;
+			reg = <0x38200000 0x1000>;
+			interrupt-parent = <&vic0>;
+			interrupts = <16>;
+			clocks = <&clkctrl CLK_DMAC0>;
+			clock-names = "apb_pclk";
+			lli-bus-interface-ahb1;
+			mem-bus-interface-ahb1;
+			memcpy-burst-size = <16>;
+			memcpy-bus-width = <32>;
+			#dma-cells = <2>;
+		};
+
+		dmac1: dma-controller@39900000 {
+			compatible = "arm,pl080", "arm,primecell";
+			arm,primecell-periphid = <0x00041080>;
+			reg = <0x39900000 0x1000>;
+			interrupt-parent = <&vic0>;
+			interrupts = <17>;
+			clocks = <&clkctrl CLK_DMAC1>;
+			clock-names = "apb_pclk";
+			lli-bus-interface-ahb1;
+			mem-bus-interface-ahb1;
+			memcpy-burst-size = <16>;
+			memcpy-bus-width = <32>;
+			#dma-cells = <2>;
+		};
+
+		/*
+		 * Watchdog. Only its reset behaviour is known: writing
+		 * 0x100000 to WDTCON resets the SoC (Rockbox system_reboot).
+		 */
+		wdt: watchdog@3c800000 {
+			compatible = "apple,s5l8702-wdt", "syscon", "simple-mfd";
+			reg = <0x3c800000 0x8>;
+
+			reboot {
+				compatible = "syscon-reboot";
+				offset = <0x0>;
+				value = <0x100000>;
+			};
+		};
+
 		sha1: sha1@38000000 {
 			compatible = "samsung,s5l8702-sha1";
 			reg = <0x38000000 0x100>;

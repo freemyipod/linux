@@ -8,6 +8,7 @@ if ARCH_S5L87XX
 config CPU_S5L8702
 	bool "Enable S5L8702 (iPod nano 3rd Generation / N46) CPU support"
 	select ARCH_MULTI_V5
+	select ARM_AMBA
 	select ARM_VIC
 	help
 	  Enable support for the Samsung/Apple S5L8702 SoC (ARM926EJ-S),
