@@ -28,6 +28,14 @@
 		clock-output-names = "clkref";
 	};
 
+	/* 32.768 kHz crystal */
+	osc1: clock-osc1 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <32768>;
+		clock-output-names = "osc1";
+	};
+
 	cpus {
 		#address-cells = <1>;
 		#size-cells = <0>;
@@ -97,7 +105,7 @@
 			interrupts = <19>;
 			phys = <&usbphy>;
 			phy-names = "usb2-phy";
-			clocks = <&clkref>;
+			clocks = <&clkctrl CLK_USBOTG>;
 			clock-names = "otg";
 			g-rx-fifo-size = <536>;
 			g-np-tx-fifo-size = <256>;
@@ -110,6 +118,7 @@
 			compatible = "samsung,s5l8702-i2c";
 			reg = <0x3c600000 0x100>;
 			clock-frequency = <100000>;
+			clocks = <&clkctrl CLK_I2C0>;
 			interrupt-parent = <&vic0>;
 			interrupts = <21>;
 			samsung,write-busy-poll;
@@ -124,6 +133,7 @@
 		spi0: spi@3c300000 {
 			compatible = "apple,s5l8702-spi";
 			reg = <0x3c300000 0x50>;
+			clocks = <&clkctrl CLK_SPI0>;
 			#address-cells = <1>;
 			#size-cells = <0>;
 			status = "okay";
@@ -136,27 +146,26 @@
 		};
 
 		/*
-		 * FMI (Flash Memory Interface) for the on-board NAND.
-		 * The driver also pokes the GPIO pinmux (0x3cf00000) and
-		 * the PWRCON0 clock-gate (0x3c500048) directly; those are
-		 * not modelled here yet.
-		 */
-		/*
 		 * LCD controller: custom 8080-series MPU interface block
 		 * driving an ILI93xx-family panel (auto-detected at probe).
-		 * Clock-gate lives in PWRCON0 bit 1 (0x3c500048); poked
-		 * directly by the driver until a clock controller is added.
 		 */
 		lcd: lcd@38300000 {
 			compatible = "apple,s5l8702-lcd";
 			reg = <0x38300000 0x100>;
+			clocks = <&clkctrl CLK_LCD>;
 			pmu-i2c = <&i2c0>;
 			status = "okay";
 		};
 
+		/*
+		 * FMI (Flash Memory Interface) for the on-board NAND.
+		 * The driver still sets the GPIO pinmux (PCON8..10) itself.
+		 */
 		nand: nand@38a00000 {
 			compatible = "apple,s5l8702-nand";
 			reg = <0x38a00000 0x400>;
+			clocks = <&clkctrl CLK_NAND>, <&clkctrl CLK_NANDECC>;
+			clock-names = "nand", "ecc";
 			pmu-i2c = <&i2c0>;
 			apple,nand-bank = <0>;
 			status = "okay";
@@ -165,6 +174,8 @@
 		clkctrl: clock-controller@3c500000 {
 			compatible = "samsung,s5l8702-clock";
 			reg = <0x3c500000 0x100>;
+			clocks = <&clkref>, <&osc1>;
+			clock-names = "osc0", "osc1";
 			#clock-cells = <1>;
 		};
 

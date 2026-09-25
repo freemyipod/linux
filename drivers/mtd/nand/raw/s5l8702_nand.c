@@ -12,6 +12,7 @@
  * fetch and the DMA copy.
  */
 
+#include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
@@ -95,11 +96,6 @@
 // Poll timeout (1 second)
 #define FMI_TIMEOUT_US		1000000
 
-// PWRCON0: clock-gate register (bit = 0 means clocked)
-#define S5L8702_PWRCON0_PHYS	0x3c500048UL
-#define PWRCON0_NAND_BIT	BIT(8)
-#define PWRCON0_NAND_ECC_BIT	BIT(12)
-
 /*
  * GPIO pinmux for the NAND data/control bus.
  * GPIO base on s5l8702 is 0x3cf00000; PCON registers are 0x20 apart.
@@ -134,7 +130,6 @@ struct s5l8702_nand {
 	struct nand_chip	chip;
 	struct device		*dev;
 	void __iomem		*regs;
-	void __iomem		*pwrcon0;
 	void __iomem		*gpio;	  // PCON8..PCON10 window
 	u32			base_bank; // Starting NAND bank from DT
 	u32			bank;	  // Current NAND bank for I/O
@@ -711,6 +706,7 @@ static int s5l8702_nand_probe(struct platform_device *pdev) {
 	struct device_node *i2c_np;
 	struct nand_chip *chip;
 	struct mtd_info *mtd;
+	struct clk_bulk_data *clks;
 	u32 bank;
 	int ret;
 
@@ -721,17 +717,16 @@ static int s5l8702_nand_probe(struct platform_device *pdev) {
 	priv->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(priv->regs)) return PTR_ERR(priv->regs);
 
-	priv->pwrcon0 = devm_ioremap(&pdev->dev, S5L8702_PWRCON0_PHYS, 4);
-	if (!priv->pwrcon0) return -ENOMEM;
-
 	priv->gpio = devm_ioremap(&pdev->dev, S5L8702_GPIO_PHYS + S5L8702_GPIO_MAP_OFF, S5L8702_GPIO_MAP_LEN);
 	if (!priv->gpio) return -ENOMEM;
 
 	// Configure pin-mux PCON8..PCON10 to NAND alternate function.
 	s5l8702_nand_configure_gpio(priv);
 
-	// Ungate the NAND and NAND-ECC clocks (PWRCON0: clear = clocked).
-	writel(readl(priv->pwrcon0) & ~(PWRCON0_NAND_BIT | PWRCON0_NAND_ECC_BIT), priv->pwrcon0);
+	// Ungate the NAND and NAND-ECC clocks.
+	ret = devm_clk_bulk_get_all_enabled(&pdev->dev, &clks);
+	if (ret < 0) return dev_err_probe(&pdev->dev, ret, "failed to enable clocks\n");
+	if (!ret) return dev_err_probe(&pdev->dev, -EINVAL, "NAND and ECC clocks missing\n");
 
 	i2c_np = of_parse_phandle(pdev->dev.of_node, "pmu-i2c", 0);
 	if (!i2c_np) return dev_err_probe(&pdev->dev, -ENODEV, "pmu-i2c phandle missing\n");

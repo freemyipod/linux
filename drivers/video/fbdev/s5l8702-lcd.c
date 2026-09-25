@@ -11,6 +11,7 @@
  *
  */
 
+#include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/fb.h>
 #include <linux/i2c.h>
@@ -47,10 +48,6 @@
 /* LCD_CONFIG values - opaque magic from Rockbox / firmware RE */
 #define LCD_MODE_P8	0x80000c20	/* 8-bit parallel - commands */
 #define LCD_MODE_P9	0x81100db8	/* 9-bit parallel - frame data */
-
-/* PWRCON0 clock-gate (PWRCON0 bit 1 = LCD) */
-#define S5L8702_PWRCON0_PHYS	0x3c500048UL
-#define PWRCON0_LCD_BIT		BIT(1)
 
 /* Dialog D1671 PMU (I2C) - backlight control.  No upstream backlight
  * driver exists for this PMU yet; we just poke it directly here to
@@ -258,7 +255,6 @@ static const u8 * const init_seq_by_type[N_LCD_TYPES] = {
 struct s5l_lcd_par {
 	struct fb_info *info;
 	void __iomem *regs;
-	void __iomem *pwrcon0;
 	struct mutex io_lock;
 	int lcd_type;
 	u8 lcd_id[4];
@@ -511,8 +507,8 @@ static int s5l_lcd_probe(struct platform_device *pdev)
 	struct s5l_lcd_par *par;
 	struct i2c_adapter *pmu;
 	struct fb_info *info;
+	struct clk *clk;
 	void *vmem;
-	u32 pwr;
 	int ret;
 
 	pmu = s5l_lcd_get_pmu(dev);
@@ -535,18 +531,12 @@ static int s5l_lcd_probe(struct platform_device *pdev)
 		goto err_release_info;
 	}
 
-	/* PWRCON0 LCD clock-gate.  Modelled standalone for now (mirrors
-	 * what s5l8702_nand.c does for its own gates); once a proper
-	 * clock controller driver exists this should consume a clock
-	 * phandle instead.
-	 */
-	par->pwrcon0 = devm_ioremap(dev, S5L8702_PWRCON0_PHYS, 4);
-	if (!par->pwrcon0) {
-		ret = -ENOMEM;
+	/* Gated off again by devres on probe failure and on unbind */
+	clk = devm_clk_get_enabled(dev, NULL);
+	if (IS_ERR(clk)) {
+		ret = dev_err_probe(dev, PTR_ERR(clk), "failed to enable clock\n");
 		goto err_release_info;
 	}
-	pwr = readl(par->pwrcon0);
-	writel(pwr & ~PWRCON0_LCD_BIT, par->pwrcon0);
 
 	writel(0x33, par->regs + LCD_PHTIME);
 
@@ -556,7 +546,7 @@ static int s5l_lcd_probe(struct platform_device *pdev)
 			par->lcd_id[0], par->lcd_id[1],
 			par->lcd_id[2], par->lcd_id[3]);
 		ret = par->lcd_type;
-		goto err_gate_off;
+		goto err_release_info;
 	}
 	dev_info(dev, "panel id %02x %02x %02x %02x (type %d)\n",
 		 par->lcd_id[0], par->lcd_id[1],
@@ -568,7 +558,7 @@ static int s5l_lcd_probe(struct platform_device *pdev)
 	vmem = vzalloc(FB_SIZE);
 	if (!vmem) {
 		ret = -ENOMEM;
-		goto err_gate_off;
+		goto err_release_info;
 	}
 
 	info->screen_buffer = vmem;
@@ -600,8 +590,6 @@ static int s5l_lcd_probe(struct platform_device *pdev)
 err_defio_cleanup:
 	fb_deferred_io_cleanup(info);
 	vfree(vmem);
-err_gate_off:
-	writel(readl(par->pwrcon0) | PWRCON0_LCD_BIT, par->pwrcon0);
 err_release_info:
 	framebuffer_release(info);
 	i2c_put_adapter(pmu);
@@ -611,12 +599,10 @@ err_release_info:
 static void s5l_lcd_remove(struct platform_device *pdev)
 {
 	struct fb_info *info = platform_get_drvdata(pdev);
-	struct s5l_lcd_par *par = info->par;
 	void *vmem = info->screen_buffer;
 
 	unregister_framebuffer(info);
 	fb_deferred_io_cleanup(info);
-	writel(readl(par->pwrcon0) | PWRCON0_LCD_BIT, par->pwrcon0);
 	vfree(vmem);
 	framebuffer_release(info);
 }

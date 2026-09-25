@@ -3,6 +3,7 @@
  * S5L8702 I2C controller driver
  */
 
+#include <linux/clk.h>
 #include <linux/device.h>
 #include <linux/dev_printk.h>
 #include <linux/i2c.h>
@@ -295,6 +296,7 @@ static int s5l8702_i2c_probe(struct platform_device *pdev)
 	struct s5l8702_i2c_dev *i2c_dev;
 	int ret;
 	struct i2c_adapter *adap;
+	struct clk *clk;
 
 	i2c_dev = devm_kzalloc(&pdev->dev, sizeof(*i2c_dev), GFP_KERNEL);
 	if (!i2c_dev)
@@ -308,6 +310,11 @@ static int s5l8702_i2c_probe(struct platform_device *pdev)
 
 	i2c_dev->write_busy_poll = of_property_read_bool(pdev->dev.of_node,
 							  "samsung,write-busy-poll");
+
+	// Optional: not every board describes the controller's clock gate
+	clk = devm_clk_get_optional_enabled(&pdev->dev, NULL);
+	if (IS_ERR(clk))
+		return dev_err_probe(&pdev->dev, PTR_ERR(clk), "failed to enable clock\n");
 
 	ret = s5l8702_i2c_init(i2c_dev);
 	if (ret) {

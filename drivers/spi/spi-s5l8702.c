@@ -5,6 +5,7 @@
  *
  * Ported from Rockbox's spi-s5l8702.c by Michael Sparmann.
  */
+#include <linux/clk.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
@@ -39,10 +40,6 @@
 #define S5L8702_PCON0_PHYS		0x3cf00000UL
 #define S5L8702_GPIOCMD_PHYS	0x3cf00200UL
 
-// PWRCON(1) = 0x3C500048 + 4*1; clockgate 34 sits in PWRCON1, bit 2
-#define S5L8702_PWRCON1_PHYS	0x3c50004cUL
-#define PWRCON1_SPI0_BIT		BIT(2)
-
 // PCON0[15:0]: set pins 0-3 to SPI function (each 4 bits = 0x2)
 #define PCON0_SPI_MASK		0xffffU
 #define PCON0_SPI_FUNC		0x2222U
@@ -61,7 +58,6 @@ struct s5l8702_spi {
 	void __iomem *base;
 	void __iomem *pcon0;
 	void __iomem *gpiocmd;
-	void __iomem *pwrcon1;
 };
 
 static int s5l8702_spi_wait_rx(struct s5l8702_spi *sspi) {
@@ -132,6 +128,7 @@ out_rxmode:
 static int s5l8702_spi_probe(struct platform_device *pdev) {
 	struct spi_controller *ctlr;
 	struct s5l8702_spi *sspi;
+	struct clk *clk;
 	int ret;
 
 	ctlr = devm_spi_alloc_host(&pdev->dev, sizeof(*sspi));
@@ -143,14 +140,14 @@ static int s5l8702_spi_probe(struct platform_device *pdev) {
 
 	sspi->pcon0 = devm_ioremap(&pdev->dev, S5L8702_PCON0_PHYS, 4);
 	sspi->gpiocmd = devm_ioremap(&pdev->dev, S5L8702_GPIOCMD_PHYS, 4);
-	sspi->pwrcon1 = devm_ioremap(&pdev->dev, S5L8702_PWRCON1_PHYS, 4);
-	if (!sspi->pcon0 || !sspi->gpiocmd || !sspi->pwrcon1) return -ENOMEM;
+	if (!sspi->pcon0 || !sspi->gpiocmd) return -ENOMEM;
 
 	// Route GPIO pins to SPI function
 	writel((readl(sspi->pcon0) & ~PCON0_SPI_MASK) | PCON0_SPI_FUNC, sspi->pcon0);
 
 	// Enable SPI0 clock gate
-	writel(readl(sspi->pwrcon1) & ~PWRCON1_SPI0_BIT, sspi->pwrcon1);
+	clk = devm_clk_get_enabled(&pdev->dev, NULL);
+	if (IS_ERR(clk)) return dev_err_probe(&pdev->dev, PTR_ERR(clk), "failed to enable clock\n");
 
 	// Deassert CS
 	writel(GPIOCMD_SPI0_CS_DEASSERT, sspi->gpiocmd);
