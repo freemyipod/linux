@@ -123,6 +123,7 @@ cat > "$FS/etc/init.d/rcS" <<'EOF'
 #!/bin/sh
 mount -t proc     proc     /proc
 mount -t sysfs    sysfs    /sys
+mount -t debugfs  debugfs  /sys/kernel/debug 2>/dev/null || true
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 mkdir -p /dev/pts
 mount -t devpts devpts /dev/pts
